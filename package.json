@@ -1,0 +1,19 @@
+{
+  "name": "ok-library",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:api": "npm --workspace apps/api-worker run dev",
+    "dev:web": "npm --workspace apps/web run dev",
+    "dev": "npm run dev --workspaces --if-present --parallel",
+    "build:shared": "npm --workspace packages/shared run build",
+    "migrate:local": "npm --workspace apps/api-worker run migrate:local",
+    "deploy:api": "npm --workspace apps/api-worker run deploy",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "echo 'lint placeholder'"
+  }
+}

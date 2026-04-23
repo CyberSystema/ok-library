@@ -1,0 +1,26 @@
+name = "ok-library-api"
+main = "src/index.ts"
+compatibility_date = "2026-04-23"
+
+[observability.logs]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ok_library"
+database_id = "replace-with-your-d1-database-id"
+migrations_dir = "migrations"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "replace-with-your-kv-namespace-id"
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "ok-library-assets"
+
+[vars]
+APP_ENV = "development"
+JWT_ISSUER = "ok-library-api"
+ACCESS_TOKEN_TTL_SECONDS = "43200"
+CORS_ORIGIN = "http://localhost:5173"

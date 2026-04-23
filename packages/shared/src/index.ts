@@ -1,0 +1,144 @@
+import { z } from 'zod';
+
+export const BookStatusSchema = z.enum(['available', 'borrowed', 'lost', 'maintenance']);
+
+export const ISODateTimeSchema = z
+  .string()
+  .min(1)
+  .refine((v) => !Number.isNaN(Date.parse(v)), 'Invalid ISO datetime');
+
+export const BookCoreSchema = z.object({
+  title: z.string().min(1).max(300),
+  author: z.string().min(1).max(200),
+  isbn: z.string().max(32).optional().nullable(),
+  publicationYear: z.number().int().min(1000).max(3000).optional().nullable(),
+  publisher: z.string().max(200).optional().nullable(),
+  language: z.string().max(50).optional().nullable(),
+  description: z.string().max(4000).optional().nullable(),
+  roomCode: z.string().max(64).optional().nullable(),
+  shelfCode: z.string().max(64).optional().nullable(),
+  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).default({})
+});
+
+export const CreateBookSchema = BookCoreSchema.extend({
+  acquisitionDate: ISODateTimeSchema.optional().nullable(),
+  tags: z.array(z.string().max(50)).max(30).default([]),
+  status: BookStatusSchema.default('available')
+});
+
+export const UpdateBookSchema = CreateBookSchema.partial().extend({
+  version: z.number().int().min(0)
+});
+
+export const BookSchema = CreateBookSchema.extend({
+  id: z.string().min(1),
+  status: BookStatusSchema,
+  createdAt: ISODateTimeSchema,
+  updatedAt: ISODateTimeSchema,
+  deletedAt: ISODateTimeSchema.nullable(),
+  version: z.number().int().min(0)
+});
+
+export const BorrowBookSchema = z.object({
+  borrowerName: z.string().min(1).max(200),
+  borrowerContact: z.string().max(200).optional().nullable(),
+  dueAt: ISODateTimeSchema,
+  notes: z.string().max(2000).optional().nullable()
+});
+
+export const ReturnBookSchema = z.object({
+  notes: z.string().max(2000).optional().nullable()
+});
+
+export const RoomSchema = z.object({
+  id: z.string().min(1),
+  code: z.string().min(1).max(64),
+  name: z.string().min(1).max(200),
+  description: z.string().max(2000).optional().nullable(),
+  mapMetadata: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).default({}),
+  createdAt: ISODateTimeSchema,
+  updatedAt: ISODateTimeSchema
+});
+
+export const UpsertRoomSchema = RoomSchema.pick({
+  code: true,
+  name: true,
+  description: true,
+  mapMetadata: true
+});
+
+export const CustomFieldTypeSchema = z.enum(['text', 'number', 'boolean', 'date', 'enum']);
+
+export const CustomFieldSchema = z.object({
+  id: z.string().min(1),
+  key: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_]+$/),
+  label: z.string().min(1).max(200),
+  type: CustomFieldTypeSchema,
+  required: z.boolean(),
+  enumOptions: z.array(z.string().max(100)).default([]),
+  createdAt: ISODateTimeSchema,
+  updatedAt: ISODateTimeSchema
+});
+
+export const UpsertCustomFieldSchema = CustomFieldSchema.pick({
+  key: true,
+  label: true,
+  type: true,
+  required: true,
+  enumOptions: true
+});
+
+export const CodeTypeSchema = z.enum(['qr', 'barcode']);
+
+export const GenerateCodeSchema = z.object({
+  type: CodeTypeSchema,
+  label: z.string().max(120).optional().nullable()
+});
+
+export const CodeAssignmentSchema = z.object({
+  id: z.string().min(1),
+  bookId: z.string().min(1),
+  type: CodeTypeSchema,
+  value: z.string().min(1),
+  label: z.string().max(120).nullable(),
+  active: z.boolean(),
+  createdAt: ISODateTimeSchema,
+  updatedAt: ISODateTimeSchema
+});
+
+export const BookFilterQuerySchema = z.object({
+  q: z.string().max(200).optional(),
+  status: BookStatusSchema.optional(),
+  roomCode: z.string().max(64).optional(),
+  shelfCode: z.string().max(64).optional(),
+  sortBy: z.enum(['title', 'author', 'updatedAt', 'publicationYear', 'status']).default('updatedAt'),
+  sortDir: z.enum(['asc', 'desc']).default('desc'),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25)
+});
+
+export const SyncPushMutationSchema = z.object({
+  operation: z.enum(['create_book', 'update_book', 'delete_book', 'borrow_book', 'return_book']),
+  payload: z.record(z.string(), z.unknown()),
+  clientMutationId: z.string().min(1),
+  clientTimestamp: ISODateTimeSchema
+});
+
+export const SyncPushSchema = z.object({
+  mutations: z.array(SyncPushMutationSchema).max(200)
+});
+
+export const ImportBooksSchema = z.object({
+  dryRun: z.boolean().default(true),
+  rows: z.array(CreateBookSchema).max(2000)
+});
+
+export type BookStatus = z.infer<typeof BookStatusSchema>;
+export type Book = z.infer<typeof BookSchema>;
+export type CreateBookInput = z.infer<typeof CreateBookSchema>;
+export type UpdateBookInput = z.infer<typeof UpdateBookSchema>;
+export type BorrowBookInput = z.infer<typeof BorrowBookSchema>;
+export type ReturnBookInput = z.infer<typeof ReturnBookSchema>;
+export type Room = z.infer<typeof RoomSchema>;
+export type CustomField = z.infer<typeof CustomFieldSchema>;
+export type CodeAssignment = z.infer<typeof CodeAssignmentSchema>;

@@ -1,0 +1,25 @@
+node_modules/
+.npm/
+.DS_Store
+*.log
+
+# Web
+apps/web/dist/
+
+# Cloudflare local state
+.apps/
+.wrangler/
+*.tsbuildinfo
+
+# TypeScript package outputs
+packages/shared/dist/
+
+# Flutter
+apps/mobile/.dart_tool/
+apps/mobile/build/
+apps/mobile/.flutter-plugins
+apps/mobile/.flutter-plugins-dependencies
+apps/mobile/.packages
+apps/mobile/.metadata
+apps/mobile/ios/Pods/
+apps/mobile/android/.gradle/
