@@ -8,12 +8,12 @@ enabled = true
 [[d1_databases]]
 binding = "DB"
 database_name = "ok_library"
-database_id = "replace-with-your-d1-database-id"
+database_id = "55bc2aa5-fa61-4597-b47f-b645fba5ed44"
 migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "CACHE"
-id = "replace-with-your-kv-namespace-id"
+id = "6faf64c9dffb407985dc58d180b4eb99"
 
 [[r2_buckets]]
 binding = "ASSETS"

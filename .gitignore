@@ -10,6 +10,8 @@ apps/web/dist/
 .apps/
 .wrangler/
 *.tsbuildinfo
+.dev.vars
+apps/api-worker/.dev.vars
 
 # TypeScript package outputs
 packages/shared/dist/

@@ -3,5 +3,5 @@ JWT_ISSUER=ok-library-api
 ACCESS_TOKEN_TTL_SECONDS=43200
 CORS_ORIGIN=http://localhost:5173
 BOOTSTRAP_ADMIN_USERNAME=admin
-BOOTSTRAP_ADMIN_PASSWORD=change-me-immediately
+BOOTSTRAP_ADMIN_PASSWORD=replace-with-strong-temporary-password
 APP_ENV=development
