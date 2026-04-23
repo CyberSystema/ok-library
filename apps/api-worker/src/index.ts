@@ -1056,30 +1056,41 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 	const payload = ImportBooksSchema.parse(await c.req.json());
 	const now = nowIso();
 
-	const skippedRows: number[] = [];
-	const validRows = payload.rows.filter((row, index) => {
-		const isValid = Boolean(row.title) && Boolean(row.author);
-		if (!isValid) {
-			skippedRows.push(index);
-		}
-		return isValid;
-	});
+	const skippedRows: Array<{ index: number; reason: string }> = [];
+	const readyRows: Array<{ index: number; row: (typeof payload.rows)[number]; customFields: Record<string, unknown> }> = [];
 
-	if (validRows.length === 0) {
+	for (let index = 0; index < payload.rows.length; index += 1) {
+		const row = payload.rows[index];
+		if (!row.title || !row.author) {
+			skippedRows.push({ index, reason: 'title and author are required' });
+			continue;
+		}
+
+		try {
+			const customFields = await validateCustomFields(c.env, row.customFields);
+			readyRows.push({ index, row, customFields });
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : 'custom field validation failed';
+			skippedRows.push({ index, reason });
+		}
+	}
+
+	if (readyRows.length === 0) {
 		return c.json({
 			dryRun: payload.dryRun,
-			error: 'No valid rows to import. title and author are required.',
+			error: 'No valid rows to import.',
 			skippedRows
 		}, 400);
 	}
 
 	if (payload.dryRun) {
-		return c.json({ dryRun: true, acceptedRows: validRows.length, skippedRows });
+		return c.json({ dryRun: true, acceptedRows: readyRows.length, skippedRows });
 	}
 
-	await withTxn(c.env, async () => {
-		for (const row of validRows) {
-			const customFields = await validateCustomFields(c.env, row.customFields);
+	let importedRows = 0;
+	for (const item of readyRows) {
+		const { index, row, customFields } = item;
+		try {
 			const bookId = crypto.randomUUID();
 			await c.env.DB.prepare(
 				`INSERT INTO books (
@@ -1109,15 +1120,19 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 				.run();
 
 			await replaceBookAttributeValues(c.env, bookId, customFields);
+			importedRows += 1;
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : 'insert failed';
+			skippedRows.push({ index, reason });
 		}
-	});
+	}
 
 	await insertAuditLog(c.env, c.get('user').sub, 'book.import', 'book', null, {
-		rows: validRows.length,
+		rows: importedRows,
 		skippedRows
 	});
 
-	return c.json({ importedRows: validRows.length, skippedRows }, 201);
+	return c.json({ importedRows, skippedRows }, 201);
 });
 
 app.get('/api/export/books.csv', async (c) => {
