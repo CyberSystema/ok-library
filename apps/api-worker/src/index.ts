@@ -1056,23 +1056,29 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 	const payload = ImportBooksSchema.parse(await c.req.json());
 	const now = nowIso();
 
-	const errors: Array<{ index: number; message: string }> = [];
-	for (let i = 0; i < payload.rows.length; i += 1) {
-		if (!payload.rows[i].title || !payload.rows[i].author) {
-			errors.push({ index: i, message: 'title and author are required' });
+	const skippedRows: number[] = [];
+	const validRows = payload.rows.filter((row, index) => {
+		const isValid = Boolean(row.title) && Boolean(row.author);
+		if (!isValid) {
+			skippedRows.push(index);
 		}
-	}
+		return isValid;
+	});
 
-	if (errors.length > 0) {
-		return c.json({ dryRun: payload.dryRun, errors }, 400);
+	if (validRows.length === 0) {
+		return c.json({
+			dryRun: payload.dryRun,
+			error: 'No valid rows to import. title and author are required.',
+			skippedRows
+		}, 400);
 	}
 
 	if (payload.dryRun) {
-		return c.json({ dryRun: true, acceptedRows: payload.rows.length });
+		return c.json({ dryRun: true, acceptedRows: validRows.length, skippedRows });
 	}
 
 	await withTxn(c.env, async () => {
-		for (const row of payload.rows) {
+		for (const row of validRows) {
 			const customFields = await validateCustomFields(c.env, row.customFields);
 			const bookId = crypto.randomUUID();
 			await c.env.DB.prepare(
@@ -1107,10 +1113,11 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 	});
 
 	await insertAuditLog(c.env, c.get('user').sub, 'book.import', 'book', null, {
-		rows: payload.rows.length
+		rows: validRows.length,
+		skippedRows
 	});
 
-	return c.json({ importedRows: payload.rows.length }, 201);
+	return c.json({ importedRows: validRows.length, skippedRows }, 201);
 });
 
 app.get('/api/export/books.csv', async (c) => {

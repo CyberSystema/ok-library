@@ -648,13 +648,18 @@ function App() {
     return similar?.key ?? preferredKey;
   }
 
-  function normalizeSpreadsheetRow(raw: Record<string, unknown>, index: number): Record<string, unknown> {
+  function normalizeSpreadsheetRow(raw: Record<string, unknown>, index: number): Record<string, unknown> | null {
     const row = Object.fromEntries(Object.entries(raw).map(([key, value]) => [key.trim().toLowerCase(), value]));
 
+    const isEmptyRow = Object.values(row).every((value) => toNullableText(value) === null);
+    if (isEmptyRow) {
+      return null;
+    }
+
     const title = toNullableText(firstSpreadsheetValue(row, ['title']));
-    const author = toNullableText(firstSpreadsheetValue(row, ['author', 'writer']));
+    const author = toNullableText(firstSpreadsheetValue(row, ['author', 'writer', 'writers']));
     if (!title || !author) {
-      throw new Error(`Row ${index + 1}: title and writer/author are required.`);
+      throw new Error(`Row ${index + 2}: title and writer/author are required.`);
     }
 
     const statusInput = toNullableText(firstSpreadsheetValue(row, ['status']))?.toLowerCase();
@@ -1622,7 +1627,41 @@ function App() {
         setMessage(`Continuing import and excluding unsupported columns: ${listed}${extra}`);
       }
 
-      const rows = rawRows.map((rawRow, index) => normalizeSpreadsheetRow(rawRow, index));
+      const rows: Record<string, unknown>[] = [];
+      const skippedBlankRows: number[] = [];
+      const skippedInvalidRows: number[] = [];
+
+      for (let index = 0; index < rawRows.length; index += 1) {
+        try {
+          const normalized = normalizeSpreadsheetRow(rawRows[index], index);
+          if (!normalized) {
+            skippedBlankRows.push(index + 2);
+            continue;
+          }
+
+          rows.push(normalized);
+        } catch (error) {
+          const message = (error as Error).message;
+          if (message.includes('title and writer/author are required')) {
+            skippedInvalidRows.push(index + 2);
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      if (rows.length === 0) {
+        throw new Error('No valid rows found to import. Please ensure rows include both Title and Writer/Author.');
+      }
+
+      const skippedCount = skippedBlankRows.length + skippedInvalidRows.length;
+      const skippedInvalidPreview = skippedInvalidRows.slice(0, 8).join(', ');
+      const skippedNote =
+        skippedCount > 0
+          ? ` Skipped ${skippedCount} row(s) (${skippedBlankRows.length} blank, ${skippedInvalidRows.length} missing title/author${
+              skippedInvalidRows.length > 0 ? `; examples: ${skippedInvalidPreview}` : ''
+            }).`
+          : '';
 
       if (importDryRun) {
         const result = await runAction(() =>
@@ -1631,7 +1670,7 @@ function App() {
             body: JSON.stringify({ dryRun: true, rows })
           })
         );
-        setMessage(`XLSX dry run complete. Accepted rows: ${result.acceptedRows ?? 0}`);
+        setMessage(`XLSX dry run complete. Accepted rows: ${result.acceptedRows ?? 0}.${skippedNote}`);
       } else {
         const totalChunks = Math.ceil(rows.length / IMPORT_CHUNK_SIZE);
         let totalImported = 0;
@@ -1654,7 +1693,9 @@ function App() {
           totalImported += result.importedRows ?? 0;
         }
 
-        setMessage(`XLSX import complete. Imported ${totalImported} rows in ${totalChunks} chunk${totalChunks > 1 ? 's' : ''}.`);
+        setMessage(
+          `XLSX import complete. Imported ${totalImported} rows in ${totalChunks} chunk${totalChunks > 1 ? 's' : ''}.${skippedNote}`
+        );
       }
 
       await loadBooks();
