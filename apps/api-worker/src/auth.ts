@@ -2,6 +2,22 @@ import { HTTPException } from 'hono/http-exception';
 import type { Context, Next } from 'hono';
 import type { AuthClaims, Env } from './types';
 
+function getCookieValue(cookieHeader: string | undefined, name: string): string | null {
+  if (!cookieHeader) {
+    return null;
+  }
+
+  const parts = cookieHeader.split(';');
+  for (const part of parts) {
+    const [k, ...rest] = part.trim().split('=');
+    if (k === name) {
+      return decodeURIComponent(rest.join('='));
+    }
+  }
+
+  return null;
+}
+
 function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = '';
   for (const b of bytes) {
@@ -103,11 +119,14 @@ export async function verifyAccessToken(env: Env, token: string): Promise<AuthCl
 
 export async function authMiddleware(c: Context<{ Bindings: Env; Variables: { user: AuthClaims } }>, next: Next) {
   const auth = c.req.header('authorization');
-  if (!auth || !auth.toLowerCase().startsWith('bearer ')) {
+  const bearerToken = auth && auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : null;
+  const cookieToken = getCookieValue(c.req.header('cookie'), 'ok_library_session');
+  const token = bearerToken ?? cookieToken;
+
+  if (!token) {
     throw new HTTPException(401, { message: 'Missing bearer token' });
   }
 
-  const token = auth.slice(7).trim();
   const claims = await verifyAccessToken(c.env, token);
   c.set('user', claims);
   await next();

@@ -32,8 +32,86 @@ import { generateCodeValue, nowIso, safeJsonParse, toCsv } from './utils';
 
 type App = Hono<{ Bindings: Env; Variables: { user: AuthClaims } }>;
 type AppContext = Context<{ Bindings: Env; Variables: { user: AuthClaims } }>;
+type DefaultBookStructureColumn = {
+	label: string;
+	coreKey?: string;
+	customKey?: string;
+	customType?: 'text' | 'number' | 'boolean' | 'date' | 'enum';
+};
+
+type ExistingCustomFieldRef = {
+	field_key: string;
+	label: string;
+};
 
 const app: App = new Hono();
+
+const DEFAULT_BOOK_STRUCTURE: DefaultBookStructureColumn[] = [
+	{ label: 'ID', coreKey: 'id' },
+	{ label: 'Title', coreKey: 'title' },
+	{ label: 'Item', customKey: 'item', customType: 'text' },
+	{ label: 'Sub Title', customKey: 'subTitle', customType: 'text' },
+	{ label: 'Writer', coreKey: 'author' },
+	{ label: 'Editor', customKey: 'editor', customType: 'text' },
+	{ label: 'Publisher', coreKey: 'publisher' },
+	{ label: 'Place of Publication', customKey: 'placeOfPublication', customType: 'text' },
+	{ label: 'Published Date', customKey: 'publishedDate', customType: 'date' },
+	{ label: 'Edition #', customKey: 'editionNumber', customType: 'text' },
+	{ label: 'Category', customKey: 'category', customType: 'text' },
+	{ label: 'Language', coreKey: 'language' },
+	{ label: 'Translator', customKey: 'translator', customType: 'text' },
+	{ label: 'Cover Type', customKey: 'coverType', customType: 'text' },
+	{ label: 'Pages', customKey: 'pages', customType: 'number' },
+	{ label: 'Condition', customKey: 'condition', customType: 'text' },
+	{ label: 'Shelf Location', coreKey: 'shelfCode' },
+	{ label: 'Description', coreKey: 'description' },
+	{ label: 'ISBN', coreKey: 'isbn' },
+	{ label: 'Num. Volume', customKey: 'numVolume', customType: 'number' },
+	{ label: 'Color', customKey: 'color', customType: 'text' },
+	{ label: 'Signature', customKey: 'signature', customType: 'text' },
+	{ label: 'More copies', customKey: 'moreCopies', customType: 'number' }
+];
+
+function normalizeColumnName(input: string): string {
+	return input.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function canonicalColumnName(input: string): string {
+	const normalized = normalizeColumnName(input);
+
+	if (normalized.includes('subtitle')) return 'subtitle';
+	if (normalized.includes('edition')) return 'edition';
+	if (normalized.includes('placeofpublication') || (normalized.includes('publication') && normalized.includes('place'))) {
+		return 'placeofpublication';
+	}
+	if (normalized.includes('covertype') || normalized === 'cover') return 'covertype';
+	if (normalized.includes('numvolume') || normalized.includes('volume')) return 'numvolume';
+	if (normalized.includes('morecopies') || normalized.includes('copycount') || normalized === 'copies' || normalized === 'copy') {
+		return 'morecopies';
+	}
+
+	return normalized;
+}
+
+function columnsAreSimilar(a: string, b: string): boolean {
+	return canonicalColumnName(a) === canonicalColumnName(b);
+}
+
+function findSimilarCustomField(
+	existingFields: ExistingCustomFieldRef[],
+	column: DefaultBookStructureColumn
+): ExistingCustomFieldRef | null {
+	const candidates = [column.customKey ?? '', column.label].filter(Boolean);
+	for (const field of existingFields) {
+		for (const candidate of candidates) {
+			if (columnsAreSimilar(candidate, field.field_key) || columnsAreSimilar(candidate, field.label)) {
+				return field;
+			}
+		}
+	}
+
+	return null;
+}
 
 function clientIp(c: AppContext): string {
 	return c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
@@ -61,7 +139,7 @@ async function enforceRateLimit(c: AppContext, bucket: string, perMinuteLimit: n
 
 app.use('*', async (c, next) => {
 	const origin = c.env.CORS_ORIGIN ?? '*';
-	return cors({ origin, allowHeaders: ['Authorization', 'Content-Type'] })(c, next);
+	return cors({ origin, allowHeaders: ['Authorization', 'Content-Type'], credentials: true })(c, next);
 });
 
 app.use('/api/*', async (c, next) => {
@@ -85,8 +163,14 @@ app.onError((error, c) => {
 		return c.json({ error: error.message }, error.status);
 	}
 
-	console.error('Unhandled error', error);
-	return c.json({ error: 'Internal server error' }, 500);
+	const requestId = crypto.randomUUID();
+	console.error('Unhandled error', {
+		requestId,
+		method: c.req.method,
+		path: c.req.path,
+		error
+	});
+	return c.json({ error: 'Internal server error', requestId }, 500);
 });
 
 app.get('/api/health', async (c) => {
@@ -129,15 +213,30 @@ app.post('/api/auth/login', async (c) => {
 		role: user.role
 	});
 
+	c.header(
+		'Set-Cookie',
+		`ok_library_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None`
+	);
+
 	return c.json({ token, user: { id: user.id, username: user.username, role: user.role } });
 });
 
+app.post('/api/auth/logout', async (c) => {
+	c.header('Set-Cookie', 'ok_library_session=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0');
+	return c.json({ ok: true });
+});
+
 app.use('/api/*', async (c, next) => {
-	if (c.req.path === '/api/health' || c.req.path === '/api/auth/login') {
+	if (c.req.path === '/api/health' || c.req.path === '/api/auth/login' || c.req.path === '/api/auth/logout') {
 		await next();
 		return;
 	}
 	await authMiddleware(c, next);
+});
+
+app.get('/api/auth/session', async (c) => {
+	const user = c.get('user');
+	return c.json({ user: { id: user.sub, username: user.username, role: user.role } });
 });
 
 app.get('/api/books', async (c) => {
@@ -612,6 +711,74 @@ app.get('/api/rooms', async (c) => {
 	return c.json({ items: rows.results ?? [] });
 });
 
+app.get('/api/setup/default-book-structure', async (c) => {
+	const customFields = await c.env.DB.prepare(
+		`SELECT field_key, label FROM custom_field_definitions WHERE deleted_at IS NULL`
+	).all<ExistingCustomFieldRef>();
+
+	const existingCustomFields = customFields.results ?? [];
+	const columns = DEFAULT_BOOK_STRUCTURE.map((column) => ({
+		label: column.label,
+		key: column.coreKey ?? column.customKey ?? '',
+		type: column.coreKey ? 'core' : 'custom',
+		ready: column.coreKey ? true : Boolean(findSimilarCustomField(existingCustomFields, column))
+	}));
+
+	return c.json({ columns });
+});
+
+app.post('/api/setup/default-book-structure', requireRole(['admin']), async (c) => {
+	const now = nowIso();
+	const customColumns = DEFAULT_BOOK_STRUCTURE.filter((column) => column.customKey && column.customType);
+	const existingCustomFieldsResult = await c.env.DB.prepare(
+		`SELECT field_key, label FROM custom_field_definitions WHERE deleted_at IS NULL`
+	).all<ExistingCustomFieldRef>();
+	const existingCustomFields = [...(existingCustomFieldsResult.results ?? [])];
+
+	let configuredCustomColumns = 0;
+	const skippedAsSimilar: string[] = [];
+
+	for (const column of customColumns) {
+		const similar = findSimilarCustomField(existingCustomFields, column);
+		if (similar) {
+			skippedAsSimilar.push(column.label);
+			continue;
+		}
+
+		await c.env.DB.prepare(
+			`INSERT INTO custom_field_definitions
+				(id, field_key, label, field_type, required, enum_options, created_at, updated_at, deleted_at)
+			 VALUES (?, ?, ?, ?, 0, '[]', ?, ?, NULL)
+			 ON CONFLICT(field_key) DO UPDATE SET
+				label = excluded.label,
+				field_type = excluded.field_type,
+				required = 0,
+				enum_options = '[]',
+				updated_at = excluded.updated_at,
+				deleted_at = NULL`
+		)
+			.bind(
+				crypto.randomUUID(),
+				column.customKey,
+				column.label,
+				column.customType,
+				now,
+				now
+			)
+			.run();
+
+		existingCustomFields.push({ field_key: column.customKey ?? '', label: column.label });
+		configuredCustomColumns += 1;
+	}
+
+	await insertAuditLog(c.env, c.get('user').sub, 'setup.defaultBookStructure', 'custom_field', null, {
+		count: configuredCustomColumns,
+		skippedAsSimilar
+	});
+
+	return c.json({ ok: true, configuredCustomColumns, skippedAsSimilar });
+});
+
 app.get('/api/rooms/summary', async (c) => {
 	const rows = await c.env.DB.prepare(
 		`SELECT
@@ -882,32 +1049,57 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 });
 
 app.get('/api/export/books.csv', async (c) => {
-	const result = await queryBooksWithFilters(c.env, {
-		q: c.req.query('q'),
-		status: c.req.query('status'),
-		roomCode: c.req.query('roomCode'),
-		shelfCode: c.req.query('shelfCode'),
-		sortBy: 'title',
-		sortDir: 'asc',
-		page: 1,
-		pageSize: 2000,
-		customFilters: []
+	const where: string[] = ['deleted_at IS NULL'];
+	const values: unknown[] = [];
+
+	const q = c.req.query('q');
+	const status = c.req.query('status');
+	const roomCode = c.req.query('roomCode');
+	const shelfCode = c.req.query('shelfCode');
+
+	if (q) {
+		const qValue = `%${q.replaceAll('%', '').replaceAll('_', '')}%`;
+		where.push('(title LIKE ? OR author LIKE ? OR isbn LIKE ?)');
+		values.push(qValue, qValue, qValue);
+	}
+
+	if (status) {
+		where.push('status = ?');
+		values.push(status);
+	}
+
+	if (roomCode) {
+		where.push('room_code = ?');
+		values.push(roomCode);
+	}
+
+	if (shelfCode) {
+		where.push('shelf_code = ?');
+		values.push(shelfCode);
+	}
+
+	const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+	const rowsResult = await c.env.DB.prepare(`SELECT * FROM books ${whereSql} ORDER BY title ASC, id ASC`).bind(...values).all();
+	const rows = (rowsResult.results ?? []).map((row) => parseBook(row as Record<string, unknown>));
+	const exportRows = rows.map((row) => {
+		const customFields = (row.customFields as Record<string, unknown> | undefined) ?? {};
+		const shaped: Record<string, unknown> = {};
+
+		for (const column of DEFAULT_BOOK_STRUCTURE) {
+			if (column.coreKey) {
+				shaped[column.label] = row[column.coreKey];
+			} else if (column.customKey) {
+				shaped[column.label] = customFields[column.customKey] ?? null;
+			}
+		}
+
+		return shaped;
 	});
 
-	const csv = toCsv(result.rows, [
-		'id',
-		'title',
-		'author',
-		'isbn',
-		'publicationYear',
-		'publisher',
-		'language',
-		'roomCode',
-		'shelfCode',
-		'status',
-		'createdAt',
-		'updatedAt'
-	]);
+	const csv = toCsv(
+		exportRows,
+		DEFAULT_BOOK_STRUCTURE.map((column) => column.label)
+	);
 
 	c.header('Content-Type', 'text/csv; charset=utf-8');
 	c.header('Content-Disposition', 'attachment; filename="books.csv"');

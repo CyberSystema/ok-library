@@ -1,5 +1,6 @@
 import React, { FormEvent, useEffect, useMemo, useState } from 'react';
 import ReactDOM from 'react-dom/client';
+import * as XLSX from 'xlsx';
 import './styles.css';
 
 type BookStatus = 'available' | 'borrowed' | 'lost' | 'maintenance';
@@ -35,6 +36,10 @@ type CustomField = {
 
 type LoginResponse = {
   token: string;
+  user: { id: string; username: string; role: string };
+};
+
+type SessionResponse = {
   user: { id: string; username: string; role: string };
 };
 
@@ -87,6 +92,7 @@ type AppSection = 'dashboard' | 'books' | 'circulation' | 'locations' | 'setting
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
 const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
 const LOCAL_STORAGE_KEY = 'ok-library-web-state-v1';
+const IMPORT_CHUNK_SIZE = 500;
 
 function joinApiUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
@@ -115,6 +121,15 @@ const RESERVED_ATTRIBUTE_KEYS = new Set([
   'deletedAt'
 ]);
 
+class ApiRequestError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function apiRequest<T>(
   token: string | null,
   path: string,
@@ -123,16 +138,32 @@ async function apiRequest<T>(
 ): Promise<T> {
   const response = await fetch(joinApiUrl(path), {
     ...init,
+    credentials: 'include',
     headers: {
       ...(raw ? {} : { 'Content-Type': 'application/json' }),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(token && token !== 'cookie' ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {})
     }
   });
 
   if (!response.ok) {
-    const errorBody = (await response.json().catch(() => ({ error: response.statusText }))) as { error?: string };
-    throw new Error(errorBody.error ?? `Request failed with status ${response.status}`);
+    const responseText = await response.text();
+    const errorBody = (() => {
+      try {
+        return JSON.parse(responseText) as { error?: string; requestId?: string };
+      } catch {
+        return { error: response.statusText };
+      }
+    })();
+
+    if (response.status === 401) {
+      throw new ApiRequestError(401, 'Session expired. Please sign in again.');
+    }
+
+    const message = errorBody.requestId
+      ? `${errorBody.error ?? `Request failed with status ${response.status}`} (ref: ${errorBody.requestId})`
+      : (errorBody.error ?? `Request failed with status ${response.status}`);
+    throw new ApiRequestError(response.status, message);
   }
 
   if (raw) {
@@ -154,6 +185,7 @@ function StatCard({ title, value, subtitle }: { title: string; value: string | n
 
 function App() {
   const [token, setToken] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [currentSection, setCurrentSection] = useState<AppSection>('dashboard');
@@ -201,6 +233,7 @@ function App() {
 
   const [importJson, setImportJson] = useState('[]');
   const [importDryRun, setImportDryRun] = useState(true);
+  const [importFileName, setImportFileName] = useState('');
 
   const [selectedBook, setSelectedBook] = useState<Book | null>(null);
   const [borrowerName, setBorrowerName] = useState('');
@@ -231,7 +264,7 @@ function App() {
   const [error, setError] = useState('');
   const [isWorking, setIsWorking] = useState(false);
 
-  const loggedIn = useMemo(() => Boolean(token), [token]);
+  const loggedIn = useMemo(() => Boolean(token && currentUser), [token, currentUser]);
 
   const totalBooks = books.length;
   const availableBooks = books.filter((book) => book.status === 'available').length;
@@ -351,10 +384,45 @@ function App() {
     window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
   }, [q, status, roomCode, borrowerName, borrowerContact, dueAt]);
 
+  useEffect(() => {
+    let isCancelled = false;
+
+    async function restoreSession() {
+      try {
+        const response = await apiRequest<SessionResponse>(null, '/api/auth/session');
+        if (isCancelled) {
+          return;
+        }
+
+        setToken('cookie');
+        setCurrentUser(response.user);
+        await refreshEverything('cookie');
+      } catch {
+        if (isCancelled) {
+          return;
+        }
+        setToken(null);
+        setCurrentUser(null);
+      }
+    }
+
+    void restoreSession();
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
   async function runAction<T>(operation: () => Promise<T>): Promise<T> {
     setIsWorking(true);
     try {
       return await operation();
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 401) {
+        setToken(null);
+        setCurrentUser(null);
+        setError('Session expired. Please sign in again.');
+      }
+      throw error;
     } finally {
       setIsWorking(false);
     }
@@ -382,6 +450,291 @@ function App() {
     return parsed;
   }
 
+  function toNullableText(value: unknown): string | null {
+    if (value === null || value === undefined) {
+      return null;
+    }
+
+    const text = String(value).trim();
+    return text ? text : null;
+  }
+
+  function parseStringArray(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value.map((item) => String(item).trim()).filter(Boolean);
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return [];
+      }
+
+      if (trimmed.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (Array.isArray(parsed)) {
+            return parsed.map((item) => String(item).trim()).filter(Boolean);
+          }
+        } catch {
+          // Fall back to comma-split.
+        }
+      }
+
+      return trimmed
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+
+    return [];
+  }
+
+  function parseSpreadsheetCustomFields(row: Record<string, unknown>): Record<string, unknown> {
+    const fields: Record<string, unknown> = {};
+
+    const explicit = row.customfields;
+    if (explicit && typeof explicit === 'string') {
+      const trimmed = explicit.trim();
+      if (trimmed) {
+        try {
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            Object.assign(fields, parsed as Record<string, unknown>);
+          }
+        } catch {
+          throw new Error('customFields column must contain valid JSON object text.');
+        }
+      }
+    }
+
+    for (const [key, value] of Object.entries(row)) {
+      if (key.startsWith('custom.') || key.startsWith('custom_')) {
+        const fieldKey = key.replace(/^custom[._]/, '').trim();
+        if (!fieldKey) {
+          continue;
+        }
+
+        if (value === null || value === undefined || String(value).trim() === '') {
+          continue;
+        }
+
+        fields[fieldKey] = value;
+      }
+    }
+
+    return fields;
+  }
+
+  function findUnknownSpreadsheetColumns(rows: Array<Record<string, unknown>>): string[] {
+    const allowedColumns = new Set([
+      'title',
+      'author',
+      'writer',
+      'id',
+      'item',
+      'sub title',
+      'subtitle',
+      'editor',
+      'isbn',
+      'publicationyear',
+      'published date',
+      'place of publication',
+      'edition #',
+      'edition',
+      'category',
+      'publisher',
+      'language',
+      'translator',
+      'cover type',
+      'pages',
+      'condition',
+      'shelf location',
+      'description',
+      'roomcode',
+      'shelfcode',
+      'acquisitiondate',
+      'num. volume',
+      'num volume',
+      'color',
+      'signature',
+      'more copies',
+      'tags',
+      'status',
+      'customfields'
+    ]);
+
+    const seen = new Set<string>();
+    const unknown: string[] = [];
+
+    for (const row of rows) {
+      for (const originalKey of Object.keys(row)) {
+        const key = originalKey.trim().toLowerCase();
+        if (!key) {
+          continue;
+        }
+
+        if (seen.has(key)) {
+          continue;
+        }
+
+        seen.add(key);
+        if (allowedColumns.has(key) || key.startsWith('custom.') || key.startsWith('custom_')) {
+          continue;
+        }
+
+        unknown.push(originalKey);
+      }
+    }
+
+    return unknown;
+  }
+
+  function firstSpreadsheetValue(row: Record<string, unknown>, aliases: string[]): unknown {
+    for (const alias of aliases) {
+      const key = alias.trim().toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(row, key)) {
+        return row[key];
+      }
+    }
+
+    return null;
+  }
+
+  function parseNullableNumber(value: unknown): number | null {
+    const text = toNullableText(value);
+    if (!text) {
+      return null;
+    }
+
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function normalizeColumnName(input: string): string {
+    return input.toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  function canonicalColumnName(input: string): string {
+    const normalized = normalizeColumnName(input);
+
+    if (normalized.includes('subtitle')) return 'subtitle';
+    if (normalized.includes('edition')) return 'edition';
+    if (normalized.includes('placeofpublication') || (normalized.includes('publication') && normalized.includes('place'))) {
+      return 'placeofpublication';
+    }
+    if (normalized.includes('covertype') || normalized === 'cover') return 'covertype';
+    if (normalized.includes('numvolume') || normalized.includes('volume')) return 'numvolume';
+    if (normalized.includes('morecopies') || normalized.includes('copycount') || normalized === 'copies' || normalized === 'copy') {
+      return 'morecopies';
+    }
+
+    return normalized;
+  }
+
+  function columnsAreSimilar(a: string, b: string): boolean {
+    return canonicalColumnName(a) === canonicalColumnName(b);
+  }
+
+  function resolveImportCustomKey(preferredKey: string, labelHint: string): string {
+    const exact = customFields.find((field) => field.key === preferredKey);
+    if (exact) {
+      return exact.key;
+    }
+
+    const similar = customFields.find(
+      (field) => columnsAreSimilar(field.key, preferredKey) || columnsAreSimilar(field.label, labelHint)
+    );
+    return similar?.key ?? preferredKey;
+  }
+
+  function normalizeSpreadsheetRow(raw: Record<string, unknown>, index: number): Record<string, unknown> {
+    const row = Object.fromEntries(Object.entries(raw).map(([key, value]) => [key.trim().toLowerCase(), value]));
+
+    const title = toNullableText(firstSpreadsheetValue(row, ['title']));
+    const author = toNullableText(firstSpreadsheetValue(row, ['author', 'writer']));
+    if (!title || !author) {
+      throw new Error(`Row ${index + 1}: title and writer/author are required.`);
+    }
+
+    const statusInput = toNullableText(firstSpreadsheetValue(row, ['status']))?.toLowerCase();
+    const status: BookStatus =
+      statusInput === 'available' || statusInput === 'borrowed' || statusInput === 'lost' || statusInput === 'maintenance'
+        ? statusInput
+        : 'available';
+
+    const publicationYearInput = toNullableText(firstSpreadsheetValue(row, ['publicationyear']));
+    let publicationYear: number | null = null;
+    if (publicationYearInput) {
+      publicationYear = parsePublicationYear(publicationYearInput);
+    }
+
+    const customFields = parseSpreadsheetCustomFields(row);
+
+    const mappedCustomTextFields: Array<{ key: string; label: string; aliases: string[] }> = [
+      { key: 'item', label: 'Item', aliases: ['item'] },
+      { key: 'subTitle', label: 'Sub Title', aliases: ['sub title', 'subtitle'] },
+      { key: 'editor', label: 'Editor', aliases: ['editor'] },
+      { key: 'placeOfPublication', label: 'Place of Publication', aliases: ['place of publication'] },
+      { key: 'publishedDate', label: 'Published Date', aliases: ['published date'] },
+      { key: 'editionNumber', label: 'Edition #', aliases: ['edition #', 'edition'] },
+      { key: 'category', label: 'Category', aliases: ['category'] },
+      { key: 'translator', label: 'Translator', aliases: ['translator'] },
+      { key: 'coverType', label: 'Cover Type', aliases: ['cover type'] },
+      { key: 'condition', label: 'Condition', aliases: ['condition'] },
+      { key: 'numVolume', label: 'Num. Volume', aliases: ['num. volume', 'num volume'] },
+      { key: 'color', label: 'Color', aliases: ['color'] },
+      { key: 'signature', label: 'Signature', aliases: ['signature'] },
+      { key: 'moreCopies', label: 'More copies', aliases: ['more copies'] }
+    ];
+
+    for (const field of mappedCustomTextFields) {
+      const resolvedKey = resolveImportCustomKey(field.key, field.label);
+      if (customFields[resolvedKey] !== undefined) {
+        continue;
+      }
+
+      const value = toNullableText(firstSpreadsheetValue(row, field.aliases));
+      if (value !== null) {
+        customFields[resolvedKey] = value;
+      }
+    }
+
+    const pagesValue = parseNullableNumber(firstSpreadsheetValue(row, ['pages']));
+    const pagesKey = resolveImportCustomKey('pages', 'Pages');
+    if (pagesValue !== null && customFields[pagesKey] === undefined) {
+      customFields[pagesKey] = pagesValue;
+    }
+
+    const numVolumeValue = parseNullableNumber(firstSpreadsheetValue(row, ['num. volume', 'num volume']));
+    const numVolumeKey = resolveImportCustomKey('numVolume', 'Num. Volume');
+    if (numVolumeValue !== null && customFields[numVolumeKey] === undefined) {
+      customFields[numVolumeKey] = numVolumeValue;
+    }
+
+    const moreCopiesValue = parseNullableNumber(firstSpreadsheetValue(row, ['more copies']));
+    const moreCopiesKey = resolveImportCustomKey('moreCopies', 'More copies');
+    if (moreCopiesValue !== null && customFields[moreCopiesKey] === undefined) {
+      customFields[moreCopiesKey] = moreCopiesValue;
+    }
+
+    return {
+      title,
+      author,
+      isbn: toNullableText(firstSpreadsheetValue(row, ['isbn'])),
+      publicationYear,
+      publisher: toNullableText(firstSpreadsheetValue(row, ['publisher'])),
+      language: toNullableText(firstSpreadsheetValue(row, ['language'])),
+      description: toNullableText(firstSpreadsheetValue(row, ['description'])),
+      roomCode: toNullableText(firstSpreadsheetValue(row, ['roomcode'])),
+      shelfCode: toNullableText(firstSpreadsheetValue(row, ['shelfcode', 'shelf location'])),
+      acquisitionDate: toNullableText(firstSpreadsheetValue(row, ['acquisitiondate'])),
+      tags: parseStringArray(firstSpreadsheetValue(row, ['tags'])),
+      customFields,
+      status
+    };
+  }
+
   async function refreshEverything(tokenOverride?: string) {
     const currentToken = tokenOverride ?? token;
     if (!currentToken) return;
@@ -404,9 +757,59 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ username, password })
       }));
-      setToken(response.token);
+      setToken('cookie');
+      setCurrentUser(response.user);
       setMessage(`Welcome ${response.user.username}. You're signed in.`);
-      await runAction(() => refreshEverything(response.token));
+      await runAction(() => refreshEverything('cookie'));
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function logout() {
+    clearStatus();
+    try {
+      await runAction(() => apiRequest<{ ok: boolean }>(token, '/api/auth/logout', { method: 'POST' }));
+    } catch {
+      // Keep sign-out resilient even if network request fails.
+    }
+
+    setToken(null);
+    setCurrentUser(null);
+    setBooks([]);
+    setRooms([]);
+    setCustomFields([]);
+    setActiveBorrows([]);
+    setAuditItems([]);
+    setBookHistory([]);
+    setMessage('Signed out.');
+  }
+
+  async function applyDefaultBookStructure() {
+    if (!token) {
+      return;
+    }
+
+    clearStatus();
+    try {
+      const result = await runAction(() =>
+        apiRequest<{ ok: boolean; configuredCustomColumns: number; skippedAsSimilar?: string[] }>(
+          token,
+          '/api/setup/default-book-structure',
+          {
+            method: 'POST'
+          }
+        )
+      );
+      await loadCustomFields();
+      const skippedCount = result.skippedAsSimilar?.length ?? 0;
+      if (skippedCount > 0) {
+        setMessage(
+          `Default structure configured. Added ${result.configuredCustomColumns} columns and skipped ${skippedCount} similar existing columns to avoid duplicates.`
+        );
+      } else {
+        setMessage(`Default structure configured. Added ${result.configuredCustomColumns} columns.`);
+      }
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1165,6 +1568,101 @@ function App() {
     }
   }
 
+  async function importFromXlsx(event: FormEvent) {
+    event.preventDefault();
+    if (!token) return;
+    clearStatus();
+
+    const form = event.target as HTMLFormElement;
+    const fileInput = form.elements.namedItem('xlsxFile') as HTMLInputElement | null;
+    const file = fileInput?.files?.[0];
+
+    if (!file) {
+      setError('Select an .xlsx file first.');
+      return;
+    }
+
+    setImportFileName(file.name);
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: 'array' });
+      const firstSheetName = workbook.SheetNames[0];
+      if (!firstSheetName) {
+        throw new Error('The XLSX file does not contain any sheet.');
+      }
+
+      const sheet = workbook.Sheets[firstSheetName];
+      const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
+        defval: null,
+        raw: false
+      });
+
+      if (rawRows.length === 0) {
+        throw new Error('The XLSX file has no data rows.');
+      }
+
+      const unknownColumns = findUnknownSpreadsheetColumns(rawRows);
+      if (unknownColumns.length > 0) {
+        const listed = unknownColumns.slice(0, 12).join(', ');
+        const extra = unknownColumns.length > 12 ? `, and ${unknownColumns.length - 12} more` : '';
+        const proceed = window.confirm(
+          `Your file has columns not mapped to the current database: ${listed}${extra}.\n\n` +
+            'Click OK to exclude these columns and continue import.\n' +
+            'Click Cancel to stop and create matching custom attributes first (or remove those columns from the file).'
+        );
+
+        if (!proceed) {
+          setError(
+            'Import canceled. Create matching custom attributes in Rooms & Fields, or remove unsupported columns, then try again.'
+          );
+          return;
+        }
+
+        setMessage(`Continuing import and excluding unsupported columns: ${listed}${extra}`);
+      }
+
+      const rows = rawRows.map((rawRow, index) => normalizeSpreadsheetRow(rawRow, index));
+
+      if (importDryRun) {
+        const result = await runAction(() =>
+          apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
+            method: 'POST',
+            body: JSON.stringify({ dryRun: true, rows })
+          })
+        );
+        setMessage(`XLSX dry run complete. Accepted rows: ${result.acceptedRows ?? 0}`);
+      } else {
+        const totalChunks = Math.ceil(rows.length / IMPORT_CHUNK_SIZE);
+        let totalImported = 0;
+
+        for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx += 1) {
+          const start = chunkIdx * IMPORT_CHUNK_SIZE;
+          const end = Math.min(start + IMPORT_CHUNK_SIZE, rows.length);
+          const chunk = rows.slice(start, end);
+
+          const chunkProgress = `Chunk ${chunkIdx + 1}/${totalChunks}`;
+          setMessage(`Importing ${chunkProgress}: rows ${start + 1}–${end} of ${rows.length}...`);
+
+          const result = await runAction(() =>
+            apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
+              method: 'POST',
+              body: JSON.stringify({ dryRun: false, rows: chunk })
+            })
+          );
+
+          totalImported += result.importedRows ?? 0;
+        }
+
+        setMessage(`XLSX import complete. Imported ${totalImported} rows in ${totalChunks} chunk${totalChunks > 1 ? 's' : ''}.`);
+      }
+
+      await loadBooks();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   const emptyState = books.length === 0 ? (
     <div className="empty-state">
       <p>No books yet.</p>
@@ -1235,7 +1733,11 @@ function App() {
             >
               Import & Export
             </button>
+            <button className="tab" onClick={() => logout()}>
+              Sign Out
+            </button>
           </nav>
+          {currentUser ? <p className="muted">Signed in as {currentUser.username} ({currentUser.role})</p> : null}
 
           {currentSection === 'dashboard' ? (
             <section className="panel">
@@ -1858,6 +2360,38 @@ function App() {
                 <div className="actions">
                   <button className="accent" onClick={exportCsv}>Download CSV</button>
                 </div>
+              </section>
+
+              <section className="panel">
+                <h2>Import from XLSX</h2>
+                <p className="panel-help">
+                  Upload an Excel .xlsx file. Required columns: Title and Writer/Author. You can also use your default
+                  structure columns (Item, Sub Title, Editor, Place of Publication, Published Date, Edition #, Category,
+                  Translator, Cover Type, Pages, Condition, Shelf Location, Num. Volume, Color, Signature, More copies).
+                </p>
+                <p className="muted">
+                  If your file contains extra/unmapped columns, you will be asked to either exclude them for this import,
+                  or stop and create matching custom attributes first.
+                </p>
+                <div className="actions" style={{ marginBottom: 10 }}>
+                  <button className="secondary" onClick={() => applyDefaultBookStructure()}>
+                    Reconstruct Default Book Columns
+                  </button>
+                </div>
+                <form onSubmit={importFromXlsx} className="grid">
+                  <div>
+                    <label>XLSX file</label>
+                    <input name="xlsxFile" type="file" accept=".xlsx" />
+                  </div>
+                  {importFileName ? <p className="muted">Selected file: {importFileName}</p> : null}
+                  <p className="muted">
+                    Tip: custom attributes can be supplied through a JSON object in customFields column, or as per-column
+                    values using custom.genre, custom.level, etc.
+                  </p>
+                  <div className="actions">
+                    <button className="primary" type="submit">Import XLSX</button>
+                  </div>
+                </form>
               </section>
 
               <section className="panel">
