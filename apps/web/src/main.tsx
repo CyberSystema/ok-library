@@ -93,6 +93,7 @@ const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'h
 const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
 const LOCAL_STORAGE_KEY = 'ok-library-web-state-v1';
 const IMPORT_CHUNK_SIZE = 500;
+const IMPORT_MIN_CHUNK_SIZE = 1;
 
 function joinApiUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
@@ -128,6 +129,18 @@ class ApiRequestError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+function isPayloadTooLargeError(error: unknown): boolean {
+  if (!(error instanceof ApiRequestError)) {
+    return false;
+  }
+
+  if (error.status === 413) {
+    return true;
+  }
+
+  return /too big|payload|entity too large|request too large/i.test(error.message);
 }
 
 async function apiRequest<T>(
@@ -1664,37 +1677,81 @@ function App() {
           : '';
 
       if (importDryRun) {
-        const result = await runAction(() =>
-          apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
-            method: 'POST',
-            body: JSON.stringify({ dryRun: true, rows })
-          })
-        );
-        setMessage(`XLSX dry run complete. Accepted rows: ${result.acceptedRows ?? 0}.${skippedNote}`);
-      } else {
-        const totalChunks = Math.ceil(rows.length / IMPORT_CHUNK_SIZE);
-        let totalImported = 0;
+        let chunkSize = IMPORT_CHUNK_SIZE;
+        let cursor = 0;
+        let totalAccepted = 0;
 
-        for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx += 1) {
-          const start = chunkIdx * IMPORT_CHUNK_SIZE;
-          const end = Math.min(start + IMPORT_CHUNK_SIZE, rows.length);
-          const chunk = rows.slice(start, end);
+        while (cursor < rows.length) {
+          const end = Math.min(cursor + chunkSize, rows.length);
+          const chunk = rows.slice(cursor, end);
+          const chunkProgress = `Chunk ${Math.floor(cursor / chunkSize) + 1}`;
+          setMessage(`Dry run ${chunkProgress}: rows ${cursor + 1}–${end} of ${rows.length}...`);
 
-          const chunkProgress = `Chunk ${chunkIdx + 1}/${totalChunks}`;
-          setMessage(`Importing ${chunkProgress}: rows ${start + 1}–${end} of ${rows.length}...`);
+          try {
+            const result = await runAction(() =>
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
+                method: 'POST',
+                body: JSON.stringify({ dryRun: true, rows: chunk })
+              })
+            );
 
-          const result = await runAction(() =>
-            apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
-              method: 'POST',
-              body: JSON.stringify({ dryRun: false, rows: chunk })
-            })
-          );
-
-          totalImported += result.importedRows ?? 0;
+            totalAccepted += result.acceptedRows ?? chunk.length;
+            cursor = end;
+          } catch (error) {
+            if (isPayloadTooLargeError(error) && chunkSize > IMPORT_MIN_CHUNK_SIZE) {
+              chunkSize = Math.max(IMPORT_MIN_CHUNK_SIZE, Math.floor(chunkSize / 2));
+              continue;
+            }
+            throw error;
+          }
         }
 
+        setMessage(`XLSX dry run complete. Accepted rows: ${totalAccepted}.${skippedNote}`);
+      } else {
+        let chunkSize = IMPORT_CHUNK_SIZE;
+        let cursor = 0;
+        let totalImported = 0;
+        const uploadSkippedRows: number[] = [];
+
+        while (cursor < rows.length) {
+          const end = Math.min(cursor + chunkSize, rows.length);
+          const chunk = rows.slice(cursor, end);
+          const chunkProgress = `Chunk ${Math.floor(cursor / chunkSize) + 1}`;
+          setMessage(`Importing ${chunkProgress}: rows ${cursor + 1}–${end} of ${rows.length}...`);
+
+          try {
+            const result = await runAction(() =>
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
+                method: 'POST',
+                body: JSON.stringify({ dryRun: false, rows: chunk })
+              })
+            );
+
+            totalImported += result.importedRows ?? 0;
+            cursor = end;
+          } catch (error) {
+            if (isPayloadTooLargeError(error)) {
+              if (chunkSize > IMPORT_MIN_CHUNK_SIZE) {
+                chunkSize = Math.max(IMPORT_MIN_CHUNK_SIZE, Math.floor(chunkSize / 2));
+                continue;
+              }
+
+              uploadSkippedRows.push(cursor + 2);
+              cursor += 1;
+              continue;
+            }
+
+            throw error;
+          }
+        }
+
+        const uploadSkippedNote =
+          uploadSkippedRows.length > 0
+            ? ` Skipped ${uploadSkippedRows.length} oversized row(s) during upload.`
+            : '';
+
         setMessage(
-          `XLSX import complete. Imported ${totalImported} rows in ${totalChunks} chunk${totalChunks > 1 ? 's' : ''}.${skippedNote}`
+          `XLSX import complete. Imported ${totalImported} rows.${skippedNote}${uploadSkippedNote}`
         );
       }
 

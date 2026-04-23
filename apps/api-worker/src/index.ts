@@ -1053,7 +1053,25 @@ app.delete('/api/custom-fields/:id', requireRole(['admin']), async (c) => {
 });
 
 app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => {
-	const payload = ImportBooksSchema.parse(await c.req.json());
+	let rawPayload: unknown;
+	try {
+		rawPayload = await c.req.json();
+	} catch {
+		return c.json({ error: 'Invalid JSON payload.' }, 400);
+	}
+
+	const parsedPayload = ImportBooksSchema.safeParse(rawPayload);
+	if (!parsedPayload.success) {
+		return c.json(
+			{
+				error: 'Invalid import payload.',
+				details: parsedPayload.error.issues.slice(0, 20)
+			},
+			400
+		);
+	}
+
+	const payload = parsedPayload.data;
 	const now = nowIso();
 
 	const skippedRows: Array<{ index: number; reason: string }> = [];
@@ -1127,10 +1145,14 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 		}
 	}
 
-	await insertAuditLog(c.env, c.get('user').sub, 'book.import', 'book', null, {
-		rows: importedRows,
-		skippedRows
-	});
+	try {
+		await insertAuditLog(c.env, c.get('user').sub, 'book.import', 'book', null, {
+			rows: importedRows,
+			skippedRows
+		});
+	} catch (error) {
+		console.warn('Audit log failed for book.import, continuing', error);
+	}
 
 	return c.json({ importedRows, skippedRows }, 201);
 });
