@@ -73,10 +73,12 @@ const DEFAULT_BOOK_STRUCTURE: DefaultBookStructureColumn[] = [
 ];
 
 function normalizeColumnName(input: string): string {
+	if (!input || typeof input !== 'string') return '';
 	return input.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 function canonicalColumnName(input: string): string {
+	if (!input || typeof input !== 'string') return '';
 	const normalized = normalizeColumnName(input);
 
 	if (normalized.includes('subtitle')) return 'subtitle';
@@ -98,12 +100,15 @@ function columnsAreSimilar(a: string, b: string): boolean {
 }
 
 function findSimilarCustomField(
-	existingFields: ExistingCustomFieldRef[],
-	column: DefaultBookStructureColumn
+	existingFields: ExistingCustomFieldRef[] | null | undefined,
+	column: DefaultBookStructureColumn | null | undefined
 ): ExistingCustomFieldRef | null {
+	if (!existingFields || !column) return null;
 	const candidates = [column.customKey ?? '', column.label].filter(Boolean);
 	for (const field of existingFields) {
+		if (!field || !field.field_key || !field.label) continue;
 		for (const candidate of candidates) {
+			if (!candidate) continue;
 			if (columnsAreSimilar(candidate, field.field_key) || columnsAreSimilar(candidate, field.label)) {
 				return field;
 			}
@@ -717,12 +722,24 @@ app.get('/api/setup/default-book-structure', async (c) => {
 	).all<ExistingCustomFieldRef>();
 
 	const existingCustomFields = customFields.results ?? [];
-	const columns = DEFAULT_BOOK_STRUCTURE.map((column) => ({
-		label: column.label,
-		key: column.coreKey ?? column.customKey ?? '',
-		type: column.coreKey ? 'core' : 'custom',
-		ready: column.coreKey ? true : Boolean(findSimilarCustomField(existingCustomFields, column))
-	}));
+	const columns = DEFAULT_BOOK_STRUCTURE.map((column) => {
+		try {
+			return {
+				label: column?.label ?? '',
+				key: column?.coreKey ?? column?.customKey ?? '',
+				type: column?.coreKey ? 'core' : 'custom',
+				ready: column?.coreKey ? true : Boolean(findSimilarCustomField(existingCustomFields, column))
+			};
+		} catch (e) {
+			console.error('Error mapping column:', column, e);
+			return {
+				label: column?.label ?? '',
+				key: column?.coreKey ?? column?.customKey ?? '',
+				type: 'custom',
+				ready: false
+			};
+		}
+	});
 
 	return c.json({ columns });
 });
