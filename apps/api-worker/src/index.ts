@@ -18,15 +18,17 @@ import { z } from 'zod';
 import { authMiddleware, createAccessToken, hashPassword, requireRole } from './auth';
 import {
 	ensureBootstrapAdmin,
+	getBookAttributeValues,
 	insertAuditLog,
 	parseBook,
 	queryBooksWithFilters,
+	replaceBookAttributeValues,
 	recordSyncMutation,
 	validateCustomFields,
 	withTxn
 } from './db';
 import type { AuthClaims, Env } from './types';
-import { generateCodeValue, nowIso, toCsv } from './utils';
+import { generateCodeValue, nowIso, safeJsonParse, toCsv } from './utils';
 
 type App = Hono<{ Bindings: Env; Variables: { user: AuthClaims } }>;
 type AppContext = Context<{ Bindings: Env; Variables: { user: AuthClaims } }>;
@@ -167,7 +169,10 @@ app.get('/api/books', async (c) => {
 });
 
 app.get('/api/books/:id', async (c) => {
-	const id = c.req.param('id');
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing book id' });
+	}
 	const row = await c.env.DB.prepare('SELECT * FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
 
 	if (!row) {
@@ -175,9 +180,11 @@ app.get('/api/books/:id', async (c) => {
 	}
 
 	const codes = await c.env.DB.prepare('SELECT * FROM code_assignments WHERE book_id = ? AND active = 1').bind(id).all();
+	const attributes = await getBookAttributeValues(c.env, id);
 
 	return c.json({
 		...parseBook(row as Record<string, unknown>),
+		attributeValues: attributes,
 		codes: codes.results
 	});
 });
@@ -215,6 +222,8 @@ app.post('/api/books', requireRole(['admin', 'librarian']), async (c) => {
 		)
 		.run();
 
+	await replaceBookAttributeValues(c.env, id, customFields);
+
 	await insertAuditLog(c.env, c.get('user').sub, 'book.create', 'book', id, {
 		title: payload.title,
 		author: payload.author
@@ -224,7 +233,10 @@ app.post('/api/books', requireRole(['admin', 'librarian']), async (c) => {
 });
 
 app.put('/api/books/:id', requireRole(['admin', 'librarian']), async (c) => {
-	const id = c.req.param('id');
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing book id' });
+	}
 	const payload = UpdateBookSchema.parse(await c.req.json());
 
 	const existing = await c.env.DB.prepare('SELECT * FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
@@ -278,6 +290,8 @@ app.put('/api/books/:id', requireRole(['admin', 'librarian']), async (c) => {
 			id
 		)
 		.run();
+
+	await replaceBookAttributeValues(c.env, id, merged.customFields as Record<string, unknown>);
 
 	await insertAuditLog(c.env, c.get('user').sub, 'book.update', 'book', id ?? null, {
 		version: merged.version
@@ -390,6 +404,145 @@ app.post('/api/books/:id/return', requireRole(['admin', 'librarian']), async (c)
 	return c.json({ transactionId: tx.id, returnedAt: now });
 });
 
+app.get('/api/books/:id/history', async (c) => {
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing book id' });
+	}
+
+	const limit = Math.max(1, Math.min(100, Number(c.req.query('limit') ?? 20)));
+	const now = nowIso();
+
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
+	if (!book) {
+		throw new HTTPException(404, { message: 'Book not found' });
+	}
+
+	const rows = await c.env.DB.prepare(
+		`SELECT
+			id,
+			book_id,
+			borrower_name,
+			borrower_contact,
+			borrowed_at,
+			due_at,
+			returned_at,
+			notes,
+			CASE WHEN returned_at IS NULL AND due_at < ? THEN 1 ELSE 0 END AS was_overdue,
+			created_by,
+			updated_at
+		 FROM borrow_transactions
+		 WHERE book_id = ?
+		 ORDER BY borrowed_at DESC
+		 LIMIT ?`
+	)
+		.bind(now, id, limit)
+		.all();
+
+	return c.json({
+		bookId: id,
+		items: (rows.results ?? []).map((row) => ({
+			id: (row as Record<string, unknown>).id,
+			bookId: (row as Record<string, unknown>).book_id,
+			borrowerName: (row as Record<string, unknown>).borrower_name,
+			borrowerContact: (row as Record<string, unknown>).borrower_contact,
+			borrowedAt: (row as Record<string, unknown>).borrowed_at,
+			dueAt: (row as Record<string, unknown>).due_at,
+			returnedAt: (row as Record<string, unknown>).returned_at,
+			notes: (row as Record<string, unknown>).notes,
+			wasOverdue: (row as Record<string, unknown>).was_overdue === 1,
+			createdBy: (row as Record<string, unknown>).created_by,
+			updatedAt: (row as Record<string, unknown>).updated_at
+		}))
+	});
+});
+
+app.get('/api/books/:id/attributes', async (c) => {
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing book id' });
+	}
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
+	if (!book) {
+		throw new HTTPException(404, { message: 'Book not found' });
+	}
+
+	const values = await getBookAttributeValues(c.env, id);
+	return c.json({ bookId: id, values });
+});
+
+app.put('/api/books/:id/attributes', requireRole(['admin', 'librarian']), async (c) => {
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing book id' });
+	}
+	const schema = z.object({ values: z.record(z.string(), z.unknown()) });
+	const payload = schema.parse(await c.req.json());
+
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
+	if (!book) {
+		throw new HTTPException(404, { message: 'Book not found' });
+	}
+
+	const normalized = await validateCustomFields(c.env, payload.values, { requireAllRequired: false });
+	await replaceBookAttributeValues(c.env, id, normalized);
+
+	await c.env.DB.prepare('UPDATE books SET custom_fields = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+		.bind(JSON.stringify(normalized), nowIso(), id)
+		.run();
+
+	await insertAuditLog(c.env, c.get('user').sub, 'book.attributes.update', 'book', id ?? null, {
+		attributeCount: Object.keys(normalized).length
+	});
+
+	return c.json({ bookId: id, values: normalized });
+});
+
+app.get('/api/borrow/active', async (c) => {
+	const overdueOnly = c.req.query('overdueOnly') === 'true';
+	const now = nowIso();
+
+	const rows = await c.env.DB.prepare(
+		`SELECT
+			bt.id,
+			bt.book_id,
+			b.title,
+			b.author,
+			bt.borrower_name,
+			bt.borrower_contact,
+			bt.borrowed_at,
+			bt.due_at,
+			CASE WHEN bt.due_at < ? THEN 1 ELSE 0 END AS is_overdue
+		 FROM borrow_transactions bt
+		 JOIN books b ON b.id = bt.book_id
+		 WHERE bt.returned_at IS NULL
+			AND b.deleted_at IS NULL
+			AND (? = 0 OR bt.due_at < ?)
+		 ORDER BY is_overdue DESC, bt.due_at ASC
+		 LIMIT 500`
+	)
+		.bind(now, overdueOnly ? 1 : 0, now)
+		.all();
+
+	const items = (rows.results ?? []).map((row) => ({
+		id: (row as Record<string, unknown>).id,
+		bookId: (row as Record<string, unknown>).book_id,
+		title: (row as Record<string, unknown>).title,
+		author: (row as Record<string, unknown>).author,
+		borrowerName: (row as Record<string, unknown>).borrower_name,
+		borrowerContact: (row as Record<string, unknown>).borrower_contact,
+		borrowedAt: (row as Record<string, unknown>).borrowed_at,
+		dueAt: (row as Record<string, unknown>).due_at,
+		isOverdue: (row as Record<string, unknown>).is_overdue === 1
+	}));
+
+	return c.json({
+		total: items.length,
+		overdueCount: items.filter((item) => item.isOverdue).length,
+		items
+	});
+});
+
 app.post('/api/books/:id/codes', requireRole(['admin', 'librarian']), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = GenerateCodeSchema.parse(await c.req.json());
@@ -457,6 +610,47 @@ app.get('/api/scan/:value', async (c) => {
 app.get('/api/rooms', async (c) => {
 	const rows = await c.env.DB.prepare('SELECT * FROM rooms ORDER BY code ASC').all();
 	return c.json({ items: rows.results ?? [] });
+});
+
+app.get('/api/rooms/summary', async (c) => {
+	const rows = await c.env.DB.prepare(
+		`SELECT
+			r.id,
+			r.code,
+			r.name,
+			r.description,
+			COUNT(b.id) AS total_books,
+			SUM(CASE WHEN b.status = 'available' THEN 1 ELSE 0 END) AS available_books,
+			SUM(CASE WHEN b.status = 'borrowed' THEN 1 ELSE 0 END) AS borrowed_books,
+			SUM(CASE WHEN b.status = 'lost' THEN 1 ELSE 0 END) AS lost_books,
+			SUM(CASE WHEN b.status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_books
+		 FROM rooms r
+		 LEFT JOIN books b ON b.room_code = r.code AND b.deleted_at IS NULL
+		 GROUP BY r.id, r.code, r.name, r.description
+		 ORDER BY r.code ASC`
+	).all();
+
+	const unassigned = await c.env.DB.prepare(
+		`SELECT
+			COUNT(*) AS total_books,
+			SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS available_books,
+			SUM(CASE WHEN status = 'borrowed' THEN 1 ELSE 0 END) AS borrowed_books,
+			SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost_books,
+			SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_books
+		 FROM books
+		 WHERE deleted_at IS NULL AND (room_code IS NULL OR TRIM(room_code) = '')`
+	).first<Record<string, unknown>>();
+
+	return c.json({
+		items: rows.results ?? [],
+		unassigned: {
+			totalBooks: Number(unassigned?.total_books ?? 0),
+			availableBooks: Number(unassigned?.available_books ?? 0),
+			borrowedBooks: Number(unassigned?.borrowed_books ?? 0),
+			lostBooks: Number(unassigned?.lost_books ?? 0),
+			maintenanceBooks: Number(unassigned?.maintenance_books ?? 0)
+		}
+	});
 });
 
 app.post('/api/rooms', requireRole(['admin', 'librarian']), async (c) => {
@@ -548,20 +742,68 @@ app.post('/api/custom-fields', requireRole(['admin']), async (c) => {
 });
 
 app.put('/api/custom-fields/:id', requireRole(['admin']), async (c) => {
-	const id = c.req.param('id');
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing custom field id' });
+	}
+
 	const payload = UpsertCustomFieldSchema.parse(await c.req.json());
 	const now = nowIso();
 
-	await c.env.DB.prepare(
-		`UPDATE custom_field_definitions
-			 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
-		 WHERE id = ? AND deleted_at IS NULL`
+	const existing = await c.env.DB.prepare(
+		'SELECT id, field_key FROM custom_field_definitions WHERE id = ? AND deleted_at IS NULL LIMIT 1'
 	)
-		.bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id)
-		.run();
+		.bind(id)
+		.first<{ id: string; field_key: string }>();
 
-	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id ?? null, {
-		key: payload.key
+	if (!existing) {
+		throw new HTTPException(404, { message: 'Custom field not found' });
+	}
+
+	let renamedBooks = 0;
+
+	await withTxn(c.env, async () => {
+		await c.env.DB.prepare(
+			`UPDATE custom_field_definitions
+				 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
+			 WHERE id = ? AND deleted_at IS NULL`
+		)
+			.bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id)
+			.run();
+
+		if (existing.field_key === payload.key) {
+			return;
+		}
+
+		const books = await c.env.DB.prepare('SELECT id, custom_fields FROM books WHERE deleted_at IS NULL').all<{
+			id: string;
+			custom_fields: string;
+		}>();
+
+		for (const row of books.results ?? []) {
+			const values = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
+			if (!Object.prototype.hasOwnProperty.call(values, existing.field_key)) {
+				continue;
+			}
+
+			const oldValue = values[existing.field_key];
+			if (!Object.prototype.hasOwnProperty.call(values, payload.key)) {
+				values[payload.key] = oldValue;
+			}
+			delete values[existing.field_key];
+
+			await c.env.DB.prepare('UPDATE books SET custom_fields = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+				.bind(JSON.stringify(values), nowIso(), row.id)
+				.run();
+
+			renamedBooks += 1;
+		}
+	});
+
+	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id, {
+		oldKey: existing.field_key,
+		key: payload.key,
+		renamedBooks
 	});
 
 	return c.json({ id });
@@ -600,6 +842,7 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 	await withTxn(c.env, async () => {
 		for (const row of payload.rows) {
 			const customFields = await validateCustomFields(c.env, row.customFields);
+			const bookId = crypto.randomUUID();
 			await c.env.DB.prepare(
 				`INSERT INTO books (
 					id, title, author, isbn, publication_year, publisher, language, description,
@@ -608,7 +851,7 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)`
 			)
 				.bind(
-					crypto.randomUUID(),
+					bookId,
 					row.title,
 					row.author,
 					row.isbn ?? null,
@@ -626,6 +869,8 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 					now
 				)
 				.run();
+
+			await replaceBookAttributeValues(c.env, bookId, customFields);
 		}
 	});
 
@@ -725,6 +970,7 @@ app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
 						now
 					)
 					.run();
+				await replaceBookAttributeValues(c.env, id, customFields);
 				resultData = { id };
 			} else if (mutation.operation === 'delete_book') {
 				const row = z.object({ id: z.string().min(1) }).parse(mutation.payload);
@@ -784,6 +1030,8 @@ app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
 						row.id
 					)
 					.run();
+
+				await replaceBookAttributeValues(c.env, row.id, merged.customFields as Record<string, unknown>);
 				resultData = { id: row.id, version: merged.version };
 			} else if (mutation.operation === 'borrow_book') {
 				const row = z.object({ id: z.string().min(1), data: BorrowBookSchema }).parse(mutation.payload);

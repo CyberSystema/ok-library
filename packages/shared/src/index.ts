@@ -1,5 +1,27 @@
 import { z } from 'zod';
 
+const ReservedBookAttributeKeys = new Set([
+  'title',
+  'subtitle',
+  'author',
+  'isbn',
+  'publicationYear',
+  'publisher',
+  'language',
+  'description',
+  'roomCode',
+  'shelfCode',
+  'acquisitionDate',
+  'status',
+  'tags',
+  'customFields',
+  'version',
+  'id',
+  'createdAt',
+  'updatedAt',
+  'deletedAt'
+]);
+
 export const BookStatusSchema = z.enum(['available', 'borrowed', 'lost', 'maintenance']);
 
 export const ISODateTimeSchema = z
@@ -86,6 +108,30 @@ export const UpsertCustomFieldSchema = CustomFieldSchema.pick({
   type: true,
   required: true,
   enumOptions: true
+}).superRefine((value, ctx) => {
+  if (ReservedBookAttributeKeys.has(value.key)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['key'],
+      message: 'This key is reserved by a standard book attribute. Choose another key.'
+    });
+  }
+
+  if (value.type === 'enum' && value.enumOptions.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['enumOptions'],
+      message: 'Enum type requires at least one option.'
+    });
+  }
+
+  if (value.type !== 'enum' && value.enumOptions.length > 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['enumOptions'],
+      message: 'Enum options are only allowed when type is enum.'
+    });
+  }
 });
 
 export const CodeTypeSchema = z.enum(['qr', 'barcode']);

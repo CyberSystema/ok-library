@@ -1,13 +1,16 @@
 :root {
-  --bg-1: #f3ede2;
-  --bg-2: #d5e4d4;
-  --panel: #ffffffcc;
-  --ink: #18231c;
-  --muted: #4e6353;
-  --accent: #d35b2d;
-  --accent-2: #1d6a57;
-  --danger: #a52a2a;
-  --line: #18231c22;
+  --bg-1: #fff8eb;
+  --bg-2: #dff0e9;
+  --bg-3: #f6f1ff;
+  --panel: #fffffff2;
+  --ink: #152018;
+  --muted: #4c6657;
+  --accent: #e16531;
+  --accent-2: #165f4f;
+  --accent-3: #0f8a70;
+  --danger: #9d2a2a;
+  --line: #1520181c;
+  --shadow: 0 12px 36px #1520181f;
 }
 
 * {
@@ -19,29 +22,54 @@ body {
   color: var(--ink);
   font-family: 'Space Grotesk', sans-serif;
   background: radial-gradient(circle at 15% 10%, #fff9ef 0%, transparent 30%),
-    radial-gradient(circle at 90% 20%, #d1efe5 0%, transparent 35%),
-    linear-gradient(145deg, var(--bg-1) 0%, var(--bg-2) 100%);
+    radial-gradient(circle at 95% 15%, #d6eee7 0%, transparent 40%),
+    radial-gradient(circle at 55% 85%, #efe7ff 0%, transparent 35%),
+    linear-gradient(145deg, var(--bg-1) 0%, var(--bg-2) 55%, var(--bg-3) 100%);
   min-height: 100vh;
 }
 
 .app-shell {
   max-width: 1200px;
   margin: 0 auto;
-  padding: 28px 18px 48px;
+  padding: 30px 18px 50px;
 }
 
 .hero {
-  padding: 20px;
+  padding: 24px;
   border: 1px solid var(--line);
-  border-radius: 20px;
-  backdrop-filter: blur(6px);
-  background: var(--panel);
+  border-radius: 24px;
+  backdrop-filter: blur(8px);
+  background: linear-gradient(115deg, #ffffffef 0%, #f9fffce8 75%);
+  box-shadow: var(--shadow);
+  position: relative;
+  overflow: hidden;
+}
+
+.hero::after {
+  content: '';
+  position: absolute;
+  top: -35px;
+  right: -50px;
+  width: 180px;
+  height: 180px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #1f9b7e44 0%, transparent 70%);
+  pointer-events: none;
 }
 
 h1 {
   margin: 0;
-  font-size: clamp(1.6rem, 4vw, 2.8rem);
+  font-size: clamp(1.8rem, 4vw, 3rem);
   letter-spacing: -0.03em;
+}
+
+.hero-kicker {
+  margin: 0;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-2);
+  font-weight: 700;
 }
 
 .hero p {
@@ -58,20 +86,53 @@ h1 {
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
 }
 
+.full-row {
+  grid-column: 1 / -1;
+}
+
 .panel {
   margin-top: 16px;
   border: 1px solid var(--line);
-  border-radius: 20px;
-  background: var(--panel);
-  backdrop-filter: blur(6px);
-  padding: 16px;
+  border-radius: 22px;
+  background: linear-gradient(145deg, #fffffff2 0%, #fcfffded 100%);
+  backdrop-filter: blur(8px);
+  padding: 18px;
+  box-shadow: var(--shadow);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.panel:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 16px 36px #15201824;
+}
+
+.panel h2 {
+  margin-top: 0;
+  margin-bottom: 8px;
+}
+
+.panel h3 {
+  margin: 0 0 8px;
+}
+
+.panel-divider {
+  margin: 14px 0;
+  height: 1px;
+  background: var(--line);
+}
+
+.panel-help {
+  margin-top: 0;
+  margin-bottom: 12px;
+  color: var(--muted);
 }
 
 label {
   display: block;
-  font-size: 0.85rem;
+  font-size: 0.88rem;
+  font-weight: 600;
   color: var(--muted);
-  margin-bottom: 4px;
+  margin-bottom: 6px;
 }
 
 input,
@@ -84,6 +145,7 @@ button {
   padding: 10px 12px;
   font-family: inherit;
   background: #fff;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 textarea {
@@ -105,16 +167,35 @@ textarea {
 button {
   cursor: pointer;
   font-weight: 600;
-  transition: transform 0.12s ease, opacity 0.12s ease;
+  transition: transform 0.12s ease, opacity 0.12s ease, box-shadow 0.12s ease;
+  width: auto;
+  min-width: 120px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+  transform: none;
+  box-shadow: none;
 }
 
 button:hover {
   transform: translateY(-1px);
+  box-shadow: 0 6px 16px #0000001a;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 3px solid #77c8ac;
+  outline-offset: 1px;
 }
 
 button.primary {
-  background: var(--accent-2);
+  background: linear-gradient(135deg, var(--accent-2) 0%, var(--accent-3) 100%);
   color: #fff;
+  border-color: transparent;
 }
 
 button.secondary {
@@ -136,11 +217,21 @@ button.accent {
   gap: 8px;
 }
 
+.list.compact .list-item {
+  padding: 10px;
+}
+
 .list-item {
-  padding: 12px;
+  padding: 14px;
   border: 1px solid var(--line);
   border-radius: 14px;
-  background: #fff;
+  background: linear-gradient(145deg, #ffffff 0%, #fafffd 100%);
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.list-item:hover {
+  border-color: #1b7c6690;
+  transform: translateY(-1px);
 }
 
 .list-item h3 {
@@ -161,6 +252,12 @@ button.accent {
   display: inline-block;
 }
 
+.code.overdue {
+  color: #fff;
+  background: var(--danger);
+  border-color: transparent;
+}
+
 .error {
   color: var(--danger);
   font-weight: 600;
@@ -171,8 +268,108 @@ button.accent {
   font-weight: 600;
 }
 
+.banner {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: linear-gradient(145deg, #ffffff 0%, #f8fffc 100%);
+  padding: 10px 12px;
+  box-shadow: 0 8px 20px #15201814;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.tab {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffffb8;
+  color: var(--ink);
+  padding: 9px 14px;
+  min-width: 0;
+}
+
+.tab.active {
+  background: linear-gradient(135deg, var(--accent-2) 0%, var(--accent-3) 100%);
+  color: #fff;
+  border-color: transparent;
+}
+
+.stat-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+}
+
+.stat-card {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 12px;
+  background: linear-gradient(180deg, #ffffff 0%, #f7fffb 100%);
+}
+
+.app-shell[aria-busy='true'] {
+  cursor: progress;
+}
+
+.mini-panel {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+  padding: 12px;
+}
+
+.mini-panel h3 {
+  margin-top: 0;
+  margin-bottom: 8px;
+}
+
+.stat-title {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.stat-value {
+  margin: 6px 0;
+  font-size: 1.8rem;
+  font-weight: 700;
+}
+
+.stat-subtitle {
+  margin: 0;
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+.empty-state {
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  background: #fff;
+  margin-bottom: 12px;
+}
+
+.inline-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.inline-check input {
+  width: auto;
+}
+
 @media (max-width: 640px) {
   .app-shell {
     padding: 14px 10px 32px;
+  }
+
+  button {
+    width: 100%;
   }
 }

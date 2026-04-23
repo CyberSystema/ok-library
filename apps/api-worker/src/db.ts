@@ -3,10 +3,15 @@ import type { AuthClaims, Env } from './types';
 import { nowIso, safeJsonParse } from './utils';
 
 type CustomFieldDef = {
+  id: string;
   field_key: string;
   field_type: 'text' | 'number' | 'boolean' | 'date' | 'enum';
   required: number;
   enum_options: string;
+};
+
+type CustomFieldValidationOptions = {
+  requireAllRequired?: boolean;
 };
 
 export async function insertAuditLog(
@@ -176,10 +181,11 @@ export async function recordSyncMutation(
 
 export async function validateCustomFields(
   env: Env,
-  customFields: Record<string, unknown>
+  customFields: Record<string, unknown>,
+  options?: CustomFieldValidationOptions
 ): Promise<Record<string, unknown>> {
   const defsResult = await env.DB.prepare(
-    `SELECT field_key, field_type, required, enum_options
+    `SELECT id, field_key, field_type, required, enum_options
      FROM custom_field_definitions WHERE deleted_at IS NULL`
   ).all<CustomFieldDef>();
 
@@ -191,11 +197,12 @@ export async function validateCustomFields(
   const defMap = new Map(defs.map((d) => [d.field_key, d]));
   const normalized: Record<string, unknown> = {};
   const errors: string[] = [];
+  const requireAllRequired = options?.requireAllRequired !== false;
 
   for (const def of defs) {
     const raw = customFields[def.field_key];
     const missing = raw === undefined || raw === null || raw === '';
-    if (def.required === 1 && missing) {
+    if (requireAllRequired && def.required === 1 && missing) {
       errors.push(`Required custom field missing: ${def.field_key}`);
       continue;
     }
@@ -261,4 +268,52 @@ export async function validateCustomFields(
   }
 
   return normalized;
+}
+
+export async function replaceBookAttributeValues(
+  env: Env,
+  bookId: string,
+  attributeValues: Record<string, unknown>
+): Promise<void> {
+  const defsResult = await env.DB.prepare(
+    `SELECT id, field_key FROM custom_field_definitions WHERE deleted_at IS NULL`
+  ).all<{ id: string; field_key: string }>();
+
+  const defs = defsResult.results ?? [];
+  const keyToDef = new Map(defs.map((d) => [d.field_key, d.id]));
+
+  await env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(bookId).run();
+
+  for (const [key, value] of Object.entries(attributeValues)) {
+    const definitionId = keyToDef.get(key);
+    if (!definitionId) {
+      continue;
+    }
+
+    await env.DB.prepare(
+      `INSERT INTO book_attribute_values
+        (id, book_id, attribute_definition_id, value_json, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+      .bind(crypto.randomUUID(), bookId, definitionId, JSON.stringify(value), nowIso(), nowIso())
+      .run();
+  }
+}
+
+export async function getBookAttributeValues(env: Env, bookId: string): Promise<Record<string, unknown>> {
+  const result = await env.DB.prepare(
+    `SELECT cfd.field_key, bav.value_json
+     FROM book_attribute_values bav
+     JOIN custom_field_definitions cfd ON cfd.id = bav.attribute_definition_id
+     WHERE bav.book_id = ? AND cfd.deleted_at IS NULL`
+  )
+    .bind(bookId)
+    .all<{ field_key: string; value_json: string }>();
+
+  const map: Record<string, unknown> = {};
+  for (const row of result.results ?? []) {
+    map[row.field_key] = safeJsonParse(row.value_json, null);
+  }
+
+  return map;
 }
