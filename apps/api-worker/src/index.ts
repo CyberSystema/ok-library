@@ -38,15 +38,23 @@ function clientIp(c: AppContext): string {
 }
 
 async function enforceRateLimit(c: AppContext, bucket: string, perMinuteLimit: number): Promise<void> {
-	const key = `rl:${bucket}:${clientIp(c)}:${Math.floor(Date.now() / 60000)}`;
-	const countRaw = await c.env.CACHE.get(key);
-	const count = Number(countRaw ?? '0');
-
-	if (count >= perMinuteLimit) {
-		throw new HTTPException(429, { message: 'Rate limit exceeded. Please retry shortly.' });
+	if (!c.env.CACHE) {
+		return;
 	}
 
-	await c.env.CACHE.put(key, String(count + 1), { expirationTtl: 70 });
+	try {
+		const key = `rl:${bucket}:${clientIp(c)}:${Math.floor(Date.now() / 60000)}`;
+		const countRaw = await c.env.CACHE.get(key);
+		const count = Number(countRaw ?? '0');
+
+		if (count >= perMinuteLimit) {
+			throw new HTTPException(429, { message: 'Rate limit exceeded. Please retry shortly.' });
+		}
+
+		await c.env.CACHE.put(key, String(count + 1), { expirationTtl: 70 });
+	} catch (error) {
+		console.warn('Rate limiter unavailable, continuing without KV enforcement', error);
+	}
 }
 
 app.use('*', async (c, next) => {

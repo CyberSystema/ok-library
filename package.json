@@ -15,5 +15,8 @@
     "deploy:api": "npm --workspace apps/api-worker run deploy",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "echo 'lint placeholder'"
+  },
+  "devDependencies": {
+    "wrangler": "^4.84.1"
   }
 }
