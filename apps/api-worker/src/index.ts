@@ -603,48 +603,56 @@ app.put('/api/books/:id/attributes', requireRole(['admin', 'librarian']), async 
 });
 
 app.get('/api/borrow/active', async (c) => {
-	const overdueOnly = c.req.query('overdueOnly') === 'true';
-	const now = nowIso();
+	try {
+		const overdueOnly = c.req.query('overdueOnly') === 'true';
+		const now = nowIso();
 
-	const rows = await c.env.DB.prepare(
-		`SELECT
-			bt.id,
-			bt.book_id,
-			b.title,
-			b.author,
-			bt.borrower_name,
-			bt.borrower_contact,
-			bt.borrowed_at,
-			bt.due_at,
-			CASE WHEN bt.due_at < ? THEN 1 ELSE 0 END AS is_overdue
-		 FROM borrow_transactions bt
-		 JOIN books b ON b.id = bt.book_id
-		 WHERE bt.returned_at IS NULL
-			AND b.deleted_at IS NULL
-			AND (? = 0 OR bt.due_at < ?)
-		 ORDER BY is_overdue DESC, bt.due_at ASC
-		 LIMIT 500`
-	)
-		.bind(now, overdueOnly ? 1 : 0, now)
-		.all();
+		const rows = await c.env.DB.prepare(
+			`SELECT
+				bt.id,
+				bt.book_id,
+				b.title,
+				b.author,
+				bt.borrower_name,
+				bt.borrower_contact,
+				bt.borrowed_at,
+				bt.due_at,
+				CASE WHEN bt.due_at < ? THEN 1 ELSE 0 END AS is_overdue
+			 FROM borrow_transactions bt
+			 JOIN books b ON b.id = bt.book_id
+			 WHERE bt.returned_at IS NULL
+				AND b.deleted_at IS NULL
+				AND (? = 0 OR bt.due_at < ?)
+			 ORDER BY is_overdue DESC, bt.due_at ASC
+			 LIMIT 500`
+		)
+			.bind(now, overdueOnly ? 1 : 0, now)
+			.all();
 
-	const items = (rows.results ?? []).map((row) => ({
-		id: (row as Record<string, unknown>).id,
-		bookId: (row as Record<string, unknown>).book_id,
-		title: (row as Record<string, unknown>).title,
-		author: (row as Record<string, unknown>).author,
-		borrowerName: (row as Record<string, unknown>).borrower_name,
-		borrowerContact: (row as Record<string, unknown>).borrower_contact,
-		borrowedAt: (row as Record<string, unknown>).borrowed_at,
-		dueAt: (row as Record<string, unknown>).due_at,
-		isOverdue: (row as Record<string, unknown>).is_overdue === 1
-	}));
+		const items = (rows.results ?? []).map((row) => {
+			const r = row as Record<string, unknown>;
+			return {
+				id: r.id ?? '',
+				bookId: r.book_id ?? '',
+				title: r.title ?? '',
+				author: r.author ?? '',
+				borrowerName: r.borrower_name ?? '',
+				borrowerContact: r.borrower_contact ?? null,
+				borrowedAt: r.borrowed_at ?? '',
+				dueAt: r.due_at ?? '',
+				isOverdue: r.is_overdue === 1
+			};
+		});
 
-	return c.json({
-		total: items.length,
-		overdueCount: items.filter((item) => item.isOverdue).length,
-		items
-	});
+		return c.json({
+			total: items.length,
+			overdueCount: items.filter((item) => item.isOverdue).length,
+			items
+		});
+	} catch (error) {
+		console.error('Error in /api/borrow/active:', error);
+		throw error;
+	}
 });
 
 app.post('/api/books/:id/codes', requireRole(['admin', 'librarian']), async (c) => {
@@ -797,44 +805,50 @@ app.post('/api/setup/default-book-structure', requireRole(['admin']), async (c) 
 });
 
 app.get('/api/rooms/summary', async (c) => {
-	const rows = await c.env.DB.prepare(
-		`SELECT
-			r.id,
-			r.code,
-			r.name,
-			r.description,
-			COUNT(b.id) AS total_books,
-			SUM(CASE WHEN b.status = 'available' THEN 1 ELSE 0 END) AS available_books,
-			SUM(CASE WHEN b.status = 'borrowed' THEN 1 ELSE 0 END) AS borrowed_books,
-			SUM(CASE WHEN b.status = 'lost' THEN 1 ELSE 0 END) AS lost_books,
-			SUM(CASE WHEN b.status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_books
-		 FROM rooms r
-		 LEFT JOIN books b ON b.room_code = r.code AND b.deleted_at IS NULL
-		 GROUP BY r.id, r.code, r.name, r.description
-		 ORDER BY r.code ASC`
-	).all();
+	try {
+		const rows = await c.env.DB.prepare(
+			`SELECT
+				r.id,
+				r.code,
+				r.name,
+				r.description,
+				COUNT(b.id) AS total_books,
+				SUM(CASE WHEN b.status = 'available' THEN 1 ELSE 0 END) AS available_books,
+				SUM(CASE WHEN b.status = 'borrowed' THEN 1 ELSE 0 END) AS borrowed_books,
+				SUM(CASE WHEN b.status = 'lost' THEN 1 ELSE 0 END) AS lost_books,
+				SUM(CASE WHEN b.status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_books
+			 FROM rooms r
+			 LEFT JOIN books b ON b.room_code = r.code AND b.deleted_at IS NULL
+			 GROUP BY r.id, r.code, r.name, r.description
+			 ORDER BY r.code ASC`
+		).all();
 
-	const unassigned = await c.env.DB.prepare(
-		`SELECT
-			COUNT(*) AS total_books,
-			SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS available_books,
-			SUM(CASE WHEN status = 'borrowed' THEN 1 ELSE 0 END) AS borrowed_books,
-			SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost_books,
-			SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_books
-		 FROM books
-		 WHERE deleted_at IS NULL AND (room_code IS NULL OR TRIM(room_code) = '')`
-	).first<Record<string, unknown>>();
+		const unassigned = await c.env.DB.prepare(
+			`SELECT
+				COUNT(*) AS total_books,
+				SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END) AS available_books,
+				SUM(CASE WHEN status = 'borrowed' THEN 1 ELSE 0 END) AS borrowed_books,
+				SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost_books,
+				SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_books
+			 FROM books
+			 WHERE deleted_at IS NULL AND (room_code IS NULL OR TRIM(room_code) = '')`
+		).first<Record<string, unknown>>();
 
-	return c.json({
-		items: rows.results ?? [],
-		unassigned: {
-			totalBooks: Number(unassigned?.total_books ?? 0),
-			availableBooks: Number(unassigned?.available_books ?? 0),
-			borrowedBooks: Number(unassigned?.borrowed_books ?? 0),
-			lostBooks: Number(unassigned?.lost_books ?? 0),
-			maintenanceBooks: Number(unassigned?.maintenance_books ?? 0)
-		}
-	});
+		const ua = unassigned ?? {};
+		return c.json({
+			items: rows.results ?? [],
+			unassigned: {
+				totalBooks: Number(ua.total_books ?? 0),
+				availableBooks: Number(ua.available_books ?? 0),
+				borrowedBooks: Number(ua.borrowed_books ?? 0),
+				lostBooks: Number(ua.lost_books ?? 0),
+				maintenanceBooks: Number(ua.maintenance_books ?? 0)
+			}
+		});
+	} catch (error) {
+		console.error('Error in /api/rooms/summary:', error);
+		throw error;
+	}
 });
 
 app.post('/api/rooms', requireRole(['admin', 'librarian']), async (c) => {
@@ -886,23 +900,45 @@ app.delete('/api/rooms/:id', requireRole(['admin']), async (c) => {
 });
 
 app.get('/api/custom-fields', async (c) => {
-	const rows = await c.env.DB.prepare(
-		`SELECT id, field_key, label, field_type, required, enum_options, created_at, updated_at
-		 FROM custom_field_definitions WHERE deleted_at IS NULL ORDER BY field_key ASC`
-	).all();
+	try {
+		const rows = await c.env.DB.prepare(
+			`SELECT id, field_key, label, field_type, required, enum_options, created_at, updated_at
+			 FROM custom_field_definitions WHERE deleted_at IS NULL ORDER BY field_key ASC`
+		).all();
 
-	const items = (rows.results ?? []).map((row) => ({
-		id: (row as Record<string, unknown>).id,
-		key: (row as Record<string, unknown>).field_key,
-		label: (row as Record<string, unknown>).label,
-		type: (row as Record<string, unknown>).field_type,
-		required: (row as Record<string, unknown>).required === 1,
-		enumOptions: JSON.parse(((row as Record<string, unknown>).enum_options as string) ?? '[]'),
-		createdAt: (row as Record<string, unknown>).created_at,
-		updatedAt: (row as Record<string, unknown>).updated_at
-	}));
+		const items = (rows.results ?? []).map((row) => {
+			try {
+				const r = row as Record<string, unknown>;
+				return {
+					id: r.id ?? '',
+					key: r.field_key ?? '',
+					label: r.label ?? '',
+					type: r.field_type ?? 'text',
+					required: r.required === 1,
+					enumOptions: JSON.parse((r.enum_options as string) ?? '[]'),
+					createdAt: r.created_at ?? '',
+					updatedAt: r.updated_at ?? ''
+				};
+			} catch (parseError) {
+				console.error('Error parsing custom field row:', row, parseError);
+				return {
+					id: (row as Record<string, unknown>).id ?? '',
+					key: (row as Record<string, unknown>).field_key ?? '',
+					label: (row as Record<string, unknown>).label ?? '',
+					type: (row as Record<string, unknown>).field_type ?? 'text',
+					required: false,
+					enumOptions: [],
+					createdAt: (row as Record<string, unknown>).created_at ?? '',
+					updatedAt: (row as Record<string, unknown>).updated_at ?? ''
+				};
+			}
+		});
 
-	return c.json({ items });
+		return c.json({ items });
+	} catch (error) {
+		console.error('Error in /api/custom-fields:', error);
+		throw error;
+	}
 });
 
 app.post('/api/custom-fields', requireRole(['admin']), async (c) => {
