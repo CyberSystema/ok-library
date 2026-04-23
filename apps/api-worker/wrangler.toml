@@ -20,7 +20,7 @@ binding = "ASSETS"
 bucket_name = "ok-library-assets"
 
 [vars]
-APP_ENV = "development"
+APP_ENV = "production"
 JWT_ISSUER = "ok-library-api"
 ACCESS_TOKEN_TTL_SECONDS = "43200"
-CORS_ORIGIN = "http://localhost:5173"
+CORS_ORIGIN = "https://ok-library.pages.dev/"
