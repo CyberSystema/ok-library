@@ -220,14 +220,14 @@ app.post('/api/auth/login', async (c) => {
 
 	c.header(
 		'Set-Cookie',
-		`ok_library_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None`
+		`ok_library_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned`
 	);
 
 	return c.json({ token, user: { id: user.id, username: user.username, role: user.role } });
 });
 
 app.post('/api/auth/logout', async (c) => {
-	c.header('Set-Cookie', 'ok_library_session=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0');
+	c.header('Set-Cookie', 'ok_library_session=; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=0');
 	return c.json({ ok: true });
 });
 
@@ -251,9 +251,15 @@ app.get('/api/books', async (c) => {
 		.map(([key, value]) => ({ key: key.replace('custom_', ''), value }));
 
 	const cacheKey = `books:${JSON.stringify({ query, customFilters })}`;
-	const cached = await c.env.CACHE.get(cacheKey, 'json');
-	if (cached) {
-		return c.json(cached);
+	if (c.env.CACHE) {
+		try {
+			const cached = await c.env.CACHE.get(cacheKey, 'json');
+			if (cached) {
+				return c.json(cached);
+			}
+		} catch (error) {
+			console.warn('Book list cache read failed, falling back to DB query', error);
+		}
 	}
 
 	const result = await queryBooksWithFilters(c.env, {
@@ -268,7 +274,13 @@ app.get('/api/books', async (c) => {
 		items: result.rows
 	};
 
-	await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+	if (c.env.CACHE) {
+		try {
+			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+		} catch (error) {
+			console.warn('Book list cache write failed, continuing without cache', error);
+		}
+	}
 	return c.json(response);
 });
 
