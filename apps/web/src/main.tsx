@@ -38,7 +38,13 @@ type LoginResponse = {
   user: { id: string; username: string; role: string };
 };
 
-const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
+const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
+const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
+
+function joinApiUrl(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return `${API_BASE}${normalizedPath}`;
+}
 
 async function apiRequest<T>(
   token: string | null,
@@ -46,7 +52,7 @@ async function apiRequest<T>(
   init?: RequestInit,
   raw = false
 ): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetch(joinApiUrl(path), {
     ...init,
     headers: {
       ...(raw ? {} : { 'Content-Type': 'application/json' }),
