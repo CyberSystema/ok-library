@@ -72,6 +72,11 @@ export async function queryBooksWithFilters(
   env: Env,
   opts: {
     q?: string;
+    qMode?: 'all' | 'any' | 'exact';
+    qExclude?: string;
+    partialWords?: boolean;
+    fuzzyTypos?: boolean;
+    searchFields?: string;
     status?: string;
     roomCode?: string;
     shelfCode?: string;
@@ -82,14 +87,84 @@ export async function queryBooksWithFilters(
     customFilters: Array<{ key: string; value: string }>;
   }
 ): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
+  const parseSearchTokens = (input: string): string[] => {
+    const tokens: string[] = [];
+    const regex = /"([^"]+)"|(\S+)/g;
+    let match: RegExpExecArray | null = regex.exec(input);
+    while (match) {
+      const token = (match[1] ?? match[2] ?? '').trim().toLowerCase();
+      if (token) {
+        tokens.push(token);
+      }
+      match = regex.exec(input);
+    }
+    return tokens;
+  };
+
+  const safeLike = (raw: string): string => raw.replaceAll('%', '').replaceAll('_', '');
+  const splitWords = (text: string): string[] => text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const normalize = (value: unknown): string => String(value ?? '').trim().toLowerCase();
+
+  const levenshtein = (a: string, b: string): number => {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i += 1) {
+      let curr = i;
+      for (let j = 1; j <= b.length; j += 1) {
+        const temp = prev[j];
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        prev[j] = Math.min(prev[j] + 1, curr + 1, prev[j - 1] + cost);
+        curr = temp;
+      }
+      prev[0] = i;
+    }
+    return prev[b.length];
+  };
+
+  const typoThreshold = (term: string): number => {
+    if (term.length <= 4) return 1;
+    if (term.length <= 9) return 2;
+    return 3;
+  };
+
+  const fuzzyWordMatch = (text: string, term: string): boolean => {
+    const words = splitWords(text);
+    const threshold = typoThreshold(term);
+    for (const word of words) {
+      if (Math.abs(word.length - term.length) > threshold) continue;
+      if (levenshtein(word, term) <= threshold) return true;
+    }
+    return false;
+  };
+
+  const fieldExprMap: Record<string, string> = {
+    title: 'COALESCE(title, \'\')',
+    author: 'COALESCE(author, \'\')',
+    isbn: 'COALESCE(isbn, \'\')',
+    publisher: 'COALESCE(publisher, \'\')',
+    language: 'COALESCE(language, \'\')',
+    description: 'COALESCE(description, \'\')',
+    roomCode: 'COALESCE(room_code, \'\')',
+    shelfCode: 'COALESCE(shelf_code, \'\')',
+    tags: 'COALESCE(tags, \'\')',
+    custom: 'COALESCE(custom_fields, \'\')'
+  };
+
+  const requestedFields = (opts.searchFields ?? '')
+    .split(',')
+    .map((f) => f.trim())
+    .filter(Boolean);
+
+  const activeFields = (requestedFields.length > 0 ? requestedFields : ['title', 'author', 'isbn'])
+    .filter((f) => Object.prototype.hasOwnProperty.call(fieldExprMap, f));
+
   const where: string[] = ['deleted_at IS NULL'];
   const values: unknown[] = [];
-
-  if (opts.q) {
-    where.push('(title LIKE ? OR author LIKE ? OR isbn LIKE ?)');
-    const qValue = `%${opts.q.replaceAll('%', '').replaceAll('_', '')}%`;
-    values.push(qValue, qValue, qValue);
-  }
+  const qText = normalize(opts.q);
+  const excludeText = normalize(opts.qExclude);
+  const useFuzzy = Boolean(opts.fuzzyTypos) && qText.length > 0 && opts.qMode !== 'exact';
 
   if (opts.status) {
     where.push('status = ?');
@@ -126,9 +201,124 @@ export async function queryBooksWithFilters(
   const limit = Math.max(1, Math.min(100, opts.pageSize));
   const offset = (Math.max(1, opts.page) - 1) * limit;
 
-  const countStmt = env.DB.prepare(`SELECT COUNT(*) as count FROM books ${whereSql}`).bind(...values);
+  if (useFuzzy) {
+    const rowsStmt = env.DB.prepare(`SELECT * FROM books ${whereSql}`).bind(...values);
+    const rowsRes = await rowsStmt.all();
+    const allRows = ((rowsRes.results ?? []) as Array<Record<string, unknown>>).map(parseBook);
+
+    const getFieldText = (row: Record<string, unknown>, field: string): string => {
+      if (field === 'custom') {
+        return normalize(JSON.stringify(row.customFields ?? {}));
+      }
+      if (field === 'tags') {
+        const tags = Array.isArray(row.tags) ? row.tags : [];
+        return normalize(tags.join(' '));
+      }
+      return normalize(row[field]);
+    };
+
+    const searchTerms = opts.qMode === 'exact' ? [qText] : parseSearchTokens(qText);
+    const excludeTerms = parseSearchTokens(excludeText);
+
+    const termMatch = (texts: string[], term: string): boolean => {
+      const directMatch = texts.some((text) => {
+        if (!term) return true;
+        if (opts.partialWords === false) {
+          return splitWords(text).includes(term);
+        }
+        return text.includes(term);
+      });
+      if (directMatch) return true;
+      return texts.some((text) => fuzzyWordMatch(text, term));
+    };
+
+    const filtered = allRows.filter((row) => {
+      const texts = activeFields.map((field) => getFieldText(row, field)).filter(Boolean);
+      if (texts.length === 0) return false;
+
+      let include = true;
+      if (qText) {
+        if (opts.qMode === 'exact') {
+          include = texts.some((text) => text.includes(qText));
+        } else if (opts.qMode === 'any') {
+          include = searchTerms.some((term) => termMatch(texts, term));
+        } else {
+          include = searchTerms.every((term) => termMatch(texts, term));
+        }
+      }
+      if (!include) return false;
+
+      if (excludeTerms.length > 0) {
+        const hasExcluded = excludeTerms.some((term) => texts.some((text) => text.includes(term)));
+        if (hasExcluded) return false;
+      }
+
+      return true;
+    });
+
+    const compareValues = (a: Record<string, unknown>, b: Record<string, unknown>): number => {
+      const pick = (row: Record<string, unknown>): string | number => {
+        if (opts.sortBy === 'publicationYear') return Number(row.publicationYear ?? 0);
+        if (opts.sortBy === 'updatedAt') return normalize(row.updatedAt);
+        if (opts.sortBy === 'status') return normalize(row.status);
+        if (opts.sortBy === 'author') return normalize(row.author);
+        return normalize(row.title);
+      };
+      const av = pick(a);
+      const bv = pick(b);
+      if (av < bv) return sortDir === 'ASC' ? -1 : 1;
+      if (av > bv) return sortDir === 'ASC' ? 1 : -1;
+      return 0;
+    };
+
+    filtered.sort(compareValues);
+    const paged = filtered.slice(offset, offset + limit);
+
+    return {
+      total: filtered.length,
+      rows: paged
+    };
+  }
+
+  if (qText) {
+    const terms = opts.qMode === 'exact' ? [qText] : parseSearchTokens(qText);
+    const termClauses: string[] = [];
+
+    for (const term of terms) {
+      const likeValue = opts.partialWords === false ? safeLike(term) : `%${safeLike(term)}%`;
+      const perFieldClause = activeFields.map((field) => `LOWER(${fieldExprMap[field]}) LIKE LOWER(?)`).join(' OR ');
+      if (perFieldClause) {
+        termClauses.push(`(${perFieldClause})`);
+        for (let i = 0; i < activeFields.length; i += 1) {
+          values.push(likeValue);
+        }
+      }
+    }
+
+    if (termClauses.length > 0) {
+      where.push(`(${termClauses.join(opts.qMode === 'any' ? ' OR ' : ' AND ')})`);
+    }
+  }
+
+  if (excludeText) {
+    const excludes = parseSearchTokens(excludeText);
+    for (const term of excludes) {
+      const likeValue = `%${safeLike(term)}%`;
+      const perFieldClause = activeFields.map((field) => `LOWER(${fieldExprMap[field]}) LIKE LOWER(?)`).join(' OR ');
+      if (perFieldClause) {
+        where.push(`NOT (${perFieldClause})`);
+        for (let i = 0; i < activeFields.length; i += 1) {
+          values.push(likeValue);
+        }
+      }
+    }
+  }
+
+  const whereSqlWithSearch = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  const countStmt = env.DB.prepare(`SELECT COUNT(*) as count FROM books ${whereSqlWithSearch}`).bind(...values);
   const rowsStmt = env.DB.prepare(
-    `SELECT * FROM books ${whereSql} ORDER BY ${sortColumn} ${sortDir}, id DESC LIMIT ? OFFSET ?`
+    `SELECT * FROM books ${whereSqlWithSearch} ORDER BY ${sortColumn} ${sortDir}, id DESC LIMIT ? OFFSET ?`
   ).bind(...values, limit, offset);
 
   const [countRes, rowsRes] = await Promise.all([countStmt.first<{ count: number }>(), rowsStmt.all()]);

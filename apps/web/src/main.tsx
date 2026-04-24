@@ -93,6 +93,8 @@ type AppSection = 'books' | 'circulation' | 'import';
 
 type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
 type DuplicateGroup = DuplicateEntry[];
+type SearchMode = 'all' | 'any' | 'exact';
+type SearchField = 'title' | 'author' | 'isbn' | 'publisher' | 'language' | 'description' | 'roomCode' | 'shelfCode' | 'tags' | 'custom';
 
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
 const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
@@ -236,6 +238,12 @@ function App() {
   const [totalBooksCount, setTotalBooksCount] = useState(0);
 
   const [q, setQ] = useState('');
+  const [qExclude, setQExclude] = useState('');
+  const [qMode, setQMode] = useState<SearchMode>('all');
+  const [partialWords, setPartialWords] = useState(true);
+  const [fuzzyTypos, setFuzzyTypos] = useState(true);
+  const [searchFields, setSearchFields] = useState<SearchField[]>(['title', 'author', 'isbn']);
+  const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
   const [status, setStatus] = useState('');
   const [roomCode, setRoomCode] = useState('');
 
@@ -334,7 +342,8 @@ function App() {
   }, [loggedIn, didBootstrapData]);
 
   const totalBooks = books.length;
-  const availableBooks = books.filter((book) => book.status === 'available').length;
+  const availableBooks =
+    roomSummary.reduce((sum, room) => sum + Number(room.available_books ?? 0), 0) + Number(unassignedSummary.availableBooks ?? 0);
   const borrowedBooks = books.filter((book) => book.status === 'borrowed').length;
   const overdueCount = activeBorrows.filter((item) => item.isOverdue).length;
   const dueSoonCount = activeBorrows.filter((item) => {
@@ -818,6 +827,10 @@ function App() {
       const page = pageOverride ?? currentPage;
       const query = new URLSearchParams();
       if (q) query.set('q', q);
+      if (qExclude) query.set('qExclude', qExclude);
+      query.set('qMode', qMode);
+      query.set('partialWords', String(partialWords));
+      query.set('searchFields', searchFields.join(','));
       if (status) query.set('status', status);
       if (roomCode) query.set('roomCode', roomCode);
       query.set('sortBy', 'updatedAt');
@@ -2193,7 +2206,7 @@ function App() {
                       <input
                         value={q}
                         onChange={(e) => setQ(e.target.value)}
-                        placeholder="Title, author, or ISBN…"
+                        placeholder="Search text (supports partial words, quotes for phrases)…"
                         onKeyDown={(e) => { if (e.key === 'Enter') { setCurrentPage(1); void loadBooks(1); } }}
                       />
                     </div>
@@ -2214,9 +2227,94 @@ function App() {
                     <div className="search-actions">
                       <label>.</label>
                       <button className="primary" onClick={() => { setCurrentPage(1); void loadBooks(1); }}>Search</button>
-                      <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); setCurrentPage(1); void loadBooks(1); }}>Reset</button>
+                      <button className="secondary" onClick={() => { setShowAdvancedSearch((v) => !v); }}>
+                        {showAdvancedSearch ? 'Hide Advanced' : 'Advanced Search'}
+                      </button>
+                      <button className="secondary" onClick={() => {
+                        setQ('');
+                        setQExclude('');
+                        setQMode('all');
+                        setPartialWords(true);
+                        setFuzzyTypos(true);
+                        setSearchFields(['title', 'author', 'isbn']);
+                        setStatus('');
+                        setRoomCode('');
+                        setCurrentPage(1);
+                        void loadBooks(1);
+                      }}>Reset</button>
                     </div>
                   </div>
+
+                  {showAdvancedSearch && (
+                    <div style={{ marginTop: '0.75rem', borderTop: '1px solid var(--border)', paddingTop: '0.75rem' }}>
+                      <div className="form-row">
+                        <div>
+                          <label>Exclude Terms</label>
+                          <input
+                            value={qExclude}
+                            onChange={(e) => setQExclude(e.target.value)}
+                            placeholder="Words/phrases to exclude"
+                          />
+                        </div>
+                        <div>
+                          <label>Match Mode</label>
+                          <select value={qMode} onChange={(e) => setQMode(e.target.value as SearchMode)}>
+                            <option value="all">All terms (AND)</option>
+                            <option value="any">Any term (OR)</option>
+                            <option value="exact">Exact phrase</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label>Partial Word Matching</label>
+                          <select value={partialWords ? 'yes' : 'no'} onChange={(e) => setPartialWords(e.target.value === 'yes')}>
+                            <option value="yes">Yes (contains text)</option>
+                            <option value="no">No (exact token)</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label>Fuzzy Typos</label>
+                          <select value={fuzzyTypos ? 'on' : 'off'} onChange={(e) => setFuzzyTypos(e.target.value === 'on')}>
+                            <option value="on">On (tolerate typos)</option>
+                            <option value="off">Off (strict matching)</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <label style={{ marginTop: '0.5rem' }}>Search In Fields</label>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.35rem' }}>
+                        {([
+                          ['title', 'Title'],
+                          ['author', 'Author'],
+                          ['isbn', 'ISBN'],
+                          ['publisher', 'Publisher'],
+                          ['language', 'Language'],
+                          ['description', 'Description'],
+                          ['roomCode', 'Room'],
+                          ['shelfCode', 'Shelf'],
+                          ['tags', 'Tags'],
+                          ['custom', 'Custom Fields']
+                        ] as Array<[SearchField, string]>).map(([field, label]) => (
+                          <label key={field} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', margin: 0, fontSize: '0.82rem' }}>
+                            <input
+                              type="checkbox"
+                              checked={searchFields.includes(field)}
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setSearchFields((prev) => (prev.includes(field) ? prev : [...prev, field]));
+                                } else {
+                                  setSearchFields((prev) => {
+                                    const next = prev.filter((value) => value !== field);
+                                    return next.length > 0 ? next : ['title'];
+                                  });
+                                }
+                              }}
+                            />
+                            {label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* Book Grid */}
@@ -2441,8 +2539,32 @@ function App() {
       )}
 
       {isWorking && <p className="banner muted">⏳ Working…</p>}
-      {error && <p className="banner error">⚠️ {error}</p>}
-      {message && <p className="banner success">✓ {message}</p>}
+      {error && (
+        <div className="banner error" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+          <span>⚠️ {error}</span>
+          <button
+            type="button"
+            className="secondary small"
+            onClick={() => setError('')}
+            style={{ padding: '0.2rem 0.5rem' }}
+          >
+            Close
+          </button>
+        </div>
+      )}
+      {message && (
+        <div className="banner success" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
+          <span>✓ {message}</span>
+          <button
+            type="button"
+            className="secondary small"
+            onClick={() => setMessage('')}
+            style={{ padding: '0.2rem 0.5rem' }}
+          >
+            Close
+          </button>
+        </div>
+      )}
     </div>
   );
 }

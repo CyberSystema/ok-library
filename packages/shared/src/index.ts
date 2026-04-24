@@ -154,6 +154,11 @@ export const CodeAssignmentSchema = z.object({
 
 export const BookFilterQuerySchema = z.object({
   q: z.string().max(200).optional(),
+  qMode: z.enum(['all', 'any', 'exact']).default('all'),
+  qExclude: z.string().max(200).optional(),
+  partialWords: z.coerce.boolean().default(true),
+  fuzzyTypos: z.coerce.boolean().default(true),
+  searchFields: z.string().max(200).optional(),
   status: BookStatusSchema.optional(),
   roomCode: z.string().max(64).optional(),
   shelfCode: z.string().max(64).optional(),
