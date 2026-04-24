@@ -16,6 +16,9 @@ type Book = {
   publicationYear?: number | null;
   customFields?: Record<string, string | number | boolean | null>;
   version: number;
+  publisher?: string | null;
+  language?: string | null;
+  description?: string | null;
 };
 
 type Room = {
@@ -292,6 +295,9 @@ function App() {
   });
   const [attributeEditorValues, setAttributeEditorValues] = useState<Record<string, unknown>>({});
   const [selectedBookIds, setSelectedBookIds] = useState<string[]>([]);
+  const [detailBook, setDetailBook] = useState<Book | null>(null);
+  const [detailMode, setDetailMode] = useState<'view' | 'edit'>('view');
+  const [showAddBook, setShowAddBook] = useState(false);
   const [bulkStatus, setBulkStatus] = useState<string>('');
   const [bulkRoomCode, setBulkRoomCode] = useState('');
   const [bulkShelfCode, setBulkShelfCode] = useState('');
@@ -919,6 +925,7 @@ function App() {
         publicationYear: '',
         customFieldsJson: '{}'
       });
+      setShowAddBook(false);
       setMessage('Book added successfully.');
       await Promise.all([loadBooks(), loadRoomSummary()]);
     } catch (e) {
@@ -1049,6 +1056,21 @@ function App() {
 
       setEditForm((prev) => ({ ...prev, version: result.version }));
       setMessage('Book updated successfully.');
+      setDetailBook((prev) =>
+        prev && prev.id === editForm.id
+          ? {
+              ...prev,
+              title: editForm.title.trim(),
+              author: editForm.author.trim(),
+              isbn: editForm.isbn.trim() || null,
+              roomCode: editForm.roomCode.trim() || null,
+              shelfCode: editForm.shelfCode.trim() || null,
+              status: editForm.status,
+              version: result.version,
+            }
+          : prev
+      );
+      setDetailMode('view');
       await loadBooks();
     } catch (e) {
       setError((e as Error).message);
@@ -1068,6 +1090,10 @@ function App() {
       await runAction(() => apiRequest<void>(token, `/api/books/${book.id}`, { method: 'DELETE' }));
       setSelectedBookIds((prev) => prev.filter((id) => id !== book.id));
       setMessage(`Removed book: ${book.title}`);
+      if (detailBook?.id === book.id) {
+        setDetailBook(null);
+        setDetailMode('view');
+      }
       await Promise.all([loadBooks(), loadRoomSummary()]);
     } catch (e) {
       setError((e as Error).message);
@@ -1723,45 +1749,269 @@ function App() {
     }
   }
 
-  const emptyState = books.length === 0 ? (
-    <div className="empty-state">
-      <p>No books yet.</p>
-      <p className="muted">Add your first book in the Books section.</p>
-    </div>
-  ) : null;
 
+  // ─── helper functions for the detail modal ──────────────────────────────
+  function openBookDetail(book: Book) {
+    setDetailBook(book);
+    setDetailMode('view');
+    setBookHistory([]);
+    void loadBookHistory(book.id);
+  }
+
+  function closeDetail() {
+    setDetailBook(null);
+    setDetailMode('view');
+    setBookHistory([]);
+  }
+
+  function startEditFromDetail() {
+    if (!detailBook) return;
+    setDetailMode('edit');
+    setEditForm({
+      id: detailBook.id,
+      title: detailBook.title,
+      author: detailBook.author,
+      isbn: detailBook.isbn ?? '',
+      roomCode: detailBook.roomCode ?? '',
+      shelfCode: detailBook.shelfCode ?? '',
+      publicationYear: detailBook.publicationYear?.toString() ?? '',
+      status: detailBook.status,
+      version: detailBook.version,
+      customFieldsJson: JSON.stringify(detailBook.customFields ?? {}, null, 2)
+    });
+    setAttributeEditorValues(detailBook.customFields ?? {});
+  }
 
   return (
     <div className="app-shell" aria-busy={isWorking}>
+
+      {/* ═══ BOOK DETAIL MODAL ═══ */}
+      {detailBook && (
+        <div className="modal-overlay" onClick={closeDetail} role="dialog" aria-modal="true">
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+
+            {/* Header */}
+            <div className="modal-header">
+              <div className="modal-avatar">{detailBook.title.charAt(0).toUpperCase()}</div>
+              <div className="modal-title-block">
+                <h2>{detailBook.title}</h2>
+                <p className="modal-author">{detailBook.author}</p>
+                <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
+              </div>
+              <button className="modal-close" onClick={closeDetail} title="Close">✕</button>
+            </div>
+
+            {/* Action bar */}
+            <div className="modal-actions">
+              {detailMode === 'view' ? (
+                <>
+                  <button className="secondary small" onClick={startEditFromDetail}>✏️ Edit</button>
+                  {detailBook.status === 'available' && (
+                    <button className="primary small" onClick={() => {
+                      setSelectedBook(detailBook);
+                      setCurrentSection('circulation');
+                      closeDetail();
+                    }}>📤 Borrow</button>
+                  )}
+                  {detailBook.status === 'borrowed' && (
+                    <button className="secondary small" onClick={() => { void returnBook(detailBook); closeDetail(); }}>
+                      📥 Return
+                    </button>
+                  )}
+                  <button className="danger small" onClick={() => void deleteBook(detailBook)}>🗑 Delete</button>
+                </>
+              ) : (
+                <button className="secondary small" onClick={() => setDetailMode('view')}>← Back to details</button>
+              )}
+            </div>
+
+            {/* Body */}
+            <div className="modal-body">
+              {detailMode === 'view' ? (
+                <>
+                  {/* Core Info */}
+                  <div className="detail-section">
+                    <div className="detail-section-title">Book Information</div>
+                    <div className="detail-grid">
+                      {detailBook.isbn && (
+                        <div className="detail-item">
+                          <span className="di-label">ISBN</span>
+                          <span className="di-value">{detailBook.isbn}</span>
+                        </div>
+                      )}
+                      {detailBook.publicationYear && (
+                        <div className="detail-item">
+                          <span className="di-label">Year Published</span>
+                          <span className="di-value">{detailBook.publicationYear}</span>
+                        </div>
+                      )}
+                      {detailBook.publisher && (
+                        <div className="detail-item">
+                          <span className="di-label">Publisher</span>
+                          <span className="di-value">{detailBook.publisher}</span>
+                        </div>
+                      )}
+                      {detailBook.language && (
+                        <div className="detail-item">
+                          <span className="di-label">Language</span>
+                          <span className="di-value">{detailBook.language}</span>
+                        </div>
+                      )}
+                      {detailBook.roomCode && (
+                        <div className="detail-item">
+                          <span className="di-label">Room</span>
+                          <span className="di-value">{detailBook.roomCode}</span>
+                        </div>
+                      )}
+                      {detailBook.shelfCode && (
+                        <div className="detail-item">
+                          <span className="di-label">Shelf</span>
+                          <span className="di-value">{detailBook.shelfCode}</span>
+                        </div>
+                      )}
+                      <div className="detail-item">
+                        <span className="di-label">Status</span>
+                        <span className="di-value">
+                          <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
+                        </span>
+                      </div>
+                    </div>
+                    {detailBook.description && (
+                      <p style={{ marginTop: '1rem', fontSize: '0.9rem', color: 'var(--text-muted)', lineHeight: '1.6' }}>
+                        {detailBook.description}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Custom field attributes */}
+                  {detailBook.customFields &&
+                    Object.entries(detailBook.customFields).filter(([, v]) => v !== null && v !== undefined && v !== '').length > 0 && (
+                    <div className="detail-section">
+                      <div className="detail-section-title">Attributes</div>
+                      <div className="attr-grid">
+                        {Object.entries(detailBook.customFields).map(([key, value]) =>
+                          value !== null && value !== undefined && value !== '' ? (
+                            <div key={key} className="attr-tile">
+                              <span className="attr-key">{key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim()}</span>
+                              <span className="attr-value">{String(value)}</span>
+                            </div>
+                          ) : null
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Borrow History */}
+                  <div className="detail-section">
+                    <div className="detail-section-title">Borrow History</div>
+                    {bookHistory.length === 0 ? (
+                      <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>No borrowing history for this book.</p>
+                    ) : (
+                      <div className="history-list">
+                        {bookHistory.map((h) => (
+                          <div key={h.id} className="history-item">
+                            <div className="history-item-info">
+                              <strong>{h.borrowerName}</strong>
+                              <span>
+                                {new Date(h.borrowedAt).toLocaleDateString()} →{' '}
+                                {h.returnedAt ? new Date(h.returnedAt).toLocaleDateString() : 'Currently active'}
+                              </span>
+                            </div>
+                            {h.wasOverdue && <span className="history-overdue-badge">Overdue</span>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                /* ── Edit Mode ── */
+                <form onSubmit={saveBookEdit} className="simple-form">
+                  <div className="form-row">
+                    <div>
+                      <label>Title *</label>
+                      <input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} required />
+                    </div>
+                    <div>
+                      <label>Author *</label>
+                      <input value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} required />
+                    </div>
+                  </div>
+                  <div className="form-row">
+                    <div>
+                      <label>ISBN</label>
+                      <input value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder="e.g. 978-..." />
+                    </div>
+                    <div>
+                      <label>Publication Year</label>
+                      <input type="number" value={editForm.publicationYear} onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })} placeholder="e.g. 2020" />
+                    </div>
+                  </div>
+                  <div className="form-row">
+                    <div>
+                      <label>Room Code</label>
+                      <input value={editForm.roomCode} onChange={(e) => setEditForm({ ...editForm, roomCode: e.target.value })} placeholder="e.g. A1" />
+                    </div>
+                    <div>
+                      <label>Shelf Code</label>
+                      <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder="e.g. Shelf-3" />
+                    </div>
+                  </div>
+                  <div className="form-field">
+                    <label>Status</label>
+                    <select value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
+                      <option value="available">Available</option>
+                      <option value="borrowed">Borrowed</option>
+                      <option value="lost">Lost</option>
+                      <option value="maintenance">Maintenance</option>
+                    </select>
+                  </div>
+                  <div className="button-group">
+                    <button type="submit" className="primary">Save Changes</button>
+                    <button type="button" className="secondary" onClick={() => setDetailMode('view')}>Cancel</button>
+                  </div>
+                </form>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ═══ LOGIN ═══ */}
       {!loggedIn ? (
         <div className="simple-center">
           <div className="simple-card">
-            <h2>Sign In</h2>
+            <div className="login-logo">📚</div>
+            <h2>OK Library</h2>
+            <p className="login-subtitle">Sign in to manage your collection</p>
             <form onSubmit={login} className="simple-form">
               <div>
                 <label>Username</label>
-                <input value={username} onChange={(e) => setUsername(e.target.value)} required />
+                <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus required />
               </div>
               <div>
                 <label>Password</label>
                 <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
               </div>
-              <button type="submit" className="primary">{isWorking ? 'Signing in...' : 'Sign In'}</button>
+              <button type="submit" className="primary">{isWorking ? 'Signing in…' : 'Sign In'}</button>
             </form>
           </div>
         </div>
       ) : (
         <>
+          {/* ─── Navbar ─── */}
           <div className="simple-navbar">
-            <div className="navbar-left">
+            <div className="navbar-brand">
+              <div className="navbar-icon">📚</div>
               <h1>OK Library</h1>
             </div>
             <div className="navbar-right">
               {currentUser && <span className="navbar-user">{currentUser.username}</span>}
-              <button className="secondary" onClick={logout}>Sign Out</button>
+              <button className="secondary small" onClick={logout}>Sign out</button>
             </div>
           </div>
 
+          {/* ─── Tabs ─── */}
           <div className="simple-tabs">
             {sectionMeta.map((section) => (
               <button
@@ -1775,231 +2025,342 @@ function App() {
           </div>
 
           <div className="simple-content">
-            {currentSection === 'books' ? (
+
+            {/* ═══ LIBRARY TAB ═══ */}
+            {currentSection === 'books' && (
               <>
                 <div className="section-header">
-                  <h2>Library</h2>
-                  <p>Manage your book collection</p>
+                  <div className="section-header-text">
+                    <h2>Library</h2>
+                    <p>Browse and manage your book collection</p>
+                  </div>
+                  <div className="section-header-actions">
+                    <button className="primary small" onClick={() => setShowAddBook((v) => !v)}>
+                      {showAddBook ? '✕ Cancel' : '+ Add Book'}
+                    </button>
+                    <button className="secondary small" onClick={exportFilteredBooksCsv}>Export CSV</button>
+                  </div>
                 </div>
 
+                {/* Stats */}
+                <div className="stats-row">
+                  <div className="stat-box accent">
+                    <span className="stat-box-label">Total Books</span>
+                    <span className="stat-box-value">{totalBooksCount.toLocaleString()}</span>
+                  </div>
+                  <div className="stat-box success">
+                    <span className="stat-box-label">Available</span>
+                    <span className="stat-box-value">{availableBooks}</span>
+                  </div>
+                  <div className="stat-box warning">
+                    <span className="stat-box-label">Borrowed</span>
+                    <span className="stat-box-value">{borrowedBooks}</span>
+                  </div>
+                  <div className="stat-box danger">
+                    <span className="stat-box-label">Overdue</span>
+                    <span className="stat-box-value">{overdueCount}</span>
+                  </div>
+                </div>
+
+                {/* Add Book (collapsible) */}
+                {showAddBook && (
+                  <div className="card" style={{ borderLeft: '3px solid var(--accent)' }}>
+                    <h3>Add New Book</h3>
+                    <form onSubmit={createBook} className="simple-form">
+                      <div className="form-row">
+                        <div>
+                          <label>Title *</label>
+                          <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder="Book title" required />
+                        </div>
+                        <div>
+                          <label>Author *</label>
+                          <input value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder="Author name" required />
+                        </div>
+                      </div>
+                      <div className="form-row">
+                        <div>
+                          <label>ISBN</label>
+                          <input value={createForm.isbn} onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })} placeholder="e.g. 978-..." />
+                        </div>
+                        <div>
+                          <label>Publication Year</label>
+                          <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder="e.g. 2020" />
+                        </div>
+                        <div>
+                          <label>Room Code</label>
+                          <input value={createForm.roomCode} onChange={(e) => setCreateForm({ ...createForm, roomCode: e.target.value })} placeholder="e.g. A1" />
+                        </div>
+                        <div>
+                          <label>Shelf Code</label>
+                          <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder="e.g. Shelf-3" />
+                        </div>
+                      </div>
+                      <div className="button-group">
+                        <button type="submit" className="primary">Add Book</button>
+                        <button type="button" className="secondary" onClick={() => setShowAddBook(false)}>Cancel</button>
+                      </div>
+                    </form>
+                  </div>
+                )}
+
+                {/* Search & Filter */}
                 <div className="card">
-                  <h3>Search Books</h3>
-                  <div className="form-row">
-                    <div>
+                  <div className="search-bar">
+                    <div className="search-field">
                       <label>Search</label>
-                      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Title, author, or ISBN" />
+                      <input
+                        value={q}
+                        onChange={(e) => setQ(e.target.value)}
+                        placeholder="Title, author, or ISBN…"
+                        onKeyDown={(e) => { if (e.key === 'Enter') { setCurrentPage(1); void loadBooks(undefined, 1); } }}
+                      />
                     </div>
-                    <div>
+                    <div className="filter-field">
                       <label>Status</label>
                       <select value={status} onChange={(e) => setStatus(e.target.value)}>
-                        <option value="">All</option>
+                        <option value="">All statuses</option>
                         <option value="available">Available</option>
                         <option value="borrowed">Borrowed</option>
                         <option value="lost">Lost</option>
                         <option value="maintenance">Maintenance</option>
                       </select>
                     </div>
-                    <div>
+                    <div className="filter-field">
                       <label>Room</label>
                       <input value={roomCode} onChange={(e) => setRoomCode(e.target.value)} placeholder="Room code" />
                     </div>
-                  </div>
-                  <div className="button-group">
-                    <button className="primary" onClick={() => { setCurrentPage(1); loadBooks(undefined, 1); }}>Search</button>
-                    <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); setCurrentPage(1); }}>Reset</button>
-                    <button className="secondary" onClick={exportFilteredBooksCsv}>Export CSV</button>
+                    <div className="search-actions">
+                      <label>.</label>
+                      <button className="primary" onClick={() => { setCurrentPage(1); void loadBooks(undefined, 1); }}>Search</button>
+                      <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); setCurrentPage(1); void loadBooks(undefined, 1); }}>Reset</button>
+                    </div>
                   </div>
                 </div>
 
+                {/* Book Grid */}
                 <div className="card">
-                  <h3>Add New Book</h3>
-                  <form onSubmit={createBook} className="simple-form">
-                    <div className="form-row">
-                      <div>
-                        <label>Title *</label>
-                        <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} required />
-                      </div>
-                      <div>
-                        <label>Author *</label>
-                        <input value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} required />
-                      </div>
-                    </div>
-                    <div className="form-row">
-                      <div>
-                        <label>ISBN</label>
-                        <input value={createForm.isbn} onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })} />
-                      </div>
-                      <div>
-                        <label>Year</label>
-                        <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} />
-                      </div>
-                    </div>
-                    <div className="form-row">
-                      <div>
-                        <label>Room Code</label>
-                        <input value={createForm.roomCode} onChange={(e) => setCreateForm({ ...createForm, roomCode: e.target.value })} />
-                      </div>
-                      <div>
-                        <label>Shelf Code</label>
-                        <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} />
-                      </div>
-                    </div>
-                    <button type="submit" className="primary">Add Book</button>
-                  </form>
-                </div>
-
-                <div className="card">
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
-                    <h3>Books ({totalBooksCount})</h3>
-                    <div style={{ fontSize: '0.9rem', color: '#666' }}>
-                      Page {currentPage} · {Math.ceil(totalBooksCount / 50)} pages
-                    </div>
-                  </div>
                   {books.length === 0 ? (
-                    <p className="muted">No books found.</p>
+                    <div className="empty-state">
+                      <p style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>📚</p>
+                      <p style={{ fontWeight: 600 }}>No books found</p>
+                      <p className="muted small">Try adjusting your search filters, or add a new book above.</p>
+                    </div>
                   ) : (
                     <>
-                      <div className="book-list">
+                      <div className="book-grid">
                         {books.map((book) => (
-                          <div key={book.id} className="book-item">
-                            <div>
-                              <strong>{book.title}</strong>
-                              <p className="muted">{book.author}</p>
-                              <p className="muted small">
-                                {book.isbn ? `ISBN: ${book.isbn}` : ''}
-                                {book.roomCode ? ` · Room: ${book.roomCode}` : ''}
-                                {book.status ? ` · ${book.status}` : ''}
-                              </p>
+                          <div
+                            key={book.id}
+                            className="book-card"
+                            onClick={() => openBookDetail(book)}
+                            role="button"
+                            tabIndex={0}
+                            onKeyDown={(e) => e.key === 'Enter' && openBookDetail(book)}
+                          >
+                            <div className="book-avatar">{book.title.charAt(0).toUpperCase()}</div>
+                            <div className="book-card-body">
+                              <span className="book-card-title">{book.title}</span>
+                              <p className="book-card-author">{book.author}</p>
+                              <div className="book-card-meta">
+                                {book.roomCode && <span className="meta-chip">📍 {book.roomCode}</span>}
+                                {book.shelfCode && <span className="meta-chip">{book.shelfCode}</span>}
+                                {book.publicationYear && <span className="meta-chip">{book.publicationYear}</span>}
+                                {book.isbn && <span className="meta-chip">ISBN</span>}
+                              </div>
                             </div>
-                            <button className="secondary small" onClick={() => beginEdit(book)}>Edit</button>
+                            <div className="book-card-status">
+                              <span className={`status-badge status-${book.status}`}>{book.status}</span>
+                            </div>
                           </div>
                         ))}
                       </div>
-                      <div className="button-group" style={{ justifyContent: 'center', marginTop: '1rem' }}>
+                      <div className="pagination">
                         <button
-                          className="secondary"
-                          onClick={() => loadBooks(undefined, currentPage - 1)}
+                          className="secondary small"
+                          onClick={() => void loadBooks(undefined, currentPage - 1)}
                           disabled={currentPage === 1}
-                        >
-                          ← Previous
-                        </button>
+                        >← Previous</button>
+                        <span className="pagination-info">
+                          Page {currentPage} of {Math.max(1, Math.ceil(totalBooksCount / 50))}
+                          {' · '}{totalBooksCount.toLocaleString()} books
+                        </span>
                         <button
-                          className="secondary"
-                          onClick={() => loadBooks(undefined, currentPage + 1)}
+                          className="secondary small"
+                          onClick={() => void loadBooks(undefined, currentPage + 1)}
                           disabled={currentPage >= Math.ceil(totalBooksCount / 50)}
-                        >
-                          Next →
-                        </button>
+                        >Next →</button>
                       </div>
                     </>
                   )}
                 </div>
               </>
-            ) : null}
+            )}
 
-            {currentSection === 'circulation' ? (
+            {/* ═══ LOANS TAB ═══ */}
+            {currentSection === 'circulation' && (
               <>
                 <div className="section-header">
-                  <h2>Loans</h2>
-                  <p>Manage book borrowing and returns</p>
+                  <div className="section-header-text">
+                    <h2>Loans</h2>
+                    <p>Track active borrowing and returns</p>
+                  </div>
                 </div>
 
+                {/* Loan stats */}
+                <div className="stats-row" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+                  <div className="stat-box accent">
+                    <span className="stat-box-label">Active Loans</span>
+                    <span className="stat-box-value">{activeBorrows.length}</span>
+                  </div>
+                  <div className="stat-box danger">
+                    <span className="stat-box-label">Overdue</span>
+                    <span className="stat-box-value">{overdueCount}</span>
+                  </div>
+                  <div className="stat-box warning">
+                    <span className="stat-box-label">Due Soon (48h)</span>
+                    <span className="stat-box-value">{dueSoonCount}</span>
+                  </div>
+                </div>
+
+                {/* Active Loans list */}
                 <div className="card">
                   <h3>Active Loans ({activeBorrows.length})</h3>
                   {activeBorrows.length === 0 ? (
-                    <p className="muted">No active loans.</p>
+                    <div className="empty-state" style={{ padding: '1.5rem 0 0.5rem' }}>
+                      <p style={{ fontSize: '1.75rem', marginBottom: '0.375rem' }}>✅</p>
+                      <p style={{ fontWeight: 600 }}>All clear — no active loans</p>
+                      <p className="muted small">All books are currently in the library.</p>
+                    </div>
                   ) : (
                     <div className="loan-list">
                       {activeBorrows.map((loan) => (
-                        <div key={loan.id} className="loan-item" style={{ borderLeft: loan.isOverdue ? '4px solid var(--danger)' : '4px solid var(--accent-2)' }}>
-                          <div>
+                        <div key={loan.id} className={`loan-item${loan.isOverdue ? ' overdue' : ''}`}>
+                          <div className="loan-item-info">
                             <strong>{loan.title}</strong>
-                            <p className="muted">{loan.borrowerName}</p>
-                            <p className="muted small">
+                            <p className="meta">
+                              Borrowed by <strong>{loan.borrowerName}</strong>
+                              {loan.borrowerContact ? ` · ${loan.borrowerContact}` : ''}
+                            </p>
+                            <p className="meta">
                               Due: {new Date(loan.dueAt).toLocaleDateString()}
-                              {loan.isOverdue && ' · OVERDUE'}
+                              {loan.isOverdue && <span className="overdue-tag"> · OVERDUE</span>}
                             </p>
                           </div>
-                          <button className="secondary small" onClick={() => quickReturnByBookId(loan.bookId, loan.title)}>Return</button>
+                          <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, loan.title)}>
+                            Return
+                          </button>
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
 
+                {/* Borrow Form */}
                 <div className="card">
                   <h3>Borrow a Book</h3>
                   {selectedBook ? (
-                    <form onSubmit={() => borrowBook(selectedBook)} className="simple-form">
-                      <p className="muted">Selected: {selectedBook.title} by {selectedBook.author}</p>
-                      <div>
-                        <label>Borrower Name *</label>
-                        <input value={borrowerName} onChange={(e) => setBorrowerName(e.target.value)} required />
+                    <form onSubmit={(e) => { e.preventDefault(); void borrowBook(selectedBook); }} className="simple-form">
+                      <div style={{ padding: '0.875rem 1rem', background: 'var(--accent-light)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--accent)', marginBottom: '0.25rem' }}>
+                        <p style={{ fontWeight: 600 }}>{selectedBook.title}</p>
+                        <p className="muted small">{selectedBook.author}</p>
                       </div>
-                      <div>
-                        <label>Borrower Contact</label>
-                        <input value={borrowerContact} onChange={(e) => setBorrowerContact(e.target.value)} />
+                      <div className="form-row">
+                        <div>
+                          <label>Borrower Name *</label>
+                          <input value={borrowerName} onChange={(e) => setBorrowerName(e.target.value)} placeholder="Full name" required />
+                        </div>
+                        <div>
+                          <label>Contact (optional)</label>
+                          <input value={borrowerContact} onChange={(e) => setBorrowerContact(e.target.value)} placeholder="Phone or email" />
+                        </div>
                       </div>
-                      <div>
+                      <div className="form-field">
                         <label>Due Date *</label>
                         <input type="date" value={dueAt.split('T')[0]} onChange={(e) => setDueAt(e.target.value + 'T00:00:00.000Z')} required />
+                        <div className="button-group" style={{ marginTop: '0.5rem' }}>
+                          <button type="button" className="secondary small" onClick={() => setDueInDays(7)}>7 days</button>
+                          <button type="button" className="secondary small" onClick={() => setDueInDays(14)}>14 days</button>
+                          <button type="button" className="secondary small" onClick={() => setDueInDays(30)}>30 days</button>
+                        </div>
                       </div>
                       <div className="button-group">
-                        <button type="submit" className="primary">Borrow</button>
+                        <button type="submit" className="primary">Confirm Borrow</button>
                         <button type="button" className="secondary" onClick={() => setSelectedBook(null)}>Cancel</button>
                       </div>
                     </form>
                   ) : (
-                    <p className="muted">Select a book from the Library tab first.</p>
+                    <div className="empty-state" style={{ padding: '1.5rem 0 0.5rem' }}>
+                      <p style={{ fontSize: '1.75rem', marginBottom: '0.375rem' }}>📖</p>
+                      <p style={{ fontWeight: 600 }}>No book selected</p>
+                      <p className="muted small">Go to the Library tab, open any available book, and click <strong>Borrow</strong>.</p>
+                    </div>
                   )}
                 </div>
               </>
-            ) : null}
+            )}
 
-            {currentSection === 'import' ? (
+            {/* ═══ IMPORT TAB ═══ */}
+            {currentSection === 'import' && (
               <>
                 <div className="section-header">
-                  <h2>Import</h2>
-                  <p>Add books from a spreadsheet</p>
+                  <div className="section-header-text">
+                    <h2>Import & Export</h2>
+                    <p>Add books from a spreadsheet or download your collection</p>
+                  </div>
                 </div>
 
                 <div className="card">
-                  <h3>Import from Excel</h3>
-                  <p className="muted">Upload an .xlsx file with Title and Author columns. Other columns are optional.</p>
+                  <h3>📥 Import from Excel (.xlsx)</h3>
+                  <p className="muted" style={{ marginBottom: '1.25rem', fontSize: '0.875rem' }}>
+                    Your file must have <strong>Title</strong> and <strong>Author/Writer</strong> columns.
+                    All other columns (color, cover type, category, etc.) are automatically imported as book attributes.
+                  </p>
                   <form onSubmit={importFromXlsx} className="simple-form">
-                    <div>
-                      <label>Select File *</label>
-                      <input name="xlsxFile" type="file" accept=".xlsx" required />
+                    <div className="import-dropzone">
+                      <p style={{ fontSize: '2.25rem', marginBottom: '0.5rem' }}>📂</p>
+                      <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Choose an Excel file</p>
+                      <p className="muted small" style={{ marginBottom: '1rem' }}>Supports .xlsx format</p>
+                      <input name="xlsxFile" type="file" accept=".xlsx" required style={{ width: 'auto', display: 'block', margin: '0 auto' }} />
                     </div>
-                    {importFileName && <p className="muted">File: {importFileName}</p>}
+                    {importFileName && (
+                      <p className="muted small">📄 Selected: <strong>{importFileName}</strong></p>
+                    )}
                     <label className="checkbox-label">
                       <input type="checkbox" checked={importDryRun} onChange={(e) => setImportDryRun(e.target.checked)} />
-                      Test only (dry run)
+                      Test only (dry run) — preview results without saving
                     </label>
-                    <button type="submit" className="primary">{importDryRun ? 'Test Import' : 'Import'}</button>
+                    <button type="submit" className="primary">
+                      {importDryRun ? '🔍 Test Import' : '📥 Import Books'}
+                    </button>
                   </form>
                 </div>
 
                 <div className="card">
-                  <h3>Setup</h3>
-                  <p className="muted">Apply default book structure to prepare for imports.</p>
-                  <button className="secondary" onClick={applyDefaultBookStructure}>Apply Default Structure</button>
+                  <h3>📤 Export Collection</h3>
+                  <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
+                    Download your entire library as a CSV file for use in Excel or other tools.
+                  </p>
+                  <button className="secondary" onClick={exportCsv}>Download Full CSV</button>
                 </div>
 
                 <div className="card">
-                  <h3>Export All Books</h3>
-                  <p className="muted">Download your entire collection as CSV.</p>
-                  <button className="secondary" onClick={exportCsv}>Download CSV</button>
+                  <h3>⚙️ Setup</h3>
+                  <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
+                    Apply the default book attribute structure to set up your database for imports.
+                    This only needs to be done once.
+                  </p>
+                  <button className="secondary" onClick={applyDefaultBookStructure}>Apply Default Structure</button>
                 </div>
               </>
-            ) : null}
+            )}
+
           </div>
         </>
       )}
 
-      {isWorking ? <p className="banner muted">Working on your request...</p> : null}
-      {error ? <p className="error banner">{error}</p> : null}
-      {message ? <p className="success banner">{message}</p> : null}
+      {isWorking && <p className="banner muted">⏳ Working…</p>}
+      {error && <p className="banner error">⚠️ {error}</p>}
+      {message && <p className="banner success">✓ {message}</p>}
     </div>
   );
 }
