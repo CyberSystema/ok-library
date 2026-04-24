@@ -310,6 +310,7 @@ function App() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [isWorking, setIsWorking] = useState(false);
+  const [didBootstrapData, setDidBootstrapData] = useState(false);
 
   const loggedIn = Boolean(currentUser);
 
@@ -320,6 +321,17 @@ function App() {
       .catch(() => { /* no session */ })
       .finally(() => setSessionLoading(false));
   }, []);
+
+  // Load app data once an authenticated session is available (fresh login or restored cookie session).
+  useEffect(() => {
+    if (!loggedIn || didBootstrapData) {
+      return;
+    }
+
+    void refreshEverything().then(() => {
+      setDidBootstrapData(true);
+    });
+  }, [loggedIn, didBootstrapData]);
 
   const totalBooks = books.length;
   const availableBooks = books.filter((book) => book.status === 'available').length;
@@ -407,8 +419,8 @@ function App() {
       return await operation();
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
-        setToken(null);
         setCurrentUser(null);
+        setDidBootstrapData(false);
         setError('Session expired. Please sign in again.');
       }
       throw error;
@@ -750,8 +762,8 @@ function App() {
         body: JSON.stringify({ username, password })
       }));
       setCurrentUser(response.user);
+      setDidBootstrapData(false);
       setMessage(`Welcome ${response.user.username}. You're signed in.`);
-      await runAction(() => refreshEverything());
     } catch (e) {
       setError((e as Error).message);
     }
@@ -766,6 +778,7 @@ function App() {
     }
 
     setCurrentUser(null);
+    setDidBootstrapData(false);
     setBooks([]);
     setRooms([]);
     setCustomFields([]);
