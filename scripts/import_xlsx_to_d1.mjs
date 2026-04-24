@@ -56,7 +56,7 @@ function get(row, keys) {
   return null;
 }
 
-function normalizeRow(raw) {
+function normalizeRow(raw, skipCustomFields = false) {
   const row = Object.fromEntries(Object.entries(raw).map(([k, v]) => [String(k).trim().toLowerCase(), v]));
 
   const title = text(get(row, ['title']));
@@ -66,30 +66,33 @@ function normalizeRow(raw) {
   }
 
   const customFields = {};
-  const put = (key, value) => {
-    if (value !== null && value !== undefined && value !== '') customFields[key] = value;
-  };
+  
+  if (!skipCustomFields) {
+    const put = (key, value) => {
+      if (value !== null && value !== undefined && value !== '') customFields[key] = value;
+    };
 
-  put('item', text(get(row, ['item'])));
-  put('subTitle', text(get(row, ['sub title', 'subtitle'])));
-  put('editor', text(get(row, ['editor'])));
-  put('placeOfPublication', text(get(row, ['place of publication'])));
-  put('publishedDate', text(get(row, ['published date'])));
-  put('editionNumber', text(get(row, ['edition #', 'edition'])));
-  put('category', text(get(row, ['category'])));
-  put('translator', text(get(row, ['translator'])));
-  put('coverType', text(get(row, ['cover type'])));
-  put('condition', text(get(row, ['condition'])));
-  put('pages', num(get(row, ['pages'])));
-  put('numVolume', num(get(row, ['num. volume', 'num volume'])));
-  put('color', text(get(row, ['color'])));
-  put('signature', text(get(row, ['signature'])));
-  put('moreCopies', num(get(row, ['more copies'])));
+    put('item', text(get(row, ['item'])));
+    put('subTitle', text(get(row, ['sub title', 'subtitle'])));
+    put('editor', text(get(row, ['editor'])));
+    put('placeOfPublication', text(get(row, ['place of publication'])));
+    put('publishedDate', text(get(row, ['published date'])));
+    put('editionNumber', text(get(row, ['edition #', 'edition'])));
+    put('category', text(get(row, ['category'])));
+    put('translator', text(get(row, ['translator'])));
+    put('coverType', text(get(row, ['cover type'])));
+    put('condition', text(get(row, ['condition'])));
+    put('pages', num(get(row, ['pages'])));
+    put('numVolume', num(get(row, ['num. volume', 'num volume'])));
+    put('color', text(get(row, ['color'])));
+    put('signature', text(get(row, ['signature'])));
+    put('moreCopies', num(get(row, ['more copies'])));
 
-  for (const [k, v] of Object.entries(row)) {
-    if (k.startsWith('custom.') || k.startsWith('custom_')) {
-      const key = k.replace(/^custom[._]/, '').trim();
-      if (key) put(key, text(v));
+    for (const [k, v] of Object.entries(row)) {
+      if (k.startsWith('custom.') || k.startsWith('custom_')) {
+        const key = k.replace(/^custom[._]/, '').trim();
+        if (key) put(key, text(v));
+      }
     }
   }
 
@@ -195,9 +198,10 @@ function main() {
   const batchSize = Number(arg('--batch', '200'));
   const remote = hasFlag('--remote');
   const dryRun = hasFlag('--dry-run');
+  const skipCustomFields = hasFlag('--no-custom-fields');
 
   if (!filePath) {
-    console.error('Usage: node scripts/import_xlsx_to_d1.mjs --file /path/to/lib.xlsx [--batch 200] [--remote] [--dry-run]');
+    console.error('Usage: node scripts/import_xlsx_to_d1.mjs --file /path/to/lib.xlsx [--batch 200] [--remote] [--dry-run] [--no-custom-fields]');
     process.exit(1);
   }
 
@@ -215,7 +219,7 @@ function main() {
 
   const sheet = workbook.Sheets[firstSheet];
   const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: null, raw: false });
-  const normalized = rawRows.map(normalizeRow).filter(Boolean);
+  const normalized = rawRows.map((row) => normalizeRow(row, skipCustomFields)).filter(Boolean);
 
   if (normalized.length === 0) {
     console.error('No valid rows with title+author found.');
@@ -225,6 +229,9 @@ function main() {
   console.log(`Rows in sheet: ${rawRows.length}`);
   console.log(`Valid rows for import: ${normalized.length}`);
   console.log(`Skipped rows: ${rawRows.length - normalized.length}`);
+  if (skipCustomFields) {
+    console.log('⚠️  Custom fields disabled: importing only core fields');
+  }
 
   if (dryRun) {
     console.log('Dry run complete. No data was written.');

@@ -229,6 +229,8 @@ function App() {
   const [books, setBooks] = useState<Book[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalBooksCount, setTotalBooksCount] = useState(0);
 
   const [q, setQ] = useState('');
   const [status, setStatus] = useState('');
@@ -790,22 +792,25 @@ function App() {
     }
   }
 
-  async function loadBooks(tokenOverride?: string) {
+  async function loadBooks(tokenOverride?: string, pageOverride?: number) {
     const currentToken = tokenOverride ?? token;
     if (!currentToken) return;
 
     try {
+      const page = pageOverride ?? currentPage;
       const query = new URLSearchParams();
       if (q) query.set('q', q);
       if (status) query.set('status', status);
       if (roomCode) query.set('roomCode', roomCode);
       query.set('sortBy', 'updatedAt');
       query.set('sortDir', 'desc');
-      query.set('page', '1');
-      query.set('pageSize', '100');
+      query.set('page', page.toString());
+      query.set('pageSize', '50');
 
-      const response = await apiRequest<{ items: Book[] }>(currentToken, `/api/books?${query.toString()}`);
+      const response = await apiRequest<{ items: Book[]; total: number }>(currentToken, `/api/books?${query.toString()}`);
       setBooks(response.items);
+      setTotalBooksCount(response.total);
+      setCurrentPage(page);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1800,8 +1805,8 @@ function App() {
                     </div>
                   </div>
                   <div className="button-group">
-                    <button className="primary" onClick={() => loadBooks()}>Search</button>
-                    <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); }}>Reset</button>
+                    <button className="primary" onClick={() => { setCurrentPage(1); loadBooks(undefined, 1); }}>Search</button>
+                    <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); setCurrentPage(1); }}>Reset</button>
                     <button className="secondary" onClick={exportFilteredBooksCsv}>Export CSV</button>
                   </div>
                 </div>
@@ -1844,26 +1849,49 @@ function App() {
                 </div>
 
                 <div className="card">
-                  <h3>Books ({visibleBooks.length})</h3>
-                  {visibleBooks.length === 0 ? (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                    <h3>Books ({totalBooksCount})</h3>
+                    <div style={{ fontSize: '0.9rem', color: '#666' }}>
+                      Page {currentPage} · {Math.ceil(totalBooksCount / 50)} pages
+                    </div>
+                  </div>
+                  {books.length === 0 ? (
                     <p className="muted">No books found.</p>
                   ) : (
-                    <div className="book-list">
-                      {visibleBooks.slice(0, 50).map((book) => (
-                        <div key={book.id} className="book-item">
-                          <div>
-                            <strong>{book.title}</strong>
-                            <p className="muted">{book.author}</p>
-                            <p className="muted small">
-                              {book.isbn ? `ISBN: ${book.isbn}` : ''}
-                              {book.roomCode ? ` · Room: ${book.roomCode}` : ''}
-                              {book.status ? ` · ${book.status}` : ''}
-                            </p>
+                    <>
+                      <div className="book-list">
+                        {books.map((book) => (
+                          <div key={book.id} className="book-item">
+                            <div>
+                              <strong>{book.title}</strong>
+                              <p className="muted">{book.author}</p>
+                              <p className="muted small">
+                                {book.isbn ? `ISBN: ${book.isbn}` : ''}
+                                {book.roomCode ? ` · Room: ${book.roomCode}` : ''}
+                                {book.status ? ` · ${book.status}` : ''}
+                              </p>
+                            </div>
+                            <button className="secondary small" onClick={() => beginEdit(book)}>Edit</button>
                           </div>
-                          <button className="secondary small" onClick={() => beginEdit(book)}>Edit</button>
-                        </div>
-                      ))}
-                    </div>
+                        ))}
+                      </div>
+                      <div className="button-group" style={{ justifyContent: 'center', marginTop: '1rem' }}>
+                        <button
+                          className="secondary"
+                          onClick={() => loadBooks(undefined, currentPage - 1)}
+                          disabled={currentPage === 1}
+                        >
+                          ← Previous
+                        </button>
+                        <button
+                          className="secondary"
+                          onClick={() => loadBooks(undefined, currentPage + 1)}
+                          disabled={currentPage >= Math.ceil(totalBooksCount / 50)}
+                        >
+                          Next →
+                        </button>
+                      </div>
+                    </>
                   )}
                 </div>
               </>
