@@ -87,7 +87,7 @@ type RoomSummaryItem = {
   maintenance_books: number;
 };
 
-type AppSection = 'dashboard' | 'books' | 'circulation' | 'locations' | 'settings';
+type AppSection = 'books' | 'circulation' | 'import';
 
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
 const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
@@ -196,12 +196,35 @@ function StatCard({ title, value, subtitle }: { title: string; value: string | n
   );
 }
 
+function SectionHeader({
+  eyebrow,
+  title,
+  description,
+  aside
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  aside?: React.ReactNode;
+}) {
+  return (
+    <div className="section-header">
+      <div>
+        <p className="section-eyebrow">{eyebrow}</p>
+        <h2>{title}</h2>
+        <p className="panel-help">{description}</p>
+      </div>
+      {aside ? <div className="section-header-aside">{aside}</div> : null}
+    </div>
+  );
+}
+
 function App() {
   const [token, setToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
-  const [currentSection, setCurrentSection] = useState<AppSection>('dashboard');
+  const [currentSection, setCurrentSection] = useState<AppSection>('books');
 
   const [books, setBooks] = useState<Book[]>([]);
   const [rooms, setRooms] = useState<Room[]>([]);
@@ -290,6 +313,16 @@ function App() {
     const diffMs = new Date(item.dueAt).getTime() - Date.now();
     return diffMs > 0 && diffMs <= 48 * 60 * 60 * 1000;
   }).length;
+  const booksWithShelf = books.filter((book) => Boolean(book.roomCode && book.shelfCode)).length;
+  const booksWithIsbn = books.filter((book) => Boolean(book.isbn && String(book.isbn).trim())).length;
+  const catalogCompleteness = totalBooks > 0 ? Math.round((booksWithIsbn / totalBooks) * 100) : 0;
+  const locationCompleteness = totalBooks > 0 ? Math.round((booksWithShelf / totalBooks) * 100) : 0;
+
+  const sectionMeta: Array<{ key: AppSection; label: string }> = [
+    { key: 'books', label: 'Library' },
+    { key: 'circulation', label: 'Loans' },
+    { key: 'import', label: 'Import' }
+  ];
 
   const overdueBorrowedBookIds = useMemo(
     () => new Set(activeBorrows.filter((item) => item.isOverdue).map((item) => item.bookId)),
@@ -348,82 +381,6 @@ function App() {
     setError('');
     setMessage('');
   }
-
-  useEffect(() => {
-    if (!message) {
-      return;
-    }
-
-    const timer = window.setTimeout(() => setMessage(''), 4500);
-    return () => window.clearTimeout(timer);
-  }, [message]);
-
-  useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(LOCAL_STORAGE_KEY);
-      if (!raw) {
-        return;
-      }
-
-      const parsed = JSON.parse(raw) as {
-        q?: string;
-        status?: string;
-        roomCode?: string;
-        borrowerName?: string;
-        borrowerContact?: string;
-        dueAt?: string;
-      };
-
-      if (typeof parsed.q === 'string') setQ(parsed.q);
-      if (typeof parsed.status === 'string') setStatus(parsed.status);
-      if (typeof parsed.roomCode === 'string') setRoomCode(parsed.roomCode);
-      if (typeof parsed.borrowerName === 'string') setBorrowerName(parsed.borrowerName);
-      if (typeof parsed.borrowerContact === 'string') setBorrowerContact(parsed.borrowerContact);
-      if (typeof parsed.dueAt === 'string') setDueAt(parsed.dueAt);
-    } catch {
-      // ignore storage parse errors
-    }
-  }, []);
-
-  useEffect(() => {
-    const payload = {
-      q,
-      status,
-      roomCode,
-      borrowerName,
-      borrowerContact,
-      dueAt
-    };
-    window.localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
-  }, [q, status, roomCode, borrowerName, borrowerContact, dueAt]);
-
-  useEffect(() => {
-    let isCancelled = false;
-
-    async function restoreSession() {
-      try {
-        const response = await apiRequest<SessionResponse>(null, '/api/auth/session');
-        if (isCancelled) {
-          return;
-        }
-
-        setToken('cookie');
-        setCurrentUser(response.user);
-        await refreshEverything('cookie');
-      } catch {
-        if (isCancelled) {
-          return;
-        }
-        setToken(null);
-        setCurrentUser(null);
-      }
-    }
-
-    void restoreSession();
-    return () => {
-      isCancelled = true;
-    };
-  }, []);
 
   async function runAction<T>(operation: () => Promise<T>): Promise<T> {
     setIsWorking(true);
@@ -1768,416 +1725,69 @@ function App() {
     </div>
   ) : null;
 
+
   return (
     <div className="app-shell" aria-busy={isWorking}>
-      <section className="hero">
-        <p className="hero-kicker">Library Assistant</p>
-        <h1>Friendly Library Organizer</h1>
-        <p>Simple workflows for everyday staff: add books, borrow and return, find locations, and export records.</p>
-      </section>
-
       {!loggedIn ? (
-        <section className="panel auth-panel">
-          <h2>Sign in</h2>
-          <p className="panel-help">Use your staff account to continue.</p>
-          <form onSubmit={login} className="grid two">
-            <div>
-              <label htmlFor="username">Username</label>
-              <input id="username" value={username} onChange={(e) => setUsername(e.target.value)} />
-            </div>
-            <div>
-              <label htmlFor="password">Password</label>
-              <input
-                id="password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-            <div className="actions">
-              <button className="primary" type="submit">
-                {isWorking ? 'Signing In...' : 'Sign In'}
-              </button>
-            </div>
-          </form>
-        </section>
+        <div className="simple-center">
+          <div className="simple-card">
+            <h2>Sign In</h2>
+            <form onSubmit={login} className="simple-form">
+              <div>
+                <label>Username</label>
+                <input value={username} onChange={(e) => setUsername(e.target.value)} required />
+              </div>
+              <div>
+                <label>Password</label>
+                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+              </div>
+              <button type="submit" className="primary">{isWorking ? 'Signing in...' : 'Sign In'}</button>
+            </form>
+          </div>
+        </div>
       ) : (
         <>
-          <nav className="tabs" aria-label="Main sections">
-            <button
-              className={currentSection === 'dashboard' ? 'tab active' : 'tab'}
-              onClick={() => setCurrentSection('dashboard')}
-            >
-              Dashboard
-            </button>
-            <button className={currentSection === 'books' ? 'tab active' : 'tab'} onClick={() => setCurrentSection('books')}>
-              Books
-            </button>
-            <button
-              className={currentSection === 'circulation' ? 'tab active' : 'tab'}
-              onClick={() => setCurrentSection('circulation')}
-            >
-              Borrow & Return
-            </button>
-            <button
-              className={currentSection === 'locations' ? 'tab active' : 'tab'}
-              onClick={() => setCurrentSection('locations')}
-            >
-              Rooms & Fields
-            </button>
-            <button
-              className={currentSection === 'settings' ? 'tab active' : 'tab'}
-              onClick={() => setCurrentSection('settings')}
-            >
-              Import & Export
-            </button>
-            <button className="tab" onClick={() => logout()}>
-              Sign Out
-            </button>
-          </nav>
-          {currentUser ? <p className="muted">Signed in as {currentUser.username} ({currentUser.role})</p> : null}
+          <div className="simple-navbar">
+            <div className="navbar-left">
+              <h1>OK Library</h1>
+            </div>
+            <div className="navbar-right">
+              {currentUser && <span className="navbar-user">{currentUser.username}</span>}
+              <button className="secondary" onClick={logout}>Sign Out</button>
+            </div>
+          </div>
 
-          {currentSection === 'dashboard' ? (
-            <section className="panel">
-              <h2>Today at a glance</h2>
-              <p className="panel-help">Use quick actions to keep the library updated.</p>
-              <div className="stat-grid">
-                <StatCard title="Total books" value={totalBooks} subtitle="All records currently visible" />
-                <StatCard title="Available" value={availableBooks} subtitle="Ready to borrow" />
-                <StatCard title="Borrowed" value={borrowedBooks} subtitle="Currently checked out" />
-                <StatCard title="Rooms" value={rooms.length} subtitle="Mapped physical spaces" />
-                <StatCard title="Overdue" value={overdueCount} subtitle="Need attention today" />
-                <StatCard title="Due in 48h" value={dueSoonCount} subtitle="Loans nearing deadline" />
-              </div>
-              <div className="actions" style={{ marginTop: 16 }}>
-                <button className="primary" onClick={() => loadBooks()}>
-                  Refresh Book List
-                </button>
-                <button className="secondary" onClick={() => refreshEverything()}>
-                  Refresh Everything
-                </button>
-                <button className="accent" onClick={() => setCurrentSection('books')}>
-                  Add New Book
-                </button>
-              </div>
+          <div className="simple-tabs">
+            {sectionMeta.map((section) => (
+              <button
+                key={section.key}
+                className={currentSection === section.key ? 'tab-btn active' : 'tab-btn'}
+                onClick={() => setCurrentSection(section.key)}
+              >
+                {section.label}
+              </button>
+            ))}
+          </div>
 
-              <div className="grid two" style={{ marginTop: 16 }}>
-                <div className="mini-panel">
-                  <h3>Recent activity</h3>
-                  {auditItems.length === 0 ? <p className="muted">No recent events to show.</p> : null}
-                  <div className="list compact">
-                    {auditItems.map((item) => (
-                      <div className="list-item" key={item.id}>
-                        <strong>{item.action}</strong>
-                        <p className="muted">{new Date(item.created_at).toLocaleString()}</p>
-                      </div>
-                    ))}
-                  </div>
+          <div className="simple-content">
+            {currentSection === 'books' ? (
+              <>
+                <div className="section-header">
+                  <h2>Library</h2>
+                  <p>Manage your book collection</p>
                 </div>
 
-                <div className="mini-panel">
-                  <h3>Overdue loans</h3>
-                  {overdueCount === 0 ? <p className="muted">No overdue books right now.</p> : null}
-                  <div className="list compact">
-                    {activeBorrows
-                      .filter((item) => item.isOverdue)
-                      .slice(0, 5)
-                      .map((item) => (
-                        <div className="list-item" key={item.id}>
-                          <strong>{item.title}</strong>
-                          <p className="muted">
-                            Due {new Date(item.dueAt).toLocaleString()} · {item.borrowerName}
-                          </p>
-                        </div>
-                      ))}
-                  </div>
-                </div>
-
-                  <div className="mini-panel">
-                    <h3>Room occupancy</h3>
-                    {roomSummary.length === 0 ? <p className="muted">No room summary yet.</p> : null}
-                    <div className="list compact">
-                      {roomSummary.slice(0, 6).map((room) => (
-                        <div className="list-item" key={room.id}>
-                          <strong>{room.code}</strong>
-                          <p className="muted">{room.name}</p>
-                          <p className="muted">
-                            Total: {room.total_books} · Available: {room.available_books} · Borrowed: {room.borrowed_books}
-                          </p>
-                        </div>
-                      ))}
-                      {unassignedSummary.totalBooks > 0 ? (
-                        <div className="list-item">
-                          <strong>Unassigned room</strong>
-                          <p className="muted">Books without room code</p>
-                          <p className="muted">Total: {unassignedSummary.totalBooks}</p>
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-              </div>
-            </section>
-          ) : null}
-
-          {currentSection === 'books' ? (
-            <>
-              <section className="panel">
-                <h2>Search books</h2>
-                <p className="panel-help">Filter by name, status, and room.</p>
-                <div className="row">
-                  <div>
-                    <label>Search text</label>
-                    <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Title, author, or ISBN" />
-                  </div>
-                  <div>
-                    <label>Status</label>
-                    <select value={status} onChange={(e) => setStatus(e.target.value)}>
-                      <option value="">All</option>
-                      <option value="available">Available</option>
-                      <option value="borrowed">Borrowed</option>
-                      <option value="lost">Lost</option>
-                      <option value="maintenance">Maintenance</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label>Room code</label>
-                    <input value={roomCode} onChange={(e) => setRoomCode(e.target.value)} placeholder="Example: A1" />
-                  </div>
-                </div>
-                <div className="actions" style={{ marginTop: 12 }}>
-                  <button className="primary" onClick={() => loadBooks()}>
-                    Apply Search
-                  </button>
-                  <button className="secondary" onClick={() => setQ('')}>
-                    Clear Text
-                  </button>
-                  <button className="secondary" onClick={() => exportFilteredBooksCsv()}>
-                    Export Visible CSV
-                  </button>
-                </div>
-                <div className="actions" style={{ marginTop: 10 }}>
-                  <button className="secondary" onClick={() => setBookQuickFilter('all')}>All Visible</button>
-                  <button className="secondary" onClick={() => setBookQuickFilter('available')}>Available</button>
-                  <button className="secondary" onClick={() => setBookQuickFilter('borrowed')}>Borrowed</button>
-                  <button className="secondary" onClick={() => setBookQuickFilter('overdue')}>Overdue</button>
-                  <button className="secondary" onClick={() => setBookQuickFilter('missingLocation')}>Missing Location</button>
-                </div>
-              </section>
-
-              <section className="panel grid two">
-                <div>
-                  <h2>Add new book</h2>
-                  <p className="panel-help">Fill the basic fields first. Advanced fields are optional.</p>
-                  <form onSubmit={createBook} className="grid">
-                    <div className="row">
-                      <div>
-                        <label>Title</label>
-                        <input
-                          value={createForm.title}
-                          onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })}
-                          required
-                        />
-                      </div>
-                      <div>
-                        <label>Author</label>
-                        <input
-                          value={createForm.author}
-                          onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })}
-                          required
-                        />
-                      </div>
-                    </div>
-                    <div className="row">
-                      <div>
-                        <label>ISBN</label>
-                        <input value={createForm.isbn} onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })} />
-                      </div>
-                      <div>
-                        <label>Publication year</label>
-                        <input
-                          type="number"
-                          value={createForm.publicationYear}
-                          onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })}
-                        />
-                      </div>
-                    </div>
-                    <div className="row">
-                      <div>
-                        <label>Room code</label>
-                        <input
-                          value={createForm.roomCode}
-                          onChange={(e) => setCreateForm({ ...createForm, roomCode: e.target.value })}
-                        />
-                      </div>
-                      <div>
-                        <label>Shelf code</label>
-                        <input
-                          value={createForm.shelfCode}
-                          onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })}
-                        />
-                      </div>
+                <div className="card">
+                  <h3>Search Books</h3>
+                  <div className="form-row">
+                    <div>
+                      <label>Search</label>
+                      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Title, author, or ISBN" />
                     </div>
                     <div>
-                      <label>Advanced custom fields (JSON)</label>
-                      <textarea
-                        value={createForm.customFieldsJson}
-                        onChange={(e) => setCreateForm({ ...createForm, customFieldsJson: e.target.value })}
-                      />
-                    </div>
-                    <div className="actions">
-                      <button className="primary" type="submit">
-                        Add Book
-                      </button>
-                    </div>
-                  </form>
-                </div>
-
-                <div>
-                  <h2>Edit selected book</h2>
-                  <p className="panel-help">Select a book from the list below, then update fields here.</p>
-                  <form onSubmit={saveBookEdit} className="grid">
-                    <div>
-                      <label>Selected ID</label>
-                      <input value={editForm.id} readOnly placeholder="Select a book first" />
-                    </div>
-                    <div className="row">
-                      <div>
-                        <label>Title</label>
-                        <input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} />
-                      </div>
-                      <div>
-                        <label>Author</label>
-                        <input value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} />
-                      </div>
-                    </div>
-                    <div className="row">
-                      <div>
-                        <label>Status</label>
-                        <select
-                          value={editForm.status}
-                          onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}
-                        >
-                          <option value="available">Available</option>
-                          <option value="borrowed">Borrowed</option>
-                          <option value="lost">Lost</option>
-                          <option value="maintenance">Maintenance</option>
-                        </select>
-                      </div>
-                      <div>
-                        <label>Room code</label>
-                        <input value={editForm.roomCode} onChange={(e) => setEditForm({ ...editForm, roomCode: e.target.value })} />
-                      </div>
-                      <div>
-                        <label>Shelf code</label>
-                        <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} />
-                      </div>
-                    </div>
-                    <div>
-                      <label>Advanced custom fields (JSON)</label>
-                      <textarea
-                        value={editForm.customFieldsJson}
-                        onChange={(e) => setEditForm({ ...editForm, customFieldsJson: e.target.value })}
-                      />
-                    </div>
-                    <div className="actions">
-                      <button className="primary" type="submit" disabled={!editForm.id}>
-                        Save Changes
-                      </button>
-                    </div>
-                  </form>
-
-                  <div className="panel-divider" />
-                  <h3>Book attributes form</h3>
-                  <p className="panel-help">Friendly input fields based on your custom attribute definitions.</p>
-                  {customFields.length === 0 ? <p className="muted">No custom attributes defined yet.</p> : null}
-                  <div className="grid">
-                    {customFields.map((field) => (
-                      <div key={field.id}>
-                        <label>{field.label}</label>
-                        {field.type === 'boolean' ? (
-                          <select
-                            value={String(attributeEditorValues[field.key] ?? '')}
-                            onChange={(e) => updateAttributeEditorValue(field.key, e.target.value)}
-                          >
-                            <option value="">Not set</option>
-                            <option value="true">True</option>
-                            <option value="false">False</option>
-                          </select>
-                        ) : field.type === 'enum' ? (
-                          <select
-                            value={String(attributeEditorValues[field.key] ?? '')}
-                            onChange={(e) => updateAttributeEditorValue(field.key, e.target.value)}
-                          >
-                            <option value="">Select</option>
-                            {field.enumOptions.map((option) => (
-                              <option key={option} value={option}>
-                                {option}
-                              </option>
-                            ))}
-                          </select>
-                        ) : field.type === 'number' ? (
-                          <input
-                            type="number"
-                            value={String(attributeEditorValues[field.key] ?? '')}
-                            onChange={(e) => updateAttributeEditorValue(field.key, e.target.value)}
-                          />
-                        ) : field.type === 'date' ? (
-                          <input
-                            type="datetime-local"
-                            value={
-                              attributeEditorValues[field.key]
-                                ? new Date(String(attributeEditorValues[field.key])).toISOString().slice(0, 16)
-                                : ''
-                            }
-                            onChange={(e) => updateAttributeEditorValue(field.key, e.target.value)}
-                          />
-                        ) : (
-                          <input
-                            value={String(attributeEditorValues[field.key] ?? '')}
-                            onChange={(e) => updateAttributeEditorValue(field.key, e.target.value)}
-                          />
-                        )}
-                      </div>
-                    ))}
-                    <div className="actions">
-                      <button className="secondary" onClick={saveBookAttributes} disabled={!editForm.id}>
-                        Save Attributes
-                      </button>
-                    </div>
-
-                    <div className="panel-divider" />
-                    <h3>Borrow history</h3>
-                    <p className="panel-help">Timeline for the selected book.</p>
-                    {bookHistory.length === 0 ? <p className="muted">No borrow history yet.</p> : null}
-                    <div className="list compact">
-                      {bookHistory.map((item) => (
-                        <div className="list-item" key={item.id}>
-                          <strong>{item.borrowerName}</strong>
-                          <p className="muted">
-                            Borrowed: {new Date(item.borrowedAt).toLocaleString()} · Due: {new Date(item.dueAt).toLocaleString()}
-                          </p>
-                          <p className="muted">
-                            {item.returnedAt ? `Returned: ${new Date(item.returnedAt).toLocaleString()}` : 'Still borrowed'}
-                            {item.wasOverdue ? ' · Overdue' : ''}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </section>
-
-              <section className="panel">
-                <h2>Book list ({visibleBooks.length}/{books.length})</h2>
-                <p className="panel-help">Use Select to edit, Borrow/Return for circulation, and code buttons for labels.</p>
-                <div className="grid" style={{ marginBottom: 12 }}>
-                  <h3>Bulk actions</h3>
-                  <p className="panel-help">Selected: {selectedBookIds.length}. Update multiple books in one action.</p>
-                  <div className="row">
-                    <div>
-                      <label>Bulk status</label>
-                      <select value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)}>
-                        <option value="">No change</option>
+                      <label>Status</label>
+                      <select value={status} onChange={(e) => setStatus(e.target.value)}>
+                        <option value="">All</option>
                         <option value="available">Available</option>
                         <option value="borrowed">Borrowed</option>
                         <option value="lost">Lost</option>
@@ -2185,332 +1795,177 @@ function App() {
                       </select>
                     </div>
                     <div>
-                      <label>Bulk room code</label>
-                      <input value={bulkRoomCode} onChange={(e) => setBulkRoomCode(e.target.value)} placeholder="A1" />
-                    </div>
-                    <div>
-                      <label>Bulk shelf code</label>
-                      <input value={bulkShelfCode} onChange={(e) => setBulkShelfCode(e.target.value)} placeholder="S-02" />
+                      <label>Room</label>
+                      <input value={roomCode} onChange={(e) => setRoomCode(e.target.value)} placeholder="Room code" />
                     </div>
                   </div>
-                  <div className="actions">
-                    <button className="secondary" onClick={selectVisibleBooks}>Select Visible</button>
-                    <button className="secondary" onClick={clearSelectedBooks}>Clear Selection</button>
-                    <button className="primary" onClick={applyBulkBookChanges}>Apply Bulk Update</button>
+                  <div className="button-group">
+                    <button className="primary" onClick={() => loadBooks()}>Search</button>
+                    <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); }}>Reset</button>
+                    <button className="secondary" onClick={exportFilteredBooksCsv}>Export CSV</button>
                   </div>
                 </div>
-                {emptyState}
-                <div className="list">
-                  {visibleBooks.map((book) => (
-                    <article className="list-item" key={book.id}>
-                      <h3>
-                        <label className="inline-check" style={{ display: 'inline-flex', marginRight: 8 }}>
-                          <input
-                            type="checkbox"
-                            checked={selectedBookIds.includes(book.id)}
-                            onChange={() => toggleBookSelection(book.id)}
-                          />
-                        </label>
-                        {book.title} <span className="code">{book.status}</span>
-                      </h3>
-                      <p className="muted">{book.author} {book.isbn ? `- ${book.isbn}` : ''}</p>
-                      <p className="muted">Location: {book.roomCode ?? '-'} / {book.shelfCode ?? '-'}</p>
-                      <div className="actions">
-                        <button className="secondary" onClick={() => beginEdit(book)}>Select</button>
-                        <button
-                          className="secondary"
-                          onClick={async () => {
-                            try {
-                              await navigator.clipboard.writeText(book.id);
-                              setMessage(`Book ID copied: ${book.id}`);
-                            } catch {
-                              setMessage(`Book ID: ${book.id}`);
-                            }
-                          }}
-                        >
-                          Copy ID
-                        </button>
-                        <button className="accent" onClick={() => generateCode(book, 'qr')}>Create QR</button>
-                        <button className="accent" onClick={() => generateCode(book, 'barcode')}>Create Barcode</button>
-                        <button className="primary" onClick={() => borrowBook(book)}>Borrow</button>
-                        <button className="secondary" onClick={() => returnBook(book)}>Return</button>
-                        <button className="danger" onClick={() => deleteBook(book)}>Delete</button>
+
+                <div className="card">
+                  <h3>Add New Book</h3>
+                  <form onSubmit={createBook} className="simple-form">
+                    <div className="form-row">
+                      <div>
+                        <label>Title *</label>
+                        <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} required />
                       </div>
-                    </article>
-                  ))}
-                </div>
-                {selectedBook ? <p className="muted">Selected: {selectedBook.title}</p> : null}
-              </section>
-            </>
-          ) : null}
-
-          {currentSection === 'circulation' ? (
-            <section className="panel grid two">
-              <div>
-                <h2>Scan to find a book</h2>
-                <p className="panel-help">Paste or type a QR/barcode value to locate the matching book.</p>
-                <form onSubmit={resolveScanCode} className="grid">
-                  <div>
-                    <label>Code value</label>
-                    <input value={scanCode} onChange={(e) => setScanCode(e.target.value)} placeholder="QR-... or BC-..." />
-                  </div>
-                  <button className="primary" type="submit">Find Book</button>
-                </form>
-                {scanResult ? <p className="success">Found: {scanResult}</p> : null}
-              </div>
-
-              <div>
-                <h2>Borrow details</h2>
-                <p className="panel-help">These details are used when you click Borrow on a book card.</p>
-                <div className="grid">
-                  <div>
-                    <label>Borrower name</label>
-                    <input value={borrowerName} onChange={(e) => setBorrowerName(e.target.value)} />
-                  </div>
-                  <div>
-                    <label>Borrower contact</label>
-                    <input value={borrowerContact} onChange={(e) => setBorrowerContact(e.target.value)} />
-                  </div>
-                  <div>
-                    <label>Due date</label>
-                    <input
-                      type="datetime-local"
-                      value={dueAt}
-                      onChange={(e) => {
-                        const parsed = e.target.value ? new Date(e.target.value).toISOString() : '';
-                        setDueAt(parsed);
-                      }}
-                    />
-                  </div>
-                  <div className="actions">
-                    <button className="secondary" onClick={() => setDueInDays(7)}>+7 days</button>
-                    <button className="secondary" onClick={() => setDueInDays(14)}>+14 days</button>
-                    <button className="secondary" onClick={() => setDueInDays(30)}>+30 days</button>
-                  </div>
-                </div>
-              </div>
-
-              <div className="full-row">
-                <h2>Active loans</h2>
-                <p className="panel-help">Track open loans and quickly process returns.</p>
-                <div className="actions" style={{ marginBottom: 10 }}>
-                  <button className="secondary" onClick={() => setLoanFilter('all')}>All</button>
-                  <button className="secondary" onClick={() => setLoanFilter('overdue')}>Overdue</button>
-                  <button className="secondary" onClick={() => setLoanFilter('dueSoon')}>Due in 48h</button>
-                  <button className="danger" onClick={() => returnAllOverdue()}>Return All Overdue</button>
-                </div>
-                {visibleActiveBorrows.length === 0 ? <p className="muted">No active loans in this filter.</p> : null}
-                <div className="list">
-                  {visibleActiveBorrows.map((item) => (
-                    <div className="list-item" key={item.id}>
-                      <h3>
-                        {item.title} {item.isOverdue ? <span className="code overdue">Overdue</span> : null}
-                      </h3>
-                      <p className="muted">
-                        Borrower: {item.borrowerName} · Due: {new Date(item.dueAt).toLocaleString()}
-                      </p>
-                      <div className="actions">
-                        <button className="secondary" onClick={() => quickReturnByBookId(item.bookId, item.title)}>
-                          Quick Return
-                        </button>
+                      <div>
+                        <label>Author *</label>
+                        <input value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} required />
                       </div>
                     </div>
-                  ))}
-                </div>
-              </div>
-            </section>
-          ) : null}
-
-          {currentSection === 'locations' ? (
-            <section className="panel grid two">
-              <div>
-                <h2>Rooms</h2>
-                <p className="panel-help">Define real physical spaces so staff can find books quickly.</p>
-                <form className="grid" onSubmit={createRoom}>
-                  <div className="row">
-                    <div>
-                      <label>Code</label>
-                      <input value={roomForm.code} onChange={(e) => setRoomForm({ ...roomForm, code: e.target.value })} required />
-                    </div>
-                    <div>
-                      <label>Name</label>
-                      <input value={roomForm.name} onChange={(e) => setRoomForm({ ...roomForm, name: e.target.value })} required />
-                    </div>
-                  </div>
-                  <div>
-                    <label>Description</label>
-                    <input
-                      value={roomForm.description}
-                      onChange={(e) => setRoomForm({ ...roomForm, description: e.target.value })}
-                    />
-                  </div>
-                  <button className="primary" type="submit">Add Room</button>
-                </form>
-
-                <div className="list" style={{ marginTop: 10 }}>
-                  {rooms.map((room) => (
-                    <div className="list-item" key={room.id}>
-                      <strong>{room.code}</strong> - {room.name}
-                      {room.description ? <p className="muted">{room.description}</p> : null}
-                      <div className="actions" style={{ marginTop: 8 }}>
-                        <button className="danger" onClick={() => deleteRoom(room)}>Delete</button>
+                    <div className="form-row">
+                      <div>
+                        <label>ISBN</label>
+                        <input value={createForm.isbn} onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })} />
+                      </div>
+                      <div>
+                        <label>Year</label>
+                        <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} />
                       </div>
                     </div>
-                  ))}
-                </div>
-
-                <div className="panel-divider" />
-                <h3>Occupancy snapshot</h3>
-                <p className="panel-help">See book distribution in each room.</p>
-                <div className="list compact">
-                  {roomSummary.map((room) => (
-                    <div className="list-item" key={`summary-${room.id}`}>
-                      <strong>{room.code} · {room.name}</strong>
-                      <p className="muted">
-                        Total: {room.total_books} · Available: {room.available_books} · Borrowed: {room.borrowed_books}
-                      </p>
-                    </div>
-                  ))}
-                  {unassignedSummary.totalBooks > 0 ? (
-                    <div className="list-item">
-                      <strong>Unassigned room code</strong>
-                      <p className="muted">Books without location: {unassignedSummary.totalBooks}</p>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-
-              <div>
-                <h2>Custom attributes</h2>
-                <p className="panel-help">Create extra attributes beyond standard book fields like title/author/isbn.</p>
-                <form className="grid" onSubmit={saveCustomField}>
-                  <div className="row">
-                    <div>
-                      <label>Field key</label>
-                      <input value={fieldForm.key} onChange={(e) => setFieldForm({ ...fieldForm, key: e.target.value })} required />
-                    </div>
-                    <div>
-                      <label>Label</label>
-                      <input value={fieldForm.label} onChange={(e) => setFieldForm({ ...fieldForm, label: e.target.value })} required />
-                    </div>
-                  </div>
-                  <div className="row">
-                    <div>
-                      <label>Type</label>
-                      <select
-                        value={fieldForm.type}
-                        onChange={(e) =>
-                          setFieldForm({ ...fieldForm, type: e.target.value as 'text' | 'number' | 'boolean' | 'date' | 'enum' })
-                        }
-                      >
-                        <option value="text">Text</option>
-                        <option value="number">Number</option>
-                        <option value="boolean">Boolean</option>
-                        <option value="date">Date</option>
-                        <option value="enum">Enum</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label>Enum options (comma separated)</label>
-                      <input value={fieldForm.enumOptionsCsv} onChange={(e) => setFieldForm({ ...fieldForm, enumOptionsCsv: e.target.value })} />
-                    </div>
-                  </div>
-                  <label className="inline-check">
-                    <input
-                      type="checkbox"
-                      checked={fieldForm.required}
-                      onChange={(e) => setFieldForm({ ...fieldForm, required: e.target.checked })}
-                    />
-                    This field is required
-                  </label>
-                  <div className="actions">
-                    <button className="primary" type="submit">{editingCustomFieldId ? 'Save Field' : 'Add Field'}</button>
-                    {editingCustomFieldId ? (
-                      <button className="secondary" type="button" onClick={resetCustomFieldForm}>Cancel Edit</button>
-                    ) : null}
-                  </div>
-                </form>
-                <p className="muted" style={{ marginTop: 8 }}>
-                  Reserved keys: title, author, isbn, publicationYear, publisher, language, description, status, and other built-in fields.
-                </p>
-
-                <div className="list" style={{ marginTop: 10 }}>
-                  {customFields.map((field) => (
-                    <div className="list-item" key={field.id}>
-                      <strong>{field.key}</strong> <span className="code">{field.type}</span>
-                      <p className="muted">{field.label}</p>
-                      <div className="actions">
-                        <button className="secondary" onClick={() => beginCustomFieldEdit(field)}>Edit</button>
-                        <button className="danger" onClick={() => deleteCustomField(field)}>Delete</button>
+                    <div className="form-row">
+                      <div>
+                        <label>Room Code</label>
+                        <input value={createForm.roomCode} onChange={(e) => setCreateForm({ ...createForm, roomCode: e.target.value })} />
+                      </div>
+                      <div>
+                        <label>Shelf Code</label>
+                        <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} />
                       </div>
                     </div>
-                  ))}
+                    <button type="submit" className="primary">Add Book</button>
+                  </form>
                 </div>
-              </div>
-            </section>
-          ) : null}
 
-          {currentSection === 'settings' ? (
-            <>
-              <section className="panel">
-                <h2>Export records</h2>
-                <p className="panel-help">Download the current book list as a CSV file.</p>
-                <div className="actions">
-                  <button className="accent" onClick={exportCsv}>Download CSV</button>
+                <div className="card">
+                  <h3>Books ({visibleBooks.length})</h3>
+                  {visibleBooks.length === 0 ? (
+                    <p className="muted">No books found.</p>
+                  ) : (
+                    <div className="book-list">
+                      {visibleBooks.slice(0, 50).map((book) => (
+                        <div key={book.id} className="book-item">
+                          <div>
+                            <strong>{book.title}</strong>
+                            <p className="muted">{book.author}</p>
+                            <p className="muted small">
+                              {book.isbn ? `ISBN: ${book.isbn}` : ''}
+                              {book.roomCode ? ` · Room: ${book.roomCode}` : ''}
+                              {book.status ? ` · ${book.status}` : ''}
+                            </p>
+                          </div>
+                          <button className="secondary small" onClick={() => beginEdit(book)}>Edit</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
-              </section>
+              </>
+            ) : null}
 
-              <section className="panel">
-                <h2>Import from XLSX</h2>
-                <p className="panel-help">
-                  Upload an Excel .xlsx file. Required columns: Title and Writer/Author. You can also use your default
-                  structure columns (Item, Sub Title, Editor, Place of Publication, Published Date, Edition #, Category,
-                  Translator, Cover Type, Pages, Condition, Shelf Location, Num. Volume, Color, Signature, More copies).
-                </p>
-                <p className="muted">
-                  If your file contains extra/unmapped columns, you will be asked to either exclude them for this import,
-                  or stop and create matching custom attributes first.
-                </p>
-                <div className="actions" style={{ marginBottom: 10 }}>
-                  <button className="secondary" onClick={() => applyDefaultBookStructure()}>
-                    Reconstruct Default Book Columns
-                  </button>
+            {currentSection === 'circulation' ? (
+              <>
+                <div className="section-header">
+                  <h2>Loans</h2>
+                  <p>Manage book borrowing and returns</p>
                 </div>
-                <form onSubmit={importFromXlsx} className="grid">
-                  <div>
-                    <label>XLSX file</label>
-                    <input name="xlsxFile" type="file" accept=".xlsx" />
-                  </div>
-                  {importFileName ? <p className="muted">Selected file: {importFileName}</p> : null}
-                  <p className="muted">
-                    Tip: custom attributes can be supplied through a JSON object in customFields column, or as per-column
-                    values using custom.genre, custom.level, etc.
-                  </p>
-                  <div className="actions">
-                    <button className="primary" type="submit">Import XLSX</button>
-                  </div>
-                </form>
-              </section>
 
-              <section className="panel">
-                <h2>Bulk import</h2>
-                <p className="panel-help">Paste a JSON array of book rows. Use dry run first to validate.</p>
-                <form onSubmit={runImport} className="grid">
-                  <div>
-                    <label>Rows JSON</label>
-                    <textarea value={importJson} onChange={(e) => setImportJson(e.target.value)} style={{ minHeight: 180 }} />
-                  </div>
-                  <label className="inline-check">
-                    <input type="checkbox" checked={importDryRun} onChange={(e) => setImportDryRun(e.target.checked)} />
-                    Dry run (check only, no changes saved)
-                  </label>
-                  <div className="actions">
-                    <button className="primary" type="submit">Run Import</button>
-                  </div>
-                </form>
-              </section>
-            </>
-          ) : null}
+                <div className="card">
+                  <h3>Active Loans ({activeBorrows.length})</h3>
+                  {activeBorrows.length === 0 ? (
+                    <p className="muted">No active loans.</p>
+                  ) : (
+                    <div className="loan-list">
+                      {activeBorrows.map((loan) => (
+                        <div key={loan.id} className="loan-item" style={{ borderLeft: loan.isOverdue ? '4px solid var(--danger)' : '4px solid var(--accent-2)' }}>
+                          <div>
+                            <strong>{loan.title}</strong>
+                            <p className="muted">{loan.borrowerName}</p>
+                            <p className="muted small">
+                              Due: {new Date(loan.dueAt).toLocaleDateString()}
+                              {loan.isOverdue && ' · OVERDUE'}
+                            </p>
+                          </div>
+                          <button className="secondary small" onClick={() => quickReturnByBookId(loan.bookId, loan.title)}>Return</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="card">
+                  <h3>Borrow a Book</h3>
+                  {selectedBook ? (
+                    <form onSubmit={() => borrowBook(selectedBook)} className="simple-form">
+                      <p className="muted">Selected: {selectedBook.title} by {selectedBook.author}</p>
+                      <div>
+                        <label>Borrower Name *</label>
+                        <input value={borrowerName} onChange={(e) => setBorrowerName(e.target.value)} required />
+                      </div>
+                      <div>
+                        <label>Borrower Contact</label>
+                        <input value={borrowerContact} onChange={(e) => setBorrowerContact(e.target.value)} />
+                      </div>
+                      <div>
+                        <label>Due Date *</label>
+                        <input type="date" value={dueAt.split('T')[0]} onChange={(e) => setDueAt(e.target.value + 'T00:00:00.000Z')} required />
+                      </div>
+                      <div className="button-group">
+                        <button type="submit" className="primary">Borrow</button>
+                        <button type="button" className="secondary" onClick={() => setSelectedBook(null)}>Cancel</button>
+                      </div>
+                    </form>
+                  ) : (
+                    <p className="muted">Select a book from the Library tab first.</p>
+                  )}
+                </div>
+              </>
+            ) : null}
+
+            {currentSection === 'import' ? (
+              <>
+                <div className="section-header">
+                  <h2>Import</h2>
+                  <p>Add books from a spreadsheet</p>
+                </div>
+
+                <div className="card">
+                  <h3>Import from Excel</h3>
+                  <p className="muted">Upload an .xlsx file with Title and Author columns. Other columns are optional.</p>
+                  <form onSubmit={importFromXlsx} className="simple-form">
+                    <div>
+                      <label>Select File *</label>
+                      <input name="xlsxFile" type="file" accept=".xlsx" required />
+                    </div>
+                    {importFileName && <p className="muted">File: {importFileName}</p>}
+                    <label className="checkbox-label">
+                      <input type="checkbox" checked={importDryRun} onChange={(e) => setImportDryRun(e.target.checked)} />
+                      Test only (dry run)
+                    </label>
+                    <button type="submit" className="primary">{importDryRun ? 'Test Import' : 'Import'}</button>
+                  </form>
+                </div>
+
+                <div className="card">
+                  <h3>Setup</h3>
+                  <p className="muted">Apply default book structure to prepare for imports.</p>
+                  <button className="secondary" onClick={applyDefaultBookStructure}>Apply Default Structure</button>
+                </div>
+
+                <div className="card">
+                  <h3>Export All Books</h3>
+                  <p className="muted">Download your entire collection as CSV.</p>
+                  <button className="secondary" onClick={exportCsv}>Download CSV</button>
+                </div>
+              </>
+            ) : null}
+          </div>
         </>
       )}
 

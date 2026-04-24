@@ -14,7 +14,9 @@
     "migrate:local": "npm --workspace apps/api-worker run migrate:local",
     "deploy:api": "npm --workspace apps/api-worker run deploy",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "lint": "echo 'lint placeholder'"
+    "lint": "echo 'lint placeholder'",
+    "import:xlsx:d1:local": "node scripts/import_xlsx_to_d1.mjs",
+    "import:xlsx:d1:remote": "node scripts/import_xlsx_to_d1.mjs --remote"
   },
   "devDependencies": {
     "wrangler": "^4.84.1"
