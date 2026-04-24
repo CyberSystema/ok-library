@@ -28,7 +28,7 @@ import {
 	withTxn
 } from './db';
 import type { AuthClaims, Env } from './types';
-import { generateCodeValue, nowIso, safeJsonParse, toCsv } from './utils';
+import { generateCodeValue, normalizeBookData, nowIso, safeJsonParse, toCsv } from './utils';
 
 type App = Hono<{ Bindings: Env; Variables: { user: AuthClaims } }>;
 type AppContext = Context<{ Bindings: Env; Variables: { user: AuthClaims } }>;
@@ -218,12 +218,13 @@ app.post('/api/auth/login', async (c) => {
 		role: user.role
 	});
 
+	const ttl = Number(c.env.ACCESS_TOKEN_TTL_SECONDS ?? '43200');
 	c.header(
 		'Set-Cookie',
-		`ok_library_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned`
+		`ok_library_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=${ttl}`
 	);
 
-	return c.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+	return c.json({ user: { id: user.id, username: user.username, role: user.role } });
 });
 
 app.post('/api/auth/logout', async (c) => {
@@ -306,7 +307,7 @@ app.get('/api/books/:id', async (c) => {
 });
 
 app.post('/api/books', requireRole(['admin', 'librarian']), async (c) => {
-	const payload = CreateBookSchema.parse(await c.req.json());
+	const payload = normalizeBookData(CreateBookSchema.parse(await c.req.json()));
 	const now = nowIso();
 	const id = crypto.randomUUID();
 	const customFields = await validateCustomFields(c.env, payload.customFields);
@@ -345,7 +346,19 @@ app.post('/api/books', requireRole(['admin', 'librarian']), async (c) => {
 		author: payload.author
 	});
 
-	return c.json({ id }, 201);
+	// Duplicate check: warn if another non-deleted book has the same title+author
+	const dupCheck = await c.env.DB.prepare(
+		`SELECT id, title, author FROM books
+		 WHERE deleted_at IS NULL AND id != ?
+		   AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+		   AND LOWER(TRIM(author)) = LOWER(TRIM(?))`
+	)
+		.bind(id, payload.title, payload.author)
+		.all<{ id: string; title: string; author: string }>();
+
+	const duplicateOf = dupCheck.results ?? [];
+
+	return c.json({ id, ...(duplicateOf.length > 0 ? { duplicateOf } : {}) }, 201);
 });
 
 app.put('/api/books/:id', requireRole(['admin', 'librarian']), async (c) => {
@@ -353,7 +366,7 @@ app.put('/api/books/:id', requireRole(['admin', 'librarian']), async (c) => {
 	if (!id) {
 		throw new HTTPException(400, { message: 'Missing book id' });
 	}
-	const payload = UpdateBookSchema.parse(await c.req.json());
+	const payload = normalizeBookData(UpdateBookSchema.parse(await c.req.json()));
 
 	const existing = await c.env.DB.prepare('SELECT * FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
 	if (!existing) {
@@ -1107,7 +1120,8 @@ app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => 
 
 	let importedRows = 0;
 	for (const item of readyRows) {
-		const { index, row, customFields } = item;
+		const { index, customFields } = item;
+		const row = normalizeBookData(item.row);
 		try {
 			const bookId = crypto.randomUUID();
 			await c.env.DB.prepare(
@@ -1241,7 +1255,7 @@ app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
 
 		try {
 			if (mutation.operation === 'create_book') {
-				const row = CreateBookSchema.parse(mutation.payload);
+				const row = normalizeBookData(CreateBookSchema.parse(mutation.payload));
 				const customFields = await validateCustomFields(c.env, row.customFields);
 				const now = nowIso();
 				const id = crypto.randomUUID();
@@ -1287,7 +1301,7 @@ app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
 					throw new HTTPException(404, { message: 'Book not found' });
 				}
 
-				const incoming = UpdateBookSchema.parse(row.data);
+				const incoming = normalizeBookData(UpdateBookSchema.parse(row.data));
 				const currentVersion = Number((current as Record<string, unknown>).version ?? 0);
 				if (incoming.version !== currentVersion) {
 					throw new HTTPException(409, { message: 'Version conflict' });
@@ -1413,6 +1427,96 @@ app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
 	});
 
 	return c.json({ results });
+});
+
+app.get('/api/books/duplicates', requireRole(['admin', 'librarian']), async (c) => {
+	const rows = await c.env.DB.prepare(
+		`SELECT id, title, author, isbn FROM books WHERE deleted_at IS NULL ORDER BY title ASC, author ASC`
+	).all<{ id: string; title: string; author: string; isbn: string | null }>();
+
+	const groups = new Map<string, Array<{ id: string; title: string; author: string; isbn: string | null }>>();
+	for (const row of rows.results ?? []) {
+		const key = `${row.title.trim().toLowerCase()}|||${row.author.trim().toLowerCase()}`;
+		const group = groups.get(key) ?? [];
+		group.push(row);
+		groups.set(key, group);
+	}
+
+	const duplicates = Array.from(groups.values()).filter((g) => g.length > 1);
+	return c.json({ total: duplicates.length, groups: duplicates });
+});
+
+app.post('/api/admin/normalize-books', requireRole(['admin']), async (c) => {
+	const limit = Math.min(500, Math.max(1, Number(c.req.query('limit') ?? 500)));
+	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
+
+	const rows = await c.env.DB.prepare(
+		`SELECT id, title, author, isbn, publisher, language, description,
+		        room_code, shelf_code, acquisition_date, tags, custom_fields
+		 FROM books WHERE deleted_at IS NULL LIMIT ? OFFSET ?`
+	).bind(limit, offset).all<Record<string, unknown>>();
+
+	let updated = 0;
+	const processed = rows.results?.length ?? 0;
+	const now = nowIso();
+
+	for (const row of rows.results ?? []) {
+		const original = {
+			title: (row.title as string) ?? '',
+			author: (row.author as string) ?? '',
+			isbn: row.isbn as string | null,
+			publisher: row.publisher as string | null,
+			language: row.language as string | null,
+			description: row.description as string | null,
+			roomCode: row.room_code as string | null,
+			shelfCode: row.shelf_code as string | null,
+			acquisitionDate: row.acquisition_date as string | null,
+			tags: safeJsonParse<string[]>((row.tags as string) ?? '[]', []),
+			customFields: safeJsonParse<Record<string, unknown>>((row.custom_fields as string) ?? '{}', {})
+		};
+
+		const n = normalizeBookData(original);
+
+		const changed =
+			n.title !== original.title ||
+			n.author !== original.author ||
+			n.isbn !== original.isbn ||
+			n.publisher !== original.publisher ||
+			n.language !== original.language ||
+			n.description !== original.description ||
+			n.roomCode !== original.roomCode ||
+			n.shelfCode !== original.shelfCode ||
+			n.acquisitionDate !== original.acquisitionDate ||
+			JSON.stringify(n.tags) !== JSON.stringify(original.tags) ||
+			JSON.stringify(n.customFields) !== JSON.stringify(original.customFields);
+
+		if (!changed) continue;
+
+		await c.env.DB.prepare(
+			`UPDATE books SET
+			   title=?, author=?, isbn=?, publisher=?, language=?, description=?,
+			   room_code=?, shelf_code=?, acquisition_date=?, tags=?, custom_fields=?,
+			   updated_at=?, version=version+1
+			 WHERE id=?`
+		)
+			.bind(
+				n.title, n.author, n.isbn ?? null, n.publisher ?? null, n.language ?? null, n.description ?? null,
+				n.roomCode ?? null, n.shelfCode ?? null, n.acquisitionDate ?? null,
+				JSON.stringify(n.tags), JSON.stringify(n.customFields), now, row.id as string
+			)
+			.run();
+
+		updated++;
+	}
+
+	const countResult = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL').first<{ n: number }>();
+	const totalBooks = countResult?.n ?? 0;
+
+	await insertAuditLog(c.env, c.get('user').sub, 'admin.normalizeBooks', 'book', null, {
+		processed, updated, offset, limit
+	});
+
+	return c.json({ processed, updated, unchanged: processed - updated, offset, nextOffset: offset + processed, totalBooks });
 });
 
 app.get('/api/audit-logs', requireRole(['admin']), async (c) => {

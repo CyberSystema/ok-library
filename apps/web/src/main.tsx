@@ -38,7 +38,6 @@ type CustomField = {
 };
 
 type LoginResponse = {
-  token: string;
   user: { id: string; username: string; role: string };
 };
 
@@ -91,6 +90,9 @@ type RoomSummaryItem = {
 };
 
 type AppSection = 'books' | 'circulation' | 'import';
+
+type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
+type DuplicateGroup = DuplicateEntry[];
 
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
 const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
@@ -147,7 +149,6 @@ function isPayloadTooLargeError(error: unknown): boolean {
 }
 
 async function apiRequest<T>(
-  token: string | null,
   path: string,
   init?: RequestInit,
   raw = false
@@ -157,7 +158,6 @@ async function apiRequest<T>(
     credentials: 'include',
     headers: {
       ...(raw ? {} : { 'Content-Type': 'application/json' }),
-      ...(token && token !== 'cookie' ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {})
     }
   });
@@ -223,8 +223,8 @@ function SectionHeader({
 }
 
 function App() {
-  const [token, setToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
   const [currentSection, setCurrentSection] = useState<AppSection>('books');
@@ -303,12 +303,23 @@ function App() {
   const [bulkShelfCode, setBulkShelfCode] = useState('');
   const [bookQuickFilter, setBookQuickFilter] = useState<'all' | 'available' | 'borrowed' | 'overdue' | 'missingLocation'>('all');
   const [loanFilter, setLoanFilter] = useState<'all' | 'overdue' | 'dueSoon'>('all');
+  const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
+  const [showDuplicatesPanel, setShowDuplicatesPanel] = useState(false);
+  const [duplicateWarning, setDuplicateWarning] = useState<DuplicateEntry[]>([]);
 
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [isWorking, setIsWorking] = useState(false);
 
-  const loggedIn = useMemo(() => Boolean(token && currentUser), [token, currentUser]);
+  const loggedIn = Boolean(currentUser);
+
+  // Restore session from HttpOnly cookie on first load
+  useEffect(() => {
+    apiRequest<SessionResponse>('/api/auth/session')
+      .then((res) => setCurrentUser(res.user))
+      .catch(() => { /* no session */ })
+      .finally(() => setSessionLoading(false));
+  }, []);
 
   const totalBooks = books.length;
   const availableBooks = books.filter((book) => book.status === 'available').length;
@@ -718,16 +729,14 @@ function App() {
     };
   }
 
-  async function refreshEverything(tokenOverride?: string) {
-    const currentToken = tokenOverride ?? token;
-    if (!currentToken) return;
+  async function refreshEverything() {
     await Promise.all([
-      loadBooks(currentToken),
-      loadRooms(currentToken),
-      loadRoomSummary(currentToken),
-      loadCustomFields(currentToken),
-      loadActiveBorrows(currentToken),
-      loadAuditLogs(currentToken)
+      loadBooks(),
+      loadRooms(),
+      loadRoomSummary(),
+      loadCustomFields(),
+      loadActiveBorrows(),
+      loadAuditLogs()
     ]);
   }
 
@@ -736,14 +745,13 @@ function App() {
     clearStatus();
 
     try {
-      const response = await runAction(() => apiRequest<LoginResponse>(null, '/api/auth/login', {
+      const response = await runAction(() => apiRequest<LoginResponse>('/api/auth/login', {
         method: 'POST',
         body: JSON.stringify({ username, password })
       }));
-      setToken('cookie');
       setCurrentUser(response.user);
       setMessage(`Welcome ${response.user.username}. You're signed in.`);
-      await runAction(() => refreshEverything('cookie'));
+      await runAction(() => refreshEverything());
     } catch (e) {
       setError((e as Error).message);
     }
@@ -752,12 +760,11 @@ function App() {
   async function logout() {
     clearStatus();
     try {
-      await runAction(() => apiRequest<{ ok: boolean }>(token, '/api/auth/logout', { method: 'POST' }));
+      await runAction(() => apiRequest<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }));
     } catch {
       // Keep sign-out resilient even if network request fails.
     }
 
-    setToken(null);
     setCurrentUser(null);
     setBooks([]);
     setRooms([]);
@@ -769,15 +776,10 @@ function App() {
   }
 
   async function applyDefaultBookStructure() {
-    if (!token) {
-      return;
-    }
-
     clearStatus();
     try {
       const result = await runAction(() =>
         apiRequest<{ ok: boolean; configuredCustomColumns: number; skippedAsSimilar?: string[] }>(
-          token,
           '/api/setup/default-book-structure',
           {
             method: 'POST'
@@ -798,10 +800,7 @@ function App() {
     }
   }
 
-  async function loadBooks(tokenOverride?: string, pageOverride?: number) {
-    const currentToken = tokenOverride ?? token;
-    if (!currentToken) return;
-
+  async function loadBooks(pageOverride?: number) {
     try {
       const page = pageOverride ?? currentPage;
       const query = new URLSearchParams();
@@ -813,7 +812,7 @@ function App() {
       query.set('page', page.toString());
       query.set('pageSize', '50');
 
-      const response = await apiRequest<{ items: Book[]; total: number }>(currentToken, `/api/books?${query.toString()}`);
+      const response = await apiRequest<{ items: Book[]; total: number }>(`/api/books?${query.toString()}`);
       setBooks(response.items);
       setTotalBooksCount(response.total);
       setCurrentPage(page);
@@ -822,34 +821,25 @@ function App() {
     }
   }
 
-  async function loadRooms(tokenOverride?: string) {
-    const currentToken = tokenOverride ?? token;
-    if (!currentToken) return;
-
+  async function loadRooms() {
     try {
-      const response = await apiRequest<{ items: Room[] }>(currentToken, '/api/rooms');
+      const response = await apiRequest<{ items: Room[] }>('/api/rooms');
       setRooms(response.items);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
-  async function loadCustomFields(tokenOverride?: string) {
-    const currentToken = tokenOverride ?? token;
-    if (!currentToken) return;
-
+  async function loadCustomFields() {
     try {
-      const response = await apiRequest<{ items: CustomField[] }>(currentToken, '/api/custom-fields');
+      const response = await apiRequest<{ items: CustomField[] }>('/api/custom-fields');
       setCustomFields(response.items);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
-  async function loadRoomSummary(tokenOverride?: string) {
-    const currentToken = tokenOverride ?? token;
-    if (!currentToken) return;
-
+  async function loadRoomSummary() {
     try {
       const response = await apiRequest<{
         items: RoomSummaryItem[];
@@ -860,7 +850,7 @@ function App() {
           lostBooks: number;
           maintenanceBooks: number;
         };
-      }>(currentToken, '/api/rooms/summary');
+      }>('/api/rooms/summary');
       setRoomSummary(response.items ?? []);
       setUnassignedSummary(response.unassigned);
     } catch (e) {
@@ -868,24 +858,18 @@ function App() {
     }
   }
 
-  async function loadActiveBorrows(tokenOverride?: string) {
-    const currentToken = tokenOverride ?? token;
-    if (!currentToken) return;
-
+  async function loadActiveBorrows() {
     try {
-      const response = await apiRequest<{ items: ActiveBorrow[] }>(currentToken, '/api/borrow/active');
+      const response = await apiRequest<{ items: ActiveBorrow[] }>('/api/borrow/active');
       setActiveBorrows(response.items ?? []);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
-  async function loadAuditLogs(tokenOverride?: string) {
-    const currentToken = tokenOverride ?? token;
-    if (!currentToken) return;
-
+  async function loadAuditLogs() {
     try {
-      const response = await apiRequest<{ items: AuditLogItem[] }>(currentToken, '/api/audit-logs?page=1&pageSize=8');
+      const response = await apiRequest<{ items: AuditLogItem[] }>('/api/audit-logs?page=1&pageSize=8');
       setAuditItems(response.items ?? []);
     } catch {
       // Non-admin users may not have access to audit logs; keep UI silent.
@@ -895,13 +879,13 @@ function App() {
 
   async function createBook(event: FormEvent) {
     event.preventDefault();
-    if (!token) return;
     clearStatus();
+    setDuplicateWarning([]);
 
     try {
       const customFieldsValue = parseJsonObject(createForm.customFieldsJson, 'Advanced custom fields');
       const publicationYear = parsePublicationYear(createForm.publicationYear);
-      await runAction(() => apiRequest<{ id: string }>(token, '/api/books', {
+      const result = await runAction(() => apiRequest<{ id: string; duplicateOf?: DuplicateEntry[] }>('/api/books', {
         method: 'POST',
         body: JSON.stringify({
           title: createForm.title.trim(),
@@ -926,15 +910,63 @@ function App() {
         customFieldsJson: '{}'
       });
       setShowAddBook(false);
-      setMessage('Book added successfully.');
+
+      if (result.duplicateOf && result.duplicateOf.length > 0) {
+        setDuplicateWarning(result.duplicateOf);
+        setMessage('Book added. ⚠️ Possible duplicates detected — see warning below.');
+      } else {
+        setMessage('Book added successfully.');
+      }
+
       await Promise.all([loadBooks(), loadRoomSummary()]);
     } catch (e) {
       setError((e as Error).message);
     }
   }
 
+  async function checkDuplicates() {
+    clearStatus();
+    try {
+      const result = await runAction(() =>
+        apiRequest<{ total: number; groups: DuplicateGroup[] }>('/api/books/duplicates')
+      );
+      setDuplicateGroups(result.groups ?? []);
+      setShowDuplicatesPanel(true);
+      if (result.total === 0) {
+        setMessage('No duplicate books found.');
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function normalizeAllBooks() {
+    clearStatus();
+    try {
+      let offset = 0;
+      let totalUpdated = 0;
+      let totalBooks = 0;
+
+      while (true) {
+        const result = await apiRequest<{
+          processed: number; updated: number; offset: number; nextOffset: number; totalBooks: number;
+        }>(`/api/admin/normalize-books?limit=500&offset=${offset}`, { method: 'POST' });
+
+        totalUpdated += result.updated;
+        totalBooks = result.totalBooks;
+
+        if (result.processed < 500) break;
+        offset = result.nextOffset;
+      }
+
+      setMessage(`Normalization complete. ${totalUpdated} of ${totalBooks} books were updated.`);
+      if (totalUpdated > 0) await loadBooks();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   function beginEdit(book: Book) {
-    setSelectedBook(book);
     setEditForm({
       id: book.id,
       title: book.title,
@@ -953,13 +985,12 @@ function App() {
   }
 
   async function loadBookHistory(bookId: string) {
-    if (!token || !bookId) {
+    if (!bookId) {
       return;
     }
 
     try {
       const response = await apiRequest<{ bookId: string; items: BorrowHistoryItem[] }>(
-        token,
         `/api/books/${bookId}/history?limit=20`
       );
       setBookHistory(response.items ?? []);
@@ -973,7 +1004,7 @@ function App() {
   }
 
   async function saveBookAttributes() {
-    if (!token || !editForm.id) return;
+    if (!editForm.id) return;
     clearStatus();
 
     try {
@@ -1019,7 +1050,7 @@ function App() {
         throw new Error(`Please fill required attributes: ${requiredMissing.join(', ')}`);
       }
 
-      await runAction(() => apiRequest<{ bookId: string }>(token, `/api/books/${editForm.id}/attributes`, {
+      await runAction(() => apiRequest<{ bookId: string }>(`/api/books/${editForm.id}/attributes`, {
         method: 'PUT',
         body: JSON.stringify({ values: typedValues })
       }));
@@ -1033,13 +1064,13 @@ function App() {
 
   async function saveBookEdit(event: FormEvent) {
     event.preventDefault();
-    if (!token || !editForm.id) return;
+    if (!editForm.id) return;
     clearStatus();
 
     try {
       const customFieldsValue = parseJsonObject(editForm.customFieldsJson, 'Advanced custom fields');
       const publicationYear = parsePublicationYear(editForm.publicationYear);
-      const result = await runAction(() => apiRequest<{ id: string; version: number }>(token, `/api/books/${editForm.id}`, {
+      const result = await runAction(() => apiRequest<{ id: string; version: number }>(`/api/books/${editForm.id}`, {
         method: 'PUT',
         body: JSON.stringify({
           title: editForm.title.trim(),
@@ -1078,8 +1109,6 @@ function App() {
   }
 
   async function deleteBook(book: Book) {
-    if (!token) return;
-
     if (!window.confirm(`Delete "${book.title}"? This action cannot be undone.`)) {
       return;
     }
@@ -1087,7 +1116,7 @@ function App() {
     clearStatus();
 
     try {
-      await runAction(() => apiRequest<void>(token, `/api/books/${book.id}`, { method: 'DELETE' }));
+      await runAction(() => apiRequest<void>(`/api/books/${book.id}`, { method: 'DELETE' }));
       setSelectedBookIds((prev) => prev.filter((id) => id !== book.id));
       setMessage(`Removed book: ${book.title}`);
       if (detailBook?.id === book.id) {
@@ -1101,7 +1130,6 @@ function App() {
   }
 
   async function borrowBook(book: Book) {
-    if (!token) return;
     clearStatus();
 
     if (!borrowerName || !dueAt) {
@@ -1110,7 +1138,7 @@ function App() {
     }
 
     try {
-      await runAction(() => apiRequest(token, `/api/books/${book.id}/borrow`, {
+      await runAction(() => apiRequest(`/api/books/${book.id}/borrow`, {
         method: 'POST',
         body: JSON.stringify({
           borrowerName,
@@ -1128,11 +1156,10 @@ function App() {
   }
 
   async function returnBook(book: Book) {
-    if (!token) return;
     clearStatus();
 
     try {
-      await runAction(() => apiRequest(token, `/api/books/${book.id}/return`, {
+      await runAction(() => apiRequest(`/api/books/${book.id}/return`, {
         method: 'POST',
         body: JSON.stringify({ notes: null })
       }));
@@ -1145,11 +1172,10 @@ function App() {
   }
 
   async function quickReturnByBookId(bookId: string, title: string) {
-    if (!token) return;
     clearStatus();
 
     try {
-      await runAction(() => apiRequest(token, `/api/books/${bookId}/return`, {
+      await runAction(() => apiRequest(`/api/books/${bookId}/return`, {
         method: 'POST',
         body: JSON.stringify({ notes: 'Returned from active loans list' })
       }));
@@ -1161,7 +1187,6 @@ function App() {
   }
 
   async function returnAllOverdue() {
-    if (!token) return;
     clearStatus();
 
     try {
@@ -1174,7 +1199,7 @@ function App() {
       const results = await runAction(() =>
         Promise.allSettled(
           overdueItems.map((item) =>
-            apiRequest(token, `/api/books/${item.bookId}/return`, {
+            apiRequest(`/api/books/${item.bookId}/return`, {
               method: 'POST',
               body: JSON.stringify({ notes: 'Bulk returned from overdue list' })
             })
@@ -1202,11 +1227,10 @@ function App() {
   }
 
   async function generateCode(book: Book, type: 'qr' | 'barcode') {
-    if (!token) return;
     clearStatus();
 
     try {
-      const response = await runAction(() => apiRequest<{ value: string }>(token, `/api/books/${book.id}/codes`, {
+      const response = await runAction(() => apiRequest<{ value: string }>(`/api/books/${book.id}/codes`, {
         method: 'POST',
         body: JSON.stringify({ type, label: `auto-${type}` })
       }));
@@ -1240,7 +1264,6 @@ function App() {
   }
 
   async function applyBulkBookChanges() {
-    if (!token) return;
     clearStatus();
 
     try {
@@ -1267,7 +1290,7 @@ function App() {
       const results = await runAction(() =>
         Promise.allSettled(
           selectedBooks.map((book) =>
-            apiRequest<{ id: string; version: number }>(token, `/api/books/${book.id}`, {
+            apiRequest<{ id: string; version: number }>(`/api/books/${book.id}`, {
               method: 'PUT',
               body: JSON.stringify({
                 ...updates,
@@ -1350,7 +1373,6 @@ function App() {
 
   async function resolveScanCode(event: FormEvent) {
     event.preventDefault();
-    if (!token) return;
     clearStatus();
     setScanResult('');
 
@@ -1360,7 +1382,7 @@ function App() {
         throw new Error('Please enter a QR or barcode value.');
       }
 
-      const response = await runAction(() => apiRequest<{ book: Book }>(token, `/api/scan/${encodeURIComponent(value)}`));
+      const response = await runAction(() => apiRequest<{ book: Book }>(`/api/scan/${encodeURIComponent(value)}`));
       setScanResult(`${response.book.title} by ${response.book.author}`);
     } catch (e) {
       setError((e as Error).message);
@@ -1368,11 +1390,10 @@ function App() {
   }
 
   async function exportCsv() {
-    if (!token) return;
     clearStatus();
 
     try {
-      const csv = await runAction(() => apiRequest<string>(token, '/api/export/books.csv', undefined, true));
+      const csv = await runAction(() => apiRequest<string>('/api/export/books.csv', undefined, true));
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
@@ -1388,11 +1409,10 @@ function App() {
 
   async function createRoom(event: FormEvent) {
     event.preventDefault();
-    if (!token) return;
     clearStatus();
 
     try {
-      await runAction(() => apiRequest<{ id: string }>(token, '/api/rooms', {
+      await runAction(() => apiRequest<{ id: string }>('/api/rooms', {
         method: 'POST',
         body: JSON.stringify({
           code: roomForm.code.trim(),
@@ -1410,8 +1430,6 @@ function App() {
   }
 
   async function deleteRoom(room: Room) {
-    if (!token) return;
-
     if (!window.confirm(`Delete room "${room.code}"?`)) {
       return;
     }
@@ -1419,7 +1437,7 @@ function App() {
     clearStatus();
 
     try {
-      await runAction(() => apiRequest<void>(token, `/api/rooms/${room.id}`, { method: 'DELETE' }));
+      await runAction(() => apiRequest<void>(`/api/rooms/${room.id}`, { method: 'DELETE' }));
       await Promise.all([loadRooms(), loadRoomSummary()]);
       setMessage(`Room deleted: ${room.code}`);
     } catch (e) {
@@ -1445,7 +1463,6 @@ function App() {
 
   async function saveCustomField(event: FormEvent) {
     event.preventDefault();
-    if (!token) return;
     clearStatus();
 
     try {
@@ -1487,7 +1504,7 @@ function App() {
       const path = editingCustomFieldId ? `/api/custom-fields/${editingCustomFieldId}` : '/api/custom-fields';
       const method = editingCustomFieldId ? 'PUT' : 'POST';
 
-      await runAction(() => apiRequest<{ id: string }>(token, path, {
+      await runAction(() => apiRequest<{ id: string }>(path, {
         method,
         body: JSON.stringify({
           key: normalizedKey,
@@ -1508,8 +1525,6 @@ function App() {
   }
 
   async function deleteCustomField(field: CustomField) {
-    if (!token) return;
-
     if (!window.confirm(`Delete custom field "${field.key}"?`)) {
       return;
     }
@@ -1517,7 +1532,7 @@ function App() {
     clearStatus();
 
     try {
-      await runAction(() => apiRequest<void>(token, `/api/custom-fields/${field.id}`, { method: 'DELETE' }));
+      await runAction(() => apiRequest<void>(`/api/custom-fields/${field.id}`, { method: 'DELETE' }));
       if (editingCustomFieldId === field.id) {
         resetCustomFieldForm();
       }
@@ -1530,7 +1545,6 @@ function App() {
 
   async function runImport(event: FormEvent) {
     event.preventDefault();
-    if (!token) return;
     clearStatus();
 
     try {
@@ -1555,7 +1569,6 @@ function App() {
       }));
 
       const result = await runAction(() => apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(
-        token,
         '/api/import/books',
         {
           method: 'POST',
@@ -1576,7 +1589,6 @@ function App() {
 
   async function importFromXlsx(event: FormEvent) {
     event.preventDefault();
-    if (!token) return;
     clearStatus();
 
     const form = event.target as HTMLFormElement;
@@ -1677,7 +1689,7 @@ function App() {
 
           try {
             const result = await runAction(() =>
-              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>('/api/import/books', {
                 method: 'POST',
                 body: JSON.stringify({ dryRun: true, rows: chunk })
               })
@@ -1709,7 +1721,7 @@ function App() {
 
           try {
             const result = await runAction(() =>
-              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(token, '/api/import/books', {
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>('/api/import/books', {
                 method: 'POST',
                 body: JSON.stringify({ dryRun: false, rows: chunk })
               })
@@ -1978,7 +1990,14 @@ function App() {
       )}
 
       {/* ═══ LOGIN ═══ */}
-      {!loggedIn ? (
+      {sessionLoading ? (
+        <div className="simple-center">
+          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '1rem' }}>
+            <div style={{ fontSize: '2.5rem', marginBottom: '0.75rem' }}>📚</div>
+            <p>Loading…</p>
+          </div>
+        </div>
+      ) : !loggedIn ? (
         <div className="simple-center">
           <div className="simple-card">
             <div className="login-logo">📚</div>
@@ -2038,6 +2057,10 @@ function App() {
                     <button className="primary small" onClick={() => setShowAddBook((v) => !v)}>
                       {showAddBook ? '✕ Cancel' : '+ Add Book'}
                     </button>
+                    <button className="secondary small" onClick={() => void checkDuplicates()}>Check Duplicates</button>
+                    {currentUser?.role === 'admin' && (
+                      <button className="secondary small" onClick={() => void normalizeAllBooks()}>Normalize All</button>
+                    )}
                     <button className="secondary small" onClick={exportFilteredBooksCsv}>Export CSV</button>
                   </div>
                 </div>
@@ -2103,6 +2126,52 @@ function App() {
                   </div>
                 )}
 
+                {/* Duplicate warning after creating a book */}
+                {duplicateWarning.length > 0 && (
+                  <div className="card" style={{ borderLeft: '3px solid var(--warning, #f59e0b)', background: 'var(--bg-warning, #fffbeb)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                      <div>
+                        <strong>⚠️ Possible Duplicate Detected</strong>
+                        <p style={{ marginTop: '0.4rem', marginBottom: '0.5rem', fontSize: '0.875rem', color: 'var(--text-muted)' }}>
+                          The book you just added matches existing entries:
+                        </p>
+                        <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.875rem' }}>
+                          {duplicateWarning.map((d) => (
+                            <li key={d.id}><em>{d.title}</em> — {d.author}{d.isbn ? ` (ISBN: ${d.isbn})` : ''}</li>
+                          ))}
+                        </ul>
+                      </div>
+                      <button className="secondary small" onClick={() => setDuplicateWarning([])}>Dismiss</button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Duplicates panel */}
+                {showDuplicatesPanel && duplicateGroups.length > 0 && (
+                  <div className="card" style={{ borderLeft: '3px solid var(--warning, #f59e0b)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                      <strong>⚠️ Duplicate Books Found ({duplicateGroups.length} group{duplicateGroups.length !== 1 ? 's' : ''})</strong>
+                      <button className="secondary small" onClick={() => setShowDuplicatesPanel(false)}>Close</button>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                      {duplicateGroups.map((group, i) => (
+                        <div key={i} style={{ background: 'var(--bg-muted, #f9fafb)', borderRadius: '6px', padding: '0.75rem' }}>
+                          <p style={{ margin: '0 0 0.4rem', fontWeight: 600, fontSize: '0.875rem' }}>
+                            "{group[0].title}" — {group[0].author}
+                          </p>
+                          <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                            {group.map((entry) => (
+                              <li key={entry.id}>
+                                ID: {entry.id.slice(0, 8)}…{entry.isbn ? ` | ISBN: ${entry.isbn}` : ''}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {/* Search & Filter */}
                 <div className="card">
                   <div className="search-bar">
@@ -2112,7 +2181,7 @@ function App() {
                         value={q}
                         onChange={(e) => setQ(e.target.value)}
                         placeholder="Title, author, or ISBN…"
-                        onKeyDown={(e) => { if (e.key === 'Enter') { setCurrentPage(1); void loadBooks(undefined, 1); } }}
+                        onKeyDown={(e) => { if (e.key === 'Enter') { setCurrentPage(1); void loadBooks(1); } }}
                       />
                     </div>
                     <div className="filter-field">
@@ -2131,8 +2200,8 @@ function App() {
                     </div>
                     <div className="search-actions">
                       <label>.</label>
-                      <button className="primary" onClick={() => { setCurrentPage(1); void loadBooks(undefined, 1); }}>Search</button>
-                      <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); setCurrentPage(1); void loadBooks(undefined, 1); }}>Reset</button>
+                      <button className="primary" onClick={() => { setCurrentPage(1); void loadBooks(1); }}>Search</button>
+                      <button className="secondary" onClick={() => { setQ(''); setStatus(''); setRoomCode(''); setCurrentPage(1); void loadBooks(1); }}>Reset</button>
                     </div>
                   </div>
                 </div>
@@ -2177,7 +2246,7 @@ function App() {
                       <div className="pagination">
                         <button
                           className="secondary small"
-                          onClick={() => void loadBooks(undefined, currentPage - 1)}
+                          onClick={() => void loadBooks( currentPage - 1)}
                           disabled={currentPage === 1}
                         >← Previous</button>
                         <span className="pagination-info">
@@ -2186,7 +2255,7 @@ function App() {
                         </span>
                         <button
                           className="secondary small"
-                          onClick={() => void loadBooks(undefined, currentPage + 1)}
+                          onClick={() => void loadBooks( currentPage + 1)}
                           disabled={currentPage >= Math.ceil(totalBooksCount / 50)}
                         >Next →</button>
                       </div>
