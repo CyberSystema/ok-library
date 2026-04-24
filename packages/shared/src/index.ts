@@ -160,6 +160,8 @@ export const BookFilterQuerySchema = z.object({
   fuzzyTypos: z.coerce.boolean().default(true),
   searchFields: z.string().max(200).optional(),
   status: BookStatusSchema.optional(),
+  language: z.string().max(50).optional(),
+  year: z.coerce.number().int().min(1000).max(3000).optional(),
   roomCode: z.string().max(64).optional(),
   shelfCode: z.string().max(64).optional(),
   sortBy: z.enum(['title', 'author', 'updatedAt', 'publicationYear', 'status']).default('updatedAt'),

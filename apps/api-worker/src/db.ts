@@ -78,6 +78,8 @@ export async function queryBooksWithFilters(
     fuzzyTypos?: boolean;
     searchFields?: string;
     status?: string;
+    language?: string;
+    year?: number;
     roomCode?: string;
     shelfCode?: string;
     sortBy: string;
@@ -169,6 +171,16 @@ export async function queryBooksWithFilters(
   if (opts.status) {
     where.push('status = ?');
     values.push(opts.status);
+  }
+
+  if (opts.language) {
+    where.push('LOWER(language) = LOWER(?)');
+    values.push(opts.language);
+  }
+
+  if (opts.year) {
+    where.push('publication_year = ?');
+    values.push(opts.year);
   }
 
   if (opts.roomCode) {

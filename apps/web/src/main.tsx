@@ -89,7 +89,7 @@ type RoomSummaryItem = {
   maintenance_books: number;
 };
 
-type AppSection = 'books' | 'circulation' | 'import';
+type AppSection = 'books' | 'circulation' | 'import' | 'maintenance';
 
 type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
 type DuplicateGroup = DuplicateEntry[];
@@ -245,13 +245,15 @@ function App() {
   const [searchFields, setSearchFields] = useState<SearchField[]>(['title', 'author', 'isbn']);
   const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
   const [status, setStatus] = useState('');
-  const [roomCode, setRoomCode] = useState('');
+  const [filterLanguage, setFilterLanguage] = useState('');
+  const [filterCategory, setFilterCategory] = useState('');
+  const [filterYear, setFilterYear] = useState('');
+  const [shelfFilter, setShelfFilter] = useState('');
 
   const [createForm, setCreateForm] = useState({
     title: '',
     author: '',
     isbn: '',
-    roomCode: '',
     shelfCode: '',
     publicationYear: '',
     customFieldsJson: '{}'
@@ -262,7 +264,6 @@ function App() {
     title: '',
     author: '',
     isbn: '',
-    roomCode: '',
     shelfCode: '',
     publicationYear: '',
     status: 'available' as BookStatus,
@@ -344,6 +345,7 @@ function App() {
   const totalBooks = books.length;
   const availableBooks =
     roomSummary.reduce((sum, room) => sum + Number(room.available_books ?? 0), 0) + Number(unassignedSummary.availableBooks ?? 0);
+  const availableBooksDisplay = availableBooks.toLocaleString('de-DE');
   const borrowedBooks = books.filter((book) => book.status === 'borrowed').length;
   const overdueCount = activeBorrows.filter((item) => item.isOverdue).length;
   const dueSoonCount = activeBorrows.filter((item) => {
@@ -361,7 +363,8 @@ function App() {
   const sectionMeta: Array<{ key: AppSection; label: string }> = [
     { key: 'books', label: 'Library' },
     { key: 'circulation', label: 'Loans' },
-    { key: 'import', label: 'Import' }
+    { key: 'import', label: 'Import/Export' },
+    { key: 'maintenance', label: 'Maintainance' }
   ];
 
   const overdueBorrowedBookIds = useMemo(
@@ -830,9 +833,13 @@ function App() {
       if (qExclude) query.set('qExclude', qExclude);
       query.set('qMode', qMode);
       query.set('partialWords', String(partialWords));
+      query.set('fuzzyTypos', String(fuzzyTypos));
       query.set('searchFields', searchFields.join(','));
       if (status) query.set('status', status);
-      if (roomCode) query.set('roomCode', roomCode);
+      if (filterLanguage) query.set('language', filterLanguage);
+      if (filterYear) query.set('year', filterYear);
+      if (filterCategory) query.set('custom_category', filterCategory);
+      if (shelfFilter) query.set('shelfCode', shelfFilter);
       query.set('sortBy', 'updatedAt');
       query.set('sortDir', 'desc');
       query.set('page', page.toString());
@@ -917,7 +924,6 @@ function App() {
           title: createForm.title.trim(),
           author: createForm.author.trim(),
           isbn: createForm.isbn.trim() || null,
-          roomCode: createForm.roomCode.trim() || null,
           shelfCode: createForm.shelfCode.trim() || null,
           publicationYear,
           tags: [],
@@ -930,7 +936,6 @@ function App() {
         title: '',
         author: '',
         isbn: '',
-        roomCode: '',
         shelfCode: '',
         publicationYear: '',
         customFieldsJson: '{}'
@@ -998,7 +1003,6 @@ function App() {
       title: book.title,
       author: book.author,
       isbn: book.isbn ?? '',
-      roomCode: book.roomCode ?? '',
       shelfCode: book.shelfCode ?? '',
       publicationYear: book.publicationYear?.toString() ?? '',
       status: book.status,
@@ -1102,7 +1106,6 @@ function App() {
           title: editForm.title.trim(),
           author: editForm.author.trim(),
           isbn: editForm.isbn.trim() || null,
-          roomCode: editForm.roomCode.trim() || null,
           shelfCode: editForm.shelfCode.trim() || null,
           publicationYear,
           customFields: customFieldsValue,
@@ -1120,7 +1123,6 @@ function App() {
               title: editForm.title.trim(),
               author: editForm.author.trim(),
               isbn: editForm.isbn.trim() || null,
-              roomCode: editForm.roomCode.trim() || null,
               shelfCode: editForm.shelfCode.trim() || null,
               status: editForm.status,
               version: result.version,
@@ -1810,7 +1812,6 @@ function App() {
       title: detailBook.title,
       author: detailBook.author,
       isbn: detailBook.isbn ?? '',
-      roomCode: detailBook.roomCode ?? '',
       shelfCode: detailBook.shelfCode ?? '',
       publicationYear: detailBook.publicationYear?.toString() ?? '',
       status: detailBook.status,
@@ -1987,10 +1988,6 @@ function App() {
                   </div>
                   <div className="form-row">
                     <div>
-                      <label>Room Code</label>
-                      <input value={editForm.roomCode} onChange={(e) => setEditForm({ ...editForm, roomCode: e.target.value })} placeholder="e.g. A1" />
-                    </div>
-                    <div>
                       <label>Shelf Code</label>
                       <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder="e.g. Shelf-3" />
                     </div>
@@ -2083,10 +2080,6 @@ function App() {
                     <button className="primary small" onClick={() => setShowAddBook((v) => !v)}>
                       {showAddBook ? '✕ Cancel' : '+ Add Book'}
                     </button>
-                    <button className="secondary small" onClick={() => void checkDuplicates()}>Check Duplicates</button>
-                    {currentUser?.role === 'admin' && (
-                      <button className="secondary small" onClick={() => void normalizeAllBooks()}>Normalize All</button>
-                    )}
                     <button className="secondary small" onClick={exportFilteredBooksCsv}>Export CSV</button>
                   </div>
                 </div>
@@ -2099,7 +2092,7 @@ function App() {
                   </div>
                   <div className="stat-box success">
                     <span className="stat-box-label">Available</span>
-                    <span className="stat-box-value">{availableBooks}</span>
+                    <span className="stat-box-value">{availableBooksDisplay}</span>
                   </div>
                   <div className="stat-box warning">
                     <span className="stat-box-label">Borrowed</span>
@@ -2136,10 +2129,6 @@ function App() {
                           <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder="e.g. 2020" />
                         </div>
                         <div>
-                          <label>Room Code</label>
-                          <input value={createForm.roomCode} onChange={(e) => setCreateForm({ ...createForm, roomCode: e.target.value })} placeholder="e.g. A1" />
-                        </div>
-                        <div>
                           <label>Shelf Code</label>
                           <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder="e.g. Shelf-3" />
                         </div>
@@ -2172,32 +2161,6 @@ function App() {
                   </div>
                 )}
 
-                {/* Duplicates panel */}
-                {showDuplicatesPanel && duplicateGroups.length > 0 && (
-                  <div className="card" style={{ borderLeft: '3px solid var(--warning, #f59e0b)' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-                      <strong>⚠️ Duplicate Books Found ({duplicateGroups.length} group{duplicateGroups.length !== 1 ? 's' : ''})</strong>
-                      <button className="secondary small" onClick={() => setShowDuplicatesPanel(false)}>Close</button>
-                    </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                      {duplicateGroups.map((group, i) => (
-                        <div key={i} style={{ background: 'var(--bg-muted, #f9fafb)', borderRadius: '6px', padding: '0.75rem' }}>
-                          <p style={{ margin: '0 0 0.4rem', fontWeight: 600, fontSize: '0.875rem' }}>
-                            "{group[0].title}" — {group[0].author}
-                          </p>
-                          <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-                            {group.map((entry) => (
-                              <li key={entry.id}>
-                                ID: {entry.id.slice(0, 8)}…{entry.isbn ? ` | ISBN: ${entry.isbn}` : ''}
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
                 {/* Search & Filter */}
                 <div className="card">
                   <div className="search-bar">
@@ -2221,8 +2184,20 @@ function App() {
                       </select>
                     </div>
                     <div className="filter-field">
-                      <label>Room</label>
-                      <input value={roomCode} onChange={(e) => setRoomCode(e.target.value)} placeholder="Room code" />
+                      <label>Shelf</label>
+                      <input value={shelfFilter} onChange={(e) => setShelfFilter(e.target.value)} placeholder="Shelf code" />
+                    </div>
+                    <div className="filter-field">
+                      <label>Language</label>
+                      <input value={filterLanguage} onChange={(e) => setFilterLanguage(e.target.value)} placeholder="e.g. English" />
+                    </div>
+                    <div className="filter-field">
+                      <label>Category</label>
+                      <input value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} placeholder="e.g. Theology" />
+                    </div>
+                    <div className="filter-field">
+                      <label>Year</label>
+                      <input type="number" value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder="e.g. 2024" />
                     </div>
                     <div className="search-actions">
                       <label>.</label>
@@ -2238,7 +2213,10 @@ function App() {
                         setFuzzyTypos(true);
                         setSearchFields(['title', 'author', 'isbn']);
                         setStatus('');
-                        setRoomCode('');
+                        setFilterLanguage('');
+                        setFilterCategory('');
+                        setFilterYear('');
+                        setShelfFilter('');
                         setCurrentPage(1);
                         void loadBooks(1);
                       }}>Reset</button>
@@ -2289,7 +2267,6 @@ function App() {
                           ['publisher', 'Publisher'],
                           ['language', 'Language'],
                           ['description', 'Description'],
-                          ['roomCode', 'Room'],
                           ['shelfCode', 'Shelf'],
                           ['tags', 'Tags'],
                           ['custom', 'Custom Fields']
@@ -2531,6 +2508,61 @@ function App() {
                   </p>
                   <button className="secondary" onClick={applyDefaultBookStructure}>Apply Default Structure</button>
                 </div>
+              </>
+            )}
+
+            {/* ═══ MAINTAINANCE TAB ═══ */}
+            {currentSection === 'maintenance' && (
+              <>
+                <div className="section-header">
+                  <div className="section-header-text">
+                    <h2>Maintainance</h2>
+                    <p>Database hygiene and duplicate prevention tools</p>
+                  </div>
+                </div>
+
+                <div className="card">
+                  <h3>🔎 Duplicate Checker</h3>
+                  <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
+                    Scan the full catalog for entries with same title and author.
+                  </p>
+                  <button className="secondary" onClick={() => void checkDuplicates()}>Check Duplicates</button>
+                </div>
+
+                {showDuplicatesPanel && duplicateGroups.length > 0 && (
+                  <div className="card" style={{ borderLeft: '3px solid var(--warning, #f59e0b)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+                      <strong>⚠️ Duplicate Books Found ({duplicateGroups.length} group{duplicateGroups.length !== 1 ? 's' : ''})</strong>
+                      <button className="secondary small" onClick={() => setShowDuplicatesPanel(false)}>Close</button>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                      {duplicateGroups.map((group, i) => (
+                        <div key={i} style={{ background: 'var(--bg-muted, #f9fafb)', borderRadius: '6px', padding: '0.75rem' }}>
+                          <p style={{ margin: '0 0 0.4rem', fontWeight: 600, fontSize: '0.875rem' }}>
+                            "{group[0].title}" — {group[0].author}
+                          </p>
+                          <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                            {group.map((entry) => (
+                              <li key={entry.id}>
+                                ID: {entry.id.slice(0, 8)}…{entry.isbn ? ` | ISBN: ${entry.isbn}` : ''}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {currentUser?.role === 'admin' && (
+                  <div className="card">
+                    <h3>🧹 Normalize Entries</h3>
+                    <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
+                      Apply normalization to all existing books (spacing, casing, ISBN cleanup, and tags).
+                    </p>
+                    <button className="secondary" onClick={() => void normalizeAllBooks()}>Normalize All</button>
+                  </div>
+                )}
               </>
             )}
 
