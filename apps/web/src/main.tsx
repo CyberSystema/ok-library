@@ -1,7 +1,11 @@
-import React, { FormEvent, useEffect, useMemo, useState } from 'react';
+import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
-import * as XLSX from 'xlsx';
 import './styles.css';
+
+// Lazy-loaded only when the user opens the Import tab — saves ~1MB from the initial bundle.
+async function loadXlsx() {
+  return await import('xlsx');
+}
 
 type BookStatus = 'available' | 'borrowed' | 'lost' | 'maintenance';
 
@@ -19,13 +23,21 @@ type Book = {
   publisher?: string | null;
   language?: string | null;
   description?: string | null;
+  legacyId?: string | null;
 };
 
-type Room = {
-  id: string;
-  code: string;
-  name: string;
+type CatalogRow = {
+  legacyId?: string | null;
+  title?: string | null;
+  author?: string | null;
+  isbn?: string | null;
+  publicationYear?: number | null;
+  publisher?: string | null;
+  language?: string | null;
   description?: string | null;
+  shelfCode?: string | null;
+  needsReview?: boolean;
+  customFields: Record<string, string | number | boolean | null>;
 };
 
 type CustomField = {
@@ -89,6 +101,12 @@ type RoomSummaryItem = {
   maintenance_books: number;
 };
 
+type CategoryItem = {
+  code: string;
+  label: string | null;
+  count: number;
+};
+
 type AppSection = 'books' | 'circulation' | 'import' | 'maintenance';
 
 type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
@@ -98,9 +116,35 @@ type SearchField = 'title' | 'author' | 'isbn' | 'publisher' | 'language' | 'des
 
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
 const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
-const LOCAL_STORAGE_KEY = 'ok-library-web-state-v1';
 const IMPORT_CHUNK_SIZE = 500;
 const IMPORT_MIN_CHUNK_SIZE = 1;
+const PAGE_SIZE = 50;
+const DEBOUNCE_MS = 350;
+const PREFS_STORAGE_KEY = 'ok-library-prefs-v1';
+
+type SortBy = 'updatedAt' | 'title' | 'author' | 'publicationYear' | 'status';
+type SortDir = 'asc' | 'desc';
+type Density = 'comfortable' | 'compact';
+
+// Kept in sync with CATALOG_CUSTOM_FIELDS in apps/api-worker/src/index.ts.
+const CATALOG_FIELD_COUNT = 25;
+const TITLE_PLACEHOLDER = '(Untitled)';
+const AUTHOR_PLACEHOLDER = '(Unknown)';
+
+function isPlaceholder(value: string | null | undefined, kind: 'title' | 'author'): boolean {
+  const text = (value ?? '').trim();
+  return kind === 'title' ? text === TITLE_PLACEHOLDER : text === AUTHOR_PLACEHOLDER;
+}
+
+function displayTitle(book: { title: string }): string {
+  const trimmed = book.title?.trim() ?? '';
+  return trimmed === '' ? TITLE_PLACEHOLDER : trimmed;
+}
+
+function displayAuthor(book: { author: string }): string {
+  const trimmed = book.author?.trim() ?? '';
+  return trimmed === '' ? AUTHOR_PLACEHOLDER : trimmed;
+}
 
 function joinApiUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
@@ -232,7 +276,6 @@ function App() {
   const [currentSection, setCurrentSection] = useState<AppSection>('books');
 
   const [books, setBooks] = useState<Book[]>([]);
-  const [rooms, setRooms] = useState<Room[]>([]);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const [totalBooksCount, setTotalBooksCount] = useState(0);
@@ -241,7 +284,7 @@ function App() {
   const [qExclude, setQExclude] = useState('');
   const [qMode, setQMode] = useState<SearchMode>('all');
   const [partialWords, setPartialWords] = useState(true);
-  const [fuzzyTypos, setFuzzyTypos] = useState(true);
+  const [fuzzyTypos, setFuzzyTypos] = useState(false);
   const [searchFields, setSearchFields] = useState<SearchField[]>(['title', 'author', 'isbn']);
   const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
   const [status, setStatus] = useState('');
@@ -249,6 +292,18 @@ function App() {
   const [filterCategory, setFilterCategory] = useState('');
   const [filterYear, setFilterYear] = useState('');
   const [shelfFilter, setShelfFilter] = useState('');
+  const [sortBy, setSortBy] = useState<SortBy>('updatedAt');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [density, setDensity] = useState<Density>('comfortable');
+  const [jumpPage, setJumpPage] = useState('');
+  const [categories, setCategories] = useState<CategoryItem[]>([]);
+  const [categoryFilter, setCategoryFilter] = useState<string>('');
+  const [needsReviewFilter, setNeedsReviewFilter] = useState(false);
+  const [needsReviewCount, setNeedsReviewCount] = useState(0);
+  const [showCategoryRail, setShowCategoryRail] = useState(true);
+  const [categoryRailQuery, setCategoryRailQuery] = useState('');
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const lastSearchSignatureRef = useRef<string>('');
 
   const [createForm, setCreateForm] = useState({
     title: '',
@@ -256,8 +311,11 @@ function App() {
     isbn: '',
     shelfCode: '',
     publicationYear: '',
-    customFieldsJson: '{}'
+    publisher: '',
+    language: '',
+    description: ''
   });
+  const [createAttrValues, setCreateAttrValues] = useState<Record<string, unknown>>({});
 
   const [editForm, setEditForm] = useState({
     id: '',
@@ -268,10 +326,11 @@ function App() {
     publicationYear: '',
     status: 'available' as BookStatus,
     version: 0,
-    customFieldsJson: '{}'
+    publisher: '',
+    language: '',
+    description: ''
   });
 
-  const [roomForm, setRoomForm] = useState({ code: '', name: '', description: '' });
   const [fieldForm, setFieldForm] = useState({
     key: '',
     label: '',
@@ -342,11 +401,54 @@ function App() {
     });
   }, [loggedIn, didBootstrapData]);
 
-  const totalBooks = books.length;
-  const availableBooks =
+  // Restore UI preferences (sort, density) from localStorage so the app feels personal across sessions.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PREFS_STORAGE_KEY);
+      if (!raw) return;
+      const prefs = JSON.parse(raw) as { sortBy?: SortBy; sortDir?: SortDir; density?: Density };
+      if (prefs.sortBy) setSortBy(prefs.sortBy);
+      if (prefs.sortDir) setSortDir(prefs.sortDir);
+      if (prefs.density) setDensity(prefs.density);
+    } catch {
+      // Ignore — corrupted prefs shouldn't break the app.
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify({ sortBy, sortDir, density }));
+    } catch {
+      // Storage may be disabled (private mode); ignore.
+    }
+  }, [sortBy, sortDir, density]);
+
+  // Power-user shortcuts: "/" focuses search, "Esc" closes the open detail modal.
+  useEffect(() => {
+    if (!loggedIn) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === '/' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+        return;
+      }
+      if (event.key === 'Escape' && detailBook) {
+        setDetailBook(null);
+        setDetailMode('view');
+        setBookHistory([]);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [loggedIn, detailBook]);
+
+  const availableBooksFromSummary =
     roomSummary.reduce((sum, room) => sum + Number(room.available_books ?? 0), 0) + Number(unassignedSummary.availableBooks ?? 0);
-  const availableBooksDisplay = availableBooks.toLocaleString('de-DE');
-  const borrowedBooks = books.filter((book) => book.status === 'borrowed').length;
+  const borrowedBooksFromSummary =
+    roomSummary.reduce((sum, room) => sum + Number(room.borrowed_books ?? 0), 0) + Number(unassignedSummary.borrowedBooks ?? 0);
+  const availableBooksDisplay = availableBooksFromSummary.toLocaleString('en-US');
+  const borrowedBooksDisplay = borrowedBooksFromSummary.toLocaleString('en-US');
   const overdueCount = activeBorrows.filter((item) => item.isOverdue).length;
   const dueSoonCount = activeBorrows.filter((item) => {
     if (item.isOverdue) {
@@ -355,10 +457,6 @@ function App() {
     const diffMs = new Date(item.dueAt).getTime() - Date.now();
     return diffMs > 0 && diffMs <= 48 * 60 * 60 * 1000;
   }).length;
-  const booksWithShelf = books.filter((book) => Boolean(book.roomCode && book.shelfCode)).length;
-  const booksWithIsbn = books.filter((book) => Boolean(book.isbn && String(book.isbn).trim())).length;
-  const catalogCompleteness = totalBooks > 0 ? Math.round((booksWithIsbn / totalBooks) * 100) : 0;
-  const locationCompleteness = totalBooks > 0 ? Math.round((booksWithShelf / totalBooks) * 100) : 0;
 
   const sectionMeta: Array<{ key: AppSection; label: string }> = [
     { key: 'books', label: 'Library' },
@@ -441,13 +539,51 @@ function App() {
     }
   }
 
-  function parseJsonObject(text: string, fieldLabel: string): Record<string, unknown> {
-    const value = JSON.parse(text || '{}') as unknown;
-    if (!value || Array.isArray(value) || typeof value !== 'object') {
-      throw new Error(`${fieldLabel} must be a JSON object (example: {}).`);
+  // Convert one form-input value into the type the server expects for that
+  // custom-field definition. Empty/missing → null (skip from payload).
+  function coerceCustomFieldValue(field: CustomField, raw: unknown): unknown {
+    if (raw === '' || raw === undefined || raw === null) return null;
+    if (field.type === 'number') {
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
     }
+    if (field.type === 'boolean') {
+      if (typeof raw === 'boolean') return raw;
+      const t = String(raw).toLowerCase();
+      return t === 'true' || t === 'yes' || t === '1' || t === 'on';
+    }
+    if (field.type === 'date') {
+      const d = new Date(String(raw));
+      return Number.isNaN(d.getTime()) ? null : d.toISOString();
+    }
+    return String(raw);
+  }
 
-    return value as Record<string, unknown>;
+  // Walk the form values once and build the {key: value} object the API accepts.
+  // Throws when a required field is missing so callers can surface a single
+  // error instead of letting the server reject after a round-trip.
+  function buildCustomFieldsPayload(values: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    const requiredMissing: string[] = [];
+    for (const field of customFields) {
+      const raw = values[field.key];
+      const empty = raw === undefined || raw === null || raw === '';
+      if (field.required && empty) {
+        requiredMissing.push(field.label);
+        continue;
+      }
+      if (empty) continue;
+      const v = coerceCustomFieldValue(field, raw);
+      if (v === null || v === undefined) {
+        if (field.required) requiredMissing.push(field.label);
+        continue;
+      }
+      out[field.key] = v;
+    }
+    if (requiredMissing.length > 0) {
+      throw new Error(`Please fill required attributes: ${requiredMissing.join(', ')}`);
+    }
+    return out;
   }
 
   function parsePublicationYear(raw: string): number | null {
@@ -756,12 +892,32 @@ function App() {
   async function refreshEverything() {
     await Promise.all([
       loadBooks(),
-      loadRooms(),
       loadRoomSummary(),
       loadCustomFields(),
       loadActiveBorrows(),
-      loadAuditLogs()
+      loadAuditLogs(),
+      loadCategories(),
+      loadNeedsReviewCount()
     ]);
+  }
+
+  async function loadCategories() {
+    try {
+      const response = await apiRequest<{ items: CategoryItem[] }>('/api/categories');
+      setCategories(response.items ?? []);
+    } catch {
+      // Best-effort: a stale category rail isn't worth blocking the UI for.
+      setCategories([]);
+    }
+  }
+
+  async function loadNeedsReviewCount() {
+    try {
+      const response = await apiRequest<{ count: number }>('/api/needs-review-count');
+      setNeedsReviewCount(response.count ?? 0);
+    } catch {
+      setNeedsReviewCount(0);
+    }
   }
 
   async function login(event: FormEvent) {
@@ -792,11 +948,11 @@ function App() {
     setCurrentUser(null);
     setDidBootstrapData(false);
     setBooks([]);
-    setRooms([]);
     setCustomFields([]);
     setActiveBorrows([]);
     setAuditItems([]);
     setBookHistory([]);
+    setCategories([]);
     setMessage('Signed out.');
   }
 
@@ -825,7 +981,7 @@ function App() {
     }
   }
 
-  async function loadBooks(pageOverride?: number) {
+  const loadBooks = useCallback(async (pageOverride?: number) => {
     try {
       const page = pageOverride ?? currentPage;
       const query = new URLSearchParams();
@@ -839,11 +995,13 @@ function App() {
       if (filterLanguage) query.set('language', filterLanguage);
       if (filterYear) query.set('year', filterYear);
       if (filterCategory) query.set('custom_category', filterCategory);
+      if (categoryFilter) query.set('custom_category_code', categoryFilter);
+      if (needsReviewFilter) query.set('custom_needs_review', '1');
       if (shelfFilter) query.set('shelfCode', shelfFilter);
-      query.set('sortBy', 'updatedAt');
-      query.set('sortDir', 'desc');
+      query.set('sortBy', sortBy);
+      query.set('sortDir', sortDir);
       query.set('page', page.toString());
-      query.set('pageSize', '50');
+      query.set('pageSize', String(PAGE_SIZE));
 
       const response = await apiRequest<{ items: Book[]; total: number }>(`/api/books?${query.toString()}`);
       setBooks(response.items);
@@ -852,16 +1010,33 @@ function App() {
     } catch (e) {
       setError((e as Error).message);
     }
-  }
+  }, [
+    currentPage, q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
+    status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
+    shelfFilter, sortBy, sortDir
+  ]);
 
-  async function loadRooms() {
-    try {
-      const response = await apiRequest<{ items: Room[] }>('/api/rooms');
-      setRooms(response.items);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
+  // Debounced auto-search: any change to query/filters/sort re-fetches books on page 1.
+  useEffect(() => {
+    if (!loggedIn || !didBootstrapData) return;
+    const signature = JSON.stringify({
+      q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
+      status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
+      shelfFilter, sortBy, sortDir
+    });
+    if (signature === lastSearchSignatureRef.current) return;
+    lastSearchSignatureRef.current = signature;
+    const handle = window.setTimeout(() => {
+      void loadBooks(1);
+    }, DEBOUNCE_MS);
+    return () => window.clearTimeout(handle);
+  }, [
+    loggedIn, didBootstrapData,
+    q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
+    status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
+    shelfFilter, sortBy, sortDir,
+    loadBooks
+  ]);
 
   async function loadCustomFields() {
     try {
@@ -916,7 +1091,7 @@ function App() {
     setDuplicateWarning([]);
 
     try {
-      const customFieldsValue = parseJsonObject(createForm.customFieldsJson, 'Advanced custom fields');
+      const customFieldsValue = buildCustomFieldsPayload(createAttrValues);
       const publicationYear = parsePublicationYear(createForm.publicationYear);
       const result = await runAction(() => apiRequest<{ id: string; duplicateOf?: DuplicateEntry[] }>('/api/books', {
         method: 'POST',
@@ -925,6 +1100,9 @@ function App() {
           author: createForm.author.trim(),
           isbn: createForm.isbn.trim() || null,
           shelfCode: createForm.shelfCode.trim() || null,
+          publisher: createForm.publisher.trim() || null,
+          language: createForm.language.trim() || null,
+          description: createForm.description.trim() || null,
           publicationYear,
           tags: [],
           customFields: customFieldsValue,
@@ -938,8 +1116,11 @@ function App() {
         isbn: '',
         shelfCode: '',
         publicationYear: '',
-        customFieldsJson: '{}'
+        publisher: '',
+        language: '',
+        description: ''
       });
+      setCreateAttrValues({});
       setShowAddBook(false);
 
       if (result.duplicateOf && result.duplicateOf.length > 0) {
@@ -949,7 +1130,7 @@ function App() {
         setMessage('Book added successfully.');
       }
 
-      await Promise.all([loadBooks(), loadRoomSummary()]);
+      await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadNeedsReviewCount()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1007,7 +1188,9 @@ function App() {
       publicationYear: book.publicationYear?.toString() ?? '',
       status: book.status,
       version: book.version,
-      customFieldsJson: JSON.stringify(book.customFields ?? {}, null, 2)
+      publisher: book.publisher ?? '',
+      language: book.language ?? '',
+      description: book.description ?? ''
     });
     setCurrentSection('books');
     setAttributeEditorValues(book.customFields ?? {});
@@ -1098,7 +1281,7 @@ function App() {
     clearStatus();
 
     try {
-      const customFieldsValue = parseJsonObject(editForm.customFieldsJson, 'Advanced custom fields');
+      const customFieldsValue = buildCustomFieldsPayload(attributeEditorValues);
       const publicationYear = parsePublicationYear(editForm.publicationYear);
       const result = await runAction(() => apiRequest<{ id: string; version: number }>(`/api/books/${editForm.id}`, {
         method: 'PUT',
@@ -1107,6 +1290,9 @@ function App() {
           author: editForm.author.trim(),
           isbn: editForm.isbn.trim() || null,
           shelfCode: editForm.shelfCode.trim() || null,
+          publisher: editForm.publisher.trim() || null,
+          language: editForm.language.trim() || null,
+          description: editForm.description.trim() || null,
           publicationYear,
           customFields: customFieldsValue,
           status: editForm.status,
@@ -1124,13 +1310,18 @@ function App() {
               author: editForm.author.trim(),
               isbn: editForm.isbn.trim() || null,
               shelfCode: editForm.shelfCode.trim() || null,
+              publisher: editForm.publisher.trim() || null,
+              language: editForm.language.trim() || null,
+              description: editForm.description.trim() || null,
+              publicationYear: publicationYear ?? null,
+              customFields: customFieldsValue as Record<string, string | number | boolean | null>,
               status: editForm.status,
               version: result.version,
             }
           : prev
       );
       setDetailMode('view');
-      await loadBooks();
+      await Promise.all([loadBooks(), loadCategories(), loadNeedsReviewCount()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1435,44 +1626,6 @@ function App() {
     }
   }
 
-  async function createRoom(event: FormEvent) {
-    event.preventDefault();
-    clearStatus();
-
-    try {
-      await runAction(() => apiRequest<{ id: string }>('/api/rooms', {
-        method: 'POST',
-        body: JSON.stringify({
-          code: roomForm.code.trim(),
-          name: roomForm.name.trim(),
-          description: roomForm.description.trim() || null,
-          mapMetadata: {}
-        })
-      }));
-      setRoomForm({ code: '', name: '', description: '' });
-      await Promise.all([loadRooms(), loadRoomSummary()]);
-      setMessage('Room added.');
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
-  async function deleteRoom(room: Room) {
-    if (!window.confirm(`Delete room "${room.code}"?`)) {
-      return;
-    }
-
-    clearStatus();
-
-    try {
-      await runAction(() => apiRequest<void>(`/api/rooms/${room.id}`, { method: 'DELETE' }));
-      await Promise.all([loadRooms(), loadRoomSummary()]);
-      setMessage(`Room deleted: ${room.code}`);
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
   function resetCustomFieldForm() {
     setFieldForm({ key: '', label: '', type: 'text', required: false, enumOptionsCsv: '' });
     setEditingCustomFieldId(null);
@@ -1615,6 +1768,184 @@ function App() {
     }
   }
 
+  function isCatalogFormat(headers: string[]): boolean {
+    // Catalogue exports use snake_case columns. Detection is conservative: we
+    // require `id` plus at least one other catalog-distinct field so we don't
+    // mistakenly route a legacy mixed-case file through this path.
+    const set = new Set(headers.map((h) => h.trim().toLowerCase()));
+    if (!set.has('id')) return false;
+    const catalogMarkers = [
+      'authors', 'place_of_publication', 'category_code', 'source_sheet',
+      'isbn_13', 'shelf_location', 'cover_type', 'has_illustrations'
+    ];
+    return catalogMarkers.some((m) => set.has(m));
+  }
+
+  function toCatalogText(value: unknown, max = 1000): string | null {
+    if (value === null || value === undefined) return null;
+    const text = String(value).trim();
+    if (!text) return null;
+    return text.length > max ? text.slice(0, max) : text;
+  }
+
+  function toCatalogBoolean(value: unknown): boolean | null {
+    if (value === null || value === undefined) return null;
+    const text = String(value).trim().toLowerCase();
+    if (!text) return null;
+    if (['true', 'yes', '1', 'y'].includes(text)) return true;
+    if (['false', 'no', '0', 'n'].includes(text)) return false;
+    return null;
+  }
+
+  function toCatalogNumber(value: unknown): number | null {
+    if (value === null || value === undefined) return null;
+    const text = String(value).replace(/[^0-9.\-]/g, '');
+    if (!text) return null;
+    const n = Number(text);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function pickIsbn(row: Record<string, unknown>): string | null {
+    const isbn13 = toCatalogText(row.isbn_13, 32);
+    if (isbn13) return isbn13;
+    const isbn10 = toCatalogText(row.isbn_10, 32);
+    if (isbn10) return isbn10;
+    return null;
+  }
+
+  function buildCatalogRow(raw: Record<string, unknown>, reviewIds: Set<string>): CatalogRow | null {
+    // Lowercase-key the row so column casing doesn't matter.
+    const row = Object.fromEntries(
+      Object.entries(raw).map(([k, v]) => [k.trim().toLowerCase(), v])
+    ) as Record<string, unknown>;
+
+    // Skip fully-empty rows.
+    if (Object.values(row).every((v) => toCatalogText(v) === null)) {
+      return null;
+    }
+
+    const legacyId = toCatalogText(row.id, 64);
+    const title = toCatalogText(row.title, 300);
+    const author = toCatalogText(row.authors, 300);
+    const yearRaw = toCatalogNumber(row.published_year);
+    const publicationYear = yearRaw && yearRaw >= 1000 && yearRaw <= 3000 ? yearRaw : null;
+
+    const customFields: Record<string, string | number | boolean | null> = {};
+    const setField = (key: string, value: string | number | boolean | null) => {
+      if (value === null || value === undefined || value === '') return;
+      customFields[key] = value;
+    };
+    setField('series', toCatalogText(row.series, 300));
+    setField('volume_label', toCatalogText(row.volume_label, 300));
+    setField('volume_num', toCatalogText(row.volume_num, 50));
+    setField('editor', toCatalogText(row.editor, 300));
+    setField('translator', toCatalogText(row.translator, 300));
+    setField('place_of_publication', toCatalogText(row.place_of_publication, 200));
+    setField('edition', toCatalogText(row.edition, 50));
+    setField('category_code', toCatalogText(row.category_code, 32));
+    setField('category_label', toCatalogText(row.category_label, 200));
+    setField('cover_type', toCatalogText(row.cover_type, 50));
+    const pages = toCatalogNumber(row.pages);
+    if (pages !== null) setField('pages', pages);
+    setField('condition', toCatalogText(row.condition, 200));
+    setField('isbn_10', toCatalogText(row.isbn_10, 32));
+    setField('issn', toCatalogText(row.issn, 32));
+    setField('additional_isbns', toCatalogText(row.additional_isbns, 500));
+    const hasIllus = toCatalogBoolean(row.has_illustrations);
+    if (hasIllus !== null) setField('has_illustrations', hasIllus);
+    setField('illustration_type', toCatalogText(row.illustration_type, 200));
+    const signed = toCatalogBoolean(row.signed_copy);
+    if (signed !== null) setField('signed_copy', signed);
+    setField('signature_notes', toCatalogText(row.signature_notes, 500));
+    const copies = toCatalogNumber(row.copies_count);
+    if (copies !== null) setField('copies_count', copies);
+    setField('source_sheet', toCatalogText(row.source_sheet, 50));
+    setField('original_id', toCatalogText(row.original_id, 64));
+    setField('transformations_applied', toCatalogText(row.transformations_applied, 1000));
+    setField('cleanup_notes', toCatalogText(row.cleanup_notes, 1000));
+
+    const needsReview = legacyId ? reviewIds.has(legacyId) : false;
+
+    return {
+      legacyId,
+      title,
+      author,
+      isbn: pickIsbn(row),
+      publicationYear,
+      publisher: toCatalogText(row.publisher, 200),
+      language: toCatalogText(row.language, 120),
+      description: toCatalogText(row.description, 4000),
+      shelfCode: toCatalogText(row.shelf_location, 64),
+      needsReview,
+      customFields
+    };
+  }
+
+  async function setupLibraryCatalog() {
+    clearStatus();
+    try {
+      const result = await runAction(() =>
+        apiRequest<{ ok: boolean; created: number; updated: number; total: number }>(
+          '/api/setup/library-catalog',
+          { method: 'POST' }
+        )
+      );
+      await loadCustomFields();
+      setMessage(
+        `Library catalog ready. ${result.created} new fields added, ${result.updated} kept current (total ${result.total}).`
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function importCatalogRows(rows: CatalogRow[], dryRun: boolean) {
+    const CHUNK = 500;
+    let cursor = 0;
+    let totalInsert = 0;
+    let totalUpdate = 0;
+    let totalAccepted = 0;
+    const allSkipped: Array<{ index: number; reason: string }> = [];
+
+    while (cursor < rows.length) {
+      const end = Math.min(cursor + CHUNK, rows.length);
+      const chunk = rows.slice(cursor, end);
+      const chunkNum = Math.floor(cursor / CHUNK) + 1;
+      const chunkTotal = Math.ceil(rows.length / CHUNK);
+      setMessage(
+        `${dryRun ? 'Previewing' : 'Importing'} chunk ${chunkNum}/${chunkTotal}: rows ${cursor + 1}–${end} of ${rows.length}…`
+      );
+
+      const result = await runAction(() =>
+        apiRequest<{
+          dryRun: boolean;
+          acceptedRows?: number;
+          willInsert?: number;
+          willUpdate?: number;
+          inserted?: number;
+          updated?: number;
+          skippedRows?: Array<{ index: number; reason: string }>;
+        }>('/api/import/books-catalog', {
+          method: 'POST',
+          body: JSON.stringify({ dryRun, rows: chunk })
+        })
+      );
+
+      if (dryRun) {
+        totalAccepted += result.acceptedRows ?? 0;
+        totalInsert += result.willInsert ?? 0;
+        totalUpdate += result.willUpdate ?? 0;
+      } else {
+        totalInsert += result.inserted ?? 0;
+        totalUpdate += result.updated ?? 0;
+      }
+      if (result.skippedRows) allSkipped.push(...result.skippedRows);
+      cursor = end;
+    }
+
+    return { totalInsert, totalUpdate, totalAccepted, allSkipped };
+  }
+
   async function importFromXlsx(event: FormEvent) {
     event.preventDefault();
     clearStatus();
@@ -1632,6 +1963,7 @@ function App() {
 
     try {
       const buffer = await file.arrayBuffer();
+      const XLSX = await loadXlsx();
       const workbook = XLSX.read(buffer, { type: 'array' });
       const firstSheetName = workbook.SheetNames[0];
       if (!firstSheetName) {
@@ -1647,6 +1979,62 @@ function App() {
       if (rawRows.length === 0) {
         throw new Error('The XLSX file has no data rows.');
       }
+
+      // ── Catalog-format fast path ─────────────────────────────────────────
+      // Detect the LIBRARY_normalized.xlsx-style snake_case schema and use
+      // the upsert endpoint, which is idempotent on `id` (legacy_id).
+      const headers = Object.keys(rawRows[0] ?? {});
+      if (isCatalogFormat(headers)) {
+        // Build the "needs review" overlay from the optional `review` sheet.
+        const reviewIds = new Set<string>();
+        const reviewSheetName = workbook.SheetNames.find((n) => n.trim().toLowerCase() === 'review');
+        if (reviewSheetName) {
+          const reviewRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[reviewSheetName], {
+            defval: null,
+            raw: false
+          });
+          for (const r of reviewRows) {
+            const idVal = r.id ?? r.ID ?? null;
+            if (idVal) reviewIds.add(String(idVal).trim());
+          }
+        }
+
+        // Use the FIRST sheet as canonical (typically named "library").
+        const catalogRows: CatalogRow[] = [];
+        let blankSkipped = 0;
+        for (const raw of rawRows) {
+          const row = buildCatalogRow(raw, reviewIds);
+          if (!row) { blankSkipped += 1; continue; }
+          catalogRows.push(row);
+        }
+        if (catalogRows.length === 0) {
+          throw new Error('No catalog rows found in the file.');
+        }
+
+        const reviewMatched = catalogRows.filter((r) => r.needsReview).length;
+        const noTitle = catalogRows.filter((r) => !r.title).length;
+        const noAuthor = catalogRows.filter((r) => !r.author).length;
+
+        if (importDryRun) {
+          const result = await importCatalogRows(catalogRows, true);
+          setMessage(
+            `Catalog dry run complete. ${result.totalAccepted} accepted (` +
+            `${result.totalInsert} new, ${result.totalUpdate} would update). ` +
+            `Review-flagged: ${reviewMatched}. Empty title: ${noTitle}, empty author: ${noAuthor}. ` +
+            `Skipped blank rows: ${blankSkipped}.`
+          );
+        } else {
+          const result = await importCatalogRows(catalogRows, false);
+          setMessage(
+            `Catalog import complete. ${result.totalInsert} added, ${result.totalUpdate} updated. ` +
+            `Review-flagged: ${reviewMatched}. Skipped: ${result.allSkipped.length}.`
+          );
+        }
+
+        await Promise.all([loadBooks(1), loadRoomSummary()]);
+        return;
+      }
+      // ── End catalog fast path ────────────────────────────────────────────
 
       const unknownColumns = findUnknownSpreadsheetColumns(rawRows);
       if (unknownColumns.length > 0) {
@@ -1804,6 +2192,76 @@ function App() {
     setBookHistory([]);
   }
 
+  function renderCustomFieldsForm(
+    values: Record<string, unknown>,
+    setValue: (key: string, value: unknown) => void
+  ): React.ReactNode {
+    if (customFields.length === 0) {
+      return (
+        <p className="muted small">
+          No custom attributes defined yet. Open <strong>Import & Export → Setup</strong> to add the catalog preset.
+        </p>
+      );
+    }
+    return (
+      <div className="custom-fields-grid">
+        {customFields.map((field) => {
+          const v = values[field.key];
+          const idAttr = `cf-${field.key}`;
+          if (field.type === 'boolean') {
+            const checked = v === true || v === 'true';
+            return (
+              <label key={field.key} className="checkbox-label cf-bool">
+                <input
+                  id={idAttr}
+                  type="checkbox"
+                  checked={checked}
+                  onChange={(e) => setValue(field.key, e.target.checked)}
+                />
+                <span>{field.label}{field.required && <span className="required-mark"> *</span>}</span>
+              </label>
+            );
+          }
+          if (field.type === 'enum') {
+            return (
+              <div key={field.key} className="form-field">
+                <label htmlFor={idAttr}>{field.label}{field.required && <span className="required-mark"> *</span>}</label>
+                <select
+                  id={idAttr}
+                  value={(v as string) ?? ''}
+                  onChange={(e) => setValue(field.key, e.target.value || null)}
+                >
+                  <option value="">— none —</option>
+                  {field.enumOptions.map((opt) => (
+                    <option key={opt} value={opt}>{opt}</option>
+                  ))}
+                </select>
+              </div>
+            );
+          }
+          const inputType = field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text';
+          // Date inputs need YYYY-MM-DD; truncate any ISO timestamp before binding.
+          const displayValue =
+            field.type === 'date' && typeof v === 'string' && v.length >= 10
+              ? v.slice(0, 10)
+              : (v as string | number | null | undefined) ?? '';
+          return (
+            <div key={field.key} className="form-field">
+              <label htmlFor={idAttr}>{field.label}{field.required && <span className="required-mark"> *</span>}</label>
+              <input
+                id={idAttr}
+                type={inputType}
+                value={displayValue === null || displayValue === undefined ? '' : String(displayValue)}
+                onChange={(e) => setValue(field.key, e.target.value)}
+                placeholder={field.key}
+              />
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   function startEditFromDetail() {
     if (!detailBook) return;
     setDetailMode('edit');
@@ -1816,7 +2274,9 @@ function App() {
       publicationYear: detailBook.publicationYear?.toString() ?? '',
       status: detailBook.status,
       version: detailBook.version,
-      customFieldsJson: JSON.stringify(detailBook.customFields ?? {}, null, 2)
+      publisher: detailBook.publisher ?? '',
+      language: detailBook.language ?? '',
+      description: detailBook.description ?? ''
     });
     setAttributeEditorValues(detailBook.customFields ?? {});
   }
@@ -1831,11 +2291,18 @@ function App() {
 
             {/* Header */}
             <div className="modal-header">
-              <div className="modal-avatar">{detailBook.title.charAt(0).toUpperCase()}</div>
+              <div className="modal-avatar">{(displayTitle(detailBook).charAt(0) || '?').toUpperCase()}</div>
               <div className="modal-title-block">
-                <h2>{detailBook.title}</h2>
-                <p className="modal-author">{detailBook.author}</p>
+                <h2 className={isPlaceholder(detailBook.title, 'title') || !detailBook.title ? 'is-placeholder' : ''}>
+                  {displayTitle(detailBook)}
+                </h2>
+                <p className={`modal-author${isPlaceholder(detailBook.author, 'author') || !detailBook.author ? ' is-placeholder' : ''}`}>
+                  {displayAuthor(detailBook)}
+                </p>
                 <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
+                {detailBook.legacyId ? (
+                  <span className="legacy-id-pill" title="Catalog ID — used to upsert on re-import">{detailBook.legacyId}</span>
+                ) : null}
               </div>
               <button className="modal-close" onClick={closeDetail} title="Close">✕</button>
             </div>
@@ -1989,18 +2456,44 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label>Shelf Code</label>
-                      <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder="e.g. Shelf-3" />
+                      <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder="e.g. 06-005" />
+                    </div>
+                    <div>
+                      <label>Status</label>
+                      <select value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
+                        <option value="available">Available</option>
+                        <option value="borrowed">Borrowed</option>
+                        <option value="lost">Lost</option>
+                        <option value="maintenance">Maintenance</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="form-row">
+                    <div>
+                      <label>Publisher</label>
+                      <input value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder="Publisher name" />
+                    </div>
+                    <div>
+                      <label>Language</label>
+                      <input value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder="e.g. EL or EL,EN,FR" />
                     </div>
                   </div>
                   <div className="form-field">
-                    <label>Status</label>
-                    <select value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
-                      <option value="available">Available</option>
-                      <option value="borrowed">Borrowed</option>
-                      <option value="lost">Lost</option>
-                      <option value="maintenance">Maintenance</option>
-                    </select>
+                    <label>Description</label>
+                    <textarea
+                      value={editForm.description}
+                      onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
+                      rows={3}
+                    />
                   </div>
+
+                  <details className="custom-fields-section" open>
+                    <summary>Catalog attributes ({customFields.length})</summary>
+                    {renderCustomFieldsForm(attributeEditorValues, (key, value) =>
+                      setAttributeEditorValues((prev) => ({ ...prev, [key]: value }))
+                    )}
+                  </details>
+
                   <div className="button-group">
                     <button type="submit" className="primary">Save Changes</button>
                     <button type="button" className="secondary" onClick={() => setDetailMode('view')}>Cancel</button>
@@ -2096,13 +2589,94 @@ function App() {
                   </div>
                   <div className="stat-box warning">
                     <span className="stat-box-label">Borrowed</span>
-                    <span className="stat-box-value">{borrowedBooks}</span>
+                    <span className="stat-box-value">{borrowedBooksDisplay}</span>
                   </div>
                   <div className="stat-box danger">
                     <span className="stat-box-label">Overdue</span>
                     <span className="stat-box-value">{overdueCount}</span>
                   </div>
                 </div>
+
+                {/* Quick filter chips: pinned shortcuts that toggle filters without opening Advanced. */}
+                <div className="filter-chips">
+                  <button
+                    type="button"
+                    className={`chip${needsReviewFilter ? ' is-active' : ''}`}
+                    onClick={() => setNeedsReviewFilter((v) => !v)}
+                    title="Books flagged during catalog cleanup"
+                  >
+                    ⚑ Needs review
+                    {needsReviewCount > 0 && <span className="chip-count">{needsReviewCount.toLocaleString()}</span>}
+                  </button>
+                  {categoryFilter && (
+                    <button
+                      type="button"
+                      className="chip is-active"
+                      onClick={() => setCategoryFilter('')}
+                      title="Clear category filter"
+                    >
+                      📚 Category: {categoryFilter}
+                      <span className="chip-x">✕</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="chip ghost"
+                    onClick={() => setShowCategoryRail((v) => !v)}
+                    title={showCategoryRail ? 'Hide category browser' : 'Show category browser'}
+                  >
+                    {showCategoryRail ? '◀ Hide categories' : '▶ Show categories'}
+                  </button>
+                </div>
+
+                <div className={`library-layout${showCategoryRail ? '' : ' no-rail'}`}>
+                  {showCategoryRail && (
+                    <aside className="category-rail">
+                      <div className="category-rail-head">
+                        <h3>Categories</h3>
+                        <span className="muted small">{categories.length} total</span>
+                      </div>
+                      <input
+                        className="category-rail-search"
+                        placeholder="Filter categories…"
+                        value={categoryRailQuery}
+                        onChange={(e) => setCategoryRailQuery(e.target.value)}
+                      />
+                      <ul className="category-rail-list">
+                        <li
+                          className={!categoryFilter ? 'is-active' : ''}
+                          onClick={() => setCategoryFilter('')}
+                        >
+                          <span className="cat-label">All categories</span>
+                          <span className="cat-count">{totalBooksCount.toLocaleString()}</span>
+                        </li>
+                        {categories
+                          .filter((c) => {
+                            const q = categoryRailQuery.trim().toLowerCase();
+                            if (!q) return true;
+                            return (
+                              c.code.toLowerCase().includes(q) ||
+                              (c.label ?? '').toLowerCase().includes(q)
+                            );
+                          })
+                          .map((c) => (
+                            <li
+                              key={c.code}
+                              className={categoryFilter === c.code ? 'is-active' : ''}
+                              onClick={() => setCategoryFilter(c.code)}
+                              title={c.label ?? c.code}
+                            >
+                              <span className="cat-label">
+                                <span className="cat-code">{c.code}</span>
+                                {c.label ? <span className="cat-text"> {c.label}</span> : null}
+                              </span>
+                              <span className="cat-count">{c.count.toLocaleString()}</span>
+                            </li>
+                          ))}
+                      </ul>
+                    </aside>
+                  )}
+                  <div className="library-main">
 
                 {/* Add Book (collapsible) */}
                 {showAddBook && (
@@ -2130,12 +2704,46 @@ function App() {
                         </div>
                         <div>
                           <label>Shelf Code</label>
-                          <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder="e.g. Shelf-3" />
+                          <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder="e.g. 06-005" />
                         </div>
                       </div>
+                      <div className="form-row">
+                        <div>
+                          <label>Publisher</label>
+                          <input value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder="Publisher name" />
+                        </div>
+                        <div>
+                          <label>Language</label>
+                          <input value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder="e.g. EL or EL,EN,FR" />
+                        </div>
+                      </div>
+                      <div className="form-field">
+                        <label>Description</label>
+                        <textarea
+                          value={createForm.description}
+                          onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
+                          rows={2}
+                          placeholder="Optional notes about this book"
+                        />
+                      </div>
+
+                      <details className="custom-fields-section" open={customFields.length > 0 && customFields.length <= 6}>
+                        <summary>Catalog attributes ({customFields.length})</summary>
+                        {renderCustomFieldsForm(createAttrValues, (key, value) =>
+                          setCreateAttrValues((prev) => ({ ...prev, [key]: value }))
+                        )}
+                      </details>
+
                       <div className="button-group">
                         <button type="submit" className="primary">Add Book</button>
-                        <button type="button" className="secondary" onClick={() => setShowAddBook(false)}>Cancel</button>
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => {
+                            setShowAddBook(false);
+                            setCreateAttrValues({});
+                          }}
+                        >Cancel</button>
                       </div>
                     </form>
                   </div>
@@ -2165,12 +2773,14 @@ function App() {
                 <div className="card">
                   <div className="search-bar">
                     <div className="search-field">
-                      <label>Search</label>
+                      <label>
+                        Search <span className="kbd-hint">press <kbd>/</kbd></span>
+                      </label>
                       <input
+                        ref={searchInputRef}
                         value={q}
                         onChange={(e) => setQ(e.target.value)}
-                        placeholder="Search text (supports partial words, quotes for phrases)…"
-                        onKeyDown={(e) => { if (e.key === 'Enter') { setCurrentPage(1); void loadBooks(1); } }}
+                        placeholder="Search title, author, ISBN…"
                       />
                     </div>
                     <div className="filter-field">
@@ -2199,26 +2809,54 @@ function App() {
                       <label>Year</label>
                       <input type="number" value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder="e.g. 2024" />
                     </div>
+                    <div className="filter-field">
+                      <label>Sort</label>
+                      <div className="sort-row">
+                        <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)}>
+                          <option value="updatedAt">Last updated</option>
+                          <option value="title">Title</option>
+                          <option value="author">Author</option>
+                          <option value="publicationYear">Year</option>
+                          <option value="status">Status</option>
+                        </select>
+                        <button
+                          type="button"
+                          className="secondary small sort-dir-btn"
+                          onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+                          title={sortDir === 'asc' ? 'Ascending — click to toggle' : 'Descending — click to toggle'}
+                          aria-label="Toggle sort direction"
+                        >
+                          {sortDir === 'asc' ? '↑' : '↓'}
+                        </button>
+                      </div>
+                    </div>
                     <div className="search-actions">
                       <label>.</label>
-                      <button className="primary" onClick={() => { setCurrentPage(1); void loadBooks(1); }}>Search</button>
                       <button className="secondary" onClick={() => { setShowAdvancedSearch((v) => !v); }}>
-                        {showAdvancedSearch ? 'Hide Advanced' : 'Advanced Search'}
+                        {showAdvancedSearch ? 'Hide Advanced' : 'Advanced'}
+                      </button>
+                      <button
+                        className="secondary"
+                        onClick={() => setDensity((d) => (d === 'compact' ? 'comfortable' : 'compact'))}
+                        title="Toggle layout density"
+                      >
+                        {density === 'compact' ? '⊞ Cards' : '☰ List'}
                       </button>
                       <button className="secondary" onClick={() => {
                         setQ('');
                         setQExclude('');
                         setQMode('all');
                         setPartialWords(true);
-                        setFuzzyTypos(true);
+                        setFuzzyTypos(false);
                         setSearchFields(['title', 'author', 'isbn']);
                         setStatus('');
                         setFilterLanguage('');
                         setFilterCategory('');
                         setFilterYear('');
                         setShelfFilter('');
+                        setCategoryFilter('');
+                        setNeedsReviewFilter(false);
                         setCurrentPage(1);
-                        void loadBooks(1);
                       }}>Reset</button>
                     </div>
                   </div>
@@ -2304,20 +2942,24 @@ function App() {
                     </div>
                   ) : (
                     <>
-                      <div className="book-grid">
+                      <div className={density === 'compact' ? 'book-list' : 'book-grid'}>
                         {books.map((book) => (
                           <div
                             key={book.id}
-                            className="book-card"
+                            className={density === 'compact' ? 'book-row' : 'book-card'}
                             onClick={() => openBookDetail(book)}
                             role="button"
                             tabIndex={0}
                             onKeyDown={(e) => e.key === 'Enter' && openBookDetail(book)}
                           >
-                            <div className="book-avatar">{book.title.charAt(0).toUpperCase()}</div>
+                            <div className="book-avatar">{(displayTitle(book).charAt(0) || '?').toUpperCase()}</div>
                             <div className="book-card-body">
-                              <span className="book-card-title">{book.title}</span>
-                              <p className="book-card-author">{book.author}</p>
+                              <span className={`book-card-title${isPlaceholder(book.title, 'title') || !book.title ? ' is-placeholder' : ''}`}>
+                                {displayTitle(book)}
+                              </span>
+                              <p className={`book-card-author${isPlaceholder(book.author, 'author') || !book.author ? ' is-placeholder' : ''}`}>
+                                {displayAuthor(book)}
+                              </p>
                               <div className="book-card-meta">
                                 {book.roomCode && <span className="meta-chip">📍 {book.roomCode}</span>}
                                 {book.shelfCode && <span className="meta-chip">{book.shelfCode}</span>}
@@ -2334,22 +2976,56 @@ function App() {
                       <div className="pagination">
                         <button
                           className="secondary small"
-                          onClick={() => void loadBooks( currentPage - 1)}
+                          onClick={() => void loadBooks(1)}
+                          disabled={currentPage === 1}
+                          title="First page"
+                        >« First</button>
+                        <button
+                          className="secondary small"
+                          onClick={() => void loadBooks(currentPage - 1)}
                           disabled={currentPage === 1}
                         >← Previous</button>
                         <span className="pagination-info">
-                          Page {currentPage} of {Math.max(1, Math.ceil(totalBooksCount / 50))}
-                          {' · '}{totalBooksCount.toLocaleString()} books
+                          Page <strong>{currentPage}</strong> of <strong>{Math.max(1, Math.ceil(totalBooksCount / PAGE_SIZE))}</strong>
+                          <span className="muted small"> · {totalBooksCount.toLocaleString()} books</span>
                         </span>
+                        <form
+                          className="page-jump"
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            const parsed = Number(jumpPage);
+                            const totalPages = Math.max(1, Math.ceil(totalBooksCount / PAGE_SIZE));
+                            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= totalPages) {
+                              void loadBooks(Math.floor(parsed));
+                              setJumpPage('');
+                            }
+                          }}
+                        >
+                          <input
+                            value={jumpPage}
+                            onChange={(e) => setJumpPage(e.target.value.replace(/[^0-9]/g, ''))}
+                            placeholder="Jump to…"
+                            aria-label="Jump to page"
+                          />
+                          <button type="submit" className="secondary small">Go</button>
+                        </form>
                         <button
                           className="secondary small"
-                          onClick={() => void loadBooks( currentPage + 1)}
-                          disabled={currentPage >= Math.ceil(totalBooksCount / 50)}
+                          onClick={() => void loadBooks(currentPage + 1)}
+                          disabled={currentPage >= Math.ceil(totalBooksCount / PAGE_SIZE)}
                         >Next →</button>
+                        <button
+                          className="secondary small"
+                          onClick={() => void loadBooks(Math.max(1, Math.ceil(totalBooksCount / PAGE_SIZE)))}
+                          disabled={currentPage >= Math.ceil(totalBooksCount / PAGE_SIZE)}
+                          title="Last page"
+                        >Last »</button>
                       </div>
                     </>
                   )}
                 </div>
+                  </div> {/* /library-main */}
+                </div> {/* /library-layout */}
               </>
             )}
 
@@ -2469,8 +3145,10 @@ function App() {
                 <div className="card">
                   <h3>📥 Import from Excel (.xlsx)</h3>
                   <p className="muted" style={{ marginBottom: '1.25rem', fontSize: '0.875rem' }}>
-                    Your file must have <strong>Title</strong> and <strong>Author/Writer</strong> columns.
-                    All other columns (color, cover type, category, etc.) are automatically imported as book attributes.
+                    Drop in your <strong>LIBRARY_normalized.xlsx</strong> (or any compatible catalog file).
+                    Catalog-format files are auto-detected and imported via the upsert path — re-running
+                    the same file updates existing books in place. Legacy <em>Title/Author</em> spreadsheets are
+                    still supported.
                   </p>
                   <form onSubmit={importFromXlsx} className="simple-form">
                     <div className="import-dropzone">
@@ -2503,10 +3181,22 @@ function App() {
                 <div className="card">
                   <h3>⚙️ Setup</h3>
                   <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
-                    Apply the default book attribute structure to set up your database for imports.
-                    This only needs to be done once.
+                    Run once before your first import — these create the custom attributes that
+                    receive every column in the spreadsheet.
                   </p>
-                  <button className="secondary" onClick={applyDefaultBookStructure}>Apply Default Structure</button>
+                  <div className="button-group" style={{ marginTop: 0 }}>
+                    <button className="primary" onClick={() => void setupLibraryCatalog()}>
+                      Set up for LIBRARY_normalized.xlsx
+                    </button>
+                    <button className="secondary" onClick={applyDefaultBookStructure}>
+                      Apply legacy Title/Author preset
+                    </button>
+                  </div>
+                  <p className="muted small" style={{ marginTop: '0.75rem' }}>
+                    The catalog preset adds <strong>{CATALOG_FIELD_COUNT}</strong> attributes (series,
+                    editor, place_of_publication, category_code, cover_type, copies_count, etc.) so every
+                    column from the file lands somewhere safe and searchable.
+                  </p>
                 </div>
               </>
             )}

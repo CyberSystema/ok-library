@@ -14,6 +14,9 @@ type CustomFieldValidationOptions = {
   requireAllRequired?: boolean;
 };
 
+const BOOKS_CACHE_VERSION_KEY = 'books:cache:version';
+const BOOKS_CACHE_PREFIX = 'books:list:';
+
 export async function insertAuditLog(
   env: Env,
   actorId: string,
@@ -28,6 +31,32 @@ export async function insertAuditLog(
   )
     .bind(crypto.randomUUID(), actorId, action, entityType, entityId, JSON.stringify(metadata), nowIso())
     .run();
+}
+
+export async function getBooksCacheVersion(env: Env): Promise<string> {
+  if (!env.CACHE) {
+    return '0';
+  }
+  try {
+    const v = await env.CACHE.get(BOOKS_CACHE_VERSION_KEY);
+    return v ?? '0';
+  } catch {
+    return '0';
+  }
+}
+
+export async function bumpBooksCacheVersion(env: Env): Promise<void> {
+  if (!env.CACHE) return;
+  try {
+    const current = Number((await env.CACHE.get(BOOKS_CACHE_VERSION_KEY)) ?? '0');
+    await env.CACHE.put(BOOKS_CACHE_VERSION_KEY, String(current + 1), { expirationTtl: 86400 });
+  } catch {
+    // Ignore cache invalidation errors — stale entries expire within seconds anyway.
+  }
+}
+
+export function booksCacheKey(version: string, payload: unknown): string {
+  return `${BOOKS_CACHE_PREFIX}${version}:${JSON.stringify(payload)}`;
 }
 
 export async function ensureBootstrapAdmin(env: Env): Promise<void> {
@@ -64,8 +93,88 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
     deletedAt: row.deleted_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    publicationYear: row.publication_year
+    publicationYear: row.publication_year,
+    legacyId: row.legacy_id ?? null
   };
+}
+
+const FIELD_TO_FTS_COLUMN: Record<string, string> = {
+  title: 'title',
+  author: 'author',
+  isbn: 'isbn',
+  publisher: 'publisher',
+  description: 'description',
+  tags: 'tags',
+  custom: 'custom_text'
+};
+
+const SQL_FIELD_EXPR: Record<string, string> = {
+  title: "COALESCE(title, '')",
+  author: "COALESCE(author, '')",
+  isbn: "COALESCE(isbn, '')",
+  publisher: "COALESCE(publisher, '')",
+  language: "COALESCE(language, '')",
+  description: "COALESCE(description, '')",
+  roomCode: "COALESCE(room_code, '')",
+  shelfCode: "COALESCE(shelf_code, '')",
+  tags: "COALESCE(tags, '')",
+  custom: "COALESCE(custom_fields, '')"
+};
+
+const SORT_COLUMN: Record<string, string> = {
+  title: 'title',
+  author: 'author',
+  publicationYear: 'publication_year',
+  status: 'status',
+  updatedAt: 'updated_at'
+};
+
+function parseSearchTokens(input: string): string[] {
+  const tokens: string[] = [];
+  const regex = /"([^"]+)"|(\S+)/g;
+  let match: RegExpExecArray | null = regex.exec(input);
+  while (match) {
+    const token = (match[1] ?? match[2] ?? '').trim().toLowerCase();
+    if (token) tokens.push(token);
+    match = regex.exec(input);
+  }
+  return tokens;
+}
+
+function escapeFtsTerm(token: string): string {
+  // FTS5 special characters: quote the whole phrase to be safe.
+  const cleaned = token.replace(/"/g, '""');
+  return `"${cleaned}"`;
+}
+
+function buildFtsQuery(opts: {
+  q: string;
+  qMode: 'all' | 'any' | 'exact';
+  partialWords: boolean;
+  fields: string[];
+}): string | null {
+  const tokens = opts.qMode === 'exact' ? [opts.q] : parseSearchTokens(opts.q);
+  if (tokens.length === 0) return null;
+
+  const ftsCols = opts.fields.map((f) => FIELD_TO_FTS_COLUMN[f]).filter(Boolean);
+  const colPrefix = ftsCols.length > 0 ? `{${ftsCols.join(' ')}}:` : '';
+
+  const formatted = tokens.map((token) => {
+    if (opts.qMode === 'exact') {
+      return `${colPrefix}${escapeFtsTerm(token)}`;
+    }
+    if (opts.partialWords) {
+      // Prefix match — append * to a quoted-but-trimmed term.
+      const cleaned = token.replace(/[*"]/g, '');
+      if (!cleaned) return null;
+      return `${colPrefix}"${cleaned}"*`;
+    }
+    return `${colPrefix}${escapeFtsTerm(token)}`;
+  }).filter(Boolean) as string[];
+
+  if (formatted.length === 0) return null;
+  const joiner = opts.qMode === 'any' ? ' OR ' : ' AND ';
+  return formatted.join(joiner);
 }
 
 export async function queryBooksWithFilters(
@@ -89,248 +198,119 @@ export async function queryBooksWithFilters(
     customFilters: Array<{ key: string; value: string }>;
   }
 ): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
-  const parseSearchTokens = (input: string): string[] => {
-    const tokens: string[] = [];
-    const regex = /"([^"]+)"|(\S+)/g;
-    let match: RegExpExecArray | null = regex.exec(input);
-    while (match) {
-      const token = (match[1] ?? match[2] ?? '').trim().toLowerCase();
-      if (token) {
-        tokens.push(token);
-      }
-      match = regex.exec(input);
-    }
-    return tokens;
-  };
-
-  const safeLike = (raw: string): string => raw.replaceAll('%', '').replaceAll('_', '');
-  const splitWords = (text: string): string[] => text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  const normalize = (value: unknown): string => String(value ?? '').trim().toLowerCase();
-
-  const levenshtein = (a: string, b: string): number => {
-    if (a === b) return 0;
-    if (!a.length) return b.length;
-    if (!b.length) return a.length;
-    const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
-    for (let i = 1; i <= a.length; i += 1) {
-      let curr = i;
-      for (let j = 1; j <= b.length; j += 1) {
-        const temp = prev[j];
-        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-        prev[j] = Math.min(prev[j] + 1, curr + 1, prev[j - 1] + cost);
-        curr = temp;
-      }
-      prev[0] = i;
-    }
-    return prev[b.length];
-  };
-
-  const typoThreshold = (term: string): number => {
-    if (term.length <= 4) return 1;
-    if (term.length <= 9) return 2;
-    return 3;
-  };
-
-  const fuzzyWordMatch = (text: string, term: string): boolean => {
-    const words = splitWords(text);
-    const threshold = typoThreshold(term);
-    for (const word of words) {
-      if (Math.abs(word.length - term.length) > threshold) continue;
-      if (levenshtein(word, term) <= threshold) return true;
-    }
-    return false;
-  };
-
-  const fieldExprMap: Record<string, string> = {
-    title: 'COALESCE(title, \'\')',
-    author: 'COALESCE(author, \'\')',
-    isbn: 'COALESCE(isbn, \'\')',
-    publisher: 'COALESCE(publisher, \'\')',
-    language: 'COALESCE(language, \'\')',
-    description: 'COALESCE(description, \'\')',
-    roomCode: 'COALESCE(room_code, \'\')',
-    shelfCode: 'COALESCE(shelf_code, \'\')',
-    tags: 'COALESCE(tags, \'\')',
-    custom: 'COALESCE(custom_fields, \'\')'
-  };
-
+  const qText = (opts.q ?? '').trim();
+  const excludeText = (opts.qExclude ?? '').trim();
   const requestedFields = (opts.searchFields ?? '')
     .split(',')
     .map((f) => f.trim())
     .filter(Boolean);
-
   const activeFields = (requestedFields.length > 0 ? requestedFields : ['title', 'author', 'isbn'])
-    .filter((f) => Object.prototype.hasOwnProperty.call(fieldExprMap, f));
+    .filter((f) => Object.prototype.hasOwnProperty.call(SQL_FIELD_EXPR, f));
 
-  const where: string[] = ['deleted_at IS NULL'];
-  const values: unknown[] = [];
-  const qText = normalize(opts.q);
-  const excludeText = normalize(opts.qExclude);
-  const useFuzzy = Boolean(opts.fuzzyTypos) && qText.length > 0 && opts.qMode !== 'exact';
-
-  if (opts.status) {
-    where.push('status = ?');
-    values.push(opts.status);
-  }
-
-  if (opts.language) {
-    where.push('LOWER(language) = LOWER(?)');
-    values.push(opts.language);
-  }
-
-  if (opts.year) {
-    where.push('publication_year = ?');
-    values.push(opts.year);
-  }
-
-  if (opts.roomCode) {
-    where.push('room_code = ?');
-    values.push(opts.roomCode);
-  }
-
-  if (opts.shelfCode) {
-    where.push('shelf_code = ?');
-    values.push(opts.shelfCode);
-  }
-
-  for (const filter of opts.customFilters) {
-    where.push(`json_extract(custom_fields, '$.${filter.key}') = ?`);
-    values.push(filter.value);
-  }
-
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-
-  const allowedSortMap: Record<string, string> = {
-    title: 'title',
-    author: 'author',
-    publicationYear: 'publication_year',
-    status: 'status',
-    updatedAt: 'updated_at'
-  };
-
-  const sortColumn = allowedSortMap[opts.sortBy] ?? 'updated_at';
+  const sortColumn = SORT_COLUMN[opts.sortBy] ?? 'updated_at';
   const sortDir = opts.sortDir === 'asc' ? 'ASC' : 'DESC';
   const limit = Math.max(1, Math.min(100, opts.pageSize));
   const offset = (Math.max(1, opts.page) - 1) * limit;
 
-  if (useFuzzy) {
-    const rowsStmt = env.DB.prepare(`SELECT * FROM books ${whereSql}`).bind(...values);
-    const rowsRes = await rowsStmt.all();
-    const allRows = ((rowsRes.results ?? []) as Array<Record<string, unknown>>).map(parseBook);
+  const where: string[] = ['b.deleted_at IS NULL'];
+  const values: unknown[] = [];
+  let useFtsJoin = false;
 
-    const getFieldText = (row: Record<string, unknown>, field: string): string => {
-      if (field === 'custom') {
-        return normalize(JSON.stringify(row.customFields ?? {}));
-      }
-      if (field === 'tags') {
-        const tags = Array.isArray(row.tags) ? row.tags : [];
-        return normalize(tags.join(' '));
-      }
-      return normalize(row[field]);
-    };
+  if (opts.status) {
+    where.push('b.status = ?');
+    values.push(opts.status);
+  }
+  if (opts.language) {
+    where.push('LOWER(b.language) = LOWER(?)');
+    values.push(opts.language);
+  }
+  if (opts.year) {
+    where.push('b.publication_year = ?');
+    values.push(opts.year);
+  }
+  if (opts.roomCode) {
+    where.push('b.room_code = ?');
+    values.push(opts.roomCode);
+  }
+  if (opts.shelfCode) {
+    where.push('b.shelf_code = ?');
+    values.push(opts.shelfCode);
+  }
+  for (const filter of opts.customFilters) {
+    // json_extract validates the path; key is constrained to [a-zA-Z0-9_] in custom_field schema.
+    if (!/^[a-zA-Z0-9_]+$/.test(filter.key)) continue;
+    where.push(`json_extract(b.custom_fields, '$.${filter.key}') = ?`);
+    values.push(filter.value);
+  }
 
-    const searchTerms = opts.qMode === 'exact' ? [qText] : parseSearchTokens(qText);
-    const excludeTerms = parseSearchTokens(excludeText);
-
-    const termMatch = (texts: string[], term: string): boolean => {
-      const directMatch = texts.some((text) => {
-        if (!term) return true;
-        if (opts.partialWords === false) {
-          return splitWords(text).includes(term);
-        }
-        return text.includes(term);
-      });
-      if (directMatch) return true;
-      return texts.some((text) => fuzzyWordMatch(text, term));
-    };
-
-    const filtered = allRows.filter((row) => {
-      const texts = activeFields.map((field) => getFieldText(row, field)).filter(Boolean);
-      if (texts.length === 0) return false;
-
-      let include = true;
-      if (qText) {
-        if (opts.qMode === 'exact') {
-          include = texts.some((text) => text.includes(qText));
-        } else if (opts.qMode === 'any') {
-          include = searchTerms.some((term) => termMatch(texts, term));
-        } else {
-          include = searchTerms.every((term) => termMatch(texts, term));
-        }
-      }
-      if (!include) return false;
-
-      if (excludeTerms.length > 0) {
-        const hasExcluded = excludeTerms.some((term) => texts.some((text) => text.includes(term)));
-        if (hasExcluded) return false;
-      }
-
-      return true;
+  // Path 1: FTS5 full-text search (default for any query).
+  if (qText && opts.qMode !== 'exact') {
+    const ftsQuery = buildFtsQuery({
+      q: qText,
+      qMode: opts.qMode ?? 'all',
+      partialWords: opts.partialWords ?? true,
+      fields: activeFields
     });
 
-    const compareValues = (a: Record<string, unknown>, b: Record<string, unknown>): number => {
-      const pick = (row: Record<string, unknown>): string | number => {
-        if (opts.sortBy === 'publicationYear') return Number(row.publicationYear ?? 0);
-        if (opts.sortBy === 'updatedAt') return normalize(row.updatedAt);
-        if (opts.sortBy === 'status') return normalize(row.status);
-        if (opts.sortBy === 'author') return normalize(row.author);
-        return normalize(row.title);
-      };
-      const av = pick(a);
-      const bv = pick(b);
-      if (av < bv) return sortDir === 'ASC' ? -1 : 1;
-      if (av > bv) return sortDir === 'ASC' ? 1 : -1;
-      return 0;
-    };
-
-    filtered.sort(compareValues);
-    const paged = filtered.slice(offset, offset + limit);
-
-    return {
-      total: filtered.length,
-      rows: paged
-    };
-  }
-
-  if (qText) {
-    const terms = opts.qMode === 'exact' ? [qText] : parseSearchTokens(qText);
-    const termClauses: string[] = [];
-
-    for (const term of terms) {
-      const likeValue = opts.partialWords === false ? safeLike(term) : `%${safeLike(term)}%`;
-      const perFieldClause = activeFields.map((field) => `LOWER(${fieldExprMap[field]}) LIKE LOWER(?)`).join(' OR ');
-      if (perFieldClause) {
-        termClauses.push(`(${perFieldClause})`);
-        for (let i = 0; i < activeFields.length; i += 1) {
-          values.push(likeValue);
-        }
-      }
+    if (ftsQuery) {
+      useFtsJoin = true;
+      where.push('books_fts MATCH ?');
+      values.push(ftsQuery);
     }
-
-    if (termClauses.length > 0) {
-      where.push(`(${termClauses.join(opts.qMode === 'any' ? ' OR ' : ' AND ')})`);
+  } else if (qText && opts.qMode === 'exact') {
+    // Exact phrase: still use FTS phrase search.
+    const ftsQuery = buildFtsQuery({
+      q: qText,
+      qMode: 'exact',
+      partialWords: false,
+      fields: activeFields
+    });
+    if (ftsQuery) {
+      useFtsJoin = true;
+      where.push('books_fts MATCH ?');
+      values.push(ftsQuery);
     }
   }
 
+  // Exclusion terms: NOT EXISTS subquery against FTS to keep the main plan fast.
   if (excludeText) {
     const excludes = parseSearchTokens(excludeText);
-    for (const term of excludes) {
-      const likeValue = `%${safeLike(term)}%`;
-      const perFieldClause = activeFields.map((field) => `LOWER(${fieldExprMap[field]}) LIKE LOWER(?)`).join(' OR ');
-      if (perFieldClause) {
-        where.push(`NOT (${perFieldClause})`);
-        for (let i = 0; i < activeFields.length; i += 1) {
-          values.push(likeValue);
-        }
-      }
+    if (excludes.length > 0) {
+      const excludeFts = excludes.map((t) => escapeFtsTerm(t)).join(' OR ');
+      where.push('b.ROWID NOT IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ?)');
+      values.push(excludeFts);
     }
   }
 
-  const whereSqlWithSearch = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  // Fuzzy typo tolerance is intentionally implemented as a *post-filter* on top of
+  // the FTS-narrowed candidate set when the user toggles it on. We cap candidate
+  // count at 2000 so we never blow up Worker CPU on a 20K table.
+  const fuzzyEnabled = Boolean(opts.fuzzyTypos) && qText.length > 0 && opts.qMode !== 'exact';
 
-  const countStmt = env.DB.prepare(`SELECT COUNT(*) as count FROM books ${whereSqlWithSearch}`).bind(...values);
+  if (fuzzyEnabled) {
+    return await runFuzzyFiltered(env, {
+      where,
+      values,
+      qText,
+      qMode: opts.qMode ?? 'all',
+      activeFields,
+      sortColumn,
+      sortDir,
+      limit,
+      offset,
+      useFtsJoin
+    });
+  }
+
+  const fromClause = useFtsJoin
+    ? 'books b JOIN books_fts ON books_fts.rowid = b.ROWID'
+    : 'books b';
+  const whereSql = `WHERE ${where.join(' AND ')}`;
+
+  const countStmt = env.DB.prepare(`SELECT COUNT(*) as count FROM ${fromClause} ${whereSql}`).bind(...values);
   const rowsStmt = env.DB.prepare(
-    `SELECT * FROM books ${whereSqlWithSearch} ORDER BY ${sortColumn} ${sortDir}, id DESC LIMIT ? OFFSET ?`
+    `SELECT b.* FROM ${fromClause} ${whereSql}
+     ORDER BY b.${sortColumn} ${sortDir}, b.id DESC LIMIT ? OFFSET ?`
   ).bind(...values, limit, offset);
 
   const [countRes, rowsRes] = await Promise.all([countStmt.first<{ count: number }>(), rowsStmt.all()]);
@@ -340,6 +320,100 @@ export async function queryBooksWithFilters(
     total: Number(countRes?.count ?? 0),
     rows
   };
+}
+
+async function runFuzzyFiltered(
+  env: Env,
+  ctx: {
+    where: string[];
+    values: unknown[];
+    qText: string;
+    qMode: 'all' | 'any' | 'exact';
+    activeFields: string[];
+    sortColumn: string;
+    sortDir: 'ASC' | 'DESC';
+    limit: number;
+    offset: number;
+    useFtsJoin: boolean;
+  }
+): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
+  const FUZZY_CANDIDATE_CAP = 2000;
+  const fromClause = ctx.useFtsJoin
+    ? 'books b JOIN books_fts ON books_fts.rowid = b.ROWID'
+    : 'books b';
+  const whereSql = `WHERE ${ctx.where.join(' AND ')}`;
+
+  const candidateStmt = env.DB.prepare(
+    `SELECT b.* FROM ${fromClause} ${whereSql}
+     ORDER BY b.${ctx.sortColumn} ${ctx.sortDir}, b.id DESC LIMIT ?`
+  ).bind(...ctx.values, FUZZY_CANDIDATE_CAP);
+  const res = await candidateStmt.all();
+  const rows = ((res.results ?? []) as Array<Record<string, unknown>>).map(parseBook);
+
+  const tokens = parseSearchTokens(ctx.qText.toLowerCase());
+  const filtered = rows.filter((row) => fuzzyRowMatches(row, tokens, ctx.activeFields, ctx.qMode));
+
+  const paged = filtered.slice(ctx.offset, ctx.offset + ctx.limit);
+  return { total: filtered.length, rows: paged };
+}
+
+function splitWords(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    let curr = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const temp = prev[j];
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      prev[j] = Math.min(prev[j] + 1, curr + 1, prev[j - 1] + cost);
+      curr = temp;
+    }
+    prev[0] = i;
+  }
+  return prev[b.length];
+}
+
+function typoThreshold(term: string): number {
+  if (term.length <= 4) return 1;
+  if (term.length <= 9) return 2;
+  return 3;
+}
+
+function fuzzyWordMatch(text: string, term: string): boolean {
+  const words = splitWords(text);
+  const threshold = typoThreshold(term);
+  for (const word of words) {
+    if (Math.abs(word.length - term.length) > threshold) continue;
+    if (levenshtein(word, term) <= threshold) return true;
+  }
+  return false;
+}
+
+function fieldText(row: Record<string, unknown>, field: string): string {
+  if (field === 'custom') return JSON.stringify(row.customFields ?? {}).toLowerCase();
+  if (field === 'tags') return (Array.isArray(row.tags) ? (row.tags as unknown[]).join(' ') : '').toLowerCase();
+  return String(row[field] ?? '').toLowerCase();
+}
+
+function fuzzyRowMatches(
+  row: Record<string, unknown>,
+  tokens: string[],
+  activeFields: string[],
+  qMode: 'all' | 'any' | 'exact'
+): boolean {
+  if (tokens.length === 0) return true;
+  const texts = activeFields.map((f) => fieldText(row, f)).filter(Boolean);
+  if (texts.length === 0) return false;
+  const matchTerm = (term: string): boolean =>
+    texts.some((text) => text.includes(term)) || texts.some((text) => fuzzyWordMatch(text, term));
+  if (qMode === 'any') return tokens.some(matchTerm);
+  return tokens.every(matchTerm);
 }
 
 export async function withTxn<T>(env: Env, fn: () => Promise<T>): Promise<T> {
@@ -386,15 +460,27 @@ export async function validateCustomFields(
   customFields: Record<string, unknown>,
   options?: CustomFieldValidationOptions
 ): Promise<Record<string, unknown>> {
+  const defs = await loadCustomFieldDefs(env);
+  if (defs.length === 0) {
+    return customFields;
+  }
+  return validateCustomFieldsAgainst(defs, customFields, options);
+}
+
+export async function loadCustomFieldDefs(env: Env): Promise<CustomFieldDef[]> {
   const defsResult = await env.DB.prepare(
     `SELECT id, field_key, field_type, required, enum_options
      FROM custom_field_definitions WHERE deleted_at IS NULL`
   ).all<CustomFieldDef>();
+  return defsResult.results ?? [];
+}
 
-  const defs = defsResult.results ?? [];
-  if (defs.length === 0) {
-    return customFields;
-  }
+export function validateCustomFieldsAgainst(
+  defs: CustomFieldDef[],
+  customFields: Record<string, unknown>,
+  options?: CustomFieldValidationOptions
+): Record<string, unknown> {
+  if (defs.length === 0) return customFields;
 
   const defMap = new Map(defs.map((d) => [d.field_key, d]));
   const normalized: Record<string, unknown> = {};
@@ -408,38 +494,23 @@ export async function validateCustomFields(
       errors.push(`Required custom field missing: ${def.field_key}`);
       continue;
     }
-
-    if (missing) {
-      continue;
-    }
+    if (missing) continue;
 
     if (def.field_type === 'text') {
-      if (typeof raw !== 'string') {
-        errors.push(`Custom field ${def.field_key} must be a text value`);
-      } else {
-        normalized[def.field_key] = raw;
-      }
+      if (typeof raw !== 'string') errors.push(`Custom field ${def.field_key} must be a text value`);
+      else normalized[def.field_key] = raw;
       continue;
     }
-
     if (def.field_type === 'number') {
-      if (typeof raw !== 'number') {
-        errors.push(`Custom field ${def.field_key} must be a number`);
-      } else {
-        normalized[def.field_key] = raw;
-      }
+      if (typeof raw !== 'number') errors.push(`Custom field ${def.field_key} must be a number`);
+      else normalized[def.field_key] = raw;
       continue;
     }
-
     if (def.field_type === 'boolean') {
-      if (typeof raw !== 'boolean') {
-        errors.push(`Custom field ${def.field_key} must be a boolean`);
-      } else {
-        normalized[def.field_key] = raw;
-      }
+      if (typeof raw !== 'boolean') errors.push(`Custom field ${def.field_key} must be a boolean`);
+      else normalized[def.field_key] = raw;
       continue;
     }
-
     if (def.field_type === 'date') {
       if (typeof raw !== 'string' || Number.isNaN(Date.parse(raw))) {
         errors.push(`Custom field ${def.field_key} must be an ISO date string`);
@@ -448,11 +519,10 @@ export async function validateCustomFields(
       }
       continue;
     }
-
     if (def.field_type === 'enum') {
-      const options = safeJsonParse<string[]>(def.enum_options ?? '[]', []);
-      if (typeof raw !== 'string' || !options.includes(raw)) {
-        errors.push(`Custom field ${def.field_key} must be one of: ${options.join(', ')}`);
+      const opts = safeJsonParse<string[]>(def.enum_options ?? '[]', []);
+      if (typeof raw !== 'string' || !opts.includes(raw)) {
+        errors.push(`Custom field ${def.field_key} must be one of: ${opts.join(', ')}`);
       } else {
         normalized[def.field_key] = raw;
       }
@@ -460,9 +530,7 @@ export async function validateCustomFields(
   }
 
   for (const key of Object.keys(customFields)) {
-    if (!defMap.has(key)) {
-      errors.push(`Unknown custom field key: ${key}`);
-    }
+    if (!defMap.has(key)) errors.push(`Unknown custom field key: ${key}`);
   }
 
   if (errors.length > 0) {
@@ -484,21 +552,25 @@ export async function replaceBookAttributeValues(
   const defs = defsResult.results ?? [];
   const keyToDef = new Map(defs.map((d) => [d.field_key, d.id]));
 
-  await env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(bookId).run();
-
+  const ops: D1PreparedStatement[] = [
+    env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(bookId)
+  ];
+  const now = nowIso();
   for (const [key, value] of Object.entries(attributeValues)) {
     const definitionId = keyToDef.get(key);
-    if (!definitionId) {
-      continue;
-    }
-
-    await env.DB.prepare(
-      `INSERT INTO book_attribute_values
-        (id, book_id, attribute_definition_id, value_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    )
-      .bind(crypto.randomUUID(), bookId, definitionId, JSON.stringify(value), nowIso(), nowIso())
-      .run();
+    if (!definitionId) continue;
+    ops.push(
+      env.DB.prepare(
+        `INSERT INTO book_attribute_values
+          (id, book_id, attribute_definition_id, value_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(crypto.randomUUID(), bookId, definitionId, JSON.stringify(value), now, now)
+    );
+  }
+  if (ops.length > 1) {
+    await env.DB.batch(ops);
+  } else {
+    await ops[0].run();
   }
 }
 

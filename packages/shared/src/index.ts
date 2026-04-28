@@ -35,10 +35,13 @@ export const BookCoreSchema = z.object({
   isbn: z.string().max(32).optional().nullable(),
   publicationYear: z.number().int().min(1000).max(3000).optional().nullable(),
   publisher: z.string().max(200).optional().nullable(),
-  language: z.string().max(50).optional().nullable(),
+  // Catalogues frequently use multi-language tags like "EL,EN,FR" so we keep
+  // the field free-form text rather than enumerated.
+  language: z.string().max(120).optional().nullable(),
   description: z.string().max(4000).optional().nullable(),
   roomCode: z.string().max(64).optional().nullable(),
   shelfCode: z.string().max(64).optional().nullable(),
+  legacyId: z.string().min(1).max(64).optional().nullable(),
   customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).default({})
 });
 
@@ -186,6 +189,29 @@ export const ImportBooksSchema = z.object({
   rows: z.array(CreateBookSchema).max(2000)
 });
 
+// Catalogue-import path is permissive: rows from a real-world XLSX often have
+// blank titles, blank authors, multi-language tags, or category codes that
+// look numeric. The server normalizes these — we just need to accept them.
+export const CatalogImportRowSchema = z.object({
+  legacyId: z.string().min(1).max(64).optional().nullable(),
+  title: z.string().max(500).optional().nullable(),
+  author: z.string().max(500).optional().nullable(),
+  isbn: z.string().max(64).optional().nullable(),
+  publicationYear: z.number().int().min(1000).max(3000).optional().nullable(),
+  publisher: z.string().max(300).optional().nullable(),
+  language: z.string().max(120).optional().nullable(),
+  description: z.string().max(8000).optional().nullable(),
+  shelfCode: z.string().max(64).optional().nullable(),
+  needsReview: z.boolean().optional(),
+  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).default({})
+});
+
+export const ImportCatalogSchema = z.object({
+  dryRun: z.boolean().default(true),
+  // Each call carries up to 1000 catalog rows; the frontend chunks the file.
+  rows: z.array(CatalogImportRowSchema).max(1000)
+});
+
 export type BookStatus = z.infer<typeof BookStatusSchema>;
 export type Book = z.infer<typeof BookSchema>;
 export type CreateBookInput = z.infer<typeof CreateBookSchema>;
@@ -195,3 +221,4 @@ export type ReturnBookInput = z.infer<typeof ReturnBookSchema>;
 export type Room = z.infer<typeof RoomSchema>;
 export type CustomField = z.infer<typeof CustomFieldSchema>;
 export type CodeAssignment = z.infer<typeof CodeAssignmentSchema>;
+export type CatalogImportRow = z.infer<typeof CatalogImportRowSchema>;
