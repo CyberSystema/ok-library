@@ -65,10 +65,31 @@ export const BookSchema = CreateBookSchema.extend({
 });
 
 export const BorrowBookSchema = z.object({
-  borrowerName: z.string().min(1).max(200),
+  // Either pick an existing borrower (preferred — gives them a profile + history)…
+  borrowerId: z.string().min(1).optional().nullable(),
+  // …or create one inline by passing a name (kept for friction-free workflows).
+  borrowerName: z.string().min(1).max(200).optional(),
   borrowerContact: z.string().max(200).optional().nullable(),
   dueAt: ISODateTimeSchema,
   notes: z.string().max(2000).optional().nullable()
+}).refine((v) => Boolean(v.borrowerId) || Boolean(v.borrowerName), {
+  message: 'Either borrowerId or borrowerName must be provided.',
+  path: ['borrowerName']
+});
+
+export const BorrowerSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1).max(200),
+  contact: z.string().max(200).optional().nullable(),
+  notes: z.string().max(2000).optional().nullable(),
+  createdAt: ISODateTimeSchema,
+  updatedAt: ISODateTimeSchema
+});
+
+export const UpsertBorrowerSchema = BorrowerSchema.pick({
+  name: true,
+  contact: true,
+  notes: true
 });
 
 export const ReturnBookSchema = z.object({
@@ -160,13 +181,23 @@ export const BookFilterQuerySchema = z.object({
   qMode: z.enum(['all', 'any', 'exact']).default('all'),
   qExclude: z.string().max(200).optional(),
   partialWords: z.coerce.boolean().default(true),
+  // Fuzzy is on by default: typos and accents shouldn't block librarians from
+  // finding the book they're looking for. The server caps the candidate set so
+  // it stays fast even at 20K rows.
   fuzzyTypos: z.coerce.boolean().default(true),
   searchFields: z.string().max(200).optional(),
   status: BookStatusSchema.optional(),
   language: z.string().max(50).optional(),
   year: z.coerce.number().int().min(1000).max(3000).optional(),
+  yearMin: z.coerce.number().int().min(1000).max(3000).optional(),
+  yearMax: z.coerce.number().int().min(1000).max(3000).optional(),
   roomCode: z.string().max(64).optional(),
   shelfCode: z.string().max(64).optional(),
+  // Smart-list filters: each maps to a WHERE clause server-side. Composable.
+  missingIsbn: z.coerce.boolean().optional(),
+  missingShelf: z.coerce.boolean().optional(),
+  untitled: z.coerce.boolean().optional(),
+  unknownAuthor: z.coerce.boolean().optional(),
   sortBy: z.enum(['title', 'author', 'updatedAt', 'publicationYear', 'status']).default('updatedAt'),
   sortDir: z.enum(['asc', 'desc']).default('desc'),
   page: z.coerce.number().int().min(1).default(1),
@@ -222,3 +253,5 @@ export type Room = z.infer<typeof RoomSchema>;
 export type CustomField = z.infer<typeof CustomFieldSchema>;
 export type CodeAssignment = z.infer<typeof CodeAssignmentSchema>;
 export type CatalogImportRow = z.infer<typeof CatalogImportRowSchema>;
+export type Borrower = z.infer<typeof BorrowerSchema>;
+export type UpsertBorrowerInput = z.infer<typeof UpsertBorrowerSchema>;

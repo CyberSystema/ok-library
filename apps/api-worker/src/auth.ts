@@ -53,11 +53,72 @@ async function sign(input: string, secret: string): Promise<string> {
   return bytesToBase64Url(new Uint8Array(sig));
 }
 
-export async function hashPassword(password: string): Promise<string> {
+// ─── Password hashing ──────────────────────────────────────────────────────
+// We support two formats so an existing deploy keeps working:
+//
+//   • Legacy: unsalted SHA-256 hex (rows where password_salt IS NULL).
+//   • New:    PBKDF2-SHA-256 with a per-user random salt + iteration count.
+//
+// On a successful login against the legacy hash, the login handler rehashes
+// with PBKDF2 and writes the new format back to the row, so over time every
+// active user's password is migrated without forcing a reset.
+
+const PBKDF2_ITERATIONS = 200_000;
+const PBKDF2_SALT_BYTES = 16;
+const PBKDF2_KEY_BYTES = 32;
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export async function hashPasswordSha256(password: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(password));
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+  return bytesToHex(new Uint8Array(digest));
+}
+
+export async function hashPasswordPbkdf2(password: string, saltHex: string, iterations: number): Promise<string> {
+  const saltBytes = new Uint8Array(saltHex.match(/.{2}/g)?.map((b) => parseInt(b, 16)) ?? []);
+  const baseKey = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits']
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations, hash: 'SHA-256' },
+    baseKey,
+    PBKDF2_KEY_BYTES * 8
+  );
+  return bytesToHex(new Uint8Array(bits));
+}
+
+export function generateSaltHex(): string {
+  const bytes = new Uint8Array(PBKDF2_SALT_BYTES);
+  crypto.getRandomValues(bytes);
+  return bytesToHex(bytes);
+}
+
+export function defaultPbkdf2Iterations(): number {
+  return PBKDF2_ITERATIONS;
+}
+
+// Constant-time string comparison to make timing-side-channel attacks on
+// password verification impractical, even though our login is rate-limited.
+export function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+// Backwards-compat shim used by ensureBootstrapAdmin (which seeds a user once,
+// from BOOTSTRAP_ADMIN_PASSWORD). We now seed with PBKDF2 directly there too,
+// but keep the legacy entry point working for any caller that still uses it.
+export async function hashPassword(password: string): Promise<string> {
+  return hashPasswordSha256(password);
 }
 
 export async function createAccessToken(env: Env, claims: Omit<AuthClaims, 'iat' | 'exp' | 'iss'>): Promise<string> {

@@ -1,5 +1,16 @@
 import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
+import {
+  BookCardSkeleton,
+  ConfirmProvider,
+  MiniBar,
+  ToastProvider,
+  fmt,
+  highlight,
+  normalizeForCompare,
+  useConfirm,
+  useToast
+} from './ui';
 import './styles.css';
 
 // Lazy-loaded only when the user opens the Import tab — saves ~1MB from the initial bundle.
@@ -24,6 +35,26 @@ type Book = {
   language?: string | null;
   description?: string | null;
   legacyId?: string | null;
+  coverUrl?: string | null;
+};
+
+type Borrower = {
+  id: string;
+  name: string;
+  contact?: string | null;
+  totalLoans: number;
+  openLoans: number;
+  overdueLoans: number;
+};
+
+// Smart lists are pre-saved filter combinations the user can apply with one click.
+// Each entry maps to query-string params understood by /api/books.
+type SmartList = {
+  key: string;
+  icon: string;
+  label: string;
+  // Returns the filter params; the caller spreads these into the URLSearchParams.
+  params: Record<string, string>;
 };
 
 type CatalogRow = {
@@ -107,7 +138,45 @@ type CategoryItem = {
   count: number;
 };
 
-type AppSection = 'books' | 'circulation' | 'import' | 'maintenance';
+type AppSection = 'dashboard' | 'books' | 'circulation' | 'import' | 'settings';
+
+type StatsResponse = {
+  byStatus: Array<{ status: string; count: number }>;
+  byLanguage: Array<{ language: string; count: number }>;
+  byYear: Array<{ bucket: string; count: number }>;
+  completeness: {
+    total: number;
+    withIsbn: number;
+    withShelf: number;
+    withPublisher: number;
+    withYear: number;
+    untitled: number;
+    unknownAuthor: number;
+  };
+  recentlyUpdated: Array<{
+    id: string;
+    title: string;
+    author: string;
+    legacyId: string | null;
+    updatedAt: string;
+  }>;
+  topShelves: Array<{ shelfCode: string; count: number }>;
+};
+
+type Theme = 'light' | 'dark';
+
+// Saved smart lists rendered as one-click filter chips. The keys must be stable
+// because they're used to highlight the active chip.
+const SMART_LISTS: SmartList[] = [
+  { key: 'missing-isbn',     icon: '🔢', label: 'Missing ISBN',     params: { missingIsbn: '1' } },
+  { key: 'missing-shelf',    icon: '📍', label: 'Missing shelf',    params: { missingShelf: '1' } },
+  { key: 'untitled',         icon: '⊘',  label: 'Untitled',         params: { untitled: '1' } },
+  { key: 'unknown-author',   icon: '?',  label: 'Unknown author',   params: { unknownAuthor: '1' } },
+  { key: 'pre-1900',         icon: '🏛', label: 'Before 1900',      params: { yearMax: '1899' } },
+  { key: 'post-2000',        icon: '🆕', label: 'From 2000+',       params: { yearMin: '2000' } },
+  { key: 'borrowed',         icon: '🔁', label: 'Currently borrowed', params: { status: 'borrowed' } },
+  { key: 'recently-added',   icon: '🕒', label: 'Recently added',   params: { sortBy: 'updatedAt', sortDir: 'desc' } }
+];
 
 type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
 type DuplicateGroup = DuplicateEntry[];
@@ -269,11 +338,15 @@ function SectionHeader({
 }
 
 function App() {
+  const toast = useToast();
+  const confirm = useConfirm();
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
   const [sessionLoading, setSessionLoading] = useState(true);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
-  const [currentSection, setCurrentSection] = useState<AppSection>('books');
+  const [currentSection, setCurrentSection] = useState<AppSection>('dashboard');
+  const [theme, setTheme] = useState<Theme>('light');
+  const [stats, setStats] = useState<StatsResponse | null>(null);
 
   const [books, setBooks] = useState<Book[]>([]);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
@@ -284,7 +357,7 @@ function App() {
   const [qExclude, setQExclude] = useState('');
   const [qMode, setQMode] = useState<SearchMode>('all');
   const [partialWords, setPartialWords] = useState(true);
-  const [fuzzyTypos, setFuzzyTypos] = useState(false);
+  const [fuzzyTypos, setFuzzyTypos] = useState(true);
   const [searchFields, setSearchFields] = useState<SearchField[]>(['title', 'author', 'isbn']);
   const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
   const [status, setStatus] = useState('');
@@ -299,6 +372,10 @@ function App() {
   const [categories, setCategories] = useState<CategoryItem[]>([]);
   const [categoryFilter, setCategoryFilter] = useState<string>('');
   const [needsReviewFilter, setNeedsReviewFilter] = useState(false);
+  const [smartListKey, setSmartListKey] = useState<string>('');
+  const [borrowerSuggestions, setBorrowerSuggestions] = useState<Borrower[]>([]);
+  const [borrowerQuery, setBorrowerQuery] = useState('');
+  const [selectedBorrowerId, setSelectedBorrowerId] = useState<string>('');
   const [needsReviewCount, setNeedsReviewCount] = useState(0);
   const [showCategoryRail, setShowCategoryRail] = useState(true);
   const [categoryRailQuery, setCategoryRailQuery] = useState('');
@@ -369,8 +446,6 @@ function App() {
   const [bulkStatus, setBulkStatus] = useState<string>('');
   const [bulkRoomCode, setBulkRoomCode] = useState('');
   const [bulkShelfCode, setBulkShelfCode] = useState('');
-  const [bookQuickFilter, setBookQuickFilter] = useState<'all' | 'available' | 'borrowed' | 'overdue' | 'missingLocation'>('all');
-  const [loanFilter, setLoanFilter] = useState<'all' | 'overdue' | 'dueSoon'>('all');
   const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
   const [showDuplicatesPanel, setShowDuplicatesPanel] = useState(false);
   const [duplicateWarning, setDuplicateWarning] = useState<DuplicateEntry[]>([]);
@@ -379,6 +454,21 @@ function App() {
   const [error, setError] = useState('');
   const [isWorking, setIsWorking] = useState(false);
   const [didBootstrapData, setDidBootstrapData] = useState(false);
+  const [isLoadingBooks, setIsLoadingBooks] = useState(false);
+
+  // Bridge legacy message/error state to the toast stack so we don't have to
+  // rewrite every set{Message,Error} call site. Effects fire when those states
+  // become non-empty, then immediately clear them.
+  useEffect(() => {
+    if (!message) return;
+    toast.push('success', message);
+    setMessage('');
+  }, [message, toast]);
+  useEffect(() => {
+    if (!error) return;
+    toast.push('error', error);
+    setError('');
+  }, [error, toast]);
 
   const loggedIn = Boolean(currentUser);
 
@@ -401,15 +491,17 @@ function App() {
     });
   }, [loggedIn, didBootstrapData]);
 
-  // Restore UI preferences (sort, density) from localStorage so the app feels personal across sessions.
+  // Restore UI preferences (sort, density, theme) from localStorage so the app feels personal across sessions.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(PREFS_STORAGE_KEY);
       if (!raw) return;
-      const prefs = JSON.parse(raw) as { sortBy?: SortBy; sortDir?: SortDir; density?: Density };
+      const prefs = JSON.parse(raw) as { sortBy?: SortBy; sortDir?: SortDir; density?: Density; theme?: Theme };
       if (prefs.sortBy) setSortBy(prefs.sortBy);
       if (prefs.sortDir) setSortDir(prefs.sortDir);
       if (prefs.density) setDensity(prefs.density);
+      if (prefs.theme) setTheme(prefs.theme);
+      else if (window.matchMedia?.('(prefers-color-scheme: dark)').matches) setTheme('dark');
     } catch {
       // Ignore — corrupted prefs shouldn't break the app.
     }
@@ -417,11 +509,15 @@ function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify({ sortBy, sortDir, density }));
+      localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify({ sortBy, sortDir, density, theme }));
     } catch {
       // Storage may be disabled (private mode); ignore.
     }
-  }, [sortBy, sortDir, density]);
+  }, [sortBy, sortDir, density, theme]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   // Power-user shortcuts: "/" focuses search, "Esc" closes the open detail modal.
   useEffect(() => {
@@ -447,8 +543,8 @@ function App() {
     roomSummary.reduce((sum, room) => sum + Number(room.available_books ?? 0), 0) + Number(unassignedSummary.availableBooks ?? 0);
   const borrowedBooksFromSummary =
     roomSummary.reduce((sum, room) => sum + Number(room.borrowed_books ?? 0), 0) + Number(unassignedSummary.borrowedBooks ?? 0);
-  const availableBooksDisplay = availableBooksFromSummary.toLocaleString('en-US');
-  const borrowedBooksDisplay = borrowedBooksFromSummary.toLocaleString('en-US');
+  const availableBooksDisplay = fmt(availableBooksFromSummary);
+  const borrowedBooksDisplay = fmt(borrowedBooksFromSummary);
   const overdueCount = activeBorrows.filter((item) => item.isOverdue).length;
   const dueSoonCount = activeBorrows.filter((item) => {
     if (item.isOverdue) {
@@ -458,65 +554,13 @@ function App() {
     return diffMs > 0 && diffMs <= 48 * 60 * 60 * 1000;
   }).length;
 
-  const sectionMeta: Array<{ key: AppSection; label: string }> = [
-    { key: 'books', label: 'Library' },
-    { key: 'circulation', label: 'Loans' },
-    { key: 'import', label: 'Import/Export' },
-    { key: 'maintenance', label: 'Maintainance' }
+  const sectionMeta: Array<{ key: AppSection; label: string; icon: string }> = [
+    { key: 'dashboard', label: 'Dashboard', icon: '📊' },
+    { key: 'books', label: 'Library', icon: '📚' },
+    { key: 'circulation', label: 'Loans', icon: '🔁' },
+    { key: 'import', label: 'Import/Export', icon: '⇅' },
+    { key: 'settings', label: 'Settings', icon: '⚙️' }
   ];
-
-  const overdueBorrowedBookIds = useMemo(
-    () => new Set(activeBorrows.filter((item) => item.isOverdue).map((item) => item.bookId)),
-    [activeBorrows]
-  );
-
-  const dueSoonBorrowBookIds = useMemo(
-    () =>
-      new Set(
-        activeBorrows
-          .filter((item) => {
-            if (item.isOverdue) {
-              return false;
-            }
-            const diffMs = new Date(item.dueAt).getTime() - Date.now();
-            return diffMs > 0 && diffMs <= 48 * 60 * 60 * 1000;
-          })
-          .map((item) => item.bookId)
-      ),
-    [activeBorrows]
-  );
-
-  const visibleBooks = useMemo(() => {
-    if (bookQuickFilter === 'all') {
-      return books;
-    }
-
-    if (bookQuickFilter === 'available') {
-      return books.filter((book) => book.status === 'available');
-    }
-
-    if (bookQuickFilter === 'borrowed') {
-      return books.filter((book) => book.status === 'borrowed');
-    }
-
-    if (bookQuickFilter === 'overdue') {
-      return books.filter((book) => overdueBorrowedBookIds.has(book.id));
-    }
-
-    return books.filter((book) => !book.roomCode || !book.shelfCode);
-  }, [bookQuickFilter, books, overdueBorrowedBookIds]);
-
-  const visibleActiveBorrows = useMemo(() => {
-    if (loanFilter === 'all') {
-      return activeBorrows;
-    }
-
-    if (loanFilter === 'overdue') {
-      return activeBorrows.filter((item) => item.isOverdue);
-    }
-
-    return activeBorrows.filter((item) => dueSoonBorrowBookIds.has(item.bookId));
-  }, [activeBorrows, dueSoonBorrowBookIds, loanFilter]);
 
   function clearStatus() {
     setError('');
@@ -897,8 +941,94 @@ function App() {
       loadActiveBorrows(),
       loadAuditLogs(),
       loadCategories(),
-      loadNeedsReviewCount()
+      loadNeedsReviewCount(),
+      loadStats()
     ]);
+  }
+
+  // Borrower autocomplete: debounced server search; result rows let the user pick
+  // an existing borrower instead of typing a duplicate name.
+  async function searchBorrowers(query: string): Promise<void> {
+    try {
+      const params = new URLSearchParams();
+      if (query.trim()) params.set('q', query.trim());
+      params.set('limit', '8');
+      const response = await apiRequest<{ items: Borrower[] }>(`/api/borrowers?${params.toString()}`);
+      setBorrowerSuggestions(response.items ?? []);
+    } catch {
+      setBorrowerSuggestions([]);
+    }
+  }
+
+  async function uploadBookCover(book: Book, file: File): Promise<void> {
+    clearStatus();
+    if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.type)) {
+      setError('Cover must be JPEG, PNG, WebP, or GIF.');
+      return;
+    }
+    if (file.size > 4 * 1024 * 1024) {
+      setError('Cover image too large (max 4 MB).');
+      return;
+    }
+    try {
+      await runAction(() =>
+        apiRequest<{ ok: boolean; coverUrl: string }>(`/api/books/${book.id}/cover`, {
+          method: 'PUT',
+          headers: { 'Content-Type': file.type },
+          body: file
+        }, false)
+      );
+      setMessage(`Cover updated for "${book.title}".`);
+      setDetailBook((prev) =>
+        prev && prev.id === book.id
+          ? { ...prev, coverUrl: `/api/books/${book.id}/cover?v=${Date.now()}` }
+          : prev
+      );
+      await loadBooks();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function deleteBookCover(book: Book): Promise<void> {
+    const ok = await confirm({
+      title: 'Remove cover image?',
+      body: 'The book stays — only the photo is deleted.',
+      confirmLabel: 'Remove cover',
+      danger: true
+    });
+    if (!ok) return;
+    clearStatus();
+    try {
+      await runAction(() => apiRequest<void>(`/api/books/${book.id}/cover`, { method: 'DELETE' }));
+      setMessage('Cover removed.');
+      setDetailBook((prev) => (prev && prev.id === book.id ? { ...prev, coverUrl: null } : prev));
+      await loadBooks();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function printLabels(targets: Book[]): Promise<void> {
+    if (targets.length === 0) return;
+    clearStatus();
+    try {
+      // Lazy-load the QR generator only when the user actually needs it.
+      const labels = await import('./labels');
+      await labels.openPrintLabels(targets, API_BASE);
+      setMessage(`Opened print preview for ${targets.length} label${targets.length === 1 ? '' : 's'}.`);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function loadStats() {
+    try {
+      const response = await apiRequest<StatsResponse>('/api/stats');
+      setStats(response);
+    } catch {
+      setStats(null);
+    }
   }
 
   async function loadCategories() {
@@ -982,6 +1112,7 @@ function App() {
   }
 
   const loadBooks = useCallback(async (pageOverride?: number) => {
+    setIsLoadingBooks(true);
     try {
       const page = pageOverride ?? currentPage;
       const query = new URLSearchParams();
@@ -998,6 +1129,15 @@ function App() {
       if (categoryFilter) query.set('custom_category_code', categoryFilter);
       if (needsReviewFilter) query.set('custom_needs_review', '1');
       if (shelfFilter) query.set('shelfCode', shelfFilter);
+      // Apply the active smart-list's filters last so it composes with the rest.
+      if (smartListKey) {
+        const list = SMART_LISTS.find((l) => l.key === smartListKey);
+        if (list) {
+          for (const [k, v] of Object.entries(list.params)) {
+            query.set(k, v);
+          }
+        }
+      }
       query.set('sortBy', sortBy);
       query.set('sortDir', sortDir);
       query.set('page', page.toString());
@@ -1009,11 +1149,13 @@ function App() {
       setCurrentPage(page);
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setIsLoadingBooks(false);
     }
   }, [
     currentPage, q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
     status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
-    shelfFilter, sortBy, sortDir
+    shelfFilter, sortBy, sortDir, smartListKey
   ]);
 
   // Debounced auto-search: any change to query/filters/sort re-fetches books on page 1.
@@ -1022,7 +1164,7 @@ function App() {
     const signature = JSON.stringify({
       q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
       status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
-      shelfFilter, sortBy, sortDir
+      shelfFilter, sortBy, sortDir, smartListKey
     });
     if (signature === lastSearchSignatureRef.current) return;
     lastSearchSignatureRef.current = signature;
@@ -1034,7 +1176,7 @@ function App() {
     loggedIn, didBootstrapData,
     q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
     status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
-    shelfFilter, sortBy, sortDir,
+    shelfFilter, sortBy, sortDir, smartListKey,
     loadBooks
   ]);
 
@@ -1212,69 +1354,6 @@ function App() {
     }
   }
 
-  function updateAttributeEditorValue(key: string, value: unknown) {
-    setAttributeEditorValues((prev) => ({ ...prev, [key]: value }));
-  }
-
-  async function saveBookAttributes() {
-    if (!editForm.id) return;
-    clearStatus();
-
-    try {
-      const typedValues: Record<string, unknown> = {};
-      const requiredMissing: string[] = [];
-      for (const field of customFields) {
-        const raw = attributeEditorValues[field.key];
-        const missing = raw === undefined || raw === null || raw === '';
-        if (missing) {
-          if (field.required) {
-            requiredMissing.push(field.label);
-          }
-          continue;
-        }
-
-        if (field.type === 'number') {
-          const parsed = Number(raw);
-          if (!Number.isFinite(parsed)) {
-            throw new Error(`${field.label} must be a valid number.`);
-          }
-          typedValues[field.key] = parsed;
-          continue;
-        }
-
-        if (field.type === 'boolean') {
-          typedValues[field.key] = raw === true || raw === 'true';
-          continue;
-        }
-
-        if (field.type === 'date') {
-          const parsedDate = new Date(String(raw));
-          if (Number.isNaN(parsedDate.getTime())) {
-            throw new Error(`${field.label} must be a valid date.`);
-          }
-          typedValues[field.key] = parsedDate.toISOString();
-          continue;
-        }
-
-        typedValues[field.key] = String(raw);
-      }
-
-      if (requiredMissing.length > 0) {
-        throw new Error(`Please fill required attributes: ${requiredMissing.join(', ')}`);
-      }
-
-      await runAction(() => apiRequest<{ bookId: string }>(`/api/books/${editForm.id}/attributes`, {
-        method: 'PUT',
-        body: JSON.stringify({ values: typedValues })
-      }));
-
-      setMessage('Book attributes saved.');
-      await loadBooks();
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
   async function saveBookEdit(event: FormEvent) {
     event.preventDefault();
     if (!editForm.id) return;
@@ -1328,9 +1407,13 @@ function App() {
   }
 
   async function deleteBook(book: Book) {
-    if (!window.confirm(`Delete "${book.title}"? This action cannot be undone.`)) {
-      return;
-    }
+    const ok = await confirm({
+      title: `Delete "${book.title}"?`,
+      body: 'This action cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true
+    });
+    if (!ok) return;
 
     clearStatus();
 
@@ -1357,17 +1440,25 @@ function App() {
     }
 
     try {
+      const body: Record<string, unknown> = { dueAt, notes: null };
+      if (selectedBorrowerId) {
+        body.borrowerId = selectedBorrowerId;
+      } else {
+        body.borrowerName = borrowerName;
+        body.borrowerContact = borrowerContact || null;
+      }
       await runAction(() => apiRequest(`/api/books/${book.id}/borrow`, {
         method: 'POST',
-        body: JSON.stringify({
-          borrowerName,
-          borrowerContact: borrowerContact || null,
-          dueAt,
-          notes: null
-        })
+        body: JSON.stringify(body)
       }));
 
       setMessage(`Book borrowed: ${book.title}`);
+      // Reset borrower form so the next borrow starts fresh.
+      setBorrowerName('');
+      setBorrowerContact('');
+      setSelectedBorrowerId('');
+      setBorrowerQuery('');
+      setBorrowerSuggestions([]);
       await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
     } catch (e) {
       setError((e as Error).message);
@@ -1474,8 +1565,8 @@ function App() {
     });
   }
 
-  function selectVisibleBooks() {
-    setSelectedBookIds(visibleBooks.map((book) => book.id));
+  function selectAllOnPage() {
+    setSelectedBookIds(books.map((book) => book.id));
   }
 
   function clearSelectedBooks() {
@@ -1542,7 +1633,7 @@ function App() {
   async function exportFilteredBooksCsv() {
     clearStatus();
     try {
-      if (visibleBooks.length === 0) {
+      if (books.length === 0) {
         throw new Error('No visible books to export.');
       }
 
@@ -1559,7 +1650,7 @@ function App() {
 
       const columns = ['id', 'title', 'author', 'isbn', 'status', 'roomCode', 'shelfCode', 'publicationYear'];
       const lines = [columns.join(',')];
-      for (const book of visibleBooks) {
+      for (const book of books) {
         lines.push(
           [
             book.id,
@@ -1584,7 +1675,7 @@ function App() {
       anchor.download = 'books-filtered.csv';
       anchor.click();
       URL.revokeObjectURL(url);
-      setMessage(`Filtered CSV downloaded (${visibleBooks.length} books).`);
+      setMessage(`Filtered CSV downloaded (${books.length} books).`);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1706,9 +1797,13 @@ function App() {
   }
 
   async function deleteCustomField(field: CustomField) {
-    if (!window.confirm(`Delete custom field "${field.key}"?`)) {
-      return;
-    }
+    const ok = await confirm({
+      title: `Delete custom field "${field.key}"?`,
+      body: 'Books that previously had this attribute will keep the data in their custom_fields JSON, but the field will no longer be editable in the form.',
+      confirmLabel: 'Delete field',
+      danger: true
+    });
+    if (!ok) return;
 
     clearStatus();
 
@@ -2040,15 +2135,16 @@ function App() {
       if (unknownColumns.length > 0) {
         const listed = unknownColumns.slice(0, 12).join(', ');
         const extra = unknownColumns.length > 12 ? `, and ${unknownColumns.length - 12} more` : '';
-        const proceed = window.confirm(
-          `Your file has columns not mapped to the current database: ${listed}${extra}.\n\n` +
-            'Click OK to exclude these columns and continue import.\n' +
-            'Click Cancel to stop and create matching custom attributes first (or remove those columns from the file).'
-        );
+        const proceed = await confirm({
+          title: 'Unmapped columns detected',
+          body: `Columns not mapped to the database: ${listed}${extra}. Continue importing without them, or cancel to add the matching custom attributes first?`,
+          confirmLabel: 'Continue without those columns',
+          cancelLabel: 'Cancel import'
+        });
 
         if (!proceed) {
           setError(
-            'Import canceled. Create matching custom attributes in Rooms & Fields, or remove unsupported columns, then try again.'
+            'Import canceled. Create matching custom attributes in Settings, or remove unsupported columns, then try again.'
           );
           return;
         }
@@ -2324,6 +2420,7 @@ function App() {
                       📥 Return
                     </button>
                   )}
+                  <button className="secondary small" onClick={() => void printLabels([detailBook])}>🖨 Label</button>
                   <button className="danger small" onClick={() => void deleteBook(detailBook)}>🗑 Delete</button>
                 </>
               ) : (
@@ -2335,6 +2432,41 @@ function App() {
             <div className="modal-body">
               {detailMode === 'view' ? (
                 <>
+                  {/* Cover image */}
+                  <div className="detail-section cover-section">
+                    {detailBook.coverUrl ? (
+                      <img
+                        className="detail-cover"
+                        src={joinApiUrl(detailBook.coverUrl)}
+                        alt={`Cover of ${displayTitle(detailBook)}`}
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div className="detail-cover detail-cover-placeholder">
+                        <span>No cover</span>
+                      </div>
+                    )}
+                    <div className="cover-actions">
+                      <label className="secondary small button-like">
+                        {detailBook.coverUrl ? 'Replace cover' : 'Upload cover'}
+                        <input
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,image/gif"
+                          style={{ display: 'none' }}
+                          onChange={(e) => {
+                            const f = e.target.files?.[0];
+                            e.target.value = '';
+                            if (f) void uploadBookCover(detailBook, f);
+                          }}
+                        />
+                      </label>
+                      {detailBook.coverUrl && (
+                        <button className="danger small" onClick={() => void deleteBookCover(detailBook)}>Remove</button>
+                      )}
+                      <span className="muted small">JPEG/PNG/WebP/GIF · max 4 MB</span>
+                    </div>
+                  </div>
+
                   {/* Core Info */}
                   <div className="detail-section">
                     <div className="detail-section-title">Book Information</div>
@@ -2541,6 +2673,14 @@ function App() {
               <h1>OK Library</h1>
             </div>
             <div className="navbar-right">
+              <button
+                className="theme-toggle"
+                onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+                title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+                aria-label="Toggle dark mode"
+              >
+                {theme === 'dark' ? '☀' : '🌙'}
+              </button>
               {currentUser && <span className="navbar-user">{currentUser.username}</span>}
               <button className="secondary small" onClick={logout}>Sign out</button>
             </div>
@@ -2554,12 +2694,178 @@ function App() {
                 className={currentSection === section.key ? 'tab-btn active' : 'tab-btn'}
                 onClick={() => setCurrentSection(section.key)}
               >
-                {section.label}
+                <span className="tab-icon" aria-hidden="true">{section.icon}</span>
+                <span className="tab-label">{section.label}</span>
               </button>
             ))}
           </div>
 
           <div className="simple-content">
+
+            {/* ═══ DASHBOARD TAB ═══ */}
+            {currentSection === 'dashboard' && (
+              <>
+                <div className="section-header">
+                  <div className="section-header-text">
+                    <h2>Dashboard</h2>
+                    <p>At-a-glance health of your collection</p>
+                  </div>
+                  <div className="section-header-actions">
+                    <button className="secondary small" onClick={() => void loadStats()}>↻ Refresh</button>
+                  </div>
+                </div>
+
+                {!stats ? (
+                  <div className="card empty-state"><p style={{ fontSize: '2rem' }}>📊</p><p>Loading statistics…</p></div>
+                ) : (
+                  <>
+                    {/* KPI tiles */}
+                    <div className="stats-row" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))' }}>
+                      <div className="stat-box accent">
+                        <span className="stat-box-label">Total Books</span>
+                        <span className="stat-box-value">{fmt(stats.completeness.total)}</span>
+                      </div>
+                      <div className="stat-box success">
+                        <span className="stat-box-label">Available</span>
+                        <span className="stat-box-value">
+                          {fmt(stats.byStatus.find((s) => s.status === 'available')?.count ?? 0)}
+                        </span>
+                      </div>
+                      <div className="stat-box warning">
+                        <span className="stat-box-label">Borrowed</span>
+                        <span className="stat-box-value">
+                          {fmt(stats.byStatus.find((s) => s.status === 'borrowed')?.count ?? 0)}
+                        </span>
+                      </div>
+                      <div className="stat-box danger">
+                        <span className="stat-box-label">Lost / Maint.</span>
+                        <span className="stat-box-value">
+                          {fmt((stats.byStatus.find((s) => s.status === 'lost')?.count ?? 0)
+                            + (stats.byStatus.find((s) => s.status === 'maintenance')?.count ?? 0))}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="dashboard-grid">
+                      {/* Completeness */}
+                      <div className="card">
+                        <h3>Catalog Completeness</h3>
+                        <div className="completeness-list">
+                          {([
+                            ['ISBN', stats.completeness.withIsbn],
+                            ['Shelf code', stats.completeness.withShelf],
+                            ['Publisher', stats.completeness.withPublisher],
+                            ['Publication year', stats.completeness.withYear]
+                          ] as Array<[string, number]>).map(([label, n]) => {
+                            const pct = stats.completeness.total > 0
+                              ? Math.round((n / stats.completeness.total) * 100)
+                              : 0;
+                            return (
+                              <div key={label} className="completeness-row">
+                                <span className="completeness-label">{label}</span>
+                                <div className="completeness-bar">
+                                  <div className="completeness-fill" style={{ width: `${pct}%` }} />
+                                </div>
+                                <span className="completeness-pct">{pct}%</span>
+                                <span className="completeness-count">{fmt(n)}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        {(stats.completeness.untitled > 0 || stats.completeness.unknownAuthor > 0) && (
+                          <p className="muted small" style={{ marginTop: '0.75rem' }}>
+                            {fmt(stats.completeness.untitled)} untitled · {fmt(stats.completeness.unknownAuthor)} with unknown author
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Languages */}
+                      <div className="card">
+                        <h3>Top Languages</h3>
+                        {stats.byLanguage.length === 0 ? (
+                          <p className="muted small">No language data.</p>
+                        ) : (
+                          <div className="minibar-list">
+                            {stats.byLanguage.map((l) => (
+                              <MiniBar
+                                key={l.language}
+                                label={l.language}
+                                value={l.count}
+                                count={l.count}
+                                max={stats.byLanguage[0].count}
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Years */}
+                      <div className="card">
+                        <h3>Publication Year</h3>
+                        <div className="minibar-list">
+                          {stats.byYear.map((y) => (
+                            <MiniBar
+                              key={y.bucket}
+                              label={y.bucket}
+                              value={y.count}
+                              count={y.count}
+                              max={Math.max(...stats.byYear.map((b) => b.count))}
+                            />
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Top Shelves */}
+                      <div className="card">
+                        <h3>Top Shelves</h3>
+                        {stats.topShelves.length === 0 ? (
+                          <p className="muted small">No shelf assignments yet.</p>
+                        ) : (
+                          <div className="minibar-list">
+                            {stats.topShelves.map((s) => (
+                              <MiniBar
+                                key={s.shelfCode}
+                                label={s.shelfCode}
+                                value={s.count}
+                                count={s.count}
+                                max={stats.topShelves[0].count}
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Recent activity */}
+                      <div className="card" style={{ gridColumn: '1 / -1' }}>
+                        <h3>Recently Updated</h3>
+                        {stats.recentlyUpdated.length === 0 ? (
+                          <p className="muted small">No recent edits.</p>
+                        ) : (
+                          <ul className="recent-list">
+                            {stats.recentlyUpdated.map((b) => (
+                              <li key={b.id}>
+                                <button
+                                  className="recent-link"
+                                  onClick={() => {
+                                    void apiRequest<{ id: string; title: string; author: string; status: BookStatus; version: number; customFields?: Record<string, string|number|boolean|null>; isbn?: string|null; shelfCode?: string|null; publicationYear?: number|null; publisher?: string|null; language?: string|null; description?: string|null; legacyId?: string|null; }>(`/api/books/${b.id}`)
+                                      .then((book) => { setDetailBook(book as Book); setDetailMode('view'); setBookHistory([]); void loadBookHistory(book.id); setCurrentSection('books'); });
+                                  }}
+                                >
+                                  <strong>{b.title || '(Untitled)'}</strong>
+                                  <span className="muted small"> · {b.author || '(Unknown)'}</span>
+                                  {b.legacyId && <span className="legacy-id-pill">{b.legacyId}</span>}
+                                </button>
+                                <span className="muted small">{new Date(b.updatedAt).toLocaleString()}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
 
             {/* ═══ LIBRARY TAB ═══ */}
             {currentSection === 'books' && (
@@ -2581,7 +2887,7 @@ function App() {
                 <div className="stats-row">
                   <div className="stat-box accent">
                     <span className="stat-box-label">Total Books</span>
-                    <span className="stat-box-value">{totalBooksCount.toLocaleString()}</span>
+                    <span className="stat-box-value">{fmt(totalBooksCount)}</span>
                   </div>
                   <div className="stat-box success">
                     <span className="stat-box-label">Available</span>
@@ -2606,8 +2912,23 @@ function App() {
                     title="Books flagged during catalog cleanup"
                   >
                     ⚑ Needs review
-                    {needsReviewCount > 0 && <span className="chip-count">{needsReviewCount.toLocaleString()}</span>}
+                    {needsReviewCount > 0 && <span className="chip-count">{fmt(needsReviewCount)}</span>}
                   </button>
+                  {SMART_LISTS.map((list) => {
+                    const active = smartListKey === list.key;
+                    return (
+                      <button
+                        key={list.key}
+                        type="button"
+                        className={`chip${active ? ' is-active' : ''}`}
+                        onClick={() => setSmartListKey(active ? '' : list.key)}
+                        title={`Smart list: ${list.label}`}
+                      >
+                        <span className="chip-icon">{list.icon}</span> {list.label}
+                        {active && <span className="chip-x">✕</span>}
+                      </button>
+                    );
+                  })}
                   {categoryFilter && (
                     <button
                       type="button"
@@ -2648,7 +2969,7 @@ function App() {
                           onClick={() => setCategoryFilter('')}
                         >
                           <span className="cat-label">All categories</span>
-                          <span className="cat-count">{totalBooksCount.toLocaleString()}</span>
+                          <span className="cat-count">{fmt(totalBooksCount)}</span>
                         </li>
                         {categories
                           .filter((c) => {
@@ -2670,7 +2991,7 @@ function App() {
                                 <span className="cat-code">{c.code}</span>
                                 {c.label ? <span className="cat-text"> {c.label}</span> : null}
                               </span>
-                              <span className="cat-count">{c.count.toLocaleString()}</span>
+                              <span className="cat-count">{fmt(c.count)}</span>
                             </li>
                           ))}
                       </ul>
@@ -2780,7 +3101,7 @@ function App() {
                         ref={searchInputRef}
                         value={q}
                         onChange={(e) => setQ(e.target.value)}
-                        placeholder="Search title, author, ISBN…"
+                        placeholder="Smart search · forgives typos & accents — try Greek, English, ISBN…"
                       />
                     </div>
                     <div className="filter-field">
@@ -2847,7 +3168,7 @@ function App() {
                         setQExclude('');
                         setQMode('all');
                         setPartialWords(true);
-                        setFuzzyTypos(false);
+                        setFuzzyTypos(true);
                         setSearchFields(['title', 'author', 'isbn']);
                         setStatus('');
                         setFilterLanguage('');
@@ -2856,6 +3177,7 @@ function App() {
                         setShelfFilter('');
                         setCategoryFilter('');
                         setNeedsReviewFilter(false);
+                        setSmartListKey('');
                         setCurrentPage(1);
                       }}>Reset</button>
                     </div>
@@ -2932,46 +3254,141 @@ function App() {
                   )}
                 </div>
 
+                {/* Bulk action bar — only visible when at least one book is selected. */}
+                {selectedBookIds.length > 0 && (
+                  <div className="bulk-bar" role="region" aria-label="Bulk actions">
+                    <div className="bulk-bar-info">
+                      <strong>{selectedBookIds.length}</strong>
+                      <span className="muted small">selected on this page</span>
+                      <button className="link-btn" onClick={selectAllOnPage}>Select all visible ({books.length})</button>
+                      <button className="link-btn" onClick={clearSelectedBooks}>Clear</button>
+                    </div>
+                    <div className="bulk-bar-actions">
+                      <select value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)} aria-label="Set status">
+                        <option value="">Set status…</option>
+                        <option value="available">Available</option>
+                        <option value="borrowed">Borrowed</option>
+                        <option value="lost">Lost</option>
+                        <option value="maintenance">Maintenance</option>
+                      </select>
+                      <input
+                        value={bulkShelfCode}
+                        onChange={(e) => setBulkShelfCode(e.target.value)}
+                        placeholder="Set shelf"
+                        aria-label="Set shelf code"
+                      />
+                      <button
+                        className="primary small"
+                        onClick={() => void applyBulkBookChanges()}
+                        disabled={!bulkStatus && !bulkShelfCode.trim() && !bulkRoomCode.trim()}
+                      >Apply</button>
+                      <button
+                        className="secondary small"
+                        onClick={() => {
+                          const targets = books.filter((b) => selectedBookIds.includes(b.id));
+                          void printLabels(targets);
+                        }}
+                      >🖨 Labels</button>
+                      <button
+                        className="danger small"
+                        onClick={async () => {
+                          const ok = await confirm({
+                            title: `Delete ${selectedBookIds.length} book${selectedBookIds.length === 1 ? '' : 's'}?`,
+                            body: 'This soft-deletes them; admins can restore by direct DB edit. Loan history stays.',
+                            confirmLabel: 'Delete selected',
+                            danger: true
+                          });
+                          if (!ok) return;
+                          clearStatus();
+                          try {
+                            const ids = [...selectedBookIds];
+                            const results = await runAction(() =>
+                              Promise.allSettled(ids.map((id) => apiRequest<void>(`/api/books/${id}`, { method: 'DELETE' })))
+                            );
+                            const failed = results.filter((r) => r.status === 'rejected').length;
+                            const success = results.length - failed;
+                            setMessage(failed === 0
+                              ? `Deleted ${success} book${success === 1 ? '' : 's'}.`
+                              : `Deleted ${success}, ${failed} failed.`);
+                            setSelectedBookIds([]);
+                            await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadStats()]);
+                          } catch (e) {
+                            setError((e as Error).message);
+                          }
+                        }}
+                      >Delete</button>
+                    </div>
+                  </div>
+                )}
+
                 {/* Book Grid */}
                 <div className="card">
-                  {books.length === 0 ? (
+                  {isLoadingBooks && books.length === 0 ? (
+                    <BookCardSkeleton count={6} />
+                  ) : books.length === 0 ? (
                     <div className="empty-state">
                       <p style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>📚</p>
                       <p style={{ fontWeight: 600 }}>No books found</p>
-                      <p className="muted small">Try adjusting your search filters, or add a new book above.</p>
+                      <p className="muted small">
+                        {q || categoryFilter || needsReviewFilter || status || filterLanguage || filterYear || shelfFilter
+                          ? 'No matches for your filters. Try clearing them or broadening the search.'
+                          : 'Add a book above, or import a catalog from the Import/Export tab.'}
+                      </p>
                     </div>
                   ) : (
                     <>
                       <div className={density === 'compact' ? 'book-list' : 'book-grid'}>
-                        {books.map((book) => (
-                          <div
-                            key={book.id}
-                            className={density === 'compact' ? 'book-row' : 'book-card'}
-                            onClick={() => openBookDetail(book)}
-                            role="button"
-                            tabIndex={0}
-                            onKeyDown={(e) => e.key === 'Enter' && openBookDetail(book)}
-                          >
-                            <div className="book-avatar">{(displayTitle(book).charAt(0) || '?').toUpperCase()}</div>
-                            <div className="book-card-body">
-                              <span className={`book-card-title${isPlaceholder(book.title, 'title') || !book.title ? ' is-placeholder' : ''}`}>
-                                {displayTitle(book)}
-                              </span>
-                              <p className={`book-card-author${isPlaceholder(book.author, 'author') || !book.author ? ' is-placeholder' : ''}`}>
-                                {displayAuthor(book)}
-                              </p>
-                              <div className="book-card-meta">
-                                {book.roomCode && <span className="meta-chip">📍 {book.roomCode}</span>}
-                                {book.shelfCode && <span className="meta-chip">{book.shelfCode}</span>}
-                                {book.publicationYear && <span className="meta-chip">{book.publicationYear}</span>}
-                                {book.isbn && <span className="meta-chip">ISBN</span>}
+                        {books.map((book) => {
+                          const isSelected = selectedBookIds.includes(book.id);
+                          return (
+                            <div
+                              key={book.id}
+                              className={`${density === 'compact' ? 'book-row' : 'book-card'}${isSelected ? ' is-selected' : ''}`}
+                              onClick={() => openBookDetail(book)}
+                              role="button"
+                              tabIndex={0}
+                              onKeyDown={(e) => e.key === 'Enter' && openBookDetail(book)}
+                            >
+                              <input
+                                type="checkbox"
+                                className="book-select"
+                                checked={isSelected}
+                                onChange={(e) => { e.stopPropagation(); toggleBookSelection(book.id); }}
+                                onClick={(e) => e.stopPropagation()}
+                                aria-label={`Select ${displayTitle(book)}`}
+                              />
+                              {book.coverUrl ? (
+                                <img
+                                  className="book-avatar book-cover"
+                                  src={joinApiUrl(book.coverUrl)}
+                                  alt=""
+                                  loading="lazy"
+                                  onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+                                />
+                              ) : (
+                                <div className="book-avatar">{(displayTitle(book).charAt(0) || '?').toUpperCase()}</div>
+                              )}
+                              <div className="book-card-body">
+                                <span className={`book-card-title${isPlaceholder(book.title, 'title') || !book.title ? ' is-placeholder' : ''}`}>
+                                  {q ? highlight(displayTitle(book), q) : displayTitle(book)}
+                                </span>
+                                <p className={`book-card-author${isPlaceholder(book.author, 'author') || !book.author ? ' is-placeholder' : ''}`}>
+                                  {q ? highlight(displayAuthor(book), q) : displayAuthor(book)}
+                                </p>
+                                <div className="book-card-meta">
+                                  {book.shelfCode && <span className="meta-chip">📍 {book.shelfCode}</span>}
+                                  {book.publicationYear && <span className="meta-chip">{book.publicationYear}</span>}
+                                  {book.language && <span className="meta-chip">{book.language}</span>}
+                                  {book.isbn && <span className="meta-chip">ISBN</span>}
+                                  {book.legacyId && <span className="meta-chip mono">{book.legacyId}</span>}
+                                </div>
+                              </div>
+                              <div className="book-card-status">
+                                <span className={`status-badge status-${book.status}`}>{book.status}</span>
                               </div>
                             </div>
-                            <div className="book-card-status">
-                              <span className={`status-badge status-${book.status}`}>{book.status}</span>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                       <div className="pagination">
                         <button
@@ -2987,7 +3404,7 @@ function App() {
                         >← Previous</button>
                         <span className="pagination-info">
                           Page <strong>{currentPage}</strong> of <strong>{Math.max(1, Math.ceil(totalBooksCount / PAGE_SIZE))}</strong>
-                          <span className="muted small"> · {totalBooksCount.toLocaleString()} books</span>
+                          <span className="muted small"> · {fmt(totalBooksCount)} books</span>
                         </span>
                         <form
                           className="page-jump"
@@ -3098,13 +3515,69 @@ function App() {
                         <p className="muted small">{selectedBook.author}</p>
                       </div>
                       <div className="form-row">
-                        <div>
-                          <label>Borrower Name *</label>
-                          <input value={borrowerName} onChange={(e) => setBorrowerName(e.target.value)} placeholder="Full name" required />
+                        <div className="combobox">
+                          <label>Borrower *</label>
+                          <input
+                            value={borrowerQuery || borrowerName}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setBorrowerQuery(v);
+                              setBorrowerName(v);
+                              setSelectedBorrowerId('');
+                              if (v.trim().length >= 2) void searchBorrowers(v);
+                              else setBorrowerSuggestions([]);
+                            }}
+                            onFocus={() => { if (!borrowerSuggestions.length) void searchBorrowers(borrowerQuery); }}
+                            placeholder="Type to search existing borrowers, or enter a new name"
+                            required
+                            autoComplete="off"
+                          />
+                          {borrowerSuggestions.length > 0 && !selectedBorrowerId && (
+                            <ul className="combobox-list" role="listbox">
+                              {borrowerSuggestions.map((b) => (
+                                <li
+                                  key={b.id}
+                                  role="option"
+                                  aria-selected={selectedBorrowerId === b.id}
+                                  onMouseDown={(e) => {
+                                    e.preventDefault();
+                                    setSelectedBorrowerId(b.id);
+                                    setBorrowerName(b.name);
+                                    setBorrowerContact(b.contact ?? '');
+                                    setBorrowerQuery('');
+                                    setBorrowerSuggestions([]);
+                                  }}
+                                >
+                                  <span className="combo-name">{b.name}</span>
+                                  {b.contact && <span className="combo-contact muted small">{b.contact}</span>}
+                                  <span className="combo-stats muted small">
+                                    {fmt(b.totalLoans)} loan{b.totalLoans === 1 ? '' : 's'}
+                                    {b.overdueLoans > 0 && <span className="overdue-tag"> · {fmt(b.overdueLoans)} overdue</span>}
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                          {selectedBorrowerId && (
+                            <p className="muted small">
+                              ✓ Using existing borrower profile.{' '}
+                              <button
+                                type="button"
+                                className="link-btn"
+                                style={{ color: 'var(--accent)' }}
+                                onClick={() => { setSelectedBorrowerId(''); setBorrowerName(''); setBorrowerContact(''); }}
+                              >Change</button>
+                            </p>
+                          )}
                         </div>
                         <div>
                           <label>Contact (optional)</label>
-                          <input value={borrowerContact} onChange={(e) => setBorrowerContact(e.target.value)} placeholder="Phone or email" />
+                          <input
+                            value={borrowerContact}
+                            onChange={(e) => setBorrowerContact(e.target.value)}
+                            placeholder="Phone or email"
+                            disabled={Boolean(selectedBorrowerId)}
+                          />
                         </div>
                       </div>
                       <div className="form-field">
@@ -3202,32 +3675,132 @@ function App() {
             )}
 
             {/* ═══ MAINTAINANCE TAB ═══ */}
-            {currentSection === 'maintenance' && (
+            {currentSection === 'settings' && (
               <>
                 <div className="section-header">
                   <div className="section-header-text">
-                    <h2>Maintainance</h2>
-                    <p>Database hygiene and duplicate prevention tools</p>
+                    <h2>Settings</h2>
+                    <p>Custom attributes, audit log, and database hygiene tools</p>
                   </div>
                 </div>
 
+                {/* Custom field manager */}
+                <div className="card">
+                  <h3>Custom Attributes ({customFields.length})</h3>
+                  <p className="muted small" style={{ marginBottom: '1rem' }}>
+                    Fields shown in every book's detail. Editable by admins.
+                  </p>
+
+                  {customFields.length > 0 && (
+                    <div className="cf-list">
+                      {customFields.map((f) => (
+                        <div key={f.id} className="cf-row">
+                          <div className="cf-row-text">
+                            <strong>{f.label}</strong>
+                            <span className="muted small">
+                              <code>{f.key}</code> · {f.type}{f.required ? ' · required' : ''}
+                              {f.type === 'enum' && f.enumOptions.length > 0 ? ` · ${f.enumOptions.length} options` : ''}
+                            </span>
+                          </div>
+                          {currentUser?.role === 'admin' && (
+                            <div className="cf-row-actions">
+                              <button className="secondary small" onClick={() => beginCustomFieldEdit(f)}>Edit</button>
+                              <button className="danger small" onClick={() => void deleteCustomField(f)}>Delete</button>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {currentUser?.role === 'admin' && (
+                    <details className="custom-fields-section" open={Boolean(editingCustomFieldId)} style={{ marginTop: '1rem' }}>
+                      <summary>{editingCustomFieldId ? 'Edit attribute' : '+ Add new attribute'}</summary>
+                      <form onSubmit={saveCustomField} className="simple-form" style={{ marginTop: '0.75rem' }}>
+                        <div className="form-row">
+                          <div>
+                            <label>Key (snake_case)</label>
+                            <input
+                              value={fieldForm.key}
+                              onChange={(e) => setFieldForm({ ...fieldForm, key: e.target.value })}
+                              placeholder="e.g. donor_name"
+                              required
+                            />
+                          </div>
+                          <div>
+                            <label>Label</label>
+                            <input
+                              value={fieldForm.label}
+                              onChange={(e) => setFieldForm({ ...fieldForm, label: e.target.value })}
+                              placeholder="e.g. Donor name"
+                              required
+                            />
+                          </div>
+                        </div>
+                        <div className="form-row">
+                          <div>
+                            <label>Type</label>
+                            <select
+                              value={fieldForm.type}
+                              onChange={(e) => setFieldForm({ ...fieldForm, type: e.target.value as CustomField['type'] })}
+                            >
+                              <option value="text">Text</option>
+                              <option value="number">Number</option>
+                              <option value="boolean">Yes/No</option>
+                              <option value="date">Date</option>
+                              <option value="enum">Enum (dropdown)</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label>Required?</label>
+                            <select
+                              value={fieldForm.required ? 'yes' : 'no'}
+                              onChange={(e) => setFieldForm({ ...fieldForm, required: e.target.value === 'yes' })}
+                            >
+                              <option value="no">No</option>
+                              <option value="yes">Yes</option>
+                            </select>
+                          </div>
+                        </div>
+                        {fieldForm.type === 'enum' && (
+                          <div className="form-field">
+                            <label>Enum options (comma-separated)</label>
+                            <input
+                              value={fieldForm.enumOptionsCsv}
+                              onChange={(e) => setFieldForm({ ...fieldForm, enumOptionsCsv: e.target.value })}
+                              placeholder="Excellent, Good, Fair, Poor"
+                            />
+                          </div>
+                        )}
+                        <div className="button-group">
+                          <button type="submit" className="primary">{editingCustomFieldId ? 'Save changes' : 'Add attribute'}</button>
+                          {editingCustomFieldId && (
+                            <button type="button" className="secondary" onClick={resetCustomFieldForm}>Cancel</button>
+                          )}
+                        </div>
+                      </form>
+                    </details>
+                  )}
+                </div>
+
+                {/* Duplicate checker */}
                 <div className="card">
                   <h3>🔎 Duplicate Checker</h3>
-                  <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
-                    Scan the full catalog for entries with same title and author.
+                  <p className="muted small" style={{ marginBottom: '1rem' }}>
+                    Find books that share the same title + author.
                   </p>
-                  <button className="secondary" onClick={() => void checkDuplicates()}>Check Duplicates</button>
+                  <button className="secondary" onClick={() => void checkDuplicates()}>Scan for duplicates</button>
                 </div>
 
                 {showDuplicatesPanel && duplicateGroups.length > 0 && (
-                  <div className="card" style={{ borderLeft: '3px solid var(--warning, #f59e0b)' }}>
+                  <div className="card" style={{ borderLeft: '3px solid var(--warning)' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-                      <strong>⚠️ Duplicate Books Found ({duplicateGroups.length} group{duplicateGroups.length !== 1 ? 's' : ''})</strong>
+                      <strong>⚠️ {duplicateGroups.length} duplicate group{duplicateGroups.length !== 1 ? 's' : ''} found</strong>
                       <button className="secondary small" onClick={() => setShowDuplicatesPanel(false)}>Close</button>
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                       {duplicateGroups.map((group, i) => (
-                        <div key={i} style={{ background: 'var(--bg-muted, #f9fafb)', borderRadius: '6px', padding: '0.75rem' }}>
+                        <div key={i} style={{ background: 'var(--surface-2)', borderRadius: '6px', padding: '0.75rem' }}>
                           <p style={{ margin: '0 0 0.4rem', fontWeight: 600, fontSize: '0.875rem' }}>
                             "{group[0].title}" — {group[0].author}
                           </p>
@@ -3244,15 +3817,48 @@ function App() {
                   </div>
                 )}
 
+                {/* Audit log */}
                 {currentUser?.role === 'admin' && (
                   <div className="card">
-                    <h3>🧹 Normalize Entries</h3>
-                    <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
-                      Apply normalization to all existing books (spacing, casing, ISBN cleanup, and tags).
-                    </p>
-                    <button className="secondary" onClick={() => void normalizeAllBooks()}>Normalize All</button>
+                    <h3>📜 Recent Activity (audit log)</h3>
+                    {auditItems.length === 0 ? (
+                      <p className="muted small">No recent activity yet.</p>
+                    ) : (
+                      <div className="audit-list">
+                        {auditItems.map((entry) => (
+                          <div key={entry.id} className="audit-row">
+                            <code className="audit-action">{entry.action}</code>
+                            <span className="muted small">{entry.entity_type}{entry.entity_id ? `:${String(entry.entity_id).slice(0, 8)}…` : ''}</span>
+                            <span className="muted small audit-time">{new Date(entry.created_at).toLocaleString()}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
+
+                {/* Maintenance tools */}
+                {currentUser?.role === 'admin' && (
+                  <div className="card">
+                    <h3>🧹 Normalize entries</h3>
+                    <p className="muted small" style={{ marginBottom: '1rem' }}>
+                      Trim, collapse spaces, and uppercase ISBNs/shelf codes across the entire catalog.
+                    </p>
+                    <button className="secondary" onClick={() => void normalizeAllBooks()}>Run normalization</button>
+                  </div>
+                )}
+
+                {/* System info */}
+                <div className="card">
+                  <h3>System</h3>
+                  <ul className="system-info">
+                    <li><span>API endpoint</span><code>{API_BASE}</code></li>
+                    <li><span>Signed in as</span><code>{currentUser?.username} ({currentUser?.role})</code></li>
+                    <li><span>Books loaded</span><code>{fmt(totalBooksCount)}</code></li>
+                    <li><span>Catalog field defs</span><code>{customFields.length}</code></li>
+                    <li><span>Theme</span><code>{theme}</code></li>
+                  </ul>
+                </div>
               </>
             )}
 
@@ -3260,39 +3866,27 @@ function App() {
         </>
       )}
 
-      {isWorking && <p className="banner muted">⏳ Working…</p>}
-      {error && (
-        <div className="banner error" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
-          <span>⚠️ {error}</span>
-          <button
-            type="button"
-            className="secondary small"
-            onClick={() => setError('')}
-            style={{ padding: '0.2rem 0.5rem' }}
-          >
-            Close
-          </button>
-        </div>
-      )}
-      {message && (
-        <div className="banner success" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.75rem' }}>
-          <span>✓ {message}</span>
-          <button
-            type="button"
-            className="secondary small"
-            onClick={() => setMessage('')}
-            style={{ padding: '0.2rem 0.5rem' }}
-          >
-            Close
-          </button>
+      {isWorking && (
+        <div className="working-pill" role="status" aria-live="polite">
+          <span className="spinner" /> Working…
         </div>
       )}
     </div>
   );
 }
 
+function Root() {
+  return (
+    <ToastProvider>
+      <ConfirmProvider>
+        <App />
+      </ConfirmProvider>
+    </ToastProvider>
+  );
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <Root />
   </React.StrictMode>
 );

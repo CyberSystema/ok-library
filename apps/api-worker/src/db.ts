@@ -1,4 +1,5 @@
 import { HTTPException } from 'hono/http-exception';
+import { defaultPbkdf2Iterations, generateSaltHex, hashPasswordPbkdf2 } from './auth';
 import type { AuthClaims, Env } from './types';
 import { nowIso, safeJsonParse } from './utils';
 
@@ -71,17 +72,16 @@ export async function ensureBootstrapAdmin(env: Env): Promise<void> {
     return;
   }
 
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(password));
-  const passwordHash = Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-
+  // Seed the bootstrap admin with PBKDF2 from the start — no legacy hash.
+  const salt = generateSaltHex();
+  const iterations = defaultPbkdf2Iterations();
+  const passwordHash = await hashPasswordPbkdf2(password, salt, iterations);
   const timestamp = nowIso();
   await env.DB.prepare(
-    `INSERT INTO staff_users (id, username, role, password_hash, active, created_at, updated_at)
-     VALUES (?, ?, 'admin', ?, 1, ?, ?)`
+    `INSERT INTO staff_users (id, username, role, password_hash, password_salt, password_iterations, active, created_at, updated_at)
+     VALUES (?, ?, 'admin', ?, ?, ?, 1, ?, ?)`
   )
-    .bind(crypto.randomUUID(), username, passwordHash, timestamp, timestamp)
+    .bind(crypto.randomUUID(), username, passwordHash, salt, iterations, timestamp, timestamp)
     .run();
 }
 
@@ -94,7 +94,8 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     publicationYear: row.publication_year,
-    legacyId: row.legacy_id ?? null
+    legacyId: row.legacy_id ?? null,
+    coverUrl: row.cover_url ?? null
   };
 }
 
@@ -189,8 +190,14 @@ export async function queryBooksWithFilters(
     status?: string;
     language?: string;
     year?: number;
+    yearMin?: number;
+    yearMax?: number;
     roomCode?: string;
     shelfCode?: string;
+    missingIsbn?: boolean;
+    missingShelf?: boolean;
+    untitled?: boolean;
+    unknownAuthor?: boolean;
     sortBy: string;
     sortDir: 'asc' | 'desc';
     page: number;
@@ -228,6 +235,26 @@ export async function queryBooksWithFilters(
     where.push('b.publication_year = ?');
     values.push(opts.year);
   }
+  if (opts.yearMin !== undefined) {
+    where.push('b.publication_year >= ?');
+    values.push(opts.yearMin);
+  }
+  if (opts.yearMax !== undefined) {
+    where.push('b.publication_year <= ?');
+    values.push(opts.yearMax);
+  }
+  if (opts.missingIsbn) {
+    where.push("(b.isbn IS NULL OR TRIM(b.isbn) = '')");
+  }
+  if (opts.missingShelf) {
+    where.push("(b.shelf_code IS NULL OR TRIM(b.shelf_code) = '')");
+  }
+  if (opts.untitled) {
+    where.push("b.title = '(Untitled)'");
+  }
+  if (opts.unknownAuthor) {
+    where.push("b.author = '(Unknown)'");
+  }
   if (opts.roomCode) {
     where.push('b.room_code = ?');
     values.push(opts.roomCode);
@@ -243,32 +270,36 @@ export async function queryBooksWithFilters(
     values.push(filter.value);
   }
 
-  // Path 1: FTS5 full-text search (default for any query).
-  if (qText && opts.qMode !== 'exact') {
-    const ftsQuery = buildFtsQuery({
-      q: qText,
-      qMode: opts.qMode ?? 'all',
-      partialWords: opts.partialWords ?? true,
-      fields: activeFields
-    });
+  const fuzzyEnabled = Boolean(opts.fuzzyTypos) && qText.length > 0 && opts.qMode !== 'exact';
 
-    if (ftsQuery) {
-      useFtsJoin = true;
-      where.push('books_fts MATCH ?');
-      values.push(ftsQuery);
-    }
-  } else if (qText && opts.qMode === 'exact') {
-    // Exact phrase: still use FTS phrase search.
-    const ftsQuery = buildFtsQuery({
-      q: qText,
-      qMode: 'exact',
-      partialWords: false,
-      fields: activeFields
-    });
-    if (ftsQuery) {
-      useFtsJoin = true;
-      where.push('books_fts MATCH ?');
-      values.push(ftsQuery);
+  // Path A: fuzzy mode — skip the FTS MATCH constraint so severe typos still
+  // get candidates. The post-filter Levenshtein step runs in the Worker, on
+  // the structurally-filtered candidate set (capped at 5000).
+  if (!fuzzyEnabled) {
+    if (qText && opts.qMode !== 'exact') {
+      const ftsQuery = buildFtsQuery({
+        q: qText,
+        qMode: opts.qMode ?? 'all',
+        partialWords: opts.partialWords ?? true,
+        fields: activeFields
+      });
+      if (ftsQuery) {
+        useFtsJoin = true;
+        where.push('books_fts MATCH ?');
+        values.push(ftsQuery);
+      }
+    } else if (qText && opts.qMode === 'exact') {
+      const ftsQuery = buildFtsQuery({
+        q: qText,
+        qMode: 'exact',
+        partialWords: false,
+        fields: activeFields
+      });
+      if (ftsQuery) {
+        useFtsJoin = true;
+        where.push('books_fts MATCH ?');
+        values.push(ftsQuery);
+      }
     }
   }
 
@@ -281,11 +312,6 @@ export async function queryBooksWithFilters(
       values.push(excludeFts);
     }
   }
-
-  // Fuzzy typo tolerance is intentionally implemented as a *post-filter* on top of
-  // the FTS-narrowed candidate set when the user toggles it on. We cap candidate
-  // count at 2000 so we never blow up Worker CPU on a 20K table.
-  const fuzzyEnabled = Boolean(opts.fuzzyTypos) && qText.length > 0 && opts.qMode !== 'exact';
 
   if (fuzzyEnabled) {
     return await runFuzzyFiltered(env, {
@@ -337,7 +363,10 @@ async function runFuzzyFiltered(
     useFtsJoin: boolean;
   }
 ): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
-  const FUZZY_CANDIDATE_CAP = 2000;
+  // Higher cap is safe because fuzzy mode no longer rides on top of an FTS
+  // MATCH constraint — the candidates here are the structurally-filtered set
+  // (status, language, year, …) and we Levenshtein-filter them in the Worker.
+  const FUZZY_CANDIDATE_CAP = 5000;
   const fromClause = ctx.useFtsJoin
     ? 'books b JOIN books_fts ON books_fts.rowid = b.ROWID'
     : 'books b';

@@ -8,6 +8,7 @@ import {
 	ReturnBookSchema,
 	SyncPushSchema,
 	UpdateBookSchema,
+	UpsertBorrowerSchema,
 	UpsertCustomFieldSchema,
 	UpsertRoomSchema
 } from '@ok-library/shared';
@@ -16,7 +17,16 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { HTTPException } from 'hono/http-exception';
 import { z } from 'zod';
-import { authMiddleware, createAccessToken, hashPassword, requireRole } from './auth';
+import {
+	authMiddleware,
+	constantTimeEqual,
+	createAccessToken,
+	defaultPbkdf2Iterations,
+	generateSaltHex,
+	hashPasswordPbkdf2,
+	hashPasswordSha256,
+	requireRole
+} from './auth';
 import {
 	booksCacheKey,
 	bumpBooksCacheVersion,
@@ -197,7 +207,7 @@ app.post('/api/auth/login', async (c) => {
 	const parsed = schema.parse(body);
 
 	const user = await c.env.DB.prepare(
-		`SELECT id, username, role, password_hash, active
+		`SELECT id, username, role, password_hash, password_salt, password_iterations, active
 		 FROM staff_users WHERE username = ? LIMIT 1`
 	)
 		.bind(parsed.username)
@@ -206,6 +216,8 @@ app.post('/api/auth/login', async (c) => {
 			username: string;
 			role: 'admin' | 'librarian' | 'viewer';
 			password_hash: string;
+			password_salt: string | null;
+			password_iterations: number;
 			active: number;
 		}>();
 
@@ -213,9 +225,38 @@ app.post('/api/auth/login', async (c) => {
 		throw new HTTPException(401, { message: 'Invalid credentials' });
 	}
 
-	const candidate = await hashPassword(parsed.password);
-	if (candidate !== user.password_hash) {
+	let authenticated = false;
+	let needsMigration = false;
+
+	if (user.password_salt && user.password_iterations > 0) {
+		// Modern format: PBKDF2 with per-user salt.
+		const candidate = await hashPasswordPbkdf2(parsed.password, user.password_salt, user.password_iterations);
+		authenticated = constantTimeEqual(candidate, user.password_hash);
+	} else {
+		// Legacy format: unsalted SHA-256. If it matches, lazy-migrate to PBKDF2.
+		const candidate = await hashPasswordSha256(parsed.password);
+		authenticated = constantTimeEqual(candidate, user.password_hash);
+		needsMigration = authenticated;
+	}
+
+	if (!authenticated) {
 		throw new HTTPException(401, { message: 'Invalid credentials' });
+	}
+
+	if (needsMigration) {
+		try {
+			const salt = generateSaltHex();
+			const iterations = defaultPbkdf2Iterations();
+			const newHash = await hashPasswordPbkdf2(parsed.password, salt, iterations);
+			await c.env.DB.prepare(
+				`UPDATE staff_users
+				   SET password_hash = ?, password_salt = ?, password_iterations = ?, updated_at = ?
+				 WHERE id = ?`
+			).bind(newHash, salt, iterations, nowIso(), user.id).run();
+		} catch (err) {
+			// Migration failure shouldn't block login — log and move on.
+			console.warn('Password rehash failed; will retry next login', err);
+		}
 	}
 
 	const token = await createAccessToken(c.env, {
@@ -240,6 +281,12 @@ app.post('/api/auth/logout', async (c) => {
 
 app.use('/api/*', async (c, next) => {
 	if (c.req.path === '/api/health' || c.req.path === '/api/auth/login' || c.req.path === '/api/auth/logout') {
+		await next();
+		return;
+	}
+	// GET /api/books/:id/cover is public so <img> tags load without round-tripping
+	// the session cookie. Mutations on the cover (PUT/DELETE) still require auth.
+	if (c.req.method === 'GET' && /^\/api\/books\/[^/]+\/cover$/.test(c.req.path)) {
 		await next();
 		return;
 	}
@@ -273,7 +320,13 @@ app.get('/api/books', async (c) => {
 
 	const result = await queryBooksWithFilters(c.env, {
 		...query,
-		customFilters
+		customFilters,
+		yearMin: query.yearMin,
+		yearMax: query.yearMax,
+		missingIsbn: query.missingIsbn,
+		missingShelf: query.missingShelf,
+		untitled: query.untitled,
+		unknownAuthor: query.unknownAuthor
 	});
 
 	const response = {
@@ -476,19 +529,52 @@ app.post('/api/books/:id/borrow', requireRole(['admin', 'librarian']), async (c)
 			throw new HTTPException(409, { message: 'Book is not available' });
 		}
 
-		const txId = crypto.randomUUID();
+		// Resolve / create the borrower entity. If borrowerId is provided we
+		// look it up; otherwise we upsert by lower-trimmed name + contact so
+		// repeated freeform names converge to a single profile.
+		let borrowerId: string | null = payload.borrowerId ?? null;
+		let borrowerName = payload.borrowerName?.trim() ?? '';
+		let borrowerContact = payload.borrowerContact ?? null;
 		const now = nowIso();
+
+		if (borrowerId) {
+			const existing = await c.env.DB.prepare('SELECT id, name, contact FROM borrowers WHERE id = ? LIMIT 1')
+				.bind(borrowerId)
+				.first<{ id: string; name: string; contact: string | null }>();
+			if (!existing) {
+				throw new HTTPException(404, { message: 'Borrower not found' });
+			}
+			borrowerName = existing.name;
+			borrowerContact = borrowerContact ?? existing.contact;
+		} else if (borrowerName) {
+			const existing = await c.env.DB.prepare(
+				`SELECT id FROM borrowers WHERE LOWER(name) = LOWER(?)
+				   AND COALESCE(contact, '') = COALESCE(?, '') LIMIT 1`
+			).bind(borrowerName, borrowerContact ?? '').first<{ id: string }>();
+			if (existing) {
+				borrowerId = existing.id;
+			} else {
+				borrowerId = crypto.randomUUID();
+				await c.env.DB.prepare(
+					`INSERT INTO borrowers (id, name, contact, notes, created_at, updated_at)
+					 VALUES (?, ?, ?, NULL, ?, ?)`
+				).bind(borrowerId, borrowerName, borrowerContact ?? null, now, now).run();
+			}
+		}
+
+		const txId = crypto.randomUUID();
 
 		await c.env.DB.prepare(
 			`INSERT INTO borrow_transactions (
-				id, book_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+				id, book_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
 		)
 			.bind(
 				txId,
 				bookId,
-				payload.borrowerName,
-				payload.borrowerContact ?? null,
+				borrowerId,
+				borrowerName,
+				borrowerContact,
 				now,
 				payload.dueAt,
 				payload.notes ?? null,
@@ -501,7 +587,7 @@ app.post('/api/books/:id/borrow', requireRole(['admin', 'librarian']), async (c)
 			.bind(now, bookId)
 			.run();
 
-		return { transactionId: txId };
+		return { transactionId: txId, borrowerId };
 	});
 
 	await bumpBooksCacheVersion(c.env);
@@ -1647,6 +1733,106 @@ app.get('/api/categories', async (c) => {
 	return c.json(response);
 });
 
+// Aggregated stats for the Dashboard. Single endpoint that returns all the
+// numbers the dashboard needs in one round-trip. KV-cached for 60s; the cache
+// version key is shared with the books list, so book writes invalidate this too.
+app.get('/api/stats', async (c) => {
+	const cacheVersion = await getBooksCacheVersion(c.env);
+	const cacheKey = `stats:${cacheVersion}`;
+	if (c.env.CACHE) {
+		try {
+			const cached = await c.env.CACHE.get(cacheKey, 'json');
+			if (cached) return c.json(cached);
+		} catch (error) {
+			console.warn('Stats cache read failed', error);
+		}
+	}
+
+	const [statusRows, langRows, yearRows, completenessRow, recentRows, topShelvesRows] = await Promise.all([
+		c.env.DB.prepare(
+			`SELECT status, COUNT(*) AS count FROM books WHERE deleted_at IS NULL GROUP BY status`
+		).all<{ status: string; count: number }>(),
+		c.env.DB.prepare(
+			`SELECT language, COUNT(*) AS count FROM books
+			 WHERE deleted_at IS NULL AND language IS NOT NULL AND language != ''
+			 GROUP BY language ORDER BY count DESC LIMIT 12`
+		).all<{ language: string; count: number }>(),
+		c.env.DB.prepare(
+			`SELECT
+				CASE
+					WHEN publication_year IS NULL THEN 'Unknown'
+					WHEN publication_year < 1900 THEN 'Pre-1900'
+					WHEN publication_year < 1950 THEN '1900–49'
+					WHEN publication_year < 1980 THEN '1950–79'
+					WHEN publication_year < 2000 THEN '1980–99'
+					WHEN publication_year < 2010 THEN '2000–09'
+					WHEN publication_year < 2020 THEN '2010–19'
+					ELSE '2020+'
+				END AS bucket,
+				COUNT(*) AS count
+			 FROM books WHERE deleted_at IS NULL
+			 GROUP BY bucket
+			 ORDER BY MIN(COALESCE(publication_year, 9999))`
+		).all<{ bucket: string; count: number }>(),
+		c.env.DB.prepare(
+			`SELECT
+				COUNT(*) AS total,
+				SUM(CASE WHEN isbn IS NOT NULL AND TRIM(isbn) != '' THEN 1 ELSE 0 END) AS with_isbn,
+				SUM(CASE WHEN shelf_code IS NOT NULL AND TRIM(shelf_code) != '' THEN 1 ELSE 0 END) AS with_shelf,
+				SUM(CASE WHEN publisher IS NOT NULL AND TRIM(publisher) != '' THEN 1 ELSE 0 END) AS with_publisher,
+				SUM(CASE WHEN publication_year IS NOT NULL THEN 1 ELSE 0 END) AS with_year,
+				SUM(CASE WHEN title = '(Untitled)' THEN 1 ELSE 0 END) AS untitled,
+				SUM(CASE WHEN author = '(Unknown)' THEN 1 ELSE 0 END) AS unknown_author
+			 FROM books WHERE deleted_at IS NULL`
+		).first<{
+			total: number; with_isbn: number; with_shelf: number; with_publisher: number;
+			with_year: number; untitled: number; unknown_author: number;
+		}>(),
+		c.env.DB.prepare(
+			`SELECT id, title, author, legacy_id, updated_at
+			 FROM books WHERE deleted_at IS NULL
+			 ORDER BY updated_at DESC LIMIT 8`
+		).all<{ id: string; title: string; author: string; legacy_id: string | null; updated_at: string }>(),
+		c.env.DB.prepare(
+			`SELECT shelf_code, COUNT(*) AS count FROM books
+			 WHERE deleted_at IS NULL AND shelf_code IS NOT NULL AND TRIM(shelf_code) != ''
+			 GROUP BY shelf_code ORDER BY count DESC LIMIT 10`
+		).all<{ shelf_code: string; count: number }>()
+	]);
+
+	const response = {
+		byStatus: statusRows.results ?? [],
+		byLanguage: (langRows.results ?? []).map((r) => ({ language: r.language, count: Number(r.count) })),
+		byYear: (yearRows.results ?? []).map((r) => ({ bucket: r.bucket, count: Number(r.count) })),
+		completeness: {
+			total: Number(completenessRow?.total ?? 0),
+			withIsbn: Number(completenessRow?.with_isbn ?? 0),
+			withShelf: Number(completenessRow?.with_shelf ?? 0),
+			withPublisher: Number(completenessRow?.with_publisher ?? 0),
+			withYear: Number(completenessRow?.with_year ?? 0),
+			untitled: Number(completenessRow?.untitled ?? 0),
+			unknownAuthor: Number(completenessRow?.unknown_author ?? 0)
+		},
+		recentlyUpdated: (recentRows.results ?? []).map((r) => ({
+			id: r.id,
+			title: r.title,
+			author: r.author,
+			legacyId: r.legacy_id,
+			updatedAt: r.updated_at
+		})),
+		topShelves: (topShelvesRows.results ?? []).map((r) => ({ shelfCode: r.shelf_code, count: Number(r.count) }))
+	};
+
+	if (c.env.CACHE) {
+		try {
+			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+		} catch (error) {
+			console.warn('Stats cache write failed', error);
+		}
+	}
+	return c.json(response);
+});
+
 app.get('/api/needs-review-count', async (c) => {
 	const result = await c.env.DB.prepare(
 		`SELECT COUNT(*) AS n FROM books
@@ -1969,6 +2155,214 @@ app.post('/api/import/books-catalog', requireRole(['admin', 'librarian']), async
 		skippedRows,
 		attributeFailures
 	}, 201);
+});
+
+// ─── Borrowers ─────────────────────────────────────────────────────────────
+// Repeat-borrower visibility: a librarian can see who has the most loans, who
+// is overdue, and who to contact. The autocomplete endpoint backs the borrow
+// form's combobox.
+
+app.get('/api/borrowers', async (c) => {
+	const q = (c.req.query('q') ?? '').trim();
+	const limit = Math.max(1, Math.min(50, Number(c.req.query('limit') ?? 20)));
+	const params: unknown[] = [];
+	let where = '';
+	if (q) {
+		where = 'WHERE LOWER(b.name) LIKE LOWER(?) OR LOWER(COALESCE(b.contact, \'\')) LIKE LOWER(?)';
+		const like = `%${q.replace(/[%_]/g, '')}%`;
+		params.push(like, like);
+	}
+
+	const rows = await c.env.DB.prepare(
+		`SELECT b.id, b.name, b.contact, b.notes, b.created_at, b.updated_at,
+		        COALESCE(c.total_loans, 0) AS total_loans,
+		        COALESCE(c.open_loans, 0) AS open_loans,
+		        COALESCE(c.overdue_loans, 0) AS overdue_loans
+		 FROM borrowers b
+		 LEFT JOIN (
+		   SELECT borrower_id,
+		          COUNT(*) AS total_loans,
+		          SUM(CASE WHEN returned_at IS NULL THEN 1 ELSE 0 END) AS open_loans,
+		          SUM(CASE WHEN returned_at IS NULL AND due_at < ? THEN 1 ELSE 0 END) AS overdue_loans
+		     FROM borrow_transactions
+		    WHERE borrower_id IS NOT NULL
+		    GROUP BY borrower_id
+		 ) c ON c.borrower_id = b.id
+		 ${where}
+		 ORDER BY total_loans DESC, LOWER(b.name) ASC
+		 LIMIT ?`
+	).bind(nowIso(), ...params, limit).all<{
+		id: string; name: string; contact: string | null; notes: string | null;
+		created_at: string; updated_at: string;
+		total_loans: number; open_loans: number; overdue_loans: number;
+	}>();
+
+	return c.json({
+		items: (rows.results ?? []).map((r) => ({
+			id: r.id,
+			name: r.name,
+			contact: r.contact,
+			notes: r.notes,
+			createdAt: r.created_at,
+			updatedAt: r.updated_at,
+			totalLoans: Number(r.total_loans ?? 0),
+			openLoans: Number(r.open_loans ?? 0),
+			overdueLoans: Number(r.overdue_loans ?? 0)
+		}))
+	});
+});
+
+app.get('/api/borrowers/:id', async (c) => {
+	const id = c.req.param('id');
+	const row = await c.env.DB.prepare('SELECT * FROM borrowers WHERE id = ? LIMIT 1').bind(id).first<{
+		id: string; name: string; contact: string | null; notes: string | null;
+		created_at: string; updated_at: string;
+	}>();
+	if (!row) {
+		throw new HTTPException(404, { message: 'Borrower not found' });
+	}
+	const loans = await c.env.DB.prepare(
+		`SELECT bt.id, bt.book_id, b.title, b.author, bt.borrowed_at, bt.due_at, bt.returned_at, bt.notes,
+		        CASE WHEN bt.returned_at IS NULL AND bt.due_at < ? THEN 1 ELSE 0 END AS is_overdue
+		 FROM borrow_transactions bt
+		 JOIN books b ON b.id = bt.book_id
+		 WHERE bt.borrower_id = ?
+		 ORDER BY bt.borrowed_at DESC LIMIT 100`
+	).bind(nowIso(), id).all();
+
+	return c.json({
+		id: row.id,
+		name: row.name,
+		contact: row.contact,
+		notes: row.notes,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+		loans: (loans.results ?? []).map((r) => {
+			const x = r as Record<string, unknown>;
+			return {
+				id: x.id, bookId: x.book_id, title: x.title, author: x.author,
+				borrowedAt: x.borrowed_at, dueAt: x.due_at, returnedAt: x.returned_at,
+				notes: x.notes, isOverdue: x.is_overdue === 1
+			};
+		})
+	});
+});
+
+app.post('/api/borrowers', requireRole(['admin', 'librarian']), async (c) => {
+	const payload = UpsertBorrowerSchema.parse(await c.req.json());
+	const id = crypto.randomUUID();
+	const now = nowIso();
+	await c.env.DB.prepare(
+		`INSERT INTO borrowers (id, name, contact, notes, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`
+	).bind(id, payload.name, payload.contact ?? null, payload.notes ?? null, now, now).run();
+	await insertAuditLog(c.env, c.get('user').sub, 'borrower.create', 'borrower', id, { name: payload.name });
+	return c.json({ id }, 201);
+});
+
+app.put('/api/borrowers/:id', requireRole(['admin', 'librarian']), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const payload = UpsertBorrowerSchema.parse(await c.req.json());
+	const result = await c.env.DB.prepare(
+		`UPDATE borrowers SET name = ?, contact = ?, notes = ?, updated_at = ? WHERE id = ?`
+	).bind(payload.name, payload.contact ?? null, payload.notes ?? null, nowIso(), id).run();
+	if (!result.success) {
+		throw new HTTPException(404, { message: 'Borrower not found' });
+	}
+	await insertAuditLog(c.env, c.get('user').sub, 'borrower.update', 'borrower', id, { name: payload.name });
+	return c.json({ id });
+});
+
+app.delete('/api/borrowers/:id', requireRole(['admin']), async (c) => {
+	const id = c.req.param('id') ?? '';
+	// Refuse if the borrower has any historical loans — better to mark inactive
+	// than orphan transaction history. Frontend can suggest the rename flow.
+	const inUse = await c.env.DB.prepare(
+		'SELECT COUNT(*) AS n FROM borrow_transactions WHERE borrower_id = ?'
+	).bind(id).first<{ n: number }>();
+	if (inUse && inUse.n > 0) {
+		throw new HTTPException(409, { message: `Cannot delete: borrower has ${inUse.n} loan(s) on record.` });
+	}
+	const result = await c.env.DB.prepare('DELETE FROM borrowers WHERE id = ?').bind(id).run();
+	if (!result.success) {
+		throw new HTTPException(404, { message: 'Borrower not found' });
+	}
+	await insertAuditLog(c.env, c.get('user').sub, 'borrower.delete', 'borrower', id, {});
+	return c.body(null, 204);
+});
+
+// ─── Cover images (R2) ────────────────────────────────────────────────────
+// Covers are stored in the ASSETS R2 bucket under `covers/<bookId>` and served
+// back through the worker so the frontend never has to deal with R2 directly
+// or handle CORS/signed URLs.
+
+const COVER_MIME_ALLOWLIST = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const COVER_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
+
+app.put('/api/books/:id/cover', requireRole(['admin', 'librarian']), async (c) => {
+	const bookId = c.req.param('id') ?? '';
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(bookId).first();
+	if (!book) {
+		throw new HTTPException(404, { message: 'Book not found' });
+	}
+	const contentType = c.req.header('content-type') ?? '';
+	if (!COVER_MIME_ALLOWLIST.has(contentType)) {
+		throw new HTTPException(415, { message: 'Cover must be JPEG, PNG, WebP, or GIF.' });
+	}
+	const buffer = await c.req.arrayBuffer();
+	if (buffer.byteLength === 0) {
+		throw new HTTPException(400, { message: 'Empty upload.' });
+	}
+	if (buffer.byteLength > COVER_MAX_BYTES) {
+		throw new HTTPException(413, { message: 'Cover image too large (max 4 MB).' });
+	}
+	const ext = contentType === 'image/jpeg' ? 'jpg'
+		: contentType === 'image/png' ? 'png'
+		: contentType === 'image/webp' ? 'webp' : 'gif';
+	const key = `covers/${bookId}.${ext}`;
+	await c.env.ASSETS.put(key, buffer, { httpMetadata: { contentType } });
+	const coverUrl = `/api/books/${bookId}/cover?v=${Date.now()}`;
+	await c.env.DB.prepare(
+		'UPDATE books SET cover_url = ?, updated_at = ?, version = version + 1 WHERE id = ?'
+	).bind(coverUrl, nowIso(), bookId).run();
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.cover.upload', 'book', bookId, { contentType, bytes: buffer.byteLength });
+	return c.json({ ok: true, coverUrl });
+});
+
+app.delete('/api/books/:id/cover', requireRole(['admin', 'librarian']), async (c) => {
+	const bookId = c.req.param('id') ?? '';
+	const book = await c.env.DB.prepare('SELECT id, cover_url FROM books WHERE id = ? AND deleted_at IS NULL')
+		.bind(bookId).first<{ id: string; cover_url: string | null }>();
+	if (!book) {
+		throw new HTTPException(404, { message: 'Book not found' });
+	}
+	for (const ext of ['jpg', 'png', 'webp', 'gif']) {
+		try { await c.env.ASSETS.delete(`covers/${bookId}.${ext}`); } catch { /* ignore */ }
+	}
+	await c.env.DB.prepare(
+		'UPDATE books SET cover_url = NULL, updated_at = ?, version = version + 1 WHERE id = ?'
+	).bind(nowIso(), bookId).run();
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.cover.delete', 'book', bookId, {});
+	return c.body(null, 204);
+});
+
+app.get('/api/books/:id/cover', async (c) => {
+	const bookId = c.req.param('id') ?? '';
+	for (const ext of ['jpg', 'png', 'webp', 'gif']) {
+		const obj = await c.env.ASSETS.get(`covers/${bookId}.${ext}`);
+		if (obj) {
+			return new Response(obj.body, {
+				headers: {
+					'Content-Type': obj.httpMetadata?.contentType ?? `image/${ext === 'jpg' ? 'jpeg' : ext}`,
+					'Cache-Control': 'public, max-age=300, must-revalidate',
+					'ETag': obj.httpEtag
+				}
+			});
+		}
+	}
+	throw new HTTPException(404, { message: 'No cover image' });
 });
 
 export default app;
