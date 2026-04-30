@@ -2395,10 +2395,18 @@ function App() {
                 <p className={`modal-author${isPlaceholder(detailBook.author, 'author') || !detailBook.author ? ' is-placeholder' : ''}`}>
                   {displayAuthor(detailBook)}
                 </p>
-                <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
-                {detailBook.legacyId ? (
-                  <span className="legacy-id-pill" title="Catalog ID — used to upsert on re-import">{detailBook.legacyId}</span>
-                ) : null}
+                <div className="modal-pills">
+                  <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
+                  {detailBook.legacyId ? (
+                    <span className="legacy-id-pill" title="Catalog ID — used to upsert on re-import">{detailBook.legacyId}</span>
+                  ) : null}
+                </div>
+              </div>
+              <div className="modal-shelf-block" aria-label={detailBook.shelfCode ? `Shelf ${detailBook.shelfCode}` : 'No shelf assigned'}>
+                <span className="modal-shelf-label">SHELF</span>
+                <span className={`modal-shelf-value${detailBook.shelfCode ? '' : ' is-empty'}`}>
+                  {detailBook.shelfCode || '—'}
+                </span>
               </div>
               <button className="modal-close" onClick={closeDetail} title="Close">✕</button>
             </div>
@@ -3376,14 +3384,21 @@ function App() {
                                   {q ? highlight(displayAuthor(book), q) : displayAuthor(book)}
                                 </p>
                                 <div className="book-card-meta">
-                                  {book.shelfCode && <span className="meta-chip">📍 {book.shelfCode}</span>}
                                   {book.publicationYear && <span className="meta-chip">{book.publicationYear}</span>}
                                   {book.language && <span className="meta-chip">{book.language}</span>}
                                   {book.isbn && <span className="meta-chip">ISBN</span>}
                                   {book.legacyId && <span className="meta-chip mono">{book.legacyId}</span>}
                                 </div>
                               </div>
-                              <div className="book-card-status">
+                              <div className="book-card-side">
+                                <span
+                                  className={`shelf-badge${book.shelfCode ? '' : ' shelf-missing'}`}
+                                  title={book.shelfCode ? `Shelf ${book.shelfCode}` : 'No shelf assigned — click the book to set one'}
+                                  aria-label={book.shelfCode ? `Shelf ${book.shelfCode}` : 'No shelf assigned'}
+                                >
+                                  <span className="shelf-icon" aria-hidden="true">📍</span>
+                                  <span className="shelf-value">{book.shelfCode || 'No shelf'}</span>
+                                </span>
                                 <span className={`status-badge status-${book.status}`}>{book.status}</span>
                               </div>
                             </div>

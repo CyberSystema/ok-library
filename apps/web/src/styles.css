@@ -382,6 +382,115 @@ label {
 }
 .book-card-status { flex-shrink: 0; margin-top: 0.125rem; }
 
+/* Right-side stack: shelf badge on top (most useful number on the card),
+   status badge below it. Always 110px wide so it forms a clean column. */
+.book-card-side {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.5rem;
+  min-width: 110px;
+}
+
+/* Shelf badge: monospace, color-coded, big enough to read across the room.
+   This is the field a librarian needs every minute, so it gets the strongest
+   visual treatment of any chip on the card. */
+.shelf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: #fff7ed;
+  color: #9a3412;
+  border: 1.5px solid #fdba74;
+  border-radius: 8px;
+  padding: 0.3rem 0.6rem 0.3rem 0.5rem;
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  box-shadow: 0 1px 2px rgba(154, 52, 18, 0.08);
+  line-height: 1.1;
+}
+.shelf-badge .shelf-icon {
+  font-size: 0.85rem;
+  filter: grayscale(0.1);
+}
+.shelf-badge .shelf-value { font-feature-settings: 'tnum'; }
+.shelf-badge.shelf-missing {
+  background: var(--bg);
+  color: var(--text-light);
+  border-color: var(--border);
+  font-style: italic;
+  font-weight: 500;
+}
+
+[data-theme="dark"] .shelf-badge {
+  background: rgba(251, 146, 60, 0.12);
+  color: #fdba74;
+  border-color: rgba(251, 146, 60, 0.45);
+  box-shadow: none;
+}
+[data-theme="dark"] .shelf-badge.shelf-missing {
+  background: var(--surface-2);
+  color: var(--text-light);
+  border-color: var(--border);
+}
+
+/* Modal: a big shelf block in the header, sized like a real shelf label sticker. */
+.modal-shelf-block {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.2rem;
+  padding: 0.45rem 0.7rem 0.55rem;
+  background: #fff7ed;
+  border: 2px solid #fdba74;
+  border-radius: 10px;
+  min-width: 84px;
+  align-self: center;
+  box-shadow: 0 1px 2px rgba(154, 52, 18, 0.1);
+}
+.modal-shelf-label {
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: #9a3412;
+  text-transform: uppercase;
+}
+.modal-shelf-value {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #7c2d12;
+  letter-spacing: 0.05em;
+  font-feature-settings: 'tnum';
+  line-height: 1.05;
+}
+.modal-shelf-value.is-empty {
+  color: var(--text-light);
+  font-size: 1.4rem;
+  font-style: normal;
+}
+
+[data-theme="dark"] .modal-shelf-block {
+  background: rgba(251, 146, 60, 0.12);
+  border-color: rgba(251, 146, 60, 0.55);
+  box-shadow: none;
+}
+[data-theme="dark"] .modal-shelf-label,
+[data-theme="dark"] .modal-shelf-value { color: #fdba74; }
+
+.modal-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.1rem;
+}
+
 /* Compact list density: a single-column dense view well-suited to scanning thousands of books. */
 .book-list {
   display: flex;
@@ -426,6 +535,16 @@ label {
 .book-row .book-card-author { margin-bottom: 0; font-size: 0.8125rem; }
 .book-row .book-card-meta { gap: 0.25rem; }
 .book-row .book-card-status { margin-top: 0; }
+.book-row .book-card-side {
+  flex-direction: row;
+  align-items: center;
+  min-width: 0;
+  gap: 0.6rem;
+}
+.book-row .shelf-badge {
+  font-size: 0.85rem;
+  padding: 0.2rem 0.5rem 0.2rem 0.4rem;
+}
 
 /* ================== STATUS BADGES ================== */
 .status-badge {
@@ -550,6 +669,7 @@ label {
   top: 0;
   background: var(--surface);
   z-index: 1;
+  flex-wrap: wrap;
 }
 .modal-avatar {
   width: 54px;
