@@ -362,7 +362,6 @@ function App() {
   const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
   const [status, setStatus] = useState('');
   const [filterLanguage, setFilterLanguage] = useState('');
-  const [filterCategory, setFilterCategory] = useState('');
   const [filterYear, setFilterYear] = useState('');
   const [shelfFilter, setShelfFilter] = useState('');
   const [sortBy, setSortBy] = useState<SortBy>('updatedAt');
@@ -1125,7 +1124,6 @@ function App() {
       if (status) query.set('status', status);
       if (filterLanguage) query.set('language', filterLanguage);
       if (filterYear) query.set('year', filterYear);
-      if (filterCategory) query.set('custom_category', filterCategory);
       if (categoryFilter) query.set('custom_category_code', categoryFilter);
       if (needsReviewFilter) query.set('custom_needs_review', '1');
       if (shelfFilter) query.set('shelfCode', shelfFilter);
@@ -1154,7 +1152,7 @@ function App() {
     }
   }, [
     currentPage, q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-    status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
+    status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
     shelfFilter, sortBy, sortDir, smartListKey
   ]);
 
@@ -1163,7 +1161,7 @@ function App() {
     if (!loggedIn || !didBootstrapData) return;
     const signature = JSON.stringify({
       q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-      status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
+      status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
       shelfFilter, sortBy, sortDir, smartListKey
     });
     if (signature === lastSearchSignatureRef.current) return;
@@ -1175,7 +1173,7 @@ function App() {
   }, [
     loggedIn, didBootstrapData,
     q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-    status, filterLanguage, filterYear, filterCategory, categoryFilter, needsReviewFilter,
+    status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
     shelfFilter, sortBy, sortDir, smartListKey,
     loadBooks
   ]);
@@ -3124,15 +3122,44 @@ function App() {
                     </div>
                     <div className="filter-field">
                       <label>Shelf</label>
-                      <input value={shelfFilter} onChange={(e) => setShelfFilter(e.target.value)} placeholder="Shelf code" />
+                      <input
+                        value={shelfFilter}
+                        onChange={(e) => setShelfFilter(e.target.value)}
+                        placeholder="06 or 06-005"
+                        title="Type any prefix — '06' matches every 06-xxx shelf"
+                      />
                     </div>
                     <div className="filter-field">
                       <label>Language</label>
-                      <input value={filterLanguage} onChange={(e) => setFilterLanguage(e.target.value)} placeholder="e.g. English" />
-                    </div>
-                    <div className="filter-field">
-                      <label>Category</label>
-                      <input value={filterCategory} onChange={(e) => setFilterCategory(e.target.value)} placeholder="e.g. Theology" />
+                      <input
+                        value={filterLanguage}
+                        onChange={(e) => setFilterLanguage(e.target.value)}
+                        placeholder="English, Greek, EN…"
+                        list="lang-suggest"
+                        title="Type a language name or ISO code — matches any book where this language appears, even in multi-language entries like 'EL,EN,FR'."
+                      />
+                      <datalist id="lang-suggest">
+                        {/*
+                          Each language is listed in English / Greek / Korean / Russian
+                          so a librarian can type their own and the server's synonym
+                          map resolves it to the ISO code stored in the catalog.
+                        */}
+                        <option value="English" /><option value="Αγγλικά" /><option value="영어" /><option value="Английский" />
+                        <option value="Greek" /><option value="Ελληνικά" /><option value="그리스어" /><option value="Греческий" />
+                        <option value="German" /><option value="Γερμανικά" /><option value="독일어" /><option value="Немецкий" />
+                        <option value="French" /><option value="Γαλλικά" /><option value="프랑스어" /><option value="Французский" />
+                        <option value="Italian" /><option value="Ιταλικά" /><option value="이탈리아어" /><option value="Итальянский" />
+                        <option value="Spanish" /><option value="Ισπανικά" /><option value="스페인어" /><option value="Испанский" />
+                        <option value="Russian" /><option value="Ρωσικά" /><option value="러시아어" /><option value="Русский" />
+                        <option value="Latin" /><option value="Λατινικά" /><option value="라틴어" /><option value="Латинский" />
+                        <option value="Bulgarian" /><option value="Βουλγαρικά" /><option value="불가리아어" /><option value="Болгарский" />
+                        <option value="Czech" /><option value="Τσεχικά" /><option value="체코어" /><option value="Чешский" />
+                        <option value="Korean" /><option value="Κορεατικά" /><option value="한국어" /><option value="Корейский" />
+                        <option value="Turkish" /><option value="Τουρκικά" /><option value="터키어" /><option value="Турецкий" />
+                        <option value="Romanian" /><option value="Ρουμανικά" /><option value="루마니아어" /><option value="Румынский" />
+                        <option value="Serbian" /><option value="Σερβικά" /><option value="세르비아어" /><option value="Сербский" />
+                        <option value="Multilingual" /><option value="Πολύγλωσσο" /><option value="다국어" /><option value="Многоязычный" />
+                      </datalist>
                     </div>
                     <div className="filter-field">
                       <label>Year</label>
@@ -3180,7 +3207,6 @@ function App() {
                         setSearchFields(['title', 'author', 'isbn']);
                         setStatus('');
                         setFilterLanguage('');
-                        setFilterCategory('');
                         setFilterYear('');
                         setShelfFilter('');
                         setCategoryFilter('');

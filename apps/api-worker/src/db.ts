@@ -94,6 +94,13 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     publicationYear: row.publication_year,
+    // ↓ snake_case → camelCase for fields the frontend reads as camelCase.
+    // Missing these (shelfCode, roomCode, acquisitionDate) was the reason the
+    // shelf badge was empty for every book — the column existed in the DB but
+    // never landed on the JSON response under the key the UI expected.
+    shelfCode: row.shelf_code ?? null,
+    roomCode: row.room_code ?? null,
+    acquisitionDate: row.acquisition_date ?? null,
     legacyId: row.legacy_id ?? null,
     coverUrl: row.cover_url ?? null
   };
@@ -121,6 +128,165 @@ const SQL_FIELD_EXPR: Record<string, string> = {
   tags: "COALESCE(tags, '')",
   custom: "COALESCE(custom_fields, '')"
 };
+
+// Friendly-name → ISO-code synonym table for the language filter.
+// Catalog rows store ISO 639-1 codes ("EN", "EL,EN,FR"), but a librarian who
+// types "English" / "Αγγλικά" / "영어" / "Английский" should all get the
+// books they expect.
+//
+// Each ISO code lists synonyms in the four user languages we explicitly
+// support: English, Greek, Korean, Russian. We also keep a few common
+// adjacent spellings (French/Spanish autonyms, ISO-639-1 short codes, etc.).
+// Keys are normalized once at module init: lower-cased, NFKD-decomposed, and
+// stripped of combining diacritics — so "Ελληνικά" and "ελληνικα" both
+// resolve to the same lookup key.
+const RAW_LANGUAGE_SYNONYMS: Record<string, string> = {
+  // English
+  english: 'en', eng: 'en',
+  αγγλικά: 'en', αγγλικα: 'en',
+  영어: 'en',
+  английский: 'en', английски: 'en', анг: 'en', англ: 'en',
+
+  // Greek
+  greek: 'el', hellenic: 'el', gr: 'el',
+  ελληνικά: 'el', ελληνικα: 'el', ελληνικός: 'el', ελληνικος: 'el',
+  그리스어: 'el',
+  греческий: 'el', греч: 'el',
+
+  // German
+  german: 'de', deutsch: 'de',
+  γερμανικά: 'de', γερμανικα: 'de',
+  독일어: 'de',
+  немецкий: 'de', нем: 'de',
+
+  // French
+  french: 'fr', francais: 'fr', français: 'fr',
+  γαλλικά: 'fr', γαλλικα: 'fr',
+  프랑스어: 'fr',
+  французский: 'fr', франц: 'fr',
+
+  // Italian
+  italian: 'it', italiano: 'it',
+  ιταλικά: 'it', ιταλικα: 'it',
+  이탈리아어: 'it',
+  итальянский: 'it', итал: 'it',
+
+  // Spanish
+  spanish: 'es', español: 'es', espanol: 'es', castellano: 'es',
+  ισπανικά: 'es', ισπανικα: 'es',
+  스페인어: 'es',
+  испанский: 'es', исп: 'es',
+
+  // Russian
+  russian: 'ru',
+  ρωσικά: 'ru', ρωσικα: 'ru',
+  러시아어: 'ru',
+  русский: 'ru', рус: 'ru',
+
+  // Bulgarian
+  bulgarian: 'bg',
+  βουλγαρικά: 'bg', βουλγαρικα: 'bg',
+  불가리아어: 'bg',
+  болгарский: 'bg', болг: 'bg', български: 'bg',
+
+  // Czech
+  czech: 'cs', česky: 'cs', cesky: 'cs',
+  τσεχικά: 'cs', τσεχικα: 'cs',
+  체코어: 'cs',
+  чешский: 'cs', чеш: 'cs',
+
+  // Latin
+  latin: 'la', latina: 'la',
+  λατινικά: 'la', λατινικα: 'la',
+  라틴어: 'la',
+  латинский: 'la', латынь: 'la', лат: 'la',
+
+  // Korean
+  korean: 'ko', korea: 'ko',
+  κορεατικά: 'ko', κορεατικα: 'ko',
+  한국어: 'ko', 한국말: 'ko',
+  корейский: 'ko', кор: 'ko',
+
+  // Chinese
+  chinese: 'zh', mandarin: 'zh',
+  κινέζικα: 'zh', κινεζικα: 'zh',
+  중국어: 'zh',
+  китайский: 'zh', кит: 'zh',
+
+  // Japanese
+  japanese: 'ja',
+  ιαπωνικά: 'ja', ιαπωνικα: 'ja',
+  일본어: 'ja',
+  японский: 'ja', яп: 'ja',
+
+  // Arabic
+  arabic: 'ar',
+  αραβικά: 'ar', αραβικα: 'ar',
+  아랍어: 'ar',
+  арабский: 'ar', араб: 'ar',
+
+  // Hebrew
+  hebrew: 'he', ivrit: 'he',
+  εβραϊκά: 'he', εβραϊκα: 'he',
+  히브리어: 'he',
+  иврит: 'he',
+
+  // Turkish
+  turkish: 'tr', türkçe: 'tr', turkce: 'tr',
+  τουρκικά: 'tr', τουρκικα: 'tr',
+  터키어: 'tr',
+  турецкий: 'tr', тур: 'tr',
+
+  // Romanian
+  romanian: 'ro', română: 'ro', romana: 'ro',
+  ρουμανικά: 'ro', ρουμανικα: 'ro',
+  루마니아어: 'ro',
+  румынский: 'ro', рум: 'ro',
+
+  // Serbian
+  serbian: 'sr', srpski: 'sr',
+  σερβικά: 'sr', σερβικα: 'sr',
+  세르비아어: 'sr',
+  сербский: 'sr', серб: 'sr',
+
+  // Georgian
+  georgian: 'ka', kartuli: 'ka',
+  γεωργιανά: 'ka', γεωργιανα: 'ka',
+  조지아어: 'ka',
+  грузинский: 'ka', груз: 'ka',
+
+  // Swedish
+  swedish: 'sv', svenska: 'sv',
+  σουηδικά: 'sv', σουηδικα: 'sv',
+  스웨덴어: 'sv',
+  шведский: 'sv', швед: 'sv',
+
+  // Multi-language synthetic marker — matches any row whose language column
+  // contains a comma (i.e. multiple ISO codes).
+  multilingual: ',', 'multi-language': ',', 'multi language': ',', multi: ',',
+  πολύγλωσσο: ',', πολυγλωσσο: ',', 'πολλαπλές γλώσσες': ',',
+  다국어: ',', '여러 언어': ',',
+  многоязычный: ',', 'много языков': ','
+};
+
+// Strip combining diacritics + lowercase. So "Ελληνικά" === "ελληνικα" === "ελληνικά".
+function normalizeLangKey(s: string): string {
+  return s.normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+}
+
+const LANGUAGE_SYNONYMS: Record<string, string> = Object.fromEntries(
+  Object.entries(RAW_LANGUAGE_SYNONYMS).map(([k, v]) => [normalizeLangKey(k), v])
+);
+
+function languageMatchTerm(input: string): string {
+  const norm = normalizeLangKey(input);
+  if (!norm) return '';
+  if (LANGUAGE_SYNONYMS[norm]) return LANGUAGE_SYNONYMS[norm];
+  // Strip common prefixes ("in english", "lang: el", "γλώσσα: ελ", "язык: ru") then retry.
+  const stripped = norm.replace(/^(in|lang|language|γλωσσα|язык|언어)\s*[:\-]?\s*/i, '').trim();
+  if (stripped !== norm && LANGUAGE_SYNONYMS[stripped]) return LANGUAGE_SYNONYMS[stripped];
+  return stripped || norm;
+}
 
 const SORT_COLUMN: Record<string, string> = {
   title: 'title',
@@ -228,8 +394,14 @@ export async function queryBooksWithFilters(
     values.push(opts.status);
   }
   if (opts.language) {
-    where.push('LOWER(b.language) = LOWER(?)');
-    values.push(opts.language);
+    // Smart match: friendly names ("English", "Greek") → ISO codes; case-
+    // insensitive substring so "EN" still matches multi-language values like
+    // "EL,EN,FR" without forcing the user to type the exact string.
+    const term = languageMatchTerm(opts.language);
+    if (term) {
+      where.push('LOWER(b.language) LIKE ?');
+      values.push(`%${term}%`);
+    }
   }
   if (opts.year) {
     where.push('b.publication_year = ?');
@@ -256,12 +428,13 @@ export async function queryBooksWithFilters(
     where.push("b.author = '(Unknown)'");
   }
   if (opts.roomCode) {
-    where.push('b.room_code = ?');
-    values.push(opts.roomCode);
+    // Substring + case-insensitive so "06" matches "06-005", "06-105", etc.
+    where.push('LOWER(b.room_code) LIKE LOWER(?)');
+    values.push(`%${opts.roomCode}%`);
   }
   if (opts.shelfCode) {
-    where.push('b.shelf_code = ?');
-    values.push(opts.shelfCode);
+    where.push('LOWER(b.shelf_code) LIKE LOWER(?)');
+    values.push(`%${opts.shelfCode}%`);
   }
   for (const filter of opts.customFilters) {
     // json_extract validates the path; key is constrained to [a-zA-Z0-9_] in custom_field schema.
