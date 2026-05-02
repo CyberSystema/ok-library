@@ -604,6 +604,14 @@ async function runFuzzyFiltered(
     .map((f) => SQL_FIELD_EXPR[f])
     .filter((expr): expr is string => Boolean(expr));
   if (tokens.length > 0 && fieldExprs.length > 0) {
+    // Per-token recall gate: a row passes if EITHER
+    //   (a) any active column LIKE '%token%' / '%prefix%'  — substring & tail-typo recall
+    //   (b) the row appears in the FTS5 index for `token*` — diacritic-insensitive
+    //       prefix recall (FTS is configured with `remove_diacritics 2`).
+    // Combining both is required because LIKE is byte-exact (so "ψυχη" misses
+    // "ψυχή") and FTS only indexes whole words (so "%mid%" misses substrings
+    // not at a word boundary). The OR keeps recall a strict superset of what
+    // the non-fuzzy FTS path would have returned.
     const perTokenSql: string[] = [];
     for (const token of tokens) {
       const threshold = typoThreshold(token);
@@ -617,6 +625,16 @@ async function runFuzzyFiltered(
           orParts.push(`LOWER(${expr}) LIKE ?`);
           values.push(`%${prefix}%`);
         }
+      }
+      // FTS recall: prefix-match the token in any of the active FTS columns.
+      const ftsCols = ctx.activeFields
+        .map((f) => FIELD_TO_FTS_COLUMN[f])
+        .filter((c): c is string => Boolean(c));
+      const cleaned = token.replace(/[*"]/g, '');
+      if (cleaned) {
+        const colPrefix = ftsCols.length > 0 ? `{${ftsCols.join(' ')}}:` : '';
+        orParts.push('b.ROWID IN (SELECT rowid FROM books_fts WHERE books_fts MATCH ?)');
+        values.push(`${colPrefix}"${cleaned}"*`);
       }
       perTokenSql.push(`(${orParts.join(' OR ')})`);
     }
@@ -651,7 +669,28 @@ function splitWords(text: string): string[] {
   // `\p{N}` classes ensure Greek / Korean / Cyrillic / etc. tokens are
   // preserved (the previous `[a-z0-9]` regex stripped non-ASCII entirely,
   // which made fuzzy match silently fail on non-Latin titles).
-  return text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  return foldDiacritics(text.toLowerCase()).split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+}
+
+/**
+ * Case-fold + diacritic-fold + Greek final-sigma normalize. Mirrors the FTS5
+ * tokenizer's `remove_diacritics 2` *and* covers a few cases SQLite's LOWER
+ * doesn't:
+ *   • SQLite's built-in LOWER only handles ASCII, so a stored "Γαβριήλ"
+ *     never matched a typed "γαβριηλ" through the LIKE branch — JS
+ *     toLowerCase here folds Greek capitals correctly.
+ *   • Greek final sigma `ς` (end of word) and `σ` (mid-word) are the same
+ *     letter; collapse them so `Δούλος` and `δούλοσ` (or `δουλος` after
+ *     diacritic strip) compare equal.
+ *   • NFKD decomposition + combining-mark strip removes tonos / dialytika /
+ *     accents across Greek, Latin, Cyrillic, and Vietnamese alike.
+ */
+function foldDiacritics(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/\p{M}/gu, '')
+    .replace(/ς/g, 'σ');
 }
 
 function levenshtein(a: string, b: string): number {
@@ -680,18 +719,21 @@ function typoThreshold(term: string): number {
 
 function fuzzyWordMatch(text: string, term: string): boolean {
   const words = splitWords(text);
-  const threshold = typoThreshold(term);
+  const folded = foldDiacritics(term);
+  const threshold = typoThreshold(folded);
   for (const word of words) {
-    if (Math.abs(word.length - term.length) > threshold) continue;
-    if (levenshtein(word, term) <= threshold) return true;
+    if (Math.abs(word.length - folded.length) > threshold) continue;
+    if (levenshtein(word, folded) <= threshold) return true;
   }
   return false;
 }
 
 function fieldText(row: Record<string, unknown>, field: string): string {
-  if (field === 'custom') return JSON.stringify(row.customFields ?? {}).toLowerCase();
-  if (field === 'tags') return (Array.isArray(row.tags) ? (row.tags as unknown[]).join(' ') : '').toLowerCase();
-  return String(row[field] ?? '').toLowerCase();
+  // Lowercase + diacritic-fold so the post-filter accepts rows that the SQL
+  // FTS gate matched via its `remove_diacritics 2` tokenizer.
+  if (field === 'custom') return foldDiacritics(JSON.stringify(row.customFields ?? {}).toLowerCase());
+  if (field === 'tags') return foldDiacritics((Array.isArray(row.tags) ? (row.tags as unknown[]).join(' ') : '').toLowerCase());
+  return foldDiacritics(String(row[field] ?? '').toLowerCase());
 }
 
 function fuzzyRowMatches(
@@ -703,8 +745,10 @@ function fuzzyRowMatches(
   if (tokens.length === 0) return true;
   const texts = activeFields.map((f) => fieldText(row, f)).filter(Boolean);
   if (texts.length === 0) return false;
-  const matchTerm = (term: string): boolean =>
-    texts.some((text) => text.includes(term)) || texts.some((text) => fuzzyWordMatch(text, term));
+  const matchTerm = (rawTerm: string): boolean => {
+    const term = foldDiacritics(rawTerm);
+    return texts.some((text) => text.includes(term)) || texts.some((text) => fuzzyWordMatch(text, rawTerm));
+  };
   if (qMode === 'any') return tokens.some(matchTerm);
   return tokens.every(matchTerm);
 }
