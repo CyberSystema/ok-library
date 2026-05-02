@@ -169,7 +169,12 @@ app.use('*', async (c, next) => {
 		throw new HTTPException(500, { message: 'CORS_ORIGIN must be set to a specific origin in production.' });
 	}
 	const origin = configured ?? '*';
-	return cors({ origin, allowHeaders: ['Authorization', 'Content-Type'], credentials: true })(c, next);
+	return cors({
+		origin,
+		allowHeaders: ['Authorization', 'Content-Type', 'X-Client-Mutation-Id'],
+		exposeHeaders: ['X-Idempotent-Replay'],
+		credentials: true
+	})(c, next);
 });
 
 app.use('/api/*', async (c, next) => {
