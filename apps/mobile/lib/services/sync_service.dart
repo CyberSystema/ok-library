@@ -40,22 +40,21 @@ class SyncService {
   Future<void> sync(String token) async {
     final pending = await localDb.listPendingMutations();
 
-    final payload = pending
-        .map(
-          (row) => {
-            'operation': row['operation'] as String,
-            'payload': jsonDecode(row['payload'] as String),
-            'clientMutationId': row['id'] as String,
-            'clientTimestamp': row['created_at'] as String,
-          },
-        )
-        .toList();
-
-    if (payload.isNotEmpty) {
-      await apiClient.pushMutations(token: token, mutations: payload);
-      for (final mutation in pending) {
-        await localDb.deleteMutation(mutation['id'] as String);
-      }
+    // Push mutations one-at-a-time so a server-side rejection of mutation N
+    // doesn't cause us to drop the still-unsent N+1..end. Each successful
+    // push is acked locally before moving on; failures abort the loop and
+    // leave the offending mutation on the queue for the next attempt (or
+    // for manual triage in a future "stuck mutations" UI).
+    for (final row in pending) {
+      final id = row['id'] as String;
+      final mutation = {
+        'operation': row['operation'] as String,
+        'payload': jsonDecode(row['payload'] as String),
+        'clientMutationId': id,
+        'clientTimestamp': row['created_at'] as String,
+      };
+      await apiClient.pushMutations(token: token, mutations: [mutation]);
+      await localDb.deleteMutation(id);
     }
 
     final changes = await apiClient.pullChanges(token: token, since: _lastSyncCursor);

@@ -1,5 +1,20 @@
 import { z } from 'zod';
 
+// Strict boolean parser for query strings. Zod's `z.coerce.boolean()` calls
+// Boolean(value) under the hood, which means the literal string "false" coerces
+// to `true` — silently breaking any code that toggled a default-on flag off via
+// the URL. This parser handles real bool-ish strings correctly.
+const ZodQueryBoolean = z
+  .union([z.boolean(), z.string()])
+  .transform((v, ctx) => {
+    if (typeof v === 'boolean') return v;
+    const t = v.trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on'].includes(t)) return true;
+    if (['false', '0', 'no', 'n', 'off', ''].includes(t)) return false;
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: `Invalid boolean: "${v}"` });
+    return z.NEVER;
+  });
+
 const ReservedBookAttributeKeys = new Set([
   'title',
   'subtitle',
@@ -73,8 +88,10 @@ export const BorrowBookSchema = z.object({
   dueAt: ISODateTimeSchema,
   notes: z.string().max(2000).optional().nullable()
 }).refine((v) => Boolean(v.borrowerId) || Boolean(v.borrowerName), {
-  message: 'Either borrowerId or borrowerName must be provided.',
-  path: ['borrowerName']
+  // Don't pin the error to a specific path: the form may be picking from the
+  // borrowerId combobox or typing borrowerName freely. A form-level error is
+  // friendlier than a misleading field-level one.
+  message: 'Either borrowerId or borrowerName must be provided.'
 });
 
 export const BorrowerSchema = z.object({
@@ -180,11 +197,11 @@ export const BookFilterQuerySchema = z.object({
   q: z.string().max(200).optional(),
   qMode: z.enum(['all', 'any', 'exact']).default('all'),
   qExclude: z.string().max(200).optional(),
-  partialWords: z.coerce.boolean().default(true),
+  partialWords: ZodQueryBoolean.default(true),
   // Fuzzy is on by default: typos and accents shouldn't block librarians from
   // finding the book they're looking for. The server caps the candidate set so
   // it stays fast even at 20K rows.
-  fuzzyTypos: z.coerce.boolean().default(true),
+  fuzzyTypos: ZodQueryBoolean.default(true),
   searchFields: z.string().max(200).optional(),
   status: BookStatusSchema.optional(),
   language: z.string().max(50).optional(),
@@ -194,10 +211,11 @@ export const BookFilterQuerySchema = z.object({
   roomCode: z.string().max(64).optional(),
   shelfCode: z.string().max(64).optional(),
   // Smart-list filters: each maps to a WHERE clause server-side. Composable.
-  missingIsbn: z.coerce.boolean().optional(),
-  missingShelf: z.coerce.boolean().optional(),
-  untitled: z.coerce.boolean().optional(),
-  unknownAuthor: z.coerce.boolean().optional(),
+  missingIsbn: ZodQueryBoolean.optional(),
+  missingShelf: ZodQueryBoolean.optional(),
+  untitled: ZodQueryBoolean.optional(),
+  unknownAuthor: ZodQueryBoolean.optional(),
+  includeDeleted: ZodQueryBoolean.optional(),
   sortBy: z.enum(['title', 'author', 'updatedAt', 'publicationYear', 'status']).default('updatedAt'),
   sortDir: z.enum(['asc', 'desc']).default('desc'),
   page: z.coerce.number().int().min(1).default(1),

@@ -8,6 +8,7 @@ import 'screens/scanner_screen.dart';
 import 'state/app_state.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const OkLibraryApp());
 }
 
@@ -20,6 +21,21 @@ class OkLibraryApp extends StatefulWidget {
 
 class _OkLibraryAppState extends State<OkLibraryApp> {
   final appState = AppState();
+
+  @override
+  void initState() {
+    super.initState();
+    // Best-effort: pull the saved JWT from the keychain. If there isn't one,
+    // we render the login screen as before. We don't await before runApp()
+    // because the boot path should never block on a network call.
+    appState.restoreSession();
+  }
+
+  @override
+  void dispose() {
+    appState.dispose();
+    super.dispose();
+  }
 
   late final GoRouter _router = GoRouter(
     routes: [

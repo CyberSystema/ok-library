@@ -1,10 +1,11 @@
 import 'dart:convert';
 
 import 'package:path/path.dart';
-import 'package:sqflite/sqflite.dart';
+import 'package:sqflite_sqlcipher/sqflite.dart';
 
 import '../models/book.dart';
 import '../models/offline_mutation.dart';
+import 'secure_store.dart';
 
 class LocalDb {
   static const _dbName = 'ok_library_mobile.db';
@@ -18,8 +19,14 @@ class LocalDb {
     final dbPath = await getDatabasesPath();
     final path = join(dbPath, _dbName);
 
+    // SQLCipher passphrase. The same key is reused for the lifetime of the
+    // install — losing it (e.g. uninstall + reinstall) re-creates the DB,
+    // which is fine because the data is server-authoritative anyway.
+    final dbPassword = await SecureStore.getOrCreateDbKey();
+
     _db = await openDatabase(
       path,
+      password: dbPassword,
       version: 1,
       onCreate: (db, _) async {
         await db.execute('''
@@ -92,15 +99,19 @@ class LocalDb {
     return rows
         .map(
           (row) => Book(
-            id: row['id'] as String,
-            title: row['title'] as String,
-            author: row['author'] as String,
-            status: row['status'] as String,
+            // Defensive null-safe casts — the schema declares NOT NULL on the
+            // four required columns, but a partially-corrupted on-device DB
+            // (e.g. from a forced kill mid-write) shouldn't crash the list.
+            id: (row['id'] as String?) ?? '',
+            title: (row['title'] as String?) ?? '',
+            author: (row['author'] as String?) ?? '',
+            status: (row['status'] as String?) ?? 'available',
             isbn: row['isbn'] as String?,
             roomCode: row['room_code'] as String?,
             shelfCode: row['shelf_code'] as String?,
-            version: row['version'] as int,
-            updatedAt: DateTime.parse(row['updated_at'] as String),
+            version: (row['version'] as int?) ?? 0,
+            updatedAt:
+                DateTime.tryParse((row['updated_at'] as String?) ?? '') ?? DateTime.now(),
           ),
         )
         .toList();
@@ -128,5 +139,13 @@ class LocalDb {
   Future<void> deleteMutation(String id) async {
     final db = await database;
     await db.delete('offline_mutations', where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// Wipes all on-device caches without dropping the encryption key. Used on
+  /// logout so the next user's session starts clean.
+  Future<void> clear() async {
+    final db = await database;
+    await db.delete('offline_mutations');
+    await db.delete('books');
   }
 }

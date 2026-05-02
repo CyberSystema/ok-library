@@ -63,7 +63,9 @@ async function sign(input: string, secret: string): Promise<string> {
 // with PBKDF2 and writes the new format back to the row, so over time every
 // active user's password is migrated without forcing a reset.
 
-const PBKDF2_ITERATIONS = 200_000;
+// Cloudflare Workers' Web Crypto caps PBKDF2 iterations at 100_000. Anything
+// higher throws `NotSupportedError` at runtime, so stay at the cap.
+const PBKDF2_ITERATIONS = 100_000;
 const PBKDF2_SALT_BYTES = 16;
 const PBKDF2_KEY_BYTES = 32;
 
@@ -201,6 +203,35 @@ export function requireRole(roles: Array<'admin' | 'librarian' | 'viewer'>) {
     const user = c.get('user');
     if (!roles.includes(user.role)) {
       throw new HTTPException(403, { message: 'Insufficient role' });
+    }
+    await next();
+  };
+}
+
+// Permission-based middleware. Admins always pass. For other roles, the
+// `role_permissions` table is consulted; missing rows fall back to the
+// caller-supplied default (typically `false`).
+export function requirePermission(
+  permission: string,
+  defaultAllowed: { librarian?: boolean; viewer?: boolean } = {}
+) {
+  return async (
+    c: Context<{ Bindings: Env; Variables: { user: AuthClaims } }>,
+    next: Next
+  ): Promise<void> => {
+    const user = c.get('user');
+    if (user.role === 'admin') {
+      await next();
+      return;
+    }
+    const row = await c.env.DB.prepare(
+      'SELECT allowed FROM role_permissions WHERE role = ? AND permission = ? LIMIT 1'
+    ).bind(user.role, permission).first<{ allowed: number }>();
+    const allowed = row
+      ? row.allowed === 1
+      : Boolean(defaultAllowed[user.role as 'librarian' | 'viewer']);
+    if (!allowed) {
+      throw new HTTPException(403, { message: `Permission denied: ${permission}` });
     }
     await next();
   };

@@ -13,6 +13,10 @@ type CustomFieldDef = {
 
 type CustomFieldValidationOptions = {
   requireAllRequired?: boolean;
+  // When true (default), unknown keys cause a 400. When false, unknown keys are
+  // silently dropped — useful for the update path so legacy data on a book
+  // (whose custom field definition was later deleted) doesn't block edits.
+  rejectUnknownKeys?: boolean;
 };
 
 const BOOKS_CACHE_VERSION_KEY = 'books:cache:version';
@@ -49,8 +53,11 @@ export async function getBooksCacheVersion(env: Env): Promise<string> {
 export async function bumpBooksCacheVersion(env: Env): Promise<void> {
   if (!env.CACHE) return;
   try {
-    const current = Number((await env.CACHE.get(BOOKS_CACHE_VERSION_KEY)) ?? '0');
-    await env.CACHE.put(BOOKS_CACHE_VERSION_KEY, String(current + 1), { expirationTtl: 86400 });
+    // Monotonic timestamp + random suffix avoids the read-modify-write race of
+    // a counter-based scheme: two concurrent writers no longer collapse to the
+    // same version, so neither will reuse a stale cache key.
+    const v = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}`;
+    await env.CACHE.put(BOOKS_CACHE_VERSION_KEY, v, { expirationTtl: 86400 });
   } catch {
     // Ignore cache invalidation errors — stale entries expire within seconds anyway.
   }
@@ -85,25 +92,42 @@ export async function ensureBootstrapAdmin(env: Env): Promise<void> {
     .run();
 }
 
+// snake_case DB columns we re-emit under camelCase. Listed once to keep
+// parseBook honest: any new column the frontend reads must be added here OR
+// passed through with its original key (status, version, id, …).
+const SNAKE_TO_CAMEL_BOOK_FIELDS: Record<string, string> = {
+  custom_fields: 'customFields',
+  publication_year: 'publicationYear',
+  shelf_code: 'shelfCode',
+  room_code: 'roomCode',
+  acquisition_date: 'acquisitionDate',
+  legacy_id: 'legacyId',
+  cover_url: 'coverUrl',
+  created_at: 'createdAt',
+  updated_at: 'updatedAt',
+  deleted_at: 'deletedAt'
+};
+
 export function parseBook(row: Record<string, unknown>): Record<string, unknown> {
-  return {
-    ...row,
-    customFields: safeJsonParse(row.custom_fields as string, {}),
-    tags: safeJsonParse(row.tags as string, []),
-    deletedAt: row.deleted_at,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    publicationYear: row.publication_year,
-    // ↓ snake_case → camelCase for fields the frontend reads as camelCase.
-    // Missing these (shelfCode, roomCode, acquisitionDate) was the reason the
-    // shelf badge was empty for every book — the column existed in the DB but
-    // never landed on the JSON response under the key the UI expected.
-    shelfCode: row.shelf_code ?? null,
-    roomCode: row.room_code ?? null,
-    acquisitionDate: row.acquisition_date ?? null,
-    legacyId: row.legacy_id ?? null,
-    coverUrl: row.cover_url ?? null
-  };
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    // Skip the snake_case copy if we know the camelCase key — keeps responses
+    // small and prevents API consumers from depending on the legacy spelling.
+    if (key in SNAKE_TO_CAMEL_BOOK_FIELDS) continue;
+    out[key] = value;
+  }
+  out.customFields = safeJsonParse((row.custom_fields as string) ?? '{}', {});
+  out.tags = Array.isArray(row.tags) ? row.tags : safeJsonParse((row.tags as string) ?? '[]', []);
+  out.publicationYear = row.publication_year ?? null;
+  out.shelfCode = row.shelf_code ?? null;
+  out.roomCode = row.room_code ?? null;
+  out.acquisitionDate = row.acquisition_date ?? null;
+  out.legacyId = row.legacy_id ?? null;
+  out.coverUrl = row.cover_url ?? null;
+  out.createdAt = row.created_at ?? null;
+  out.updatedAt = row.updated_at ?? null;
+  out.deletedAt = row.deleted_at ?? null;
+  return out;
 }
 
 const FIELD_TO_FTS_COLUMN: Record<string, string> = {
@@ -364,6 +388,7 @@ export async function queryBooksWithFilters(
     missingShelf?: boolean;
     untitled?: boolean;
     unknownAuthor?: boolean;
+    includeDeleted?: boolean;
     sortBy: string;
     sortDir: 'asc' | 'desc';
     page: number;
@@ -385,7 +410,10 @@ export async function queryBooksWithFilters(
   const limit = Math.max(1, Math.min(100, opts.pageSize));
   const offset = (Math.max(1, opts.page) - 1) * limit;
 
-  const where: string[] = ['b.deleted_at IS NULL'];
+  const where: string[] = [];
+  if (!opts.includeDeleted) {
+    where.push('b.deleted_at IS NULL');
+  }
   const values: unknown[] = [];
   let useFtsJoin = false;
 
@@ -731,8 +759,15 @@ export function validateCustomFieldsAgainst(
     }
   }
 
+  const rejectUnknownKeys = options?.rejectUnknownKeys !== false;
   for (const key of Object.keys(customFields)) {
-    if (!defMap.has(key)) errors.push(`Unknown custom field key: ${key}`);
+    if (defMap.has(key)) continue;
+    if (rejectUnknownKeys) {
+      errors.push(`Unknown custom field key: ${key}`);
+    }
+    // If unknown keys are tolerated we silently drop them; legacy values for
+    // since-deleted definitions stay in the source row's JSON until the next
+    // overwrite, which is fine because the frontend only renders defined keys.
   }
 
   if (errors.length > 0) {
@@ -754,14 +789,13 @@ export async function replaceBookAttributeValues(
   const defs = defsResult.results ?? [];
   const keyToDef = new Map(defs.map((d) => [d.field_key, d.id]));
 
-  const ops: D1PreparedStatement[] = [
-    env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(bookId)
-  ];
+  const deleteStmt = env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(bookId);
+  const inserts: D1PreparedStatement[] = [];
   const now = nowIso();
   for (const [key, value] of Object.entries(attributeValues)) {
     const definitionId = keyToDef.get(key);
     if (!definitionId) continue;
-    ops.push(
+    inserts.push(
       env.DB.prepare(
         `INSERT INTO book_attribute_values
           (id, book_id, attribute_definition_id, value_json, created_at, updated_at)
@@ -769,10 +803,20 @@ export async function replaceBookAttributeValues(
       ).bind(crypto.randomUUID(), bookId, definitionId, JSON.stringify(value), now, now)
     );
   }
-  if (ops.length > 1) {
-    await env.DB.batch(ops);
-  } else {
-    await ops[0].run();
+  if (inserts.length === 0) {
+    await deleteStmt.run();
+    return;
+  }
+  // D1 caps batch() at 50 statements per call. The DELETE goes in the first
+  // chunk so the replace is atomic with the first batch of inserts; if the
+  // book has more than 49 attributes the remaining inserts ride in follow-up
+  // batches — non-atomic, but safe because each insert is idempotent on
+  // (book_id, attribute_definition_id).
+  const BATCH_SIZE = 50;
+  const firstChunkSize = Math.min(inserts.length, BATCH_SIZE - 1);
+  await env.DB.batch([deleteStmt, ...inserts.slice(0, firstChunkSize)]);
+  for (let i = firstChunkSize; i < inserts.length; i += BATCH_SIZE) {
+    await env.DB.batch(inserts.slice(i, i + BATCH_SIZE));
   }
 }
 

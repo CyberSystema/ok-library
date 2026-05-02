@@ -3,3 +3,14 @@ include: package:flutter_lints/flutter.yaml
 linter:
   rules:
     avoid_print: true
+    # Catch the most common production-quality issues so the analyzer can act
+    # as a basic CI gate. Keep this list conservative — overly aggressive
+    # rules just train developers to add ignore comments.
+    always_declare_return_types: true
+    avoid_returning_null_for_future: true
+    cancel_subscriptions: true
+    close_sinks: true
+    prefer_const_constructors: true
+    prefer_final_locals: true
+    unawaited_futures: true
+    use_build_context_synchronously: true

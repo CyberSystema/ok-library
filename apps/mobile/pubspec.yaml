@@ -11,11 +11,18 @@ dependencies:
     sdk: flutter
   cupertino_icons: ^1.0.8
   http: ^1.2.2
-  sqflite: ^2.3.3+1
+  # SQLCipher-encrypted SQLite. Drop-in API-compatible with `sqflite`, but the
+  # on-device DB file is encrypted with a per-install key from secure storage,
+  # so a stolen / cloned device backup cannot read borrower or scan history.
+  sqflite_sqlcipher: ^3.1.0
   path: ^1.9.0
   mobile_scanner: ^5.2.3
   go_router: ^14.2.8
   uuid: ^4.5.1
+  # Keychain (iOS) / EncryptedSharedPreferences (Android) for the JWT and the
+  # SQLCipher passphrase. Replaces the previous in-RAM-only token, which was
+  # lost on every app restart and impossible to keep across crashes.
+  flutter_secure_storage: ^9.2.2
 
 dev_dependencies:
   flutter_test:

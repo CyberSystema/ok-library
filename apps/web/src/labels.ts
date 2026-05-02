@@ -16,6 +16,30 @@ type LabelTarget = {
   isbn?: string | null;
 };
 
+export type LabelStrings = {
+  docTitle: string;
+  ready: string;
+  print: string;
+  close: string;
+  toolbarHint: string;
+  popupBlocked: string;
+  untitled: string;
+  unknown: string;
+  htmlLang: string;
+};
+
+const DEFAULT_LABEL_STRINGS: LabelStrings = {
+  docTitle: 'Print labels',
+  ready: 'labels ready to print',
+  print: '🖨 Print',
+  close: 'Close',
+  toolbarHint: 'A4 · 3 columns · QR encodes a /api/scan link',
+  popupBlocked: 'Pop-up blocked. Allow pop-ups for this site to print labels.',
+  untitled: '(Untitled)',
+  unknown: '(Unknown)',
+  htmlLang: 'en'
+};
+
 function escapeHtml(s: string): string {
   return s
     .replaceAll('&', '&amp;')
@@ -25,7 +49,12 @@ function escapeHtml(s: string): string {
     .replaceAll("'", '&#39;');
 }
 
-export async function openPrintLabels(books: LabelTarget[], apiBase: string): Promise<void> {
+export async function openPrintLabels(
+  books: LabelTarget[],
+  apiBase: string,
+  strings: Partial<LabelStrings> = {}
+): Promise<void> {
+  const s: LabelStrings = { ...DEFAULT_LABEL_STRINGS, ...strings };
   // Tree-shakeable import; only the data-URL renderer is pulled in.
   const QRCode = (await import('qrcode')).default;
 
@@ -54,8 +83,8 @@ export async function openPrintLabels(books: LabelTarget[], apiBase: string): Pr
         <article class="tile">
           <img src="${dataUrl}" alt="QR" />
           <div class="text">
-            <div class="title">${escapeHtml(book.title || '(Untitled)')}</div>
-            <div class="author">${escapeHtml(book.author || '(Unknown)')}</div>
+            <div class="title">${escapeHtml(book.title || s.untitled)}</div>
+            <div class="author">${escapeHtml(book.author || s.unknown)}</div>
             ${book.legacyId ? `<div class="lid">${escapeHtml(book.legacyId)}</div>` : ''}
             ${metaHtml}
           </div>
@@ -64,10 +93,10 @@ export async function openPrintLabels(books: LabelTarget[], apiBase: string): Pr
     .join('\n');
 
   const html = `<!doctype html>
-<html lang="en">
+<html lang="${escapeHtml(s.htmlLang)}">
 <head>
   <meta charset="utf-8" />
-  <title>Print labels (${books.length})</title>
+  <title>${escapeHtml(s.docTitle)} (${books.length})</title>
   <style>
     @page { size: A4; margin: 12mm; }
     * { box-sizing: border-box; }
@@ -116,10 +145,10 @@ export async function openPrintLabels(books: LabelTarget[], apiBase: string): Pr
 </head>
 <body>
   <div class="toolbar">
-    <strong>${books.length} label${books.length === 1 ? '' : 's'} ready to print</strong>
-    <button onclick="window.print()">🖨 Print</button>
-    <button class="secondary" onclick="window.close()">Close</button>
-    <span style="margin-left: auto; color: #64748b; font-size: 0.85rem;">A4 · 3 columns · QR encodes a /api/scan link</span>
+    <strong>${books.length} ${escapeHtml(s.ready)}</strong>
+    <button onclick="window.print()">${escapeHtml(s.print)}</button>
+    <button class="secondary" onclick="window.close()">${escapeHtml(s.close)}</button>
+    <span style="margin-left: auto; color: #64748b; font-size: 0.85rem;">${escapeHtml(s.toolbarHint)}</span>
   </div>
   <div class="grid">${tilesHtml}</div>
   <script>window.addEventListener('load', () => { setTimeout(() => window.print(), 250); });</script>
@@ -128,7 +157,7 @@ export async function openPrintLabels(books: LabelTarget[], apiBase: string): Pr
 
   const win = window.open('', '_blank');
   if (!win) {
-    throw new Error('Pop-up blocked. Allow pop-ups for this site to print labels.');
+    throw new Error(s.popupBlocked);
   }
   win.document.open();
   win.document.write(html);

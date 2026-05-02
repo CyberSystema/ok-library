@@ -25,6 +25,7 @@ import {
 	generateSaltHex,
 	hashPasswordPbkdf2,
 	hashPasswordSha256,
+	requirePermission,
 	requireRole
 } from './auth';
 import {
@@ -159,14 +160,35 @@ async function enforceRateLimit(c: AppContext, bucket: string, perMinuteLimit: n
 }
 
 app.use('*', async (c, next) => {
-	const origin = c.env.CORS_ORIGIN ?? '*';
+	// Fail-closed in production: a missing CORS_ORIGIN with credentials:true and
+	// `origin: '*'` would let any site read authenticated responses. Refuse to
+	// boot rather than silently widening the exposure surface.
+	const configured = c.env.CORS_ORIGIN;
+	if ((c.env.APP_ENV === 'production') && (!configured || configured === '*')) {
+		throw new HTTPException(500, { message: 'CORS_ORIGIN must be set to a specific origin in production.' });
+	}
+	const origin = configured ?? '*';
 	return cors({ origin, allowHeaders: ['Authorization', 'Content-Type'], credentials: true })(c, next);
 });
 
 app.use('/api/*', async (c, next) => {
   const path = c.req.path;
+  const method = c.req.method;
+  // Tighter buckets for high-cost operations:
+  //   • login (brute-force surface)            → 20/min
+  //   • cover uploads (payload up to 4 MB)     → 30/min
+  //   • everything else                        → 180/min
   const isAuthLogin = path === '/api/auth/login';
-  await enforceRateLimit(c, isAuthLogin ? 'login' : 'api', isAuthLogin ? 20 : 180);
+  const isCoverWrite =
+    /^\/api\/books\/[^/]+\/cover$/.test(path) && (method === 'PUT' || method === 'DELETE');
+
+  if (isAuthLogin) {
+    await enforceRateLimit(c, 'login', 20);
+  } else if (isCoverWrite) {
+    await enforceRateLimit(c, 'cover', 30);
+  } else {
+    await enforceRateLimit(c, 'api', 180);
+  }
   await next();
 });
 
@@ -175,7 +197,13 @@ app.use('*', async (c, next) => {
 	c.header('X-Frame-Options', 'DENY');
 	c.header('Referrer-Policy', 'same-origin');
 	c.header('Permissions-Policy', 'camera=(self), microphone=(), geolocation=()');
-	c.header('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+	// Strict CSP: this worker only serves JSON and the cover-image stream. No
+	// inline scripts, no third-party loads. Cover responses get image/jpeg etc
+	// content-type; CSP blocks everything else.
+	c.header('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; img-src 'self'");
+	c.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+	// Cookie-aware caches mustn't share between users.
+	c.header('Vary', 'Origin, Cookie, Authorization');
 	await next();
 });
 
@@ -195,8 +223,18 @@ app.onError((error, c) => {
 });
 
 app.get('/api/health', async (c) => {
+	// Fail-fast indicator: if JWT_SECRET isn't configured the auth path is
+	// broken and every login/session request would 500. Surface it on /health
+	// so monitoring catches misconfiguration before users do.
 	const dbCheck = await c.env.DB.prepare('SELECT 1 AS ok').first();
-	return c.json({ ok: true, db: dbCheck?.ok === 1, timestamp: nowIso() });
+	const ok = dbCheck?.ok === 1 && Boolean(c.env.JWT_SECRET);
+	return c.json({
+		ok,
+		db: dbCheck?.ok === 1,
+		auth: Boolean(c.env.JWT_SECRET),
+		env: c.env.APP_ENV ?? 'unknown',
+		timestamp: nowIso()
+	}, ok ? 200 : 503);
 });
 
 app.post('/api/auth/login', async (c) => {
@@ -298,6 +336,112 @@ app.get('/api/auth/session', async (c) => {
 	return c.json({ user: { id: user.sub, username: user.username, role: user.role } });
 });
 
+// ─── Self-service profile (any authenticated user) ────────────────────────────
+const UpdateMeSchema = z.object({
+	username: z.string().trim().min(3).max(64).regex(/^[A-Za-z0-9._-]+$/, 'Username may use letters, numbers, dot, underscore, dash').optional(),
+	newPassword: z.string().min(8).max(200).optional(),
+	currentPassword: z.string().min(1)
+}).refine((v) => v.username !== undefined || v.newPassword !== undefined, {
+	message: 'Provide a new username or password.'
+});
+
+app.patch('/api/me', async (c) => {
+	const actor = c.get('user');
+	const body = await c.req.json();
+	const parsed = UpdateMeSchema.parse(body);
+
+	const me = await c.env.DB.prepare(
+		`SELECT id, username, role, password_hash, password_salt, password_iterations, active
+		 FROM staff_users WHERE id = ? LIMIT 1`
+	)
+		.bind(actor.sub)
+		.first<{
+			id: string;
+			username: string;
+			role: 'admin' | 'librarian' | 'viewer';
+			password_hash: string;
+			password_salt: string | null;
+			password_iterations: number;
+			active: number;
+		}>();
+	if (!me || me.active !== 1) {
+		throw new HTTPException(401, { message: 'Account not found or inactive.' });
+	}
+
+	// Verify current password (supports legacy SHA-256 too).
+	let verified = false;
+	if (me.password_salt && me.password_iterations > 0) {
+		const candidate = await hashPasswordPbkdf2(parsed.currentPassword, me.password_salt, me.password_iterations);
+		verified = constantTimeEqual(candidate, me.password_hash);
+	} else {
+		const candidate = await hashPasswordSha256(parsed.currentPassword);
+		verified = constantTimeEqual(candidate, me.password_hash);
+	}
+	if (!verified) {
+		throw new HTTPException(400, { message: 'Current password is incorrect.' });
+	}
+
+	const updates: string[] = [];
+	const binds: Array<string | number> = [];
+	const changes: Record<string, unknown> = {};
+
+	if (parsed.username && parsed.username !== me.username) {
+		const clash = await c.env.DB.prepare(
+			'SELECT id FROM staff_users WHERE username = ? AND id != ? LIMIT 1'
+		).bind(parsed.username, me.id).first<{ id: string }>();
+		if (clash) {
+			throw new HTTPException(409, { message: 'A user with this username already exists.' });
+		}
+		updates.push('username = ?');
+		binds.push(parsed.username);
+		changes.username = { from: me.username, to: parsed.username };
+	}
+
+	if (parsed.newPassword) {
+		const salt = generateSaltHex();
+		const iterations = defaultPbkdf2Iterations();
+		const newHash = await hashPasswordPbkdf2(parsed.newPassword, salt, iterations);
+		updates.push('password_hash = ?', 'password_salt = ?', 'password_iterations = ?');
+		binds.push(newHash, salt, iterations);
+		changes.password = true;
+	}
+
+	if (updates.length === 0) {
+		// Nothing actually changed (e.g. username submitted matched current one).
+		return c.json({ user: { id: me.id, username: me.username, role: me.role } });
+	}
+
+	const ts = nowIso();
+	updates.push('updated_at = ?');
+	binds.push(ts);
+	binds.push(me.id);
+
+	await c.env.DB.prepare(
+		`UPDATE staff_users SET ${updates.join(', ')} WHERE id = ?`
+	).bind(...binds).run();
+
+	await insertAuditLog(c.env, me.id, 'user.self_update', 'staff_user', me.id, changes);
+
+	const finalUsername = (changes.username as { to: string } | undefined)?.to ?? me.username;
+
+	// If the username changed, the JWT still encodes the old one. Reissue the
+	// session cookie so the client sees the up-to-date identity right away.
+	if (changes.username) {
+		const token = await createAccessToken(c.env, {
+			sub: me.id,
+			username: finalUsername,
+			role: me.role
+		});
+		const ttl = Number(c.env.ACCESS_TOKEN_TTL_SECONDS ?? '43200');
+		c.header(
+			'Set-Cookie',
+			`ok_library_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=${ttl}`
+		);
+	}
+
+	return c.json({ user: { id: me.id, username: finalUsername, role: me.role } });
+});
+
 app.get('/api/books', async (c) => {
 	const query = BookFilterQuerySchema.parse(c.req.query());
 	const customFilters = Object.entries(c.req.query())
@@ -318,6 +462,9 @@ app.get('/api/books', async (c) => {
 		}
 	}
 
+	// includeDeleted is admin-only — silently drop it for non-admins so a
+	// librarian can't browse the trash via the public list endpoint.
+	const includeDeleted = Boolean(query.includeDeleted) && c.get('user').role === 'admin';
 	const result = await queryBooksWithFilters(c.env, {
 		...query,
 		customFilters,
@@ -326,7 +473,8 @@ app.get('/api/books', async (c) => {
 		missingIsbn: query.missingIsbn,
 		missingShelf: query.missingShelf,
 		untitled: query.untitled,
-		unknownAuthor: query.unknownAuthor
+		unknownAuthor: query.unknownAuthor,
+		includeDeleted
 	});
 
 	const response = {
@@ -367,7 +515,7 @@ app.get('/api/books/:id', async (c) => {
 	});
 });
 
-app.post('/api/books', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/books', requirePermission('books.write', { librarian: true }), async (c) => {
 	const payload = normalizeBookData(CreateBookSchema.parse(await c.req.json()));
 	const now = nowIso();
 	const id = crypto.randomUUID();
@@ -424,7 +572,7 @@ app.post('/api/books', requireRole(['admin', 'librarian']), async (c) => {
 	return c.json({ id, ...(duplicateOf.length > 0 ? { duplicateOf } : {}) }, 201);
 });
 
-app.put('/api/books/:id', requireRole(['admin', 'librarian']), async (c) => {
+app.put('/api/books/:id', requirePermission('books.write', { librarian: true }), async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
 		throw new HTTPException(400, { message: 'Missing book id' });
@@ -443,9 +591,12 @@ app.put('/api/books/:id', requireRole(['admin', 'librarian']), async (c) => {
 	}
 
 	const now = nowIso();
+	// Lenient mode: tolerate keys whose custom field definition was deleted,
+	// so a legacy value on the book doesn't block an unrelated edit.
 	const customFields = await validateCustomFields(
 		c.env,
-		(payload.customFields ?? JSON.parse((existingMap.custom_fields as string) ?? '{}')) as Record<string, unknown>
+		(payload.customFields ?? JSON.parse((existingMap.custom_fields as string) ?? '{}')) as Record<string, unknown>,
+		{ requireAllRequired: payload.customFields !== undefined, rejectUnknownKeys: false }
 	);
 	const merged = {
 		...parseBook(existingMap),
@@ -494,7 +645,7 @@ app.put('/api/books/:id', requireRole(['admin', 'librarian']), async (c) => {
 	return c.json({ id, version: merged.version });
 });
 
-app.delete('/api/books/:id', requireRole(['admin']), async (c) => {
+app.delete('/api/books/:id', requirePermission('books.delete'), async (c) => {
 	const id = c.req.param('id');
 	const now = nowIso();
 	const result = await c.env.DB.prepare(
@@ -503,7 +654,10 @@ app.delete('/api/books/:id', requireRole(['admin']), async (c) => {
 		.bind(now, now, id)
 		.run();
 
-	if (!result.success) {
+	// D1's `success` is true for any well-formed statement, even if zero rows
+	// matched. The accurate signal that something was actually deleted is
+	// `meta.changes`.
+	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Book not found' });
 	}
 
@@ -512,58 +666,161 @@ app.delete('/api/books/:id', requireRole(['admin']), async (c) => {
 	return c.body(null, 204);
 });
 
-app.post('/api/books/:id/borrow', requireRole(['admin', 'librarian']), async (c) => {
+// Restore a previously soft-deleted book. Admin-only. Useful when a librarian
+// undoes an accidental deletion — book row, cover image, and history all stay
+// in the DB until a hard purge, so this is a single UPDATE.
+app.post('/api/books/:id/restore', requirePermission('books.delete'), async (c) => {
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing book id' });
+	}
+	const now = nowIso();
+	const result = await c.env.DB.prepare(
+		`UPDATE books SET deleted_at = NULL, updated_at = ?, version = version + 1
+		 WHERE id = ? AND deleted_at IS NOT NULL`
+	).bind(now, id).run();
+
+	if ((result.meta?.changes ?? 0) === 0) {
+		throw new HTTPException(404, { message: 'Book not found in trash' });
+	}
+
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.restore', 'book', id, {});
+	return c.json({ id, restored: true });
+});
+
+// List soft-deleted books — the "trash" view. Admin-only. Paged so a runaway
+// bulk-delete doesn't return a 12K-row payload.
+app.get('/api/books/trash', requirePermission('books.delete'), async (c) => {
+	const page = Math.max(1, Number(c.req.query('page') ?? 1));
+	const pageSize = Math.min(100, Math.max(1, Number(c.req.query('pageSize') ?? 25)));
+	const offset = (page - 1) * pageSize;
+
+	const [rowsRes, countRes] = await Promise.all([
+		c.env.DB.prepare(
+			`SELECT * FROM books WHERE deleted_at IS NOT NULL
+			 ORDER BY deleted_at DESC LIMIT ? OFFSET ?`
+		).bind(pageSize, offset).all(),
+		c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL').first<{ n: number }>()
+	]);
+
+	return c.json({
+		page,
+		pageSize,
+		total: Number(countRes?.n ?? 0),
+		items: ((rowsRes.results ?? []) as Array<Record<string, unknown>>).map(parseBook)
+	});
+});
+
+// Hard-delete a book from the trash. Admin-only. Removes the book row plus
+// orphan rows that referenced it; covers in R2 are wiped too.
+app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) => {
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing book id' });
+	}
+	const existing = await c.env.DB.prepare('SELECT id, cover_url FROM books WHERE id = ? AND deleted_at IS NOT NULL')
+		.bind(id)
+		.first<{ id: string; cover_url: string | null }>();
+	if (!existing) {
+		throw new HTTPException(404, { message: 'Book not in trash (must soft-delete first)' });
+	}
+
+	await withTxn(c.env, async () => {
+		// Cascade in app code since SQLite ALTER TABLE can't add ON DELETE CASCADE
+		// retroactively. Order matters: kill children first.
+		await c.env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(id).run();
+		await c.env.DB.prepare('DELETE FROM code_assignments WHERE book_id = ?').bind(id).run();
+		await c.env.DB.prepare('DELETE FROM borrow_transactions WHERE book_id = ?').bind(id).run();
+		await c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id).run();
+	});
+
+	// Best-effort R2 cleanup — failing here doesn't roll back the DB delete,
+	// orphan files would be cleaned by the maintenance sweep.
+	for (const ext of ['jpg', 'png', 'webp', 'gif']) {
+		try { await c.env.ASSETS.delete(`covers/${id}.${ext}`); } catch { /* ignore */ }
+	}
+
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.purge', 'book', id, {});
+	return c.body(null, 204);
+});
+
+// Resolve a borrower (existing id, existing name+contact, or new) and return
+// the canonical row. Used by both the direct borrow endpoint and the offline
+// sync push path so they stay in lockstep.
+async function resolveBorrower(
+	env: Env,
+	input: { borrowerId?: string | null; borrowerName?: string | null; borrowerContact?: string | null }
+): Promise<{ borrowerId: string | null; borrowerName: string; borrowerContact: string | null }> {
+	let borrowerId: string | null = input.borrowerId ?? null;
+	let borrowerName = input.borrowerName?.trim() ?? '';
+	let borrowerContact = input.borrowerContact ?? null;
+	const now = nowIso();
+
+	if (borrowerId) {
+		const existing = await env.DB.prepare('SELECT id, name, contact FROM borrowers WHERE id = ? LIMIT 1')
+			.bind(borrowerId)
+			.first<{ id: string; name: string; contact: string | null }>();
+		if (!existing) {
+			throw new HTTPException(404, { message: 'Borrower not found' });
+		}
+		return { borrowerId: existing.id, borrowerName: existing.name, borrowerContact: borrowerContact ?? existing.contact };
+	}
+
+	if (borrowerName) {
+		const existing = await env.DB.prepare(
+			`SELECT id FROM borrowers WHERE LOWER(name) = LOWER(?)
+			   AND COALESCE(contact, '') = COALESCE(?, '') LIMIT 1`
+		).bind(borrowerName, borrowerContact ?? '').first<{ id: string }>();
+		if (existing) {
+			return { borrowerId: existing.id, borrowerName, borrowerContact };
+		}
+		borrowerId = crypto.randomUUID();
+		await env.DB.prepare(
+			`INSERT INTO borrowers (id, name, contact, notes, created_at, updated_at)
+			 VALUES (?, ?, ?, NULL, ?, ?)`
+		).bind(borrowerId, borrowerName, borrowerContact ?? null, now, now).run();
+		return { borrowerId, borrowerName, borrowerContact };
+	}
+
+	return { borrowerId: null, borrowerName, borrowerContact };
+}
+
+app.post('/api/books/:id/borrow', requirePermission('books.write', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = BorrowBookSchema.parse(await c.req.json());
 
-	const result = await withTxn(c.env, async () => {
-		const book = await c.env.DB.prepare('SELECT status FROM books WHERE id = ? AND deleted_at IS NULL')
-			.bind(bookId)
-			.first<{ status: string }>();
+	// Reject due dates that are not strictly in the future. Catches calendar
+	// typos (last year) and timezone-crossed clocks before they create
+	// already-overdue loans.
+	if (Date.parse(payload.dueAt) <= Date.now()) {
+		throw new HTTPException(400, { message: 'dueAt must be in the future.' });
+	}
 
-		if (!book) {
+	const { borrowerId, borrowerName, borrowerContact } = await resolveBorrower(c.env, payload);
+
+	const now = nowIso();
+	const txId = crypto.randomUUID();
+
+	// Atomic state transition: only flip the row if it is still 'available'.
+	// A second concurrent borrow request will see meta.changes === 0 and 409.
+	// This replaces the previous read-then-write pattern that raced under load.
+	const flip = await c.env.DB.prepare(
+		`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ?
+		 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
+	).bind(now, bookId).run();
+
+	if ((flip.meta?.changes ?? 0) === 0) {
+		const exists = await c.env.DB.prepare('SELECT status FROM books WHERE id = ? AND deleted_at IS NULL')
+			.bind(bookId).first<{ status: string }>();
+		if (!exists) {
 			throw new HTTPException(404, { message: 'Book not found' });
 		}
+		throw new HTTPException(409, { message: 'Book is not available' });
+	}
 
-		if (book.status !== 'available') {
-			throw new HTTPException(409, { message: 'Book is not available' });
-		}
-
-		// Resolve / create the borrower entity. If borrowerId is provided we
-		// look it up; otherwise we upsert by lower-trimmed name + contact so
-		// repeated freeform names converge to a single profile.
-		let borrowerId: string | null = payload.borrowerId ?? null;
-		let borrowerName = payload.borrowerName?.trim() ?? '';
-		let borrowerContact = payload.borrowerContact ?? null;
-		const now = nowIso();
-
-		if (borrowerId) {
-			const existing = await c.env.DB.prepare('SELECT id, name, contact FROM borrowers WHERE id = ? LIMIT 1')
-				.bind(borrowerId)
-				.first<{ id: string; name: string; contact: string | null }>();
-			if (!existing) {
-				throw new HTTPException(404, { message: 'Borrower not found' });
-			}
-			borrowerName = existing.name;
-			borrowerContact = borrowerContact ?? existing.contact;
-		} else if (borrowerName) {
-			const existing = await c.env.DB.prepare(
-				`SELECT id FROM borrowers WHERE LOWER(name) = LOWER(?)
-				   AND COALESCE(contact, '') = COALESCE(?, '') LIMIT 1`
-			).bind(borrowerName, borrowerContact ?? '').first<{ id: string }>();
-			if (existing) {
-				borrowerId = existing.id;
-			} else {
-				borrowerId = crypto.randomUUID();
-				await c.env.DB.prepare(
-					`INSERT INTO borrowers (id, name, contact, notes, created_at, updated_at)
-					 VALUES (?, ?, ?, NULL, ?, ?)`
-				).bind(borrowerId, borrowerName, borrowerContact ?? null, now, now).run();
-			}
-		}
-
-		const txId = crypto.randomUUID();
-
+	try {
 		await c.env.DB.prepare(
 			`INSERT INTO borrow_transactions (
 				id, book_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
@@ -582,24 +839,25 @@ app.post('/api/books/:id/borrow', requireRole(['admin', 'librarian']), async (c)
 				now
 			)
 			.run();
-
-		await c.env.DB.prepare(`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ? WHERE id = ?`)
-			.bind(now, bookId)
-			.run();
-
-		return { transactionId: txId, borrowerId };
-	});
+	} catch (err) {
+		// Compensating revert if the transaction insert fails (e.g. partial
+		// unique-active-loan index trips because another writer raced in).
+		await c.env.DB.prepare(
+			`UPDATE books SET status = 'available', updated_at = ? WHERE id = ? AND status = 'borrowed'`
+		).bind(nowIso(), bookId).run();
+		throw err;
+	}
 
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.borrow', 'book', bookId ?? null, {
-		transactionId: result.transactionId,
+		transactionId: txId,
 		dueAt: payload.dueAt
 	});
 
-	return c.json(result, 201);
+	return c.json({ transactionId: txId, borrowerId }, 201);
 });
 
-app.post('/api/books/:id/return', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/books/:id/return', requirePermission('books.write', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = ReturnBookSchema.parse(await c.req.json());
 
@@ -701,7 +959,7 @@ app.get('/api/books/:id/attributes', async (c) => {
 	return c.json({ bookId: id, values });
 });
 
-app.put('/api/books/:id/attributes', requireRole(['admin', 'librarian']), async (c) => {
+app.put('/api/books/:id/attributes', requirePermission('books.write', { librarian: true }), async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
 		throw new HTTPException(400, { message: 'Missing book id' });
@@ -782,7 +1040,7 @@ app.get('/api/borrow/active', async (c) => {
 	}
 });
 
-app.post('/api/books/:id/codes', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/books/:id/codes', requirePermission('books.write', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = GenerateCodeSchema.parse(await c.req.json());
 
@@ -879,7 +1137,7 @@ app.get('/api/setup/default-book-structure', async (c) => {
 	return c.json({ columns });
 });
 
-app.post('/api/setup/default-book-structure', requireRole(['admin']), async (c) => {
+app.post('/api/setup/default-book-structure', requirePermission('setup'), async (c) => {
 	const now = nowIso();
 	const customColumns = DEFAULT_BOOK_STRUCTURE.filter((column) => column.customKey && column.customType);
 	const existingCustomFieldsResult = await c.env.DB.prepare(
@@ -978,7 +1236,7 @@ app.get('/api/rooms/summary', async (c) => {
 	}
 });
 
-app.post('/api/rooms', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/rooms', requirePermission('rooms.write', { librarian: true }), async (c) => {
 	const payload = UpsertRoomSchema.parse(await c.req.json());
 	const id = crypto.randomUUID();
 	const now = nowIso();
@@ -997,7 +1255,7 @@ app.post('/api/rooms', requireRole(['admin', 'librarian']), async (c) => {
 	return c.json({ id }, 201);
 });
 
-app.put('/api/rooms/:id', requireRole(['admin', 'librarian']), async (c) => {
+app.put('/api/rooms/:id', requirePermission('rooms.write', { librarian: true }), async (c) => {
 	const id = c.req.param('id');
 	const payload = UpsertRoomSchema.parse(await c.req.json());
 	const now = nowIso();
@@ -1015,10 +1273,10 @@ app.put('/api/rooms/:id', requireRole(['admin', 'librarian']), async (c) => {
 	return c.json({ id });
 });
 
-app.delete('/api/rooms/:id', requireRole(['admin']), async (c) => {
+app.delete('/api/rooms/:id', requirePermission('rooms.delete'), async (c) => {
 	const id = c.req.param('id');
 	const result = await c.env.DB.prepare('DELETE FROM rooms WHERE id = ?').bind(id).run();
-	if (!result.success) {
+	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Room not found' });
 	}
 
@@ -1068,7 +1326,7 @@ app.get('/api/custom-fields', async (c) => {
 	}
 });
 
-app.post('/api/custom-fields', requireRole(['admin']), async (c) => {
+app.post('/api/custom-fields', requirePermission('customFields.manage'), async (c) => {
 	const payload = UpsertCustomFieldSchema.parse(await c.req.json());
 	const id = crypto.randomUUID();
 	const now = nowIso();
@@ -1088,7 +1346,7 @@ app.post('/api/custom-fields', requireRole(['admin']), async (c) => {
 	return c.json({ id }, 201);
 });
 
-app.put('/api/custom-fields/:id', requireRole(['admin']), async (c) => {
+app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
 		throw new HTTPException(400, { message: 'Missing custom field id' });
@@ -1156,7 +1414,7 @@ app.put('/api/custom-fields/:id', requireRole(['admin']), async (c) => {
 	return c.json({ id });
 });
 
-app.delete('/api/custom-fields/:id', requireRole(['admin']), async (c) => {
+app.delete('/api/custom-fields/:id', requirePermission('customFields.manage'), async (c) => {
 	const id = c.req.param('id');
 	const now = nowIso();
 	await c.env.DB.prepare('UPDATE custom_field_definitions SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
@@ -1167,7 +1425,7 @@ app.delete('/api/custom-fields/:id', requireRole(['admin']), async (c) => {
 	return c.body(null, 204);
 });
 
-app.post('/api/import/books', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/import/books', requirePermission('import'), async (c) => {
 	let rawPayload: unknown;
 	try {
 		rawPayload = await c.req.json();
@@ -1352,7 +1610,7 @@ app.get('/api/sync/pull', async (c) => {
 	return c.json({ since, nextCursor, items });
 });
 
-app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/sync/push', requirePermission('books.write', { librarian: true }), async (c) => {
 	const payload = SyncPushSchema.parse(await c.req.json());
 	const actor = c.get('user');
 
@@ -1459,31 +1717,48 @@ app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
 				resultData = { id: row.id, version: merged.version };
 			} else if (mutation.operation === 'borrow_book') {
 				const row = z.object({ id: z.string().min(1), data: BorrowBookSchema }).parse(mutation.payload);
+				if (Date.parse(row.data.dueAt) <= Date.now()) {
+					throw new HTTPException(400, { message: 'dueAt must be in the future.' });
+				}
+				const { borrowerId, borrowerName, borrowerContact } = await resolveBorrower(c.env, row.data);
 				const txId = crypto.randomUUID();
 				const now = nowIso();
-				await c.env.DB.prepare(
-					`INSERT INTO borrow_transactions (
-						 id, book_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
-					 ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
-				)
-					.bind(
-						txId,
-						row.id,
-						row.data.borrowerName,
-						row.data.borrowerContact ?? null,
-						now,
-						row.data.dueAt,
-						row.data.notes ?? null,
-						actor.sub,
-						now
+				// Same atomic flip as the direct endpoint — prevents two queued
+				// offline borrows on the same book from both succeeding.
+				const flip = await c.env.DB.prepare(
+					`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ?
+					 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
+				).bind(now, row.id).run();
+				if ((flip.meta?.changes ?? 0) === 0) {
+					throw new HTTPException(409, { message: 'Book is not available' });
+				}
+				try {
+					await c.env.DB.prepare(
+						`INSERT INTO borrow_transactions (
+							 id, book_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
+						 ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
 					)
-					.run();
+						.bind(
+							txId,
+							row.id,
+							borrowerId,
+							borrowerName,
+							borrowerContact,
+							now,
+							row.data.dueAt,
+							row.data.notes ?? null,
+							actor.sub,
+							now
+						)
+						.run();
+				} catch (err) {
+					await c.env.DB.prepare(
+						`UPDATE books SET status = 'available', updated_at = ? WHERE id = ? AND status = 'borrowed'`
+					).bind(nowIso(), row.id).run();
+					throw err;
+				}
 
-				await c.env.DB.prepare(`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ? WHERE id = ?`)
-					.bind(now, row.id)
-					.run();
-
-				resultData = { transactionId: txId };
+				resultData = { transactionId: txId, borrowerId };
 			} else if (mutation.operation === 'return_book') {
 				const row = z.object({ id: z.string().min(1), data: ReturnBookSchema }).parse(mutation.payload);
 				const tx = await c.env.DB.prepare(
@@ -1541,7 +1816,7 @@ app.post('/api/sync/push', requireRole(['admin', 'librarian']), async (c) => {
 	return c.json({ results });
 });
 
-app.get('/api/books/duplicates', requireRole(['admin', 'librarian']), async (c) => {
+app.get('/api/books/duplicates', requirePermission('books.write', { librarian: true }), async (c) => {
 	// Step 1: aggregate to find duplicate keys directly in SQL — never loads the full table.
 	const limit = Math.max(1, Math.min(200, Number(c.req.query('limit') ?? 50)));
 	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
@@ -1603,7 +1878,7 @@ app.get('/api/books/duplicates', requireRole(['admin', 'librarian']), async (c) 
 	return c.json({ total: orderedGroups.length, groups: orderedGroups, page: { limit, offset } });
 });
 
-app.post('/api/admin/normalize-books', requireRole(['admin']), async (c) => {
+app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => {
 	const limit = Math.min(500, Math.max(1, Number(c.req.query('limit') ?? 500)));
 	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
 
@@ -1864,6 +2139,349 @@ app.get('/api/audit-logs', requireRole(['admin']), async (c) => {
 	});
 });
 
+// ─── User management (admin-only) ─────────────────────────────────────────────
+const RoleSchema = z.enum(['admin', 'librarian', 'viewer']);
+const CreateUserSchema = z.object({
+	username: z.string().trim().min(3).max(64).regex(/^[A-Za-z0-9._-]+$/, 'Username may use letters, numbers, dot, underscore, dash'),
+	password: z.string().min(8).max(200),
+	role: RoleSchema,
+	active: z.boolean().optional()
+});
+const UpdateUserSchema = z.object({
+	role: RoleSchema.optional(),
+	active: z.boolean().optional(),
+	password: z.string().min(8).max(200).optional()
+});
+
+app.get('/api/users', requireRole(['admin']), async (c) => {
+	// Only surface active accounts. DELETE is a soft-delete (audit FKs prevent
+	// hard removal), so deactivated users would otherwise linger in the UI.
+	const rows = await c.env.DB.prepare(
+		`SELECT id, username, role, active, created_at, updated_at
+		 FROM staff_users WHERE active = 1 ORDER BY username ASC`
+	).all();
+	return c.json({ items: rows.results ?? [] });
+});
+
+app.post('/api/users', requireRole(['admin']), async (c) => {
+	const body = await c.req.json();
+	const parsed = CreateUserSchema.parse(body);
+
+	const existing = await c.env.DB.prepare(
+		'SELECT id, active FROM staff_users WHERE username = ? LIMIT 1'
+	)
+		.bind(parsed.username)
+		.first<{ id: string; active: number }>();
+	if (existing && existing.active === 1) {
+		throw new HTTPException(409, { message: 'A user with this username already exists.' });
+	}
+
+	const salt = generateSaltHex();
+	const iterations = defaultPbkdf2Iterations();
+	const passwordHash = await hashPasswordPbkdf2(parsed.password, salt, iterations);
+	const ts = nowIso();
+	const active = parsed.active === false ? 0 : 1;
+
+	let id: string;
+	if (existing) {
+		// Reactivate the previously soft-deleted row instead of inserting a new
+		// one — the username is still bound to that id and audit history points
+		// to it.
+		id = existing.id;
+		await c.env.DB.prepare(
+			`UPDATE staff_users
+			   SET role = ?, password_hash = ?, password_salt = ?, password_iterations = ?,
+			       active = ?, updated_at = ?
+			 WHERE id = ?`
+		)
+			.bind(parsed.role, passwordHash, salt, iterations, active, ts, id)
+			.run();
+	} else {
+		id = crypto.randomUUID();
+		await c.env.DB.prepare(
+			`INSERT INTO staff_users (id, username, role, password_hash, password_salt, password_iterations, active, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		)
+			.bind(id, parsed.username, parsed.role, passwordHash, salt, iterations, active, ts, ts)
+			.run();
+	}
+
+	const actor = c.get('user');
+	await insertAuditLog(c.env, actor.sub, existing ? 'user.reactivate' : 'user.create', 'staff_user', id, {
+		username: parsed.username,
+		role: parsed.role,
+		active: Boolean(active)
+	});
+
+	return c.json({
+		user: {
+			id,
+			username: parsed.username,
+			role: parsed.role,
+			active: Boolean(active),
+			created_at: ts,
+			updated_at: ts
+		}
+	}, 201);
+});
+
+app.put('/api/users/:id', requireRole(['admin']), async (c) => {
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing user id' });
+	}
+	const body = await c.req.json();
+	const parsed = UpdateUserSchema.parse(body);
+
+	const existing = await c.env.DB.prepare(
+		'SELECT id, username, role, active FROM staff_users WHERE id = ? LIMIT 1'
+	)
+		.bind(id)
+		.first<{ id: string; username: string; role: 'admin' | 'librarian' | 'viewer'; active: number }>();
+	if (!existing) {
+		throw new HTTPException(404, { message: 'User not found' });
+	}
+
+	const actor = c.get('user');
+	// Guard against an admin demoting or deactivating themselves and locking
+	// the system out of admin access entirely.
+	if (existing.id === actor.sub) {
+		if (parsed.role && parsed.role !== 'admin') {
+			throw new HTTPException(400, { message: 'You cannot change your own role.' });
+		}
+		if (parsed.active === false) {
+			throw new HTTPException(400, { message: 'You cannot deactivate yourself.' });
+		}
+	}
+
+	// Don't allow demoting / deactivating the last active admin.
+	if ((parsed.role && parsed.role !== 'admin' && existing.role === 'admin') ||
+		(parsed.active === false && existing.role === 'admin')) {
+		const otherAdmins = await c.env.DB.prepare(
+			"SELECT COUNT(*) AS n FROM staff_users WHERE role = 'admin' AND active = 1 AND id != ?"
+		).bind(id).first<{ n: number }>();
+		if (!otherAdmins || otherAdmins.n === 0) {
+			throw new HTTPException(400, { message: 'Cannot remove the last active admin.' });
+		}
+	}
+
+	const updates: string[] = [];
+	const binds: Array<string | number> = [];
+
+	if (parsed.role) {
+		updates.push('role = ?');
+		binds.push(parsed.role);
+	}
+	if (typeof parsed.active === 'boolean') {
+		updates.push('active = ?');
+		binds.push(parsed.active ? 1 : 0);
+	}
+	if (parsed.password) {
+		const salt = generateSaltHex();
+		const iterations = defaultPbkdf2Iterations();
+		const passwordHash = await hashPasswordPbkdf2(parsed.password, salt, iterations);
+		updates.push('password_hash = ?', 'password_salt = ?', 'password_iterations = ?');
+		binds.push(passwordHash, salt, iterations);
+	}
+
+	if (updates.length === 0) {
+		throw new HTTPException(400, { message: 'No fields to update.' });
+	}
+
+	updates.push('updated_at = ?');
+	binds.push(nowIso());
+	binds.push(id);
+
+	await c.env.DB.prepare(`UPDATE staff_users SET ${updates.join(', ')} WHERE id = ?`)
+		.bind(...binds)
+		.run();
+
+	await insertAuditLog(c.env, actor.sub, 'user.update', 'staff_user', id, {
+		role: parsed.role,
+		active: parsed.active,
+		passwordChanged: Boolean(parsed.password)
+	});
+
+	const updated = await c.env.DB.prepare(
+		'SELECT id, username, role, active, created_at, updated_at FROM staff_users WHERE id = ?'
+	).bind(id).first();
+
+	return c.json({ user: updated });
+});
+
+app.delete('/api/users/:id', requireRole(['admin']), async (c) => {
+	const id = c.req.param('id') ?? '';
+	if (!id) {
+		throw new HTTPException(400, { message: 'Missing user id' });
+	}
+	const existing = await c.env.DB.prepare(
+		'SELECT id, username, role FROM staff_users WHERE id = ? LIMIT 1'
+	)
+		.bind(id)
+		.first<{ id: string; username: string; role: 'admin' | 'librarian' | 'viewer' }>();
+	if (!existing) {
+		throw new HTTPException(404, { message: 'User not found' });
+	}
+
+	const actor = c.get('user');
+	if (existing.id === actor.sub) {
+		throw new HTTPException(400, { message: 'You cannot delete your own account.' });
+	}
+
+	if (existing.role === 'admin') {
+		const otherAdmins = await c.env.DB.prepare(
+			"SELECT COUNT(*) AS n FROM staff_users WHERE role = 'admin' AND active = 1 AND id != ?"
+		).bind(id).first<{ n: number }>();
+		if (!otherAdmins || otherAdmins.n === 0) {
+			throw new HTTPException(400, { message: 'Cannot delete the last active admin.' });
+		}
+	}
+
+	// Try hard-delete first; if FK references in audit_logs / code_assignments
+	// block it, fall back to soft-delete (deactivate) so audit history stays
+	// intact. This mirrors the user's preferred "adaptive" behaviour.
+	let soft = false;
+	try {
+		await c.env.DB.prepare('DELETE FROM staff_users WHERE id = ?').bind(id).run();
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		// D1 surfaces FK violations as SQLITE_CONSTRAINT errors. Anything else
+		// is a real failure and should propagate.
+		if (!/FOREIGN KEY|constraint/i.test(message)) {
+			throw err;
+		}
+		soft = true;
+		await c.env.DB.prepare(
+			"UPDATE staff_users SET active = 0, updated_at = ? WHERE id = ?"
+		).bind(nowIso(), id).run();
+	}
+
+	await insertAuditLog(c.env, actor.sub, 'user.delete', 'staff_user', id, {
+		username: existing.username,
+		role: existing.role,
+		soft
+	});
+
+	return c.json({ ok: true, soft });
+});
+
+// ─── Role permissions (admin-only) ────────────────────────────────────────────
+// Catalogue of permissions the admin can toggle per role. Keep in sync with
+// the frontend `PERMISSION_CATALOG` and with the seed in migration 0007.
+// Admins always have every permission (not configurable).
+const PERMISSION_KEYS = [
+	'books.write',
+	'books.delete',
+	'rooms.write',
+	'rooms.delete',
+	'customFields.manage',
+	'import',
+	'setup',
+	'circulation',
+	'dashboard',
+	'settings'
+] as const;
+type PermissionKey = typeof PERMISSION_KEYS[number];
+const PERMISSION_KEY_SET = new Set<string>(PERMISSION_KEYS);
+
+// Defaults applied when a row is missing from the table (also used by
+// `requirePermission` middleware as the fallback).
+const DEFAULT_PERMS: Record<'librarian' | 'viewer', Record<PermissionKey, boolean>> = {
+	librarian: {
+		'books.write': true,
+		'books.delete': false,
+		'rooms.write': true,
+		'rooms.delete': false,
+		'customFields.manage': false,
+		'import': false,
+		'setup': false,
+		'circulation': true,
+		'dashboard': true,
+		'settings': true
+	},
+	viewer: {
+		'books.write': false,
+		'books.delete': false,
+		'rooms.write': false,
+		'rooms.delete': false,
+		'customFields.manage': false,
+		'import': false,
+		'setup': false,
+		'circulation': false,
+		'dashboard': false,
+		'settings': false
+	}
+};
+
+async function loadPermissionMatrix(env: Env): Promise<Record<'admin' | 'librarian' | 'viewer', Record<PermissionKey, boolean>>> {
+	const rows = await env.DB.prepare(
+		'SELECT role, permission, allowed FROM role_permissions'
+	).all<{ role: 'admin' | 'librarian' | 'viewer'; permission: string; allowed: number }>();
+	const matrix: Record<'admin' | 'librarian' | 'viewer', Record<PermissionKey, boolean>> = {
+		admin: Object.fromEntries(PERMISSION_KEYS.map((p) => [p, true])) as Record<PermissionKey, boolean>,
+		librarian: { ...DEFAULT_PERMS.librarian },
+		viewer: { ...DEFAULT_PERMS.viewer }
+	};
+	for (const row of rows.results ?? []) {
+		if (row.role === 'admin') continue; // admins are immutable
+		if (!PERMISSION_KEY_SET.has(row.permission)) continue;
+		matrix[row.role][row.permission as PermissionKey] = row.allowed === 1;
+	}
+	return matrix;
+}
+
+app.get('/api/role-permissions', requireRole(['admin']), async (c) => {
+	const matrix = await loadPermissionMatrix(c.env);
+	return c.json({ catalog: PERMISSION_KEYS, matrix });
+});
+
+const UpdatePermissionsSchema = z.object({
+	matrix: z.object({
+		librarian: z.record(z.string(), z.boolean()),
+		viewer: z.record(z.string(), z.boolean())
+	})
+});
+
+app.put('/api/role-permissions', requireRole(['admin']), async (c) => {
+	const body = await c.req.json();
+	const parsed = UpdatePermissionsSchema.parse(body);
+	const ts = nowIso();
+
+	const stmts: D1PreparedStatement[] = [];
+	for (const role of ['librarian', 'viewer'] as const) {
+		const desired = parsed.matrix[role];
+		for (const perm of PERMISSION_KEYS) {
+			const allowed = desired[perm] === true ? 1 : 0;
+			stmts.push(
+				c.env.DB.prepare(
+					`INSERT INTO role_permissions (role, permission, allowed, updated_at)
+					 VALUES (?, ?, ?, ?)
+					 ON CONFLICT(role, permission) DO UPDATE
+					   SET allowed = excluded.allowed, updated_at = excluded.updated_at`
+				).bind(role, perm, allowed, ts)
+			);
+		}
+	}
+	await c.env.DB.batch(stmts);
+
+	const actor = c.get('user');
+	await insertAuditLog(c.env, actor.sub, 'role_permissions.update', 'role_permissions', null, {
+		matrix: parsed.matrix
+	});
+
+	const matrix = await loadPermissionMatrix(c.env);
+	return c.json({ catalog: PERMISSION_KEYS, matrix });
+});
+
+// Lightweight read endpoint for ALL authenticated users — returns the
+// effective matrix so the frontend can gate UI without leaking the catalogue.
+// Admins also use this; they always see all `true`s.
+app.get('/api/me/permissions', async (c) => {
+	const matrix = await loadPermissionMatrix(c.env);
+	const user = c.get('user');
+	return c.json({ catalog: PERMISSION_KEYS, permissions: matrix[user.role] });
+});
+
 // ─── Library catalogue (LIBRARY_normalized.xlsx) — first-class support ────────
 // The xlsx ships with snake_case columns (id, title, authors, publisher,
 // place_of_publication, …). The two endpoints below let an admin (1) seed the
@@ -1903,7 +2521,7 @@ const CATALOG_CUSTOM_FIELDS: Array<{
 	{ key: 'needs_review', label: 'Needs Review', type: 'boolean' }
 ];
 
-app.post('/api/setup/library-catalog', requireRole(['admin']), async (c) => {
+app.post('/api/setup/library-catalog', requirePermission('setup'), async (c) => {
 	const now = nowIso();
 	let created = 0;
 	let updated = 0;
@@ -1945,7 +2563,7 @@ app.post('/api/setup/library-catalog', requireRole(['admin']), async (c) => {
 	return c.json({ ok: true, created, updated, total: CATALOG_CUSTOM_FIELDS.length });
 });
 
-app.post('/api/import/books-catalog', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/import/books-catalog', requirePermission('import'), async (c) => {
 	let rawPayload: unknown;
 	try {
 		rawPayload = await c.req.json();
@@ -2248,7 +2866,7 @@ app.get('/api/borrowers/:id', async (c) => {
 	});
 });
 
-app.post('/api/borrowers', requireRole(['admin', 'librarian']), async (c) => {
+app.post('/api/borrowers', requirePermission('circulation', { librarian: true }), async (c) => {
 	const payload = UpsertBorrowerSchema.parse(await c.req.json());
 	const id = crypto.randomUUID();
 	const now = nowIso();
@@ -2260,20 +2878,20 @@ app.post('/api/borrowers', requireRole(['admin', 'librarian']), async (c) => {
 	return c.json({ id }, 201);
 });
 
-app.put('/api/borrowers/:id', requireRole(['admin', 'librarian']), async (c) => {
+app.put('/api/borrowers/:id', requirePermission('circulation', { librarian: true }), async (c) => {
 	const id = c.req.param('id') ?? '';
 	const payload = UpsertBorrowerSchema.parse(await c.req.json());
 	const result = await c.env.DB.prepare(
 		`UPDATE borrowers SET name = ?, contact = ?, notes = ?, updated_at = ? WHERE id = ?`
 	).bind(payload.name, payload.contact ?? null, payload.notes ?? null, nowIso(), id).run();
-	if (!result.success) {
+	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
 	}
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.update', 'borrower', id, { name: payload.name });
 	return c.json({ id });
 });
 
-app.delete('/api/borrowers/:id', requireRole(['admin']), async (c) => {
+app.delete('/api/borrowers/:id', requirePermission('circulation'), async (c) => {
 	const id = c.req.param('id') ?? '';
 	// Refuse if the borrower has any historical loans — better to mark inactive
 	// than orphan transaction history. Frontend can suggest the rename flow.
@@ -2281,14 +2899,158 @@ app.delete('/api/borrowers/:id', requireRole(['admin']), async (c) => {
 		'SELECT COUNT(*) AS n FROM borrow_transactions WHERE borrower_id = ?'
 	).bind(id).first<{ n: number }>();
 	if (inUse && inUse.n > 0) {
-		throw new HTTPException(409, { message: `Cannot delete: borrower has ${inUse.n} loan(s) on record.` });
+		throw new HTTPException(409, { message: `Cannot delete: borrower has ${inUse.n} loan(s) on record. Use /erase to anonymize.` });
 	}
 	const result = await c.env.DB.prepare('DELETE FROM borrowers WHERE id = ?').bind(id).run();
-	if (!result.success) {
+	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
 	}
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.delete', 'borrower', id, {});
 	return c.body(null, 204);
+});
+
+// GDPR: subject-access export. Returns the borrower row plus every loan ever
+// recorded for them, in a single JSON document suitable for handing to the
+// data subject. Admin-only via the `setup` permission to match the rest of
+// the privacy-sensitive surface area.
+app.get('/api/borrowers/:id/export', requirePermission('setup'), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const borrower = await c.env.DB.prepare(
+		'SELECT id, name, contact, notes, created_at, updated_at FROM borrowers WHERE id = ? LIMIT 1'
+	).bind(id).first<{
+		id: string; name: string; contact: string | null; notes: string | null;
+		created_at: string; updated_at: string;
+	}>();
+	if (!borrower) {
+		throw new HTTPException(404, { message: 'Borrower not found' });
+	}
+	const loans = await c.env.DB.prepare(
+		`SELECT bt.id, bt.book_id, b.title, b.author, bt.borrowed_at, bt.due_at, bt.returned_at, bt.notes
+		   FROM borrow_transactions bt
+		   LEFT JOIN books b ON b.id = bt.book_id
+		  WHERE bt.borrower_id = ?
+		  ORDER BY bt.borrowed_at ASC`
+	).bind(id).all<{
+		id: string; book_id: string; title: string | null; author: string | null;
+		borrowed_at: string; due_at: string; returned_at: string | null; notes: string | null;
+	}>();
+
+	await insertAuditLog(c.env, c.get('user').sub, 'borrower.export', 'borrower', id, {});
+
+	const filename = `borrower-${id}.json`;
+	c.header('Content-Type', 'application/json; charset=utf-8');
+	c.header('Content-Disposition', `attachment; filename="${filename}"`);
+	return c.body(JSON.stringify({
+		exportedAt: nowIso(),
+		borrower: {
+			id: borrower.id,
+			name: borrower.name,
+			contact: borrower.contact,
+			notes: borrower.notes,
+			createdAt: borrower.created_at,
+			updatedAt: borrower.updated_at
+		},
+		loans: (loans.results ?? []).map((r) => ({
+			id: r.id,
+			bookId: r.book_id,
+			title: r.title,
+			author: r.author,
+			borrowedAt: r.borrowed_at,
+			dueAt: r.due_at,
+			returnedAt: r.returned_at,
+			notes: r.notes
+		}))
+	}, null, 2));
+});
+
+// GDPR: right-to-erasure. Anonymizes the borrower row in place — replaces
+// name with a sentinel, clears contact/notes, and keeps the id so foreign
+// keys on borrow_transactions remain valid. This preserves aggregate loan
+// statistics (which are not personal data once detached from the name)
+// while making the row no longer identify a natural person.
+app.post('/api/borrowers/:id/erase', requirePermission('setup'), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const sentinel = `[Erased ${id.slice(0, 8)}]`;
+	const result = await c.env.DB.prepare(
+		`UPDATE borrowers SET name = ?, contact = NULL, notes = NULL, updated_at = ? WHERE id = ?`
+	).bind(sentinel, nowIso(), id).run();
+	if ((result.meta?.changes ?? 0) === 0) {
+		throw new HTTPException(404, { message: 'Borrower not found' });
+	}
+	// Also strip any free-text `notes` on the borrower's loan history that
+	// might contain identifying phrases the operator typed at borrow time.
+	await c.env.DB.prepare(
+		'UPDATE borrow_transactions SET notes = NULL WHERE borrower_id = ?'
+	).bind(id).run();
+	await insertAuditLog(c.env, c.get('user').sub, 'borrower.erase', 'borrower', id, {});
+	return c.json({ id, anonymizedName: sentinel });
+});
+
+app.get('/api/borrowers/export.csv', requirePermission('circulation', { librarian: true }), async (c) => {
+	const rows = await c.env.DB.prepare(
+		`SELECT b.id, b.name, b.contact, b.notes, b.created_at, b.updated_at,
+		        COUNT(bt.id) AS total_loans,
+		        SUM(CASE WHEN bt.returned_at IS NULL THEN 1 ELSE 0 END) AS open_loans,
+		        SUM(CASE WHEN bt.returned_at IS NULL AND bt.due_at < ? THEN 1 ELSE 0 END) AS overdue_loans
+		   FROM borrowers b
+		   LEFT JOIN borrow_transactions bt ON bt.borrower_id = b.id
+		  GROUP BY b.id
+		  ORDER BY total_loans DESC, LOWER(b.name) ASC`
+	).bind(nowIso()).all<{
+		id: string; name: string; contact: string | null; notes: string | null;
+		created_at: string; updated_at: string;
+		total_loans: number; open_loans: number; overdue_loans: number;
+	}>();
+
+	const csv = toCsv(
+		(rows.results ?? []).map((r) => ({
+			ID: r.id,
+			Name: r.name,
+			Contact: r.contact ?? '',
+			Notes: r.notes ?? '',
+			'Total loans': Number(r.total_loans ?? 0),
+			'Open loans': Number(r.open_loans ?? 0),
+			'Overdue loans': Number(r.overdue_loans ?? 0),
+			'Created at': r.created_at,
+			'Updated at': r.updated_at
+		})),
+		['ID', 'Name', 'Contact', 'Notes', 'Total loans', 'Open loans', 'Overdue loans', 'Created at', 'Updated at']
+	);
+
+	c.header('Content-Type', 'text/csv; charset=utf-8');
+	c.header('Content-Disposition', 'attachment; filename="borrowers.csv"');
+	return c.body(csv);
+});
+
+// Maintenance endpoint: orphan cleanup. Sweeps:
+//   • code_assignments / book_attribute_values whose book row is gone
+//   • R2 covers whose books are also gone
+//   • inactive borrowers (no loans on record)            ← optional
+// Admin-only and idempotent — safe to run from a cron or on-demand.
+app.post('/api/maintenance/cleanup', requireRole(['admin']), async (c) => {
+	// Wrap in a transaction so a partial failure can't leave book_attribute_values
+	// referencing a still-present book_id while code_assignments was already gone.
+	const summary = await withTxn(c.env, async () => {
+		const orphanCodesRes = await c.env.DB.prepare(
+			`DELETE FROM code_assignments
+			 WHERE book_id NOT IN (SELECT id FROM books)`
+		).run();
+		const orphanAttrsRes = await c.env.DB.prepare(
+			`DELETE FROM book_attribute_values
+			 WHERE book_id NOT IN (SELECT id FROM books)`
+		).run();
+		const orphanLoansRes = await c.env.DB.prepare(
+			`DELETE FROM borrow_transactions
+			 WHERE book_id NOT IN (SELECT id FROM books)`
+		).run();
+		return {
+			orphanCodes: orphanCodesRes.meta?.changes ?? 0,
+			orphanAttributes: orphanAttrsRes.meta?.changes ?? 0,
+			orphanLoans: orphanLoansRes.meta?.changes ?? 0
+		};
+	});
+	await insertAuditLog(c.env, c.get('user').sub, 'maintenance.cleanup', 'system', null, summary);
+	return c.json(summary);
 });
 
 // ─── Cover images (R2) ────────────────────────────────────────────────────
@@ -2299,8 +3061,11 @@ app.delete('/api/borrowers/:id', requireRole(['admin']), async (c) => {
 const COVER_MIME_ALLOWLIST = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const COVER_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
 
-app.put('/api/books/:id/cover', requireRole(['admin', 'librarian']), async (c) => {
+app.put('/api/books/:id/cover', requirePermission('books.write', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id') ?? '';
+	if (!/^[a-zA-Z0-9-]{1,64}$/.test(bookId)) {
+		throw new HTTPException(400, { message: 'Invalid book id' });
+	}
 	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(bookId).first();
 	if (!book) {
 		throw new HTTPException(404, { message: 'Book not found' });
@@ -2330,8 +3095,11 @@ app.put('/api/books/:id/cover', requireRole(['admin', 'librarian']), async (c) =
 	return c.json({ ok: true, coverUrl });
 });
 
-app.delete('/api/books/:id/cover', requireRole(['admin', 'librarian']), async (c) => {
+app.delete('/api/books/:id/cover', requirePermission('books.write', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id') ?? '';
+	if (!/^[a-zA-Z0-9-]{1,64}$/.test(bookId)) {
+		throw new HTTPException(400, { message: 'Invalid book id' });
+	}
 	const book = await c.env.DB.prepare('SELECT id, cover_url FROM books WHERE id = ? AND deleted_at IS NULL')
 		.bind(bookId).first<{ id: string; cover_url: string | null }>();
 	if (!book) {
@@ -2350,14 +3118,25 @@ app.delete('/api/books/:id/cover', requireRole(['admin', 'librarian']), async (c
 
 app.get('/api/books/:id/cover', async (c) => {
 	const bookId = c.req.param('id') ?? '';
+	if (!/^[a-zA-Z0-9-]{1,64}$/.test(bookId)) {
+		throw new HTTPException(400, { message: 'Invalid book id' });
+	}
+	const ifNoneMatch = c.req.header('if-none-match');
 	for (const ext of ['jpg', 'png', 'webp', 'gif']) {
 		const obj = await c.env.ASSETS.get(`covers/${bookId}.${ext}`);
 		if (obj) {
+			// Honor If-None-Match so the browser can skip the body on revisits.
+			if (ifNoneMatch && obj.httpEtag && ifNoneMatch === obj.httpEtag) {
+				return new Response(null, { status: 304, headers: { ETag: obj.httpEtag } });
+			}
 			return new Response(obj.body, {
 				headers: {
 					'Content-Type': obj.httpMetadata?.contentType ?? `image/${ext === 'jpg' ? 'jpeg' : ext}`,
-					'Cache-Control': 'public, max-age=300, must-revalidate',
-					'ETag': obj.httpEtag
+					// Workers cache for 1 hour; browsers must revalidate so fresh
+					// uploads land within seconds (the cover_url query string also
+					// changes after an upload, double-defending against stale cache).
+					'Cache-Control': 'public, max-age=3600, must-revalidate',
+					ETag: obj.httpEtag
 				}
 			});
 		}

@@ -2,6 +2,7 @@
 // Kept in a small companion file because main.tsx already exceeds 3,000 lines.
 
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useT } from './i18n';
 
 // ─── Number formatting ────────────────────────────────────────────────────
 // Always uses '.' as the thousands separator regardless of the user's browser
@@ -41,6 +42,7 @@ type ToastContextValue = {
 const ToastContext = createContext<ToastContextValue | null>(null);
 
 export function ToastProvider({ children }: { children: React.ReactNode }) {
+  const t = useT();
   const [toasts, setToasts] = useState<ToastEntry[]>([]);
   const idRef = useRef(0);
 
@@ -63,14 +65,14 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      <div className="toast-stack" role="region" aria-label="Notifications">
-        {toasts.map((t) => (
-          <div key={t.id} className={`toast toast-${t.kind}`} role={t.kind === 'error' ? 'alert' : 'status'}>
+      <div className="toast-stack" role="region" aria-label={t('common.notifications')}>
+        {toasts.map((entry) => (
+          <div key={entry.id} className={`toast toast-${entry.kind}`} role={entry.kind === 'error' ? 'alert' : 'status'}>
             <span className="toast-icon">
-              {t.kind === 'success' ? '✓' : t.kind === 'error' ? '⚠' : 'ℹ'}
+              {entry.kind === 'success' ? '✓' : entry.kind === 'error' ? '⚠' : 'ℹ'}
             </span>
-            <span className="toast-msg">{t.message}</span>
-            <button className="toast-x" onClick={() => dismiss(t.id)} aria-label="Dismiss">✕</button>
+            <span className="toast-msg">{entry.message}</span>
+            <button className="toast-x" onClick={() => dismiss(entry.id)} aria-label={t('common.dismiss')}>✕</button>
           </div>
         ))}
       </div>
@@ -104,6 +106,7 @@ type PendingConfirm = ConfirmOptions & {
 const ConfirmContext = createContext<((opts: ConfirmOptions) => Promise<boolean>) | null>(null);
 
 export function ConfirmProvider({ children }: { children: React.ReactNode }) {
+  const t = useT();
   const [pending, setPending] = useState<PendingConfirm | null>(null);
 
   const confirm = useCallback((opts: ConfirmOptions): Promise<boolean> => {
@@ -127,6 +130,16 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('keydown', onKey);
   }, [pending, close]);
 
+  // Lock background scroll while a confirm is open. Without this the modal
+  // visually appears over the list, but a stray wheel event still scrolls the
+  // list underneath it on long pages.
+  useEffect(() => {
+    if (!pending) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = previous; };
+  }, [pending]);
+
   return (
     <ConfirmContext.Provider value={confirm}>
       {children}
@@ -137,14 +150,14 @@ export function ConfirmProvider({ children }: { children: React.ReactNode }) {
             {pending.body && <p className="confirm-body">{pending.body}</p>}
             <div className="confirm-actions">
               <button className="secondary" onClick={() => close(false)}>
-                {pending.cancelLabel ?? 'Cancel'}
+                {pending.cancelLabel ?? t('common.cancel')}
               </button>
               <button
                 className={pending.danger ? 'danger' : 'primary'}
                 onClick={() => close(true)}
                 autoFocus
               >
-                {pending.confirmLabel ?? 'Confirm'}
+                {pending.confirmLabel ?? t('common.confirm')}
               </button>
             </div>
           </div>

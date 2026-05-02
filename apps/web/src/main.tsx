@@ -11,6 +11,7 @@ import {
   useConfirm,
   useToast
 } from './ui';
+import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
 import './styles.css';
 
 // Lazy-loaded only when the user opens the Import tab — saves ~1MB from the initial bundle.
@@ -109,6 +110,17 @@ type AuditLogItem = {
   created_at: string;
 };
 
+type StaffRole = 'admin' | 'librarian' | 'viewer';
+
+type StaffUser = {
+  id: string;
+  username: string;
+  role: StaffRole;
+  active: number;
+  created_at: string;
+  updated_at: string;
+};
+
 type BorrowHistoryItem = {
   id: string;
   borrowerName: string;
@@ -166,16 +178,17 @@ type StatsResponse = {
 type Theme = 'light' | 'dark';
 
 // Saved smart lists rendered as one-click filter chips. The keys must be stable
-// because they're used to highlight the active chip.
-const SMART_LISTS: SmartList[] = [
-  { key: 'missing-isbn',     icon: '🔢', label: 'Missing ISBN',     params: { missingIsbn: '1' } },
-  { key: 'missing-shelf',    icon: '📍', label: 'Missing shelf',    params: { missingShelf: '1' } },
-  { key: 'untitled',         icon: '⊘',  label: 'Untitled',         params: { untitled: '1' } },
-  { key: 'unknown-author',   icon: '?',  label: 'Unknown author',   params: { unknownAuthor: '1' } },
-  { key: 'pre-1900',         icon: '🏛', label: 'Before 1900',      params: { yearMax: '1899' } },
-  { key: 'post-2000',        icon: '🆕', label: 'From 2000+',       params: { yearMin: '2000' } },
-  { key: 'borrowed',         icon: '🔁', label: 'Currently borrowed', params: { status: 'borrowed' } },
-  { key: 'recently-added',   icon: '🕒', label: 'Recently added',   params: { sortBy: 'updatedAt', sortDir: 'desc' } }
+// because they're used to highlight the active chip. The label is resolved at
+// render time via the i18n translator using `labelKey`.
+const SMART_LISTS: Array<SmartList & { labelKey: string }> = [
+  { key: 'missing-isbn',     icon: '🔢', labelKey: 'library.smart.missingIsbn',    label: 'Missing ISBN',     params: { missingIsbn: '1' } },
+  { key: 'missing-shelf',    icon: '📍', labelKey: 'library.smart.missingShelf',   label: 'Missing shelf',    params: { missingShelf: '1' } },
+  { key: 'untitled',         icon: '⊘',  labelKey: 'library.smart.untitled',       label: 'Untitled',         params: { untitled: '1' } },
+  { key: 'unknown-author',   icon: '?',  labelKey: 'library.smart.unknownAuthor',  label: 'Unknown author',   params: { unknownAuthor: '1' } },
+  { key: 'pre-1900',         icon: '🏛', labelKey: 'library.smart.pre1900',        label: 'Before 1900',      params: { yearMax: '1899' } },
+  { key: 'post-2000',        icon: '🆕', labelKey: 'library.smart.post2000',       label: 'From 2000+',       params: { yearMin: '2000' } },
+  { key: 'borrowed',         icon: '🔁', labelKey: 'library.smart.borrowed',       label: 'Currently borrowed', params: { status: 'borrowed' } },
+  { key: 'recently-added',   icon: '🕒', labelKey: 'library.smart.recent',         label: 'Recently added',   params: { sortBy: 'updatedAt', sortDir: 'desc' } }
 ];
 
 type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
@@ -340,11 +353,24 @@ function SectionHeader({
 function App() {
   const toast = useToast();
   const confirm = useConfirm();
+  const { t, lang } = useI18n();
   const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
   const [sessionLoading, setSessionLoading] = useState(true);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileUsername, setProfileUsername] = useState('');
+  const [profileNewPassword, setProfileNewPassword] = useState('');
+  const [profileCurrentPassword, setProfileCurrentPassword] = useState('');
+  const [profileSubmitting, setProfileSubmitting] = useState(false);
+  const [myPermissions, setMyPermissions] = useState<Record<string, boolean> | null>(null);
+  const [permissionMatrix, setPermissionMatrix] = useState<{
+    catalog: string[];
+    matrix: Record<'admin' | 'librarian' | 'viewer', Record<string, boolean>>;
+  } | null>(null);
+  const [permissionMatrixLoading, setPermissionMatrixLoading] = useState(false);
+  const [permissionMatrixSaving, setPermissionMatrixSaving] = useState(false);
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
-  const [currentSection, setCurrentSection] = useState<AppSection>('dashboard');
+  const [currentSection, setCurrentSection] = useState<AppSection>('books');
   const [theme, setTheme] = useState<Theme>('light');
   const [stats, setStats] = useState<StatsResponse | null>(null);
 
@@ -373,6 +399,12 @@ function App() {
   const [needsReviewFilter, setNeedsReviewFilter] = useState(false);
   const [smartListKey, setSmartListKey] = useState<string>('');
   const [borrowerSuggestions, setBorrowerSuggestions] = useState<Borrower[]>([]);
+  // Sequence number for borrower-autocomplete: every keystroke bumps the
+  // counter and only the most recent in-flight request is allowed to
+  // commit results. Prevents stale responses from overwriting a newer
+  // search when responses arrive out of order on slow networks.
+  const borrowerSearchSeqRef = useRef(0);
+  const bookHistorySeqRef = useRef(0);
   const [borrowerQuery, setBorrowerQuery] = useState('');
   const [selectedBorrowerId, setSelectedBorrowerId] = useState<string>('');
   const [needsReviewCount, setNeedsReviewCount] = useState(0);
@@ -428,6 +460,13 @@ function App() {
   const [scanResult, setScanResult] = useState<string>('');
   const [activeBorrows, setActiveBorrows] = useState<ActiveBorrow[]>([]);
   const [auditItems, setAuditItems] = useState<AuditLogItem[]>([]);
+  const [staffUsers, setStaffUsers] = useState<StaffUser[]>([]);
+  const [staffUsersLoading, setStaffUsersLoading] = useState(false);
+  const [newUserUsername, setNewUserUsername] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [newUserRole, setNewUserRole] = useState<StaffRole>('viewer');
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editUserPassword, setEditUserPassword] = useState('');
   const [bookHistory, setBookHistory] = useState<BorrowHistoryItem[]>([]);
   const [roomSummary, setRoomSummary] = useState<RoomSummaryItem[]>([]);
   const [unassignedSummary, setUnassignedSummary] = useState({
@@ -443,41 +482,68 @@ function App() {
   const [detailMode, setDetailMode] = useState<'view' | 'edit'>('view');
   const [showAddBook, setShowAddBook] = useState(false);
   const [bulkStatus, setBulkStatus] = useState<string>('');
-  const [bulkRoomCode, setBulkRoomCode] = useState('');
   const [bulkShelfCode, setBulkShelfCode] = useState('');
   const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
   const [showDuplicatesPanel, setShowDuplicatesPanel] = useState(false);
   const [duplicateWarning, setDuplicateWarning] = useState<DuplicateEntry[]>([]);
-
-  const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
   const [isWorking, setIsWorking] = useState(false);
   const [didBootstrapData, setDidBootstrapData] = useState(false);
   const [isLoadingBooks, setIsLoadingBooks] = useState(false);
 
-  // Bridge legacy message/error state to the toast stack so we don't have to
-  // rewrite every set{Message,Error} call site. Effects fire when those states
-  // become non-empty, then immediately clear them.
+  const splashStartRef = useRef(0);
+  const splashActiveRef = useRef(false);
+  const [showSplash, setShowSplash] = useState(false);
+  const [splashHiding, setSplashHiding] = useState(false);
+  const queuedToastsRef = useRef<Array<{ type: 'success' | 'error'; text: string }>>([]);
+
+  const pushAppToast = useCallback((type: 'success' | 'error', text: string) => {
+    if (!text) return;
+    if (splashActiveRef.current) {
+      queuedToastsRef.current.push({ type, text });
+      return;
+    }
+    toast.push(type, text);
+  }, [toast]);
+
+  // Bridge legacy message/error calls to the toast stack while holding
+  // notifications until the splash screen is fully gone.
+  const setMessage = useCallback((m: string) => {
+    pushAppToast('success', m);
+  }, [pushAppToast]);
+  const setError = useCallback((e: string) => {
+    pushAppToast('error', e);
+  }, [pushAppToast]);
+
+  const beginSplash = useCallback(() => {
+    splashActiveRef.current = true;
+    splashStartRef.current = Date.now();
+    setSplashHiding(false);
+    setShowSplash(true);
+  }, []);
+
   useEffect(() => {
-    if (!message) return;
-    toast.push('success', message);
-    setMessage('');
-  }, [message, toast]);
-  useEffect(() => {
-    if (!error) return;
-    toast.push('error', error);
-    setError('');
-  }, [error, toast]);
+    if (showSplash || queuedToastsRef.current.length === 0) {
+      return;
+    }
+    const queued = queuedToastsRef.current;
+    queuedToastsRef.current = [];
+    for (const item of queued) {
+      toast.push(item.type, item.text);
+    }
+  }, [showSplash, toast]);
 
   const loggedIn = Boolean(currentUser);
 
   // Restore session from HttpOnly cookie on first load
   useEffect(() => {
     apiRequest<SessionResponse>('/api/auth/session')
-      .then((res) => setCurrentUser(res.user))
+      .then((res) => {
+        beginSplash();
+        setCurrentUser(res.user);
+      })
       .catch(() => { /* no session */ })
       .finally(() => setSessionLoading(false));
-  }, []);
+  }, [beginSplash]);
 
   // Load app data once an authenticated session is available (fresh login or restored cookie session).
   useEffect(() => {
@@ -489,6 +555,23 @@ function App() {
       setDidBootstrapData(true);
     });
   }, [loggedIn, didBootstrapData]);
+
+  // Dismiss the splash screen after 3 seconds minimum AND once data is ready.
+  useEffect(() => {
+    if (!showSplash) return;
+    const dataReady = !sessionLoading && loggedIn && didBootstrapData;
+    if (!dataReady) return;
+    const elapsed = Date.now() - splashStartRef.current;
+    const remaining = Math.max(0, 3000 - elapsed);
+    const timer = setTimeout(() => {
+      setSplashHiding(true);
+      setTimeout(() => {
+        splashActiveRef.current = false;
+        setShowSplash(false);
+      }, 400);
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [showSplash, sessionLoading, loggedIn, didBootstrapData]);
 
   // Restore UI preferences (sort, density, theme) from localStorage so the app feels personal across sessions.
   useEffect(() => {
@@ -538,6 +621,17 @@ function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [loggedIn, detailBook]);
 
+  // Lock the body scroll while any full-screen modal is open. Without this a
+  // long detail/profile modal lets the underlying list scroll on touch+wheel,
+  // which is jarring on mobile and noticeable on desktops with momentum.
+  useEffect(() => {
+    const anyOpen = Boolean(detailBook) || profileOpen;
+    if (!anyOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = previous; };
+  }, [detailBook, profileOpen]);
+
   const availableBooksFromSummary =
     roomSummary.reduce((sum, room) => sum + Number(room.available_books ?? 0), 0) + Number(unassignedSummary.availableBooks ?? 0);
   const borrowedBooksFromSummary =
@@ -553,17 +647,49 @@ function App() {
     return diffMs > 0 && diffMs <= 48 * 60 * 60 * 1000;
   }).length;
 
+  const role = currentUser?.role ?? null;
+  const isAdmin = role === 'admin';
+  // Permission helper: admins always have everything; for other roles consult
+  // the matrix fetched from /api/me/permissions. Falls back to `false` until
+  // the permissions are loaded.
+  const can = (perm: string): boolean => {
+    if (isAdmin) return true;
+    return Boolean(myPermissions?.[perm]);
+  };
+  const canWrite = can('books.write');
+  const canDelete = can('books.delete');
+  const canImport = can('import');
+  const canSeeSettings = isAdmin || can('settings');
+  const canSeeDashboard = isAdmin || can('dashboard');
+  const canSeeCirculation = isAdmin || can('circulation');
+
   const sectionMeta: Array<{ key: AppSection; label: string; icon: string }> = [
-    { key: 'dashboard', label: 'Dashboard', icon: '📊' },
-    { key: 'books', label: 'Library', icon: '📚' },
-    { key: 'circulation', label: 'Loans', icon: '🔁' },
-    { key: 'import', label: 'Import/Export', icon: '⇅' },
-    { key: 'settings', label: 'Settings', icon: '⚙️' }
+    { key: 'books', label: t('tab.books'), icon: '📚' },
+    ...(canSeeCirculation ? [{ key: 'circulation' as AppSection, label: t('tab.circulation'), icon: '🔁' }] : []),
+    ...(canImport ? [{ key: 'import' as AppSection, label: t('tab.import'), icon: '⇅' }] : []),
+    ...(canSeeDashboard ? [{ key: 'dashboard' as AppSection, label: t('tab.dashboard'), icon: '📊' }] : []),
+    ...(canSeeSettings ? [{ key: 'settings' as AppSection, label: t('tab.settings'), icon: '⚙️' }] : [])
   ];
 
+  // If the user lands on a section they no longer have access to (after role
+  // change or first login as a non-admin), bounce them to the always-visible
+  // Library tab so they don't see a blank screen.
+  useEffect(() => {
+    if (!currentUser) return;
+    const allowed = new Set<AppSection>(['books']);
+    if (canSeeCirculation) allowed.add('circulation');
+    if (canImport) allowed.add('import');
+    if (canSeeDashboard) allowed.add('dashboard');
+    if (canSeeSettings) allowed.add('settings');
+    if (!allowed.has(currentSection)) {
+      setCurrentSection('books');
+    }
+  }, [currentUser, currentSection, canSeeCirculation, canImport, canSeeDashboard, canSeeSettings]);
+
+  // Kept as a no-op for back-compat with call sites; the toast layer auto-
+  // dismisses now so we no longer need to wipe state on every action.
   function clearStatus() {
-    setError('');
-    setMessage('');
+    /* intentional: toasts manage their own lifecycle */
   }
 
   async function runAction<T>(operation: () => Promise<T>): Promise<T> {
@@ -574,7 +700,7 @@ function App() {
       if (error instanceof ApiRequestError && error.status === 401) {
         setCurrentUser(null);
         setDidBootstrapData(false);
-        setError('Session expired. Please sign in again.');
+        setError(t('login.sessionExpired'));
       }
       throw error;
     } finally {
@@ -624,7 +750,7 @@ function App() {
       out[field.key] = v;
     }
     if (requiredMissing.length > 0) {
-      throw new Error(`Please fill required attributes: ${requiredMissing.join(', ')}`);
+      throw new Error(t('toast.requiredAttrs', { list: requiredMissing.join(', ') }));
     }
     return out;
   }
@@ -636,7 +762,7 @@ function App() {
 
     const parsed = Number(raw);
     if (!Number.isInteger(parsed) || parsed < 1000 || parsed > 3000) {
-      throw new Error('Publication year must be an integer between 1000 and 3000.');
+      throw new Error(t('toast.invalidYear'));
     }
 
     return parsed;
@@ -695,7 +821,7 @@ function App() {
             Object.assign(fields, parsed as Record<string, unknown>);
           }
         } catch {
-          throw new Error('customFields column must contain valid JSON object text.');
+          throw new Error(t('toast.xlsxCustomFieldsJson'));
         }
       }
     }
@@ -851,7 +977,7 @@ function App() {
     const title = toNullableText(firstSpreadsheetValue(row, ['title']));
     const author = toNullableText(firstSpreadsheetValue(row, ['author', 'writer', 'writers']));
     if (!title || !author) {
-      throw new Error(`Row ${index + 2}: title and writer/author are required.`);
+      throw new Error(t('toast.rowMissing', { row: index + 2 }));
     }
 
     const statusInput = toNullableText(firstSpreadsheetValue(row, ['status']))?.toLowerCase();
@@ -939,22 +1065,29 @@ function App() {
       loadCustomFields(),
       loadActiveBorrows(),
       loadAuditLogs(),
+      loadStaffUsers(),
       loadCategories(),
       loadNeedsReviewCount(),
-      loadStats()
+      loadStats(),
+      loadMyPermissions()
     ]);
   }
 
   // Borrower autocomplete: debounced server search; result rows let the user pick
-  // an existing borrower instead of typing a duplicate name.
+  // an existing borrower instead of typing a duplicate name. We use a sequence
+  // counter to drop stale responses (a slow earlier request returning after a
+  // newer one would otherwise clobber the suggestions list).
   async function searchBorrowers(query: string): Promise<void> {
+    const seq = ++borrowerSearchSeqRef.current;
     try {
       const params = new URLSearchParams();
       if (query.trim()) params.set('q', query.trim());
       params.set('limit', '8');
       const response = await apiRequest<{ items: Borrower[] }>(`/api/borrowers?${params.toString()}`);
+      if (seq !== borrowerSearchSeqRef.current) return;
       setBorrowerSuggestions(response.items ?? []);
     } catch {
+      if (seq !== borrowerSearchSeqRef.current) return;
       setBorrowerSuggestions([]);
     }
   }
@@ -962,11 +1095,11 @@ function App() {
   async function uploadBookCover(book: Book, file: File): Promise<void> {
     clearStatus();
     if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.type)) {
-      setError('Cover must be JPEG, PNG, WebP, or GIF.');
+      setError(t('toast.coverInvalidType'));
       return;
     }
     if (file.size > 4 * 1024 * 1024) {
-      setError('Cover image too large (max 4 MB).');
+      setError(t('toast.coverTooLarge'));
       return;
     }
     try {
@@ -977,7 +1110,7 @@ function App() {
           body: file
         }, false)
       );
-      setMessage(`Cover updated for "${book.title}".`);
+      setMessage(t('toast.coverUpdated', { title: book.title }));
       setDetailBook((prev) =>
         prev && prev.id === book.id
           ? { ...prev, coverUrl: `/api/books/${book.id}/cover?v=${Date.now()}` }
@@ -991,16 +1124,16 @@ function App() {
 
   async function deleteBookCover(book: Book): Promise<void> {
     const ok = await confirm({
-      title: 'Remove cover image?',
-      body: 'The book stays — only the photo is deleted.',
-      confirmLabel: 'Remove cover',
+      title: t('confirm.removeCoverTitle'),
+      body: t('confirm.removeCoverBody'),
+      confirmLabel: t('confirm.removeCoverAction'),
       danger: true
     });
     if (!ok) return;
     clearStatus();
     try {
       await runAction(() => apiRequest<void>(`/api/books/${book.id}/cover`, { method: 'DELETE' }));
-      setMessage('Cover removed.');
+      setMessage(t('toast.coverRemoved'));
       setDetailBook((prev) => (prev && prev.id === book.id ? { ...prev, coverUrl: null } : prev));
       await loadBooks();
     } catch (e) {
@@ -1014,8 +1147,18 @@ function App() {
     try {
       // Lazy-load the QR generator only when the user actually needs it.
       const labels = await import('./labels');
-      await labels.openPrintLabels(targets, API_BASE);
-      setMessage(`Opened print preview for ${targets.length} label${targets.length === 1 ? '' : 's'}.`);
+      await labels.openPrintLabels(targets, API_BASE, {
+        docTitle: t('labels.docTitle', { n: targets.length }),
+        ready: t('labels.ready', { n: targets.length, s: targets.length === 1 ? '' : 's' }),
+        print: t('labels.print'),
+        close: t('labels.close'),
+        toolbarHint: t('labels.toolbarHint'),
+        popupBlocked: t('labels.popupBlocked'),
+        untitled: t('common.untitled'),
+        unknown: t('common.unknown'),
+        htmlLang: lang
+      });
+      setMessage(t('toast.printOpened', { n: targets.length, s: targets.length === 1 ? '' : 's' }));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1058,9 +1201,10 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ username, password })
       }));
+      beginSplash();
       setCurrentUser(response.user);
       setDidBootstrapData(false);
-      setMessage(`Welcome ${response.user.username}. You're signed in.`);
+      setMessage(t('login.welcome', { username: response.user.username }));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1076,13 +1220,65 @@ function App() {
 
     setCurrentUser(null);
     setDidBootstrapData(false);
+    splashActiveRef.current = false;
+    setShowSplash(false);
+    setSplashHiding(false);
     setBooks([]);
     setCustomFields([]);
     setActiveBorrows([]);
     setAuditItems([]);
+    setStaffUsers([]);
     setBookHistory([]);
     setCategories([]);
-    setMessage('Signed out.');
+    setMyPermissions(null);
+    setPermissionMatrix(null);
+    setMessage(t('login.signedOut'));
+  }
+
+  function openProfile() {
+    if (!currentUser) return;
+    setProfileUsername(currentUser.username);
+    setProfileNewPassword('');
+    setProfileCurrentPassword('');
+    setProfileOpen(true);
+  }
+
+  async function saveProfile(e: React.FormEvent) {
+    e.preventDefault();
+    if (!currentUser) return;
+    if (!profileCurrentPassword) {
+      toast.push('error', t('profile.errCurrent'));
+      return;
+    }
+    const usernameChanged = profileUsername.trim() && profileUsername.trim() !== currentUser.username;
+    const passwordChanged = Boolean(profileNewPassword);
+    if (!usernameChanged && !passwordChanged) {
+      toast.push('error', t('profile.errNoChange'));
+      return;
+    }
+    if (passwordChanged && profileNewPassword.length < 8) {
+      toast.push('error', t('users.errPasswordShort'));
+      return;
+    }
+    setProfileSubmitting(true);
+    try {
+      const body: Record<string, string> = { currentPassword: profileCurrentPassword };
+      if (usernameChanged) body.username = profileUsername.trim();
+      if (passwordChanged) body.newPassword = profileNewPassword;
+      const res = await apiRequest<{ user: { id: string; username: string; role: string } }>(
+        '/api/me',
+        { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+      );
+      setCurrentUser(res.user);
+      toast.push('success', t('profile.saved'));
+      setProfileOpen(false);
+      setProfileNewPassword('');
+      setProfileCurrentPassword('');
+    } catch (err) {
+      toast.push('error', (err as Error).message);
+    } finally {
+      setProfileSubmitting(false);
+    }
   }
 
   async function applyDefaultBookStructure() {
@@ -1100,10 +1296,10 @@ function App() {
       const skippedCount = result.skippedAsSimilar?.length ?? 0;
       if (skippedCount > 0) {
         setMessage(
-          `Default structure configured. Added ${result.configuredCustomColumns} columns and skipped ${skippedCount} similar existing columns to avoid duplicates.`
+          t('toast.defaultStructureSkipped', { added: result.configuredCustomColumns, skipped: skippedCount })
         );
       } else {
-        setMessage(`Default structure configured. Added ${result.configuredCustomColumns} columns.`);
+        setMessage(t('toast.defaultStructureAdded', { added: result.configuredCustomColumns }));
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1225,6 +1421,173 @@ function App() {
     }
   }
 
+  async function loadStaffUsers() {
+    setStaffUsersLoading(true);
+    try {
+      const response = await apiRequest<{ items: StaffUser[] }>('/api/users');
+      setStaffUsers(response.items ?? []);
+    } catch {
+      // Non-admin users can't list users; clear and stay silent.
+      setStaffUsers([]);
+    } finally {
+      setStaffUsersLoading(false);
+    }
+  }
+
+  async function loadMyPermissions() {
+    try {
+      const res = await apiRequest<{ catalog: string[]; permissions: Record<string, boolean> }>('/api/me/permissions');
+      setMyPermissions(res.permissions);
+    } catch {
+      setMyPermissions(null);
+    }
+  }
+
+  async function loadPermissionMatrix() {
+    setPermissionMatrixLoading(true);
+    try {
+      const res = await apiRequest<{
+        catalog: string[];
+        matrix: Record<'admin' | 'librarian' | 'viewer', Record<string, boolean>>;
+      }>('/api/role-permissions');
+      setPermissionMatrix(res);
+    } catch {
+      setPermissionMatrix(null);
+    } finally {
+      setPermissionMatrixLoading(false);
+    }
+  }
+
+  function togglePermissionCell(role: 'librarian' | 'viewer', perm: string) {
+    setPermissionMatrix((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        matrix: {
+          ...prev.matrix,
+          [role]: { ...prev.matrix[role], [perm]: !prev.matrix[role][perm] }
+        }
+      };
+    });
+  }
+
+  async function savePermissionMatrix() {
+    if (!permissionMatrix) return;
+    setPermissionMatrixSaving(true);
+    try {
+      const res = await apiRequest<{
+        catalog: string[];
+        matrix: Record<'admin' | 'librarian' | 'viewer', Record<string, boolean>>;
+      }>('/api/role-permissions', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          matrix: {
+            librarian: permissionMatrix.matrix.librarian,
+            viewer: permissionMatrix.matrix.viewer
+          }
+        })
+      });
+      setPermissionMatrix(res);
+      // The current user might be affected; refresh their effective perms.
+      await loadMyPermissions();
+      toast.push('success', t('roles.saved'));
+    } catch (err) {
+      toast.push('error', (err as Error).message);
+    } finally {
+      setPermissionMatrixSaving(false);
+    }
+  }
+
+  async function createStaffUser(event: FormEvent) {
+    event.preventDefault();
+    const username = newUserUsername.trim();
+    const password = newUserPassword;
+    if (!username || !password) {
+      toast.push('error', t('users.errMissing'));
+      return;
+    }
+    try {
+      await runAction(() => apiRequest<{ user: StaffUser }>('/api/users', {
+        method: 'POST',
+        body: JSON.stringify({ username, password, role: newUserRole })
+      }));
+      setNewUserUsername('');
+      setNewUserPassword('');
+      setNewUserRole('viewer');
+      toast.push('success', t('users.created', { username }));
+      await loadStaffUsers();
+    } catch (e) {
+      toast.push('error', (e as Error).message);
+    }
+  }
+
+  async function updateStaffUserRole(user: StaffUser, role: StaffRole) {
+    if (user.role === role) return;
+    try {
+      await runAction(() => apiRequest<{ user: StaffUser }>(`/api/users/${user.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ role })
+      }));
+      toast.push('success', t('users.roleUpdated', { username: user.username }));
+      await loadStaffUsers();
+    } catch (e) {
+      toast.push('error', (e as Error).message);
+    }
+  }
+
+  async function toggleStaffUserActive(user: StaffUser) {
+    const nextActive = user.active === 1 ? false : true;
+    try {
+      await runAction(() => apiRequest<{ user: StaffUser }>(`/api/users/${user.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ active: nextActive })
+      }));
+      toast.push('success', nextActive
+        ? t('users.activated', { username: user.username })
+        : t('users.deactivated', { username: user.username }));
+      await loadStaffUsers();
+    } catch (e) {
+      toast.push('error', (e as Error).message);
+    }
+  }
+
+  async function resetStaffUserPassword(user: StaffUser) {
+    const password = editUserPassword;
+    if (!password || password.length < 8) {
+      toast.push('error', t('users.errPasswordShort'));
+      return;
+    }
+    try {
+      await runAction(() => apiRequest<{ user: StaffUser }>(`/api/users/${user.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ password })
+      }));
+      setEditingUserId(null);
+      setEditUserPassword('');
+      toast.push('success', t('users.passwordReset', { username: user.username }));
+    } catch (e) {
+      toast.push('error', (e as Error).message);
+    }
+  }
+
+  async function deleteStaffUser(user: StaffUser) {
+    const ok = await confirm({
+      title: t('users.confirmDeleteTitle', { username: user.username }),
+      body: t('users.confirmDeleteBody'),
+      confirmLabel: t('common.delete'),
+      danger: true
+    });
+    if (!ok) return;
+    try {
+      await runAction(() => apiRequest<{ ok: boolean }>(`/api/users/${user.id}`, { method: 'DELETE' }));
+      toast.push('success', t('users.deleted', { username: user.username }));
+      await loadStaffUsers();
+    } catch (e) {
+      toast.push('error', (e as Error).message);
+    }
+  }
+
   async function createBook(event: FormEvent) {
     event.preventDefault();
     clearStatus();
@@ -1265,9 +1628,9 @@ function App() {
 
       if (result.duplicateOf && result.duplicateOf.length > 0) {
         setDuplicateWarning(result.duplicateOf);
-        setMessage('Book added. ⚠️ Possible duplicates detected — see warning below.');
+        setMessage(t('toast.bookAddedDuplicate'));
       } else {
-        setMessage('Book added successfully.');
+        setMessage(t('toast.bookAdded'));
       }
 
       await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadNeedsReviewCount()]);
@@ -1285,7 +1648,7 @@ function App() {
       setDuplicateGroups(result.groups ?? []);
       setShowDuplicatesPanel(true);
       if (result.total === 0) {
-        setMessage('No duplicate books found.');
+        setMessage(t('toast.noDuplicates'));
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1311,7 +1674,7 @@ function App() {
         offset = result.nextOffset;
       }
 
-      setMessage(`Normalization complete. ${totalUpdated} of ${totalBooks} books were updated.`);
+      setMessage(t('toast.normalizedAll', { updated: totalUpdated, total: totalBooks }));
       if (totalUpdated > 0) await loadBooks();
     } catch (e) {
       setError((e as Error).message);
@@ -1342,12 +1705,18 @@ function App() {
       return;
     }
 
+    // Drop responses for books the user has already navigated away from.
+    // Without this guard, switching detail panes quickly can leave the wrong
+    // book's history rendered against a different book's data.
+    const seq = ++bookHistorySeqRef.current;
     try {
       const response = await apiRequest<{ bookId: string; items: BorrowHistoryItem[] }>(
         `/api/books/${bookId}/history?limit=20`
       );
+      if (seq !== bookHistorySeqRef.current) return;
       setBookHistory(response.items ?? []);
     } catch {
+      if (seq !== bookHistorySeqRef.current) return;
       setBookHistory([]);
     }
   }
@@ -1378,7 +1747,7 @@ function App() {
       }));
 
       setEditForm((prev) => ({ ...prev, version: result.version }));
-      setMessage('Book updated successfully.');
+      setMessage(t('toast.bookUpdated'));
       setDetailBook((prev) =>
         prev && prev.id === editForm.id
           ? {
@@ -1406,9 +1775,9 @@ function App() {
 
   async function deleteBook(book: Book) {
     const ok = await confirm({
-      title: `Delete "${book.title}"?`,
-      body: 'This action cannot be undone.',
-      confirmLabel: 'Delete',
+      title: t('confirm.deleteBookTitle', { title: book.title }),
+      body: t('confirm.deleteBookBody'),
+      confirmLabel: t('common.delete'),
       danger: true
     });
     if (!ok) return;
@@ -1418,7 +1787,7 @@ function App() {
     try {
       await runAction(() => apiRequest<void>(`/api/books/${book.id}`, { method: 'DELETE' }));
       setSelectedBookIds((prev) => prev.filter((id) => id !== book.id));
-      setMessage(`Removed book: ${book.title}`);
+      setMessage(t('toast.bookRemoved', { title: book.title }));
       if (detailBook?.id === book.id) {
         setDetailBook(null);
         setDetailMode('view');
@@ -1433,7 +1802,7 @@ function App() {
     clearStatus();
 
     if (!borrowerName || !dueAt) {
-      setError('Please enter borrower name and due date.');
+      setError(t('toast.borrowerRequired'));
       return;
     }
 
@@ -1450,7 +1819,7 @@ function App() {
         body: JSON.stringify(body)
       }));
 
-      setMessage(`Book borrowed: ${book.title}`);
+      setMessage(t('toast.bookBorrowed', { title: book.title }));
       // Reset borrower form so the next borrow starts fresh.
       setBorrowerName('');
       setBorrowerContact('');
@@ -1472,7 +1841,7 @@ function App() {
         body: JSON.stringify({ notes: null })
       }));
 
-      setMessage(`Book returned: ${book.title}`);
+      setMessage(t('toast.bookReturned', { title: book.title }));
       await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
     } catch (e) {
       setError((e as Error).message);
@@ -1487,7 +1856,7 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ notes: 'Returned from active loans list' })
       }));
-      setMessage(`Book returned: ${title}`);
+      setMessage(t('toast.bookReturned', { title }));
       await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
     } catch (e) {
       setError((e as Error).message);
@@ -1500,7 +1869,7 @@ function App() {
     try {
       const overdueItems = activeBorrows.filter((item) => item.isOverdue);
       if (overdueItems.length === 0) {
-        setMessage('No overdue loans to return.');
+        setMessage(t('toast.noOverdue'));
         return;
       }
 
@@ -1518,9 +1887,9 @@ function App() {
       const failed = results.filter((entry) => entry.status === 'rejected').length;
       const success = results.length - failed;
       if (failed > 0) {
-        setMessage(`Returned ${success} overdue books, ${failed} failed.`);
+        setMessage(t('toast.returnedOverdueMixed', { success, failed }));
       } else {
-        setMessage(`Returned all overdue books (${success}).`);
+        setMessage(t('toast.returnedOverdueAll', { n: success }));
       }
 
       await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
@@ -1529,9 +1898,21 @@ function App() {
     }
   }
 
+  // Build an end-of-day ISO datetime in the user's local timezone. The date
+  // input only gives us YYYY-MM-DD, and naïvely appending "T00:00:00.000Z"
+  // shifts the date by up to a day in non-UTC zones. Anchoring to local 23:59
+  // means a "due Friday" loan stays due on the librarian's Friday wherever
+  // they are.
+  function endOfLocalDayIso(yyyymmdd: string): string {
+    const [y, m, d] = yyyymmdd.split('-').map(Number);
+    if (!y || !m || !d) return '';
+    return new Date(y, m - 1, d, 23, 59, 59, 999).toISOString();
+  }
+
   function setDueInDays(days: number) {
-    const due = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-    setDueAt(due);
+    const target = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    target.setHours(23, 59, 59, 999);
+    setDueAt(target.toISOString());
   }
 
   async function generateCode(book: Book, type: 'qr' | 'barcode') {
@@ -1544,9 +1925,9 @@ function App() {
       }));
       try {
         await navigator.clipboard.writeText(response.value);
-        setMessage(`${type.toUpperCase()} code created and copied: ${response.value}`);
+        setMessage(t('toast.codeCreatedCopied', { type: type.toUpperCase(), value: response.value }));
       } catch {
-        setMessage(`${type.toUpperCase()} code created: ${response.value}`);
+        setMessage(t('toast.codeCreated', { type: type.toUpperCase(), value: response.value }));
       }
     } catch (e) {
       setError((e as Error).message);
@@ -1576,22 +1957,19 @@ function App() {
 
     try {
       if (selectedBookIds.length === 0) {
-        throw new Error('Select at least one book for bulk update.');
+        throw new Error(t('toast.bulkSelectAtLeastOne'));
       }
 
       const updates: Record<string, unknown> = {};
       if (bulkStatus) {
         updates.status = bulkStatus;
       }
-      if (bulkRoomCode.trim()) {
-        updates.roomCode = bulkRoomCode.trim();
-      }
       if (bulkShelfCode.trim()) {
         updates.shelfCode = bulkShelfCode.trim();
       }
 
       if (Object.keys(updates).length === 0) {
-        throw new Error('Set at least one bulk value (status, room, or shelf).');
+        throw new Error(t('toast.bulkRequireValue'));
       }
 
       const selectedBooks = books.filter((book) => selectedBookIds.includes(book.id));
@@ -1613,13 +1991,12 @@ function App() {
       const success = results.length - failed;
 
       if (failed > 0) {
-        setMessage(`Bulk update done: ${success} updated, ${failed} failed (likely version conflicts).`);
+        setMessage(t('toast.bulkPartial', { success, failed }));
       } else {
-        setMessage(`Bulk update complete for ${success} books.`);
+        setMessage(t('toast.bulkAll', { n: success }));
       }
 
       setBulkStatus('');
-      setBulkRoomCode('');
       setBulkShelfCode('');
       setSelectedBookIds([]);
       await Promise.all([loadBooks(), loadRoomSummary()]);
@@ -1632,7 +2009,7 @@ function App() {
     clearStatus();
     try {
       if (books.length === 0) {
-        throw new Error('No visible books to export.');
+        throw new Error(t('toast.noBooksToExport'));
       }
 
       const escape = (value: unknown): string => {
@@ -1673,7 +2050,7 @@ function App() {
       anchor.download = 'books-filtered.csv';
       anchor.click();
       URL.revokeObjectURL(url);
-      setMessage(`Filtered CSV downloaded (${books.length} books).`);
+      setMessage(t('toast.csvFiltered', { n: books.length }));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1687,7 +2064,7 @@ function App() {
     try {
       const value = scanCode.trim();
       if (!value) {
-        throw new Error('Please enter a QR or barcode value.');
+        throw new Error(t('toast.scanRequired'));
       }
 
       const response = await runAction(() => apiRequest<{ book: Book }>(`/api/scan/${encodeURIComponent(value)}`));
@@ -1709,7 +2086,7 @@ function App() {
       anchor.download = 'books.csv';
       anchor.click();
       URL.revokeObjectURL(url);
-      setMessage('CSV downloaded.');
+      setMessage(t('toast.csvDownloaded'));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1738,11 +2115,11 @@ function App() {
     try {
       const normalizedKey = fieldForm.key.trim();
       if (RESERVED_ATTRIBUTE_KEYS.has(normalizedKey)) {
-        throw new Error('This key is already used by a standard book field. Please choose another key.');
+        throw new Error(t('toast.customFieldKeyReserved'));
       }
 
       if (!/^[a-zA-Z0-9_]+$/.test(normalizedKey)) {
-        throw new Error('Field key can use only letters, numbers, and underscore.');
+        throw new Error(t('toast.customFieldKeyInvalid'));
       }
 
       const enumOptions = fieldForm.enumOptionsCsv
@@ -1753,11 +2130,11 @@ function App() {
       const normalizedOptions = Array.from(new Set(enumOptions));
 
       if (fieldForm.type === 'enum' && normalizedOptions.length === 0) {
-        throw new Error('Enum attributes require at least one option.');
+        throw new Error(t('toast.customFieldEnumRequired'));
       }
 
       if (fieldForm.type !== 'enum' && normalizedOptions.length > 0) {
-        throw new Error('Enum options are only allowed when field type is Enum.');
+        throw new Error(t('toast.customFieldEnumOnly'));
       }
 
       const keyConflict = customFields.some((field) => {
@@ -1768,7 +2145,7 @@ function App() {
       });
 
       if (keyConflict) {
-        throw new Error('A custom attribute with this key already exists.');
+        throw new Error(t('toast.customFieldKeyConflict'));
       }
 
       const path = editingCustomFieldId ? `/api/custom-fields/${editingCustomFieldId}` : '/api/custom-fields';
@@ -1788,7 +2165,7 @@ function App() {
       resetCustomFieldForm();
       await loadCustomFields();
       await loadBooks();
-      setMessage(editingCustomFieldId ? 'Custom attribute updated.' : 'Custom attribute added.');
+      setMessage(editingCustomFieldId ? t('toast.customFieldUpdated') : t('toast.customFieldAdded'));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1796,9 +2173,9 @@ function App() {
 
   async function deleteCustomField(field: CustomField) {
     const ok = await confirm({
-      title: `Delete custom field "${field.key}"?`,
-      body: 'Books that previously had this attribute will keep the data in their custom_fields JSON, but the field will no longer be editable in the form.',
-      confirmLabel: 'Delete field',
+      title: t('confirm.deleteFieldTitle', { key: field.key }),
+      body: t('confirm.deleteFieldBody'),
+      confirmLabel: t('confirm.deleteFieldAction'),
       danger: true
     });
     if (!ok) return;
@@ -1811,7 +2188,7 @@ function App() {
         resetCustomFieldForm();
       }
       await loadCustomFields();
-      setMessage(`Custom field removed: ${field.key}`);
+      setMessage(t('toast.customFieldRemoved', { key: field.key }));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -1824,7 +2201,7 @@ function App() {
     try {
       const parsedRows = JSON.parse(importJson) as Array<Record<string, unknown>>;
       if (!Array.isArray(parsedRows)) {
-        throw new Error('Rows JSON must be an array of objects.');
+        throw new Error(t('toast.xlsxRowsRequired'));
       }
       const rows = parsedRows.map((row) => ({
         title: String(row.title ?? ''),
@@ -1851,9 +2228,9 @@ function App() {
       ));
 
       if (result.dryRun) {
-        setMessage(`Dry run complete. Accepted rows: ${result.acceptedRows ?? 0}`);
+        setMessage(t('toast.dryRunDone', { n: result.acceptedRows ?? 0 }));
       } else {
-        setMessage(`Import complete. Imported rows: ${result.importedRows ?? 0}`);
+        setMessage(t('toast.importDone', { n: result.importedRows ?? 0 }));
       }
       await loadBooks();
     } catch (e) {
@@ -1985,7 +2362,7 @@ function App() {
       );
       await loadCustomFields();
       setMessage(
-        `Library catalog ready. ${result.created} new fields added, ${result.updated} kept current (total ${result.total}).`
+        t('toast.libraryCatalogReady', { created: result.created, updated: result.updated, total: result.total })
       );
     } catch (e) {
       setError((e as Error).message);
@@ -2006,7 +2383,7 @@ function App() {
       const chunkNum = Math.floor(cursor / CHUNK) + 1;
       const chunkTotal = Math.ceil(rows.length / CHUNK);
       setMessage(
-        `${dryRun ? 'Previewing' : 'Importing'} chunk ${chunkNum}/${chunkTotal}: rows ${cursor + 1}–${end} of ${rows.length}…`
+        t(dryRun ? 'toast.catalogPreviewing' : 'toast.catalogImportingChunk', { chunk: chunkNum, total: chunkTotal, from: cursor + 1, to: end, n: rows.length })
       );
 
       const result = await runAction(() =>
@@ -2048,7 +2425,7 @@ function App() {
     const file = fileInput?.files?.[0];
 
     if (!file) {
-      setError('Select an .xlsx file first.');
+      setError(t('toast.xlsxSelectFile'));
       return;
     }
 
@@ -2060,7 +2437,7 @@ function App() {
       const workbook = XLSX.read(buffer, { type: 'array' });
       const firstSheetName = workbook.SheetNames[0];
       if (!firstSheetName) {
-        throw new Error('The XLSX file does not contain any sheet.');
+        throw new Error(t('toast.xlsxNoSheet'));
       }
 
       const sheet = workbook.Sheets[firstSheetName];
@@ -2070,7 +2447,7 @@ function App() {
       });
 
       if (rawRows.length === 0) {
-        throw new Error('The XLSX file has no data rows.');
+        throw new Error(t('toast.xlsxEmpty'));
       }
 
       // ── Catalog-format fast path ─────────────────────────────────────────
@@ -2101,7 +2478,7 @@ function App() {
           catalogRows.push(row);
         }
         if (catalogRows.length === 0) {
-          throw new Error('No catalog rows found in the file.');
+          throw new Error(t('toast.xlsxNoCatalog'));
         }
 
         const reviewMatched = catalogRows.filter((r) => r.needsReview).length;
@@ -2111,16 +2488,25 @@ function App() {
         if (importDryRun) {
           const result = await importCatalogRows(catalogRows, true);
           setMessage(
-            `Catalog dry run complete. ${result.totalAccepted} accepted (` +
-            `${result.totalInsert} new, ${result.totalUpdate} would update). ` +
-            `Review-flagged: ${reviewMatched}. Empty title: ${noTitle}, empty author: ${noAuthor}. ` +
-            `Skipped blank rows: ${blankSkipped}.`
+            t('toast.catalogDryRun', {
+              accepted: result.totalAccepted,
+              insert: result.totalInsert,
+              update: result.totalUpdate,
+              review: reviewMatched,
+              noTitle,
+              noAuthor,
+              blank: blankSkipped
+            })
           );
         } else {
           const result = await importCatalogRows(catalogRows, false);
           setMessage(
-            `Catalog import complete. ${result.totalInsert} added, ${result.totalUpdate} updated. ` +
-            `Review-flagged: ${reviewMatched}. Skipped: ${result.allSkipped.length}.`
+            t('toast.catalogImport', {
+              insert: result.totalInsert,
+              update: result.totalUpdate,
+              review: reviewMatched,
+              skipped: result.allSkipped.length
+            })
           );
         }
 
@@ -2134,20 +2520,20 @@ function App() {
         const listed = unknownColumns.slice(0, 12).join(', ');
         const extra = unknownColumns.length > 12 ? `, and ${unknownColumns.length - 12} more` : '';
         const proceed = await confirm({
-          title: 'Unmapped columns detected',
-          body: `Columns not mapped to the database: ${listed}${extra}. Continue importing without them, or cancel to add the matching custom attributes first?`,
-          confirmLabel: 'Continue without those columns',
-          cancelLabel: 'Cancel import'
+          title: t('toast.unmappedTitle'),
+          body: t('toast.unmappedBody', { listed, extra }),
+          confirmLabel: t('toast.unmappedConfirm'),
+          cancelLabel: t('toast.unmappedCancel')
         });
 
         if (!proceed) {
           setError(
-            'Import canceled. Create matching custom attributes in Settings, or remove unsupported columns, then try again.'
+            t('toast.unmappedCanceled')
           );
           return;
         }
 
-        setMessage(`Continuing import and excluding unsupported columns: ${listed}${extra}`);
+        setMessage(t('toast.unmappedContinuing', { listed, extra }));
       }
 
       const rows: Record<string, unknown>[] = [];
@@ -2174,16 +2560,15 @@ function App() {
       }
 
       if (rows.length === 0) {
-        throw new Error('No valid rows found to import. Please ensure rows include both Title and Writer/Author.');
+        throw new Error(t('toast.xlsxNoValid'));
       }
 
       const skippedCount = skippedBlankRows.length + skippedInvalidRows.length;
       const skippedInvalidPreview = skippedInvalidRows.slice(0, 8).join(', ');
+      const examples = skippedInvalidRows.length > 0 ? t('toast.skippedExamples', { list: skippedInvalidPreview }) : '';
       const skippedNote =
         skippedCount > 0
-          ? ` Skipped ${skippedCount} row(s) (${skippedBlankRows.length} blank, ${skippedInvalidRows.length} missing title/author${
-              skippedInvalidRows.length > 0 ? `; examples: ${skippedInvalidPreview}` : ''
-            }).`
+          ? t('toast.skippedNote', { count: skippedCount, blank: skippedBlankRows.length, invalid: skippedInvalidRows.length, examples })
           : '';
 
       if (importDryRun) {
@@ -2194,8 +2579,8 @@ function App() {
         while (cursor < rows.length) {
           const end = Math.min(cursor + chunkSize, rows.length);
           const chunk = rows.slice(cursor, end);
-          const chunkProgress = `Chunk ${Math.floor(cursor / chunkSize) + 1}`;
-          setMessage(`Dry run ${chunkProgress}: rows ${cursor + 1}–${end} of ${rows.length}...`);
+          const chunkProgress = t('toast.chunkLabel', { n: Math.floor(cursor / chunkSize) + 1 });
+          setMessage(t('toast.dryRunChunk', { progress: chunkProgress, from: cursor + 1, to: end, n: rows.length }));
 
           try {
             const result = await runAction(() =>
@@ -2216,7 +2601,7 @@ function App() {
           }
         }
 
-        setMessage(`XLSX dry run complete. Accepted rows: ${totalAccepted}.${skippedNote}`);
+        setMessage(t('toast.xlsxDryRunDone', { n: totalAccepted, skippedNote }));
       } else {
         let chunkSize = IMPORT_CHUNK_SIZE;
         let cursor = 0;
@@ -2226,8 +2611,8 @@ function App() {
         while (cursor < rows.length) {
           const end = Math.min(cursor + chunkSize, rows.length);
           const chunk = rows.slice(cursor, end);
-          const chunkProgress = `Chunk ${Math.floor(cursor / chunkSize) + 1}`;
-          setMessage(`Importing ${chunkProgress}: rows ${cursor + 1}–${end} of ${rows.length}...`);
+          const chunkProgress = t('toast.chunkLabel', { n: Math.floor(cursor / chunkSize) + 1 });
+          setMessage(t('toast.importingChunk', { progress: chunkProgress, from: cursor + 1, to: end, n: rows.length }));
 
           try {
             const result = await runAction(() =>
@@ -2257,11 +2642,11 @@ function App() {
 
         const uploadSkippedNote =
           uploadSkippedRows.length > 0
-            ? ` Skipped ${uploadSkippedRows.length} oversized row(s) during upload.`
+            ? t('toast.uploadSkipped', { n: uploadSkippedRows.length })
             : '';
 
         setMessage(
-          `XLSX import complete. Imported ${totalImported} rows.${skippedNote}${uploadSkippedNote}`
+          t('toast.xlsxImportDone', { n: totalImported, skippedNote, uploadSkippedNote })
         );
       }
 
@@ -2378,6 +2763,101 @@ function App() {
   return (
     <div className="app-shell" aria-busy={isWorking}>
 
+      {/* ═══ SPLASH SCREEN ═══ */}
+      {showSplash && (
+        <div className={`splash-overlay${splashHiding ? ' splash-hiding' : ''}`}>
+          <div className="splash-content">
+            <div className="splash-logo">📚</div>
+            <h1 className="splash-title">{t('app.brand')}</h1>
+            <div className="splash-spinner" />
+          </div>
+        </div>
+      )}
+
+      {/* ═══ PROFILE MODAL ═══ */}
+      {profileOpen && currentUser && (
+        <div className="modal-overlay" onClick={() => setProfileOpen(false)} role="dialog" aria-modal="true">
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '32rem' }}>
+            <div className="modal-header">
+              <div className="modal-title-block">
+                <h2>{t('profile.title')}</h2>
+                <p className="muted small">{t('profile.subtitle')}</p>
+              </div>
+            </div>
+            <div style={{ padding: '1rem 1.5rem 1.5rem' }}>
+              <div style={{ marginBottom: '1rem' }}>
+                <label className="muted small">{t('users.uuid')}</label>
+                <div
+                  style={{
+                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                    background: 'rgba(127,127,127,0.1)',
+                    padding: '0.5rem 0.75rem',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    wordBreak: 'break-all',
+                    marginTop: '0.25rem'
+                  }}
+                  title={t('users.uuidCopy')}
+                  onClick={() => {
+                    void navigator.clipboard?.writeText(currentUser.id);
+                    toast.push('success', t('users.uuidCopied'));
+                  }}
+                >
+                  {currentUser.id}
+                </div>
+                <p className="muted small" style={{ marginTop: '0.35rem' }}>{t('profile.uuidHint')}</p>
+              </div>
+              <div style={{ marginBottom: '1rem' }}>
+                <label className="muted small">{t('users.role')}</label>
+                <div><code>{t(`users.role.${currentUser.role}` as never)}</code></div>
+              </div>
+              <form onSubmit={saveProfile} className="simple-form">
+                <div>
+                  <label>{t('users.username')}</label>
+                  <input
+                    value={profileUsername}
+                    onChange={(e) => setProfileUsername(e.target.value)}
+                    minLength={3}
+                    autoComplete="username"
+                  />
+                </div>
+                <div>
+                  <label>{t('profile.newPassword')}</label>
+                  <input
+                    type="password"
+                    value={profileNewPassword}
+                    onChange={(e) => setProfileNewPassword(e.target.value)}
+                    placeholder={t('profile.newPasswordPh')}
+                    autoComplete="new-password"
+                    minLength={8}
+                  />
+                  <p className="muted small">{t('users.passwordHint')}</p>
+                </div>
+                <div>
+                  <label>{t('profile.currentPassword')} *</label>
+                  <input
+                    type="password"
+                    value={profileCurrentPassword}
+                    onChange={(e) => setProfileCurrentPassword(e.target.value)}
+                    autoComplete="current-password"
+                    required
+                  />
+                  <p className="muted small">{t('profile.currentHint')}</p>
+                </div>
+                <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem', justifyContent: 'flex-end' }}>
+                  <button type="button" className="secondary" onClick={() => setProfileOpen(false)} disabled={profileSubmitting}>
+                    {t('common.cancel')}
+                  </button>
+                  <button type="submit" className="primary" disabled={profileSubmitting}>
+                    {profileSubmitting ? t('common.loading') : t('profile.save')}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ═══ BOOK DETAIL MODAL ═══ */}
       {detailBook && (
         <div className="modal-overlay" onClick={closeDetail} role="dialog" aria-modal="true">
@@ -2396,41 +2876,45 @@ function App() {
                 <div className="modal-pills">
                   <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
                   {detailBook.legacyId ? (
-                    <span className="legacy-id-pill" title="Catalog ID — used to upsert on re-import">{detailBook.legacyId}</span>
+                    <span className="legacy-id-pill" title={t('detail.legacyTitle')}>{detailBook.legacyId}</span>
                   ) : null}
                 </div>
               </div>
-              <div className="modal-shelf-block" aria-label={detailBook.shelfCode ? `Shelf ${detailBook.shelfCode}` : 'No shelf assigned'}>
-                <span className="modal-shelf-label">SHELF</span>
+              <div className="modal-shelf-block" aria-label={detailBook.shelfCode ? t('detail.shelfAria', { code: detailBook.shelfCode }) : t('detail.shelfNoneAria')}>
+                <span className="modal-shelf-label">{t('detail.shelf')}</span>
                 <span className={`modal-shelf-value${detailBook.shelfCode ? '' : ' is-empty'}`}>
                   {detailBook.shelfCode || '—'}
                 </span>
               </div>
-              <button className="modal-close" onClick={closeDetail} title="Close">✕</button>
+              <button className="modal-close" onClick={closeDetail} title={t('common.close')}>✕</button>
             </div>
 
             {/* Action bar */}
             <div className="modal-actions">
               {detailMode === 'view' ? (
                 <>
-                  <button className="secondary small" onClick={startEditFromDetail}>✏️ Edit</button>
-                  {detailBook.status === 'available' && (
+                  {canWrite && (
+                    <button className="secondary small" onClick={startEditFromDetail}>✏️ {t('detail.editBtn')}</button>
+                  )}
+                  {canWrite && detailBook.status === 'available' && (
                     <button className="primary small" onClick={() => {
                       setSelectedBook(detailBook);
                       setCurrentSection('circulation');
                       closeDetail();
-                    }}>📤 Borrow</button>
+                    }}>📤 {t('detail.borrowBtn')}</button>
                   )}
-                  {detailBook.status === 'borrowed' && (
+                  {canWrite && detailBook.status === 'borrowed' && (
                     <button className="secondary small" onClick={() => { void returnBook(detailBook); closeDetail(); }}>
-                      📥 Return
+                      📥 {t('detail.returnBtn')}
                     </button>
                   )}
-                  <button className="secondary small" onClick={() => void printLabels([detailBook])}>🖨 Label</button>
-                  <button className="danger small" onClick={() => void deleteBook(detailBook)}>🗑 Delete</button>
+                  <button className="secondary small" onClick={() => void printLabels([detailBook])}>🖨 {t('detail.labelBtn')}</button>
+                  {canDelete && (
+                    <button className="danger small" onClick={() => void deleteBook(detailBook)}>🗑 {t('detail.deleteBtn')}</button>
+                  )}
                 </>
               ) : (
-                <button className="secondary small" onClick={() => setDetailMode('view')}>← Back to details</button>
+                <button className="secondary small" onClick={() => setDetailMode('view')}>← {t('detail.backBtn')}</button>
               )}
             </div>
 
@@ -2444,79 +2928,81 @@ function App() {
                       <img
                         className="detail-cover"
                         src={joinApiUrl(detailBook.coverUrl)}
-                        alt={`Cover of ${displayTitle(detailBook)}`}
+                        alt={t('detail.coverAlt', { title: displayTitle(detailBook) })}
                         loading="lazy"
                       />
                     ) : (
                       <div className="detail-cover detail-cover-placeholder">
-                        <span>No cover</span>
+                        <span>{t('detail.noCover')}</span>
                       </div>
                     )}
-                    <div className="cover-actions">
-                      <label className="secondary small button-like">
-                        {detailBook.coverUrl ? 'Replace cover' : 'Upload cover'}
-                        <input
-                          type="file"
-                          accept="image/png,image/jpeg,image/webp,image/gif"
-                          style={{ display: 'none' }}
-                          onChange={(e) => {
-                            const f = e.target.files?.[0];
-                            e.target.value = '';
-                            if (f) void uploadBookCover(detailBook, f);
-                          }}
-                        />
-                      </label>
-                      {detailBook.coverUrl && (
-                        <button className="danger small" onClick={() => void deleteBookCover(detailBook)}>Remove</button>
-                      )}
-                      <span className="muted small">JPEG/PNG/WebP/GIF · max 4 MB</span>
-                    </div>
+                    {canWrite && (
+                      <div className="cover-actions">
+                        <label className="secondary small button-like">
+                          {detailBook.coverUrl ? t('detail.replaceCover') : t('detail.uploadCover')}
+                          <input
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp,image/gif"
+                            style={{ display: 'none' }}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              e.target.value = '';
+                              if (f) void uploadBookCover(detailBook, f);
+                            }}
+                          />
+                        </label>
+                        {detailBook.coverUrl && (
+                          <button className="danger small" onClick={() => void deleteBookCover(detailBook)}>{t('detail.removeCover')}</button>
+                        )}
+                        <span className="muted small">{t('detail.coverHint')}</span>
+                      </div>
+                    )}
                   </div>
 
                   {/* Core Info */}
                   <div className="detail-section">
-                    <div className="detail-section-title">Book Information</div>
+                    <div className="detail-section-title">{t('detail.bookInfo')}</div>
                     <div className="detail-grid">
                       {detailBook.isbn && (
                         <div className="detail-item">
-                          <span className="di-label">ISBN</span>
+                          <span className="di-label">{t('detail.isbn')}</span>
                           <span className="di-value">{detailBook.isbn}</span>
                         </div>
                       )}
                       {detailBook.publicationYear && (
                         <div className="detail-item">
-                          <span className="di-label">Year Published</span>
+                          <span className="di-label">{t('detail.yearPublished')}</span>
                           <span className="di-value">{detailBook.publicationYear}</span>
                         </div>
                       )}
                       {detailBook.publisher && (
                         <div className="detail-item">
-                          <span className="di-label">Publisher</span>
+                          <span className="di-label">{t('detail.publisher')}</span>
                           <span className="di-value">{detailBook.publisher}</span>
                         </div>
                       )}
                       {detailBook.language && (
                         <div className="detail-item">
-                          <span className="di-label">Language</span>
+                          <span className="di-label">{t('detail.language')}</span>
                           <span className="di-value">{detailBook.language}</span>
                         </div>
                       )}
                       {detailBook.roomCode && (
                         <div className="detail-item">
-                          <span className="di-label">Room</span>
+                          <span className="di-label">{t('detail.room')}</span>
                           <span className="di-value">{detailBook.roomCode}</span>
                         </div>
                       )}
                       {detailBook.shelfCode && (
                         <div className="detail-item">
-                          <span className="di-label">Shelf</span>
+                          <span className="di-label">{t('detail.shelfRow')}</span>
                           <span className="di-value">{detailBook.shelfCode}</span>
                         </div>
                       )}
                       <div className="detail-item">
-                        <span className="di-label">Status</span>
+                        <span className="di-label">{t('detail.statusRow')}</span>
                         <span className="di-value">
-                          <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
+                          <span className={`status-badge status-${detailBook.status}`}>{t(`status.${detailBook.status}`)}</span>
                         </span>
                       </div>
                     </div>
@@ -2531,7 +3017,7 @@ function App() {
                   {detailBook.customFields &&
                     Object.entries(detailBook.customFields).filter(([, v]) => v !== null && v !== undefined && v !== '').length > 0 && (
                     <div className="detail-section">
-                      <div className="detail-section-title">Attributes</div>
+                      <div className="detail-section-title">{t('detail.attributes')}</div>
                       <div className="attr-grid">
                         {Object.entries(detailBook.customFields).map(([key, value]) =>
                           value !== null && value !== undefined && value !== '' ? (
@@ -2547,9 +3033,9 @@ function App() {
 
                   {/* Borrow History */}
                   <div className="detail-section">
-                    <div className="detail-section-title">Borrow History</div>
+                    <div className="detail-section-title">{t('detail.history')}</div>
                     {bookHistory.length === 0 ? (
-                      <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>No borrowing history for this book.</p>
+                      <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>{t('detail.noHistory')}</p>
                     ) : (
                       <div className="history-list">
                         {bookHistory.map((h) => (
@@ -2558,10 +3044,10 @@ function App() {
                               <strong>{h.borrowerName}</strong>
                               <span>
                                 {new Date(h.borrowedAt).toLocaleDateString()} →{' '}
-                                {h.returnedAt ? new Date(h.returnedAt).toLocaleDateString() : 'Currently active'}
+                                {h.returnedAt ? new Date(h.returnedAt).toLocaleDateString() : t('detail.currentlyActive')}
                               </span>
                             </div>
-                            {h.wasOverdue && <span className="history-overdue-badge">Overdue</span>}
+                            {h.wasOverdue && <span className="history-overdue-badge">{t('detail.overdueBadge')}</span>}
                           </div>
                         ))}
                       </div>
@@ -2573,51 +3059,51 @@ function App() {
                 <form onSubmit={saveBookEdit} className="simple-form">
                   <div className="form-row">
                     <div>
-                      <label>Title *</label>
+                      <label>{t('detail.title')} *</label>
                       <input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} required />
                     </div>
                     <div>
-                      <label>Author *</label>
+                      <label>{t('detail.author')} *</label>
                       <input value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} required />
                     </div>
                   </div>
                   <div className="form-row">
                     <div>
-                      <label>ISBN</label>
-                      <input value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder="e.g. 978-..." />
+                      <label>{t('detail.isbn')}</label>
+                      <input value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder={t('detail.isbnPh')} />
                     </div>
                     <div>
-                      <label>Publication Year</label>
-                      <input type="number" value={editForm.publicationYear} onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })} placeholder="e.g. 2020" />
+                      <label>{t('detail.yearPublished')}</label>
+                      <input type="number" value={editForm.publicationYear} onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })} placeholder={t('detail.yearPh')} />
                     </div>
                   </div>
                   <div className="form-row">
                     <div>
-                      <label>Shelf Code</label>
-                      <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder="e.g. 06-005" />
+                      <label>{t('detail.shelfRow')}</label>
+                      <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder={t('detail.shelfPh')} />
                     </div>
                     <div>
-                      <label>Status</label>
+                      <label>{t('detail.statusRow')}</label>
                       <select value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
-                        <option value="available">Available</option>
-                        <option value="borrowed">Borrowed</option>
-                        <option value="lost">Lost</option>
-                        <option value="maintenance">Maintenance</option>
+                        <option value="available">{t('status.available')}</option>
+                        <option value="borrowed">{t('status.borrowed')}</option>
+                        <option value="lost">{t('status.lost')}</option>
+                        <option value="maintenance">{t('status.maintenance')}</option>
                       </select>
                     </div>
                   </div>
                   <div className="form-row">
                     <div>
-                      <label>Publisher</label>
-                      <input value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder="Publisher name" />
+                      <label>{t('detail.publisher')}</label>
+                      <input value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder={t('detail.publisherPh')} />
                     </div>
                     <div>
-                      <label>Language</label>
-                      <input value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder="e.g. EL or EL,EN,FR" />
+                      <label>{t('detail.language')}</label>
+                      <input value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder={t('detail.languagePh')} />
                     </div>
                   </div>
                   <div className="form-field">
-                    <label>Description</label>
+                    <label>{t('library.add.description')}</label>
                     <textarea
                       value={editForm.description}
                       onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
@@ -2626,15 +3112,15 @@ function App() {
                   </div>
 
                   <details className="custom-fields-section" open>
-                    <summary>Catalog attributes ({customFields.length})</summary>
+                    <summary>{t('library.add.attributes', { n: customFields.length })}</summary>
                     {renderCustomFieldsForm(attributeEditorValues, (key, value) =>
                       setAttributeEditorValues((prev) => ({ ...prev, [key]: value }))
                     )}
                   </details>
 
                   <div className="button-group">
-                    <button type="submit" className="primary">Save Changes</button>
-                    <button type="button" className="secondary" onClick={() => setDetailMode('view')}>Cancel</button>
+                    <button type="submit" className="primary">{t('detail.saveChanges')}</button>
+                    <button type="button" className="secondary" onClick={() => setDetailMode('view')}>{t('common.cancel')}</button>
                   </div>
                 </form>
               )}
@@ -2644,29 +3130,25 @@ function App() {
       )}
 
       {/* ═══ LOGIN ═══ */}
-      {sessionLoading ? (
-        <div className="simple-center">
-          <div style={{ textAlign: 'center', color: 'var(--text-muted)', fontSize: '1rem' }}>
-            <div style={{ fontSize: '2.5rem', marginBottom: '0.75rem' }}>📚</div>
-            <p>Loading…</p>
-          </div>
-        </div>
-      ) : !loggedIn ? (
+      {sessionLoading ? null : !loggedIn ? (
         <div className="simple-center">
           <div className="simple-card">
             <div className="login-logo">📚</div>
-            <h2>OK Library</h2>
-            <p className="login-subtitle">Sign in to manage your collection</p>
+            <h2>{t('app.brand')}</h2>
+            <p className="login-subtitle">{t('app.subtitle')}</p>
+            <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '0.75rem' }}>
+              <LanguageSwitcher />
+            </div>
             <form onSubmit={login} className="simple-form">
               <div>
-                <label>Username</label>
+                <label>{t('login.username')}</label>
                 <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus required />
               </div>
               <div>
-                <label>Password</label>
+                <label>{t('login.password')}</label>
                 <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
               </div>
-              <button type="submit" className="primary">{isWorking ? 'Signing in…' : 'Sign In'}</button>
+              <button type="submit" className="primary">{isWorking ? t('login.signingIn') : t('login.signIn')}</button>
             </form>
           </div>
         </div>
@@ -2676,19 +3158,30 @@ function App() {
           <div className="simple-navbar">
             <div className="navbar-brand">
               <div className="navbar-icon">📚</div>
-              <h1>OK Library</h1>
+              <h1>{t('app.brand')}</h1>
             </div>
             <div className="navbar-right">
+              <LanguageSwitcher />
               <button
                 className="theme-toggle"
-                onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-                title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-                aria-label="Toggle dark mode"
+                onClick={() => setTheme((curr) => (curr === 'dark' ? 'light' : 'dark'))}
+                title={theme === 'dark' ? t('app.switchToLight') : t('app.switchToDark')}
+                aria-label={t('app.toggleDark')}
               >
                 {theme === 'dark' ? '☀' : '🌙'}
               </button>
-              {currentUser && <span className="navbar-user">{currentUser.username}</span>}
-              <button className="secondary small" onClick={logout}>Sign out</button>
+              {currentUser && (
+                <button
+                  type="button"
+                  className="secondary small"
+                  onClick={openProfile}
+                  title={t('profile.open')}
+                  aria-label={t('profile.open')}
+                >
+                  👤 {currentUser.username}
+                </button>
+              )}
+              <button className="secondary small" onClick={logout}>{t('app.signOut')}</button>
             </div>
           </div>
 
@@ -2713,38 +3206,38 @@ function App() {
               <>
                 <div className="section-header">
                   <div className="section-header-text">
-                    <h2>Dashboard</h2>
-                    <p>At-a-glance health of your collection</p>
+                    <h2>{t('dashboard.title')}</h2>
+                    <p>{t('dashboard.description')}</p>
                   </div>
                   <div className="section-header-actions">
-                    <button className="secondary small" onClick={() => void loadStats()}>↻ Refresh</button>
+                    <button className="secondary small" onClick={() => void loadStats()}>{t('common.refresh')}</button>
                   </div>
                 </div>
 
                 {!stats ? (
-                  <div className="card empty-state"><p style={{ fontSize: '2rem' }}>📊</p><p>Loading statistics…</p></div>
+                  <div className="card empty-state"><p style={{ fontSize: '2rem' }}>📊</p><p>{t('dashboard.loading')}</p></div>
                 ) : (
                   <>
                     {/* KPI tiles */}
                     <div className="stats-row" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))' }}>
                       <div className="stat-box accent">
-                        <span className="stat-box-label">Total Books</span>
+                        <span className="stat-box-label">{t('dashboard.totalBooks')}</span>
                         <span className="stat-box-value">{fmt(stats.completeness.total)}</span>
                       </div>
                       <div className="stat-box success">
-                        <span className="stat-box-label">Available</span>
+                        <span className="stat-box-label">{t('status.available')}</span>
                         <span className="stat-box-value">
                           {fmt(stats.byStatus.find((s) => s.status === 'available')?.count ?? 0)}
                         </span>
                       </div>
                       <div className="stat-box warning">
-                        <span className="stat-box-label">Borrowed</span>
+                        <span className="stat-box-label">{t('status.borrowed')}</span>
                         <span className="stat-box-value">
                           {fmt(stats.byStatus.find((s) => s.status === 'borrowed')?.count ?? 0)}
                         </span>
                       </div>
                       <div className="stat-box danger">
-                        <span className="stat-box-label">Lost / Maint.</span>
+                        <span className="stat-box-label">{t('dashboard.lostMaint')}</span>
                         <span className="stat-box-value">
                           {fmt((stats.byStatus.find((s) => s.status === 'lost')?.count ?? 0)
                             + (stats.byStatus.find((s) => s.status === 'maintenance')?.count ?? 0))}
@@ -2755,13 +3248,13 @@ function App() {
                     <div className="dashboard-grid">
                       {/* Completeness */}
                       <div className="card">
-                        <h3>Catalog Completeness</h3>
+                        <h3>{t('dashboard.completeness')}</h3>
                         <div className="completeness-list">
                           {([
-                            ['ISBN', stats.completeness.withIsbn],
-                            ['Shelf code', stats.completeness.withShelf],
-                            ['Publisher', stats.completeness.withPublisher],
-                            ['Publication year', stats.completeness.withYear]
+                            [t('dashboard.compl.isbn'), stats.completeness.withIsbn],
+                            [t('dashboard.compl.shelf'), stats.completeness.withShelf],
+                            [t('dashboard.compl.publisher'), stats.completeness.withPublisher],
+                            [t('dashboard.compl.year'), stats.completeness.withYear]
                           ] as Array<[string, number]>).map(([label, n]) => {
                             const pct = stats.completeness.total > 0
                               ? Math.round((n / stats.completeness.total) * 100)
@@ -2780,16 +3273,16 @@ function App() {
                         </div>
                         {(stats.completeness.untitled > 0 || stats.completeness.unknownAuthor > 0) && (
                           <p className="muted small" style={{ marginTop: '0.75rem' }}>
-                            {fmt(stats.completeness.untitled)} untitled · {fmt(stats.completeness.unknownAuthor)} with unknown author
+                            {t('dashboard.complNote', { untitled: fmt(stats.completeness.untitled), unknown: fmt(stats.completeness.unknownAuthor) })}
                           </p>
                         )}
                       </div>
 
                       {/* Languages */}
                       <div className="card">
-                        <h3>Top Languages</h3>
+                        <h3>{t('dashboard.languages')}</h3>
                         {stats.byLanguage.length === 0 ? (
-                          <p className="muted small">No language data.</p>
+                          <p className="muted small">{t('dashboard.noLangData')}</p>
                         ) : (
                           <div className="minibar-list">
                             {stats.byLanguage.map((l) => (
@@ -2807,7 +3300,7 @@ function App() {
 
                       {/* Years */}
                       <div className="card">
-                        <h3>Publication Year</h3>
+                        <h3>{t('dashboard.publicationYear')}</h3>
                         <div className="minibar-list">
                           {stats.byYear.map((y) => (
                             <MiniBar
@@ -2823,9 +3316,9 @@ function App() {
 
                       {/* Top Shelves */}
                       <div className="card">
-                        <h3>Top Shelves</h3>
+                        <h3>{t('dashboard.topShelves')}</h3>
                         {stats.topShelves.length === 0 ? (
-                          <p className="muted small">No shelf assignments yet.</p>
+                          <p className="muted small">{t('dashboard.noShelves')}</p>
                         ) : (
                           <div className="minibar-list">
                             {stats.topShelves.map((s) => (
@@ -2843,9 +3336,9 @@ function App() {
 
                       {/* Recent activity */}
                       <div className="card" style={{ gridColumn: '1 / -1' }}>
-                        <h3>Recently Updated</h3>
+                        <h3>{t('dashboard.recent')}</h3>
                         {stats.recentlyUpdated.length === 0 ? (
-                          <p className="muted small">No recent edits.</p>
+                          <p className="muted small">{t('dashboard.noRecent')}</p>
                         ) : (
                           <ul className="recent-list">
                             {stats.recentlyUpdated.map((b) => (
@@ -2857,8 +3350,8 @@ function App() {
                                       .then((book) => { setDetailBook(book as Book); setDetailMode('view'); setBookHistory([]); void loadBookHistory(book.id); setCurrentSection('books'); });
                                   }}
                                 >
-                                  <strong>{b.title || '(Untitled)'}</strong>
-                                  <span className="muted small"> · {b.author || '(Unknown)'}</span>
+                                  <strong>{b.title || t('common.untitled')}</strong>
+                                  <span className="muted small"> · {b.author || t('common.unknown')}</span>
                                   {b.legacyId && <span className="legacy-id-pill">{b.legacyId}</span>}
                                 </button>
                                 <span className="muted small">{new Date(b.updatedAt).toLocaleString()}</span>
@@ -2878,33 +3371,35 @@ function App() {
               <>
                 <div className="section-header">
                   <div className="section-header-text">
-                    <h2>Library</h2>
-                    <p>Browse and manage your book collection</p>
+                    <h2>{t('library.title')}</h2>
+                    <p>{t('library.description')}</p>
                   </div>
                   <div className="section-header-actions">
-                    <button className="primary small" onClick={() => setShowAddBook((v) => !v)}>
-                      {showAddBook ? '✕ Cancel' : '+ Add Book'}
-                    </button>
-                    <button className="secondary small" onClick={exportFilteredBooksCsv}>Export CSV</button>
+                    {canWrite && (
+                      <button className="primary small" onClick={() => setShowAddBook((v) => !v)}>
+                        {showAddBook ? t('library.cancelAdd') : t('library.addBook')}
+                      </button>
+                    )}
+                    <button className="secondary small" onClick={exportFilteredBooksCsv}>{t('library.exportCsv')}</button>
                   </div>
                 </div>
 
                 {/* Stats */}
                 <div className="stats-row">
                   <div className="stat-box accent">
-                    <span className="stat-box-label">Total Books</span>
+                    <span className="stat-box-label">{t('library.totalBooks')}</span>
                     <span className="stat-box-value">{fmt(totalBooksCount)}</span>
                   </div>
                   <div className="stat-box success">
-                    <span className="stat-box-label">Available</span>
+                    <span className="stat-box-label">{t('status.available')}</span>
                     <span className="stat-box-value">{availableBooksDisplay}</span>
                   </div>
                   <div className="stat-box warning">
-                    <span className="stat-box-label">Borrowed</span>
+                    <span className="stat-box-label">{t('status.borrowed')}</span>
                     <span className="stat-box-value">{borrowedBooksDisplay}</span>
                   </div>
                   <div className="stat-box danger">
-                    <span className="stat-box-label">Overdue</span>
+                    <span className="stat-box-label">{t('library.overdue')}</span>
                     <span className="stat-box-value">{overdueCount}</span>
                   </div>
                 </div>
@@ -2915,22 +3410,23 @@ function App() {
                     type="button"
                     className={`chip${needsReviewFilter ? ' is-active' : ''}`}
                     onClick={() => setNeedsReviewFilter((v) => !v)}
-                    title="Books flagged during catalog cleanup"
+                    title={t('library.needsReviewTitle')}
                   >
-                    ⚑ Needs review
+                    {t('library.needsReview')}
                     {needsReviewCount > 0 && <span className="chip-count">{fmt(needsReviewCount)}</span>}
                   </button>
                   {SMART_LISTS.map((list) => {
                     const active = smartListKey === list.key;
+                    const label = t(list.labelKey);
                     return (
                       <button
                         key={list.key}
                         type="button"
                         className={`chip${active ? ' is-active' : ''}`}
                         onClick={() => setSmartListKey(active ? '' : list.key)}
-                        title={`Smart list: ${list.label}`}
+                        title={t('library.smartListTitle', { label })}
                       >
-                        <span className="chip-icon">{list.icon}</span> {list.label}
+                        <span className="chip-icon">{list.icon}</span> {label}
                         {active && <span className="chip-x">✕</span>}
                       </button>
                     );
@@ -2940,9 +3436,9 @@ function App() {
                       type="button"
                       className="chip is-active"
                       onClick={() => setCategoryFilter('')}
-                      title="Clear category filter"
+                      title={t('library.categoryFilterTitle')}
                     >
-                      📚 Category: {categoryFilter}
+                      {t('library.categoryChip', { code: categoryFilter })}
                       <span className="chip-x">✕</span>
                     </button>
                   )}
@@ -2950,9 +3446,9 @@ function App() {
                     type="button"
                     className="chip ghost"
                     onClick={() => setShowCategoryRail((v) => !v)}
-                    title={showCategoryRail ? 'Hide category browser' : 'Show category browser'}
+                    title={showCategoryRail ? t('library.catBrowser.hide') : t('library.catBrowser.show')}
                   >
-                    {showCategoryRail ? '◀ Hide categories' : '▶ Show categories'}
+                    {showCategoryRail ? t('library.hideCats') : t('library.showCats')}
                   </button>
                 </div>
 
@@ -2960,22 +3456,26 @@ function App() {
                   {showCategoryRail && (
                     <aside className="category-rail">
                       <div className="category-rail-head">
-                        <h3>Categories</h3>
-                        <span className="muted small">{categories.length} total</span>
+                        <h3>{t('library.cats.title')}</h3>
+                        <span className="muted small">{t('library.cats.totalCount', { n: categories.length })}</span>
                       </div>
                       <input
                         className="category-rail-search"
-                        placeholder="Filter categories…"
+                        placeholder={t('library.cats.filter')}
                         value={categoryRailQuery}
                         onChange={(e) => setCategoryRailQuery(e.target.value)}
                       />
                       <ul className="category-rail-list">
-                        <li
-                          className={!categoryFilter ? 'is-active' : ''}
-                          onClick={() => setCategoryFilter('')}
-                        >
-                          <span className="cat-label">All categories</span>
-                          <span className="cat-count">{fmt(totalBooksCount)}</span>
+                        <li>
+                          <button
+                            type="button"
+                            className={`category-rail-item${!categoryFilter ? ' is-active' : ''}`}
+                            aria-pressed={!categoryFilter}
+                            onClick={() => setCategoryFilter('')}
+                          >
+                            <span className="cat-label">{t('library.cats.all')}</span>
+                            <span className="cat-count">{fmt(totalBooksCount)}</span>
+                          </button>
                         </li>
                         {categories
                           .filter((c) => {
@@ -2987,17 +3487,20 @@ function App() {
                             );
                           })
                           .map((c) => (
-                            <li
-                              key={c.code}
-                              className={categoryFilter === c.code ? 'is-active' : ''}
-                              onClick={() => setCategoryFilter(c.code)}
-                              title={c.label ?? c.code}
-                            >
-                              <span className="cat-label">
-                                <span className="cat-code">{c.code}</span>
-                                {c.label ? <span className="cat-text"> {c.label}</span> : null}
-                              </span>
-                              <span className="cat-count">{fmt(c.count)}</span>
+                            <li key={c.code}>
+                              <button
+                                type="button"
+                                className={`category-rail-item${categoryFilter === c.code ? ' is-active' : ''}`}
+                                aria-pressed={categoryFilter === c.code}
+                                onClick={() => setCategoryFilter(c.code)}
+                                title={c.label ?? c.code}
+                              >
+                                <span className="cat-label">
+                                  <span className="cat-code">{c.code}</span>
+                                  {c.label ? <span className="cat-text"> {c.label}</span> : null}
+                                </span>
+                                <span className="cat-count">{fmt(c.count)}</span>
+                              </button>
                             </li>
                           ))}
                       </ul>
@@ -3006,63 +3509,63 @@ function App() {
                   <div className="library-main">
 
                 {/* Add Book (collapsible) */}
-                {showAddBook && (
+                {canWrite && showAddBook && (
                   <div className="card" style={{ borderLeft: '3px solid var(--accent)' }}>
-                    <h3>Add New Book</h3>
+                    <h3>{t('library.add.title')}</h3>
                     <form onSubmit={createBook} className="simple-form">
                       <div className="form-row">
                         <div>
-                          <label>Title *</label>
-                          <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder="Book title" required />
+                          <label>{t('library.add.bookTitle')} *</label>
+                          <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} required />
                         </div>
                         <div>
-                          <label>Author *</label>
-                          <input value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder="Author name" required />
-                        </div>
-                      </div>
-                      <div className="form-row">
-                        <div>
-                          <label>ISBN</label>
-                          <input value={createForm.isbn} onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })} placeholder="e.g. 978-..." />
-                        </div>
-                        <div>
-                          <label>Publication Year</label>
-                          <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder="e.g. 2020" />
-                        </div>
-                        <div>
-                          <label>Shelf Code</label>
-                          <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder="e.g. 06-005" />
+                          <label>{t('library.add.author')} *</label>
+                          <input value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder={t('library.add.authorPh')} required />
                         </div>
                       </div>
                       <div className="form-row">
                         <div>
-                          <label>Publisher</label>
-                          <input value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder="Publisher name" />
+                          <label>{t('library.add.isbn')}</label>
+                          <input value={createForm.isbn} onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })} placeholder={t('library.add.isbnPh')} />
                         </div>
                         <div>
-                          <label>Language</label>
-                          <input value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder="e.g. EL or EL,EN,FR" />
+                          <label>{t('library.add.year')}</label>
+                          <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder={t('library.add.yearPh')} />
+                        </div>
+                        <div>
+                          <label>{t('library.add.shelf')}</label>
+                          <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder={t('library.add.shelfPh')} />
+                        </div>
+                      </div>
+                      <div className="form-row">
+                        <div>
+                          <label>{t('library.add.publisher')}</label>
+                          <input value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder={t('library.add.publisherPh')} />
+                        </div>
+                        <div>
+                          <label>{t('library.add.language')}</label>
+                          <input value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder={t('library.add.languagePh')} />
                         </div>
                       </div>
                       <div className="form-field">
-                        <label>Description</label>
+                        <label>{t('library.add.description')}</label>
                         <textarea
                           value={createForm.description}
                           onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
                           rows={2}
-                          placeholder="Optional notes about this book"
+                          placeholder={t('library.add.descriptionPh')}
                         />
                       </div>
 
                       <details className="custom-fields-section" open={customFields.length > 0 && customFields.length <= 6}>
-                        <summary>Catalog attributes ({customFields.length})</summary>
+                        <summary>{t('library.add.attributes', { n: customFields.length })}</summary>
                         {renderCustomFieldsForm(createAttrValues, (key, value) =>
                           setCreateAttrValues((prev) => ({ ...prev, [key]: value }))
                         )}
                       </details>
 
                       <div className="button-group">
-                        <button type="submit" className="primary">Add Book</button>
+                        <button type="submit" className="primary">{t('library.add.submit')}</button>
                         <button
                           type="button"
                           className="secondary"
@@ -3070,7 +3573,7 @@ function App() {
                             setShowAddBook(false);
                             setCreateAttrValues({});
                           }}
-                        >Cancel</button>
+                        >{t('common.cancel')}</button>
                       </div>
                     </form>
                   </div>
@@ -3081,17 +3584,17 @@ function App() {
                   <div className="card" style={{ borderLeft: '3px solid var(--warning, #f59e0b)', background: 'var(--bg-warning, #fffbeb)' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                       <div>
-                        <strong>⚠️ Possible Duplicate Detected</strong>
+                        <strong>{t('library.dup.title')}</strong>
                         <p style={{ marginTop: '0.4rem', marginBottom: '0.5rem', fontSize: '0.875rem', color: 'var(--text-muted)' }}>
-                          The book you just added matches existing entries:
+                          {t('library.dup.body')}
                         </p>
                         <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.875rem' }}>
                           {duplicateWarning.map((d) => (
-                            <li key={d.id}><em>{d.title}</em> — {d.author}{d.isbn ? ` (ISBN: ${d.isbn})` : ''}</li>
+                            <li key={d.id}><em>{d.title}</em> — {d.author}{d.isbn ? ` (${t('library.add.isbn')}: ${d.isbn})` : ''}</li>
                           ))}
                         </ul>
                       </div>
-                      <button className="secondary small" onClick={() => setDuplicateWarning([])}>Dismiss</button>
+                      <button className="secondary small" onClick={() => setDuplicateWarning([])}>{t('common.dismiss')}</button>
                     </div>
                   </div>
                 )}
@@ -3101,42 +3604,42 @@ function App() {
                   <div className="search-bar">
                     <div className="search-field">
                       <label>
-                        Search <span className="kbd-hint">press <kbd>/</kbd></span>
+                        {t('library.search.label')} <span className="kbd-hint">{t('library.search.kbdHint')} <kbd>/</kbd></span>
                       </label>
                       <input
                         ref={searchInputRef}
                         value={q}
                         onChange={(e) => setQ(e.target.value)}
-                        placeholder="Smart search · forgives typos & accents — try Greek, English, ISBN…"
+                        placeholder={t('library.search.placeholder')}
                       />
                     </div>
                     <div className="filter-field">
-                      <label>Status</label>
+                      <label>{t('library.search.status')}</label>
                       <select value={status} onChange={(e) => setStatus(e.target.value)}>
-                        <option value="">All statuses</option>
-                        <option value="available">Available</option>
-                        <option value="borrowed">Borrowed</option>
-                        <option value="lost">Lost</option>
-                        <option value="maintenance">Maintenance</option>
+                        <option value="">{t('status.allStatuses')}</option>
+                        <option value="available">{t('status.available')}</option>
+                        <option value="borrowed">{t('status.borrowed')}</option>
+                        <option value="lost">{t('status.lost')}</option>
+                        <option value="maintenance">{t('status.maintenance')}</option>
                       </select>
                     </div>
                     <div className="filter-field">
-                      <label>Shelf</label>
+                      <label>{t('library.search.shelf')}</label>
                       <input
                         value={shelfFilter}
                         onChange={(e) => setShelfFilter(e.target.value)}
-                        placeholder="06 or 06-005"
-                        title="Type any prefix — '06' matches every 06-xxx shelf"
+                        placeholder={t('library.search.shelfPh')}
+                        title={t('library.search.shelfTitle')}
                       />
                     </div>
                     <div className="filter-field">
-                      <label>Language</label>
+                      <label>{t('library.search.language')}</label>
                       <input
                         value={filterLanguage}
                         onChange={(e) => setFilterLanguage(e.target.value)}
-                        placeholder="English, Greek, EN…"
+                        placeholder={t('library.search.languagePh')}
                         list="lang-suggest"
-                        title="Type a language name or ISO code — matches any book where this language appears, even in multi-language entries like 'EL,EN,FR'."
+                        title={t('library.search.languageTitle')}
                       />
                       <datalist id="lang-suggest">
                         {/*
@@ -3162,25 +3665,25 @@ function App() {
                       </datalist>
                     </div>
                     <div className="filter-field">
-                      <label>Year</label>
-                      <input type="number" value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder="e.g. 2024" />
+                      <label>{t('library.search.year')}</label>
+                      <input type="number" value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder={t('library.search.yearPh')} />
                     </div>
                     <div className="filter-field">
-                      <label>Sort</label>
+                      <label>{t('library.search.sort')}</label>
                       <div className="sort-row">
                         <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)}>
-                          <option value="updatedAt">Last updated</option>
-                          <option value="title">Title</option>
-                          <option value="author">Author</option>
-                          <option value="publicationYear">Year</option>
-                          <option value="status">Status</option>
+                          <option value="updatedAt">{t('library.search.sortUpdated')}</option>
+                          <option value="title">{t('library.search.sortTitle')}</option>
+                          <option value="author">{t('library.search.sortAuthor')}</option>
+                          <option value="publicationYear">{t('library.search.sortYear')}</option>
+                          <option value="status">{t('library.search.sortStatus')}</option>
                         </select>
                         <button
                           type="button"
                           className="secondary small sort-dir-btn"
                           onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
-                          title={sortDir === 'asc' ? 'Ascending — click to toggle' : 'Descending — click to toggle'}
-                          aria-label="Toggle sort direction"
+                          title={sortDir === 'asc' ? t('library.search.sortAsc') : t('library.search.sortDesc')}
+                          aria-label={t('library.search.sortDirAria')}
                         >
                           {sortDir === 'asc' ? '↑' : '↓'}
                         </button>
@@ -3189,14 +3692,14 @@ function App() {
                     <div className="search-actions">
                       <label>.</label>
                       <button className="secondary" onClick={() => { setShowAdvancedSearch((v) => !v); }}>
-                        {showAdvancedSearch ? 'Hide Advanced' : 'Advanced'}
+                        {showAdvancedSearch ? t('library.search.hideAdvanced') : t('library.search.advanced')}
                       </button>
                       <button
                         className="secondary"
                         onClick={() => setDensity((d) => (d === 'compact' ? 'comfortable' : 'compact'))}
-                        title="Toggle layout density"
+                        title={t('library.search.densityTitle')}
                       >
-                        {density === 'compact' ? '⊞ Cards' : '☰ List'}
+                        {density === 'compact' ? t('library.search.densityCards') : t('library.search.densityList')}
                       </button>
                       <button className="secondary" onClick={() => {
                         setQ('');
@@ -3213,7 +3716,7 @@ function App() {
                         setNeedsReviewFilter(false);
                         setSmartListKey('');
                         setCurrentPage(1);
-                      }}>Reset</button>
+                      }}>{t('common.reset')}</button>
                     </div>
                   </div>
 
@@ -3221,49 +3724,49 @@ function App() {
                     <div style={{ marginTop: '0.75rem', borderTop: '1px solid var(--border)', paddingTop: '0.75rem' }}>
                       <div className="form-row">
                         <div>
-                          <label>Exclude Terms</label>
+                          <label>{t('library.adv.exclude')}</label>
                           <input
                             value={qExclude}
                             onChange={(e) => setQExclude(e.target.value)}
-                            placeholder="Words/phrases to exclude"
+                            placeholder={t('library.adv.excludePh')}
                           />
                         </div>
                         <div>
-                          <label>Match Mode</label>
+                          <label>{t('library.adv.matchMode')}</label>
                           <select value={qMode} onChange={(e) => setQMode(e.target.value as SearchMode)}>
-                            <option value="all">All terms (AND)</option>
-                            <option value="any">Any term (OR)</option>
-                            <option value="exact">Exact phrase</option>
+                            <option value="all">{t('library.adv.modeAll')}</option>
+                            <option value="any">{t('library.adv.modeAny')}</option>
+                            <option value="exact">{t('library.adv.modeExact')}</option>
                           </select>
                         </div>
                         <div>
-                          <label>Partial Word Matching</label>
+                          <label>{t('library.adv.partialWords')}</label>
                           <select value={partialWords ? 'yes' : 'no'} onChange={(e) => setPartialWords(e.target.value === 'yes')}>
-                            <option value="yes">Yes (contains text)</option>
-                            <option value="no">No (exact token)</option>
+                            <option value="yes">{t('library.adv.partialYes')}</option>
+                            <option value="no">{t('library.adv.partialNo')}</option>
                           </select>
                         </div>
                         <div>
-                          <label>Fuzzy Typos</label>
+                          <label>{t('library.adv.fuzzy')}</label>
                           <select value={fuzzyTypos ? 'on' : 'off'} onChange={(e) => setFuzzyTypos(e.target.value === 'on')}>
-                            <option value="on">On (tolerate typos)</option>
-                            <option value="off">Off (strict matching)</option>
+                            <option value="on">{t('library.adv.fuzzyOn')}</option>
+                            <option value="off">{t('library.adv.fuzzyOff')}</option>
                           </select>
                         </div>
                       </div>
 
-                      <label style={{ marginTop: '0.5rem' }}>Search In Fields</label>
+                      <label style={{ marginTop: '0.5rem' }}>{t('library.adv.searchIn')}</label>
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.35rem' }}>
                         {([
-                          ['title', 'Title'],
-                          ['author', 'Author'],
-                          ['isbn', 'ISBN'],
-                          ['publisher', 'Publisher'],
-                          ['language', 'Language'],
-                          ['description', 'Description'],
-                          ['shelfCode', 'Shelf'],
-                          ['tags', 'Tags'],
-                          ['custom', 'Custom Fields']
+                          ['title', t('library.adv.field.title')],
+                          ['author', t('library.adv.field.author')],
+                          ['isbn', t('library.adv.field.isbn')],
+                          ['publisher', t('library.adv.field.publisher')],
+                          ['language', t('library.adv.field.language')],
+                          ['description', t('library.adv.field.description')],
+                          ['shelfCode', t('library.adv.field.shelfCode')],
+                          ['tags', t('library.adv.field.tags')],
+                          ['custom', t('library.adv.field.custom')]
                         ] as Array<[SearchField, string]>).map(([field, label]) => (
                           <label key={field} style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem', margin: 0, fontSize: '0.82rem' }}>
                             <input
@@ -3289,47 +3792,47 @@ function App() {
                 </div>
 
                 {/* Bulk action bar — only visible when at least one book is selected. */}
-                {selectedBookIds.length > 0 && (
-                  <div className="bulk-bar" role="region" aria-label="Bulk actions">
+                {canWrite && selectedBookIds.length > 0 && (
+                  <div className="bulk-bar" role="region" aria-label={t('library.bulk.aria')}>
                     <div className="bulk-bar-info">
-                      <strong>{selectedBookIds.length}</strong>
-                      <span className="muted small">selected on this page</span>
-                      <button className="link-btn" onClick={selectAllOnPage}>Select all visible ({books.length})</button>
-                      <button className="link-btn" onClick={clearSelectedBooks}>Clear</button>
+                      <strong>{selectedBookIds.length} </strong>
+                      <span className="muted small">{t('library.bulk.selectedSuffix')}</span>
+                      <button className="link-btn" onClick={selectAllOnPage}>{t('library.bulk.selectAll', { n: books.length })}</button>
+                      <button className="link-btn" onClick={clearSelectedBooks}>{t('library.bulk.clear')}</button>
                     </div>
                     <div className="bulk-bar-actions">
-                      <select value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)} aria-label="Set status">
-                        <option value="">Set status…</option>
-                        <option value="available">Available</option>
-                        <option value="borrowed">Borrowed</option>
-                        <option value="lost">Lost</option>
-                        <option value="maintenance">Maintenance</option>
+                      <select value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)} aria-label={t('library.bulk.setStatusAria')}>
+                        <option value="">{t('library.bulk.setStatus')}</option>
+                        <option value="available">{t('status.available')}</option>
+                        <option value="borrowed">{t('status.borrowed')}</option>
+                        <option value="lost">{t('status.lost')}</option>
+                        <option value="maintenance">{t('status.maintenance')}</option>
                       </select>
                       <input
                         value={bulkShelfCode}
                         onChange={(e) => setBulkShelfCode(e.target.value)}
-                        placeholder="Set shelf"
-                        aria-label="Set shelf code"
+                        placeholder={t('library.bulk.setShelf')}
+                        aria-label={t('library.bulk.setShelfAria')}
                       />
                       <button
                         className="primary small"
                         onClick={() => void applyBulkBookChanges()}
-                        disabled={!bulkStatus && !bulkShelfCode.trim() && !bulkRoomCode.trim()}
-                      >Apply</button>
+                        disabled={!bulkStatus && !bulkShelfCode.trim()}
+                      >{t('common.apply')}</button>
                       <button
                         className="secondary small"
                         onClick={() => {
                           const targets = books.filter((b) => selectedBookIds.includes(b.id));
                           void printLabels(targets);
                         }}
-                      >🖨 Labels</button>
+                      >{t('library.bulk.labels')}</button>
                       <button
                         className="danger small"
                         onClick={async () => {
                           const ok = await confirm({
-                            title: `Delete ${selectedBookIds.length} book${selectedBookIds.length === 1 ? '' : 's'}?`,
-                            body: 'This soft-deletes them; admins can restore by direct DB edit. Loan history stays.',
-                            confirmLabel: 'Delete selected',
+                            title: t('confirm.deleteBulkTitle', { n: selectedBookIds.length, s: selectedBookIds.length === 1 ? '' : 's' }),
+                            body: t('confirm.deleteBulkBody'),
+                            confirmLabel: t('confirm.deleteBulkAction'),
                             danger: true
                           });
                           if (!ok) return;
@@ -3342,15 +3845,15 @@ function App() {
                             const failed = results.filter((r) => r.status === 'rejected').length;
                             const success = results.length - failed;
                             setMessage(failed === 0
-                              ? `Deleted ${success} book${success === 1 ? '' : 's'}.`
-                              : `Deleted ${success}, ${failed} failed.`);
+                              ? t('toast.deletedAll', { n: success, s: success === 1 ? '' : 's' })
+                              : t('toast.deletedMixed', { success, failed }));
                             setSelectedBookIds([]);
                             await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadStats()]);
                           } catch (e) {
                             setError((e as Error).message);
                           }
                         }}
-                      >Delete</button>
+                      >{t('common.delete')}</button>
                     </div>
                   </div>
                 )}
@@ -3362,11 +3865,11 @@ function App() {
                   ) : books.length === 0 ? (
                     <div className="empty-state">
                       <p style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>📚</p>
-                      <p style={{ fontWeight: 600 }}>No books found</p>
+                      <p style={{ fontWeight: 600 }}>{t('library.empty.title')}</p>
                       <p className="muted small">
                         {q || categoryFilter || needsReviewFilter || status || filterLanguage || filterYear || shelfFilter
-                          ? 'No matches for your filters. Try clearing them or broadening the search.'
-                          : 'Add a book above, or import a catalog from the Import/Export tab.'}
+                          ? t('library.empty.filtered')
+                          : t('library.empty.bare')}
                       </p>
                     </div>
                   ) : (
@@ -3389,18 +3892,22 @@ function App() {
                                 checked={isSelected}
                                 onChange={(e) => { e.stopPropagation(); toggleBookSelection(book.id); }}
                                 onClick={(e) => e.stopPropagation()}
-                                aria-label={`Select ${displayTitle(book)}`}
+                                aria-label={t('library.book.selectAria', { title: displayTitle(book) })}
+                                style={canWrite ? undefined : { display: 'none' }}
                               />
                               {book.coverUrl ? (
                                 <img
                                   className="book-avatar book-cover"
                                   src={joinApiUrl(book.coverUrl)}
-                                  alt=""
+                                  alt={`Cover of ${displayTitle(book)}`}
                                   loading="lazy"
+                                  decoding="async"
                                   onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
                                 />
                               ) : (
-                                <div className="book-avatar">{(displayTitle(book).charAt(0) || '?').toUpperCase()}</div>
+                                <div className="book-avatar" aria-hidden="true">
+                                  {(displayTitle(book).charAt(0) || '?').toUpperCase()}
+                                </div>
                               )}
                               <div className="book-card-body">
                                 <span className={`book-card-title${isPlaceholder(book.title, 'title') || !book.title ? ' is-placeholder' : ''}`}>
@@ -3419,13 +3926,13 @@ function App() {
                               <div className="book-card-side">
                                 <span
                                   className={`shelf-badge${book.shelfCode ? '' : ' shelf-missing'}`}
-                                  title={book.shelfCode ? `Shelf ${book.shelfCode}` : 'No shelf assigned — click the book to set one'}
-                                  aria-label={book.shelfCode ? `Shelf ${book.shelfCode}` : 'No shelf assigned'}
+                                  title={book.shelfCode ? t('library.book.shelfTitle', { code: book.shelfCode }) : t('library.book.noShelfTitle')}
+                                  aria-label={book.shelfCode ? t('library.book.shelfTitle', { code: book.shelfCode }) : t('library.book.noShelfAria')}
                                 >
                                   <span className="shelf-icon" aria-hidden="true">📍</span>
-                                  <span className="shelf-value">{book.shelfCode || 'No shelf'}</span>
+                                  <span className="shelf-value">{book.shelfCode || t('library.book.noShelf')}</span>
                                 </span>
-                                <span className={`status-badge status-${book.status}`}>{book.status}</span>
+                                <span className={`status-badge status-${book.status}`}>{t(`status.${book.status}`)}</span>
                               </div>
                             </div>
                           );
@@ -3436,16 +3943,16 @@ function App() {
                           className="secondary small"
                           onClick={() => void loadBooks(1)}
                           disabled={currentPage === 1}
-                          title="First page"
-                        >« First</button>
+                          title={t('library.page.firstTitle')}
+                        >{t('library.page.first')}</button>
                         <button
                           className="secondary small"
                           onClick={() => void loadBooks(currentPage - 1)}
                           disabled={currentPage === 1}
-                        >← Previous</button>
+                        >{t('library.page.prev')}</button>
                         <span className="pagination-info">
-                          Page <strong>{currentPage}</strong> of <strong>{Math.max(1, Math.ceil(totalBooksCount / PAGE_SIZE))}</strong>
-                          <span className="muted small"> · {fmt(totalBooksCount)} books</span>
+                          {t('library.page.info')} <strong>{currentPage}</strong> {t('library.page.of')} <strong>{Math.max(1, Math.ceil(totalBooksCount / PAGE_SIZE))}</strong>
+                          <span className="muted small"> · {t('library.page.booksSuffix', { n: fmt(totalBooksCount) })}</span>
                         </span>
                         <form
                           className="page-jump"
@@ -3462,22 +3969,22 @@ function App() {
                           <input
                             value={jumpPage}
                             onChange={(e) => setJumpPage(e.target.value.replace(/[^0-9]/g, ''))}
-                            placeholder="Jump to…"
-                            aria-label="Jump to page"
+                            placeholder={t('library.page.jump')}
+                            aria-label={t('library.page.jumpAria')}
                           />
-                          <button type="submit" className="secondary small">Go</button>
+                          <button type="submit" className="secondary small">{t('common.go')}</button>
                         </form>
                         <button
                           className="secondary small"
                           onClick={() => void loadBooks(currentPage + 1)}
                           disabled={currentPage >= Math.ceil(totalBooksCount / PAGE_SIZE)}
-                        >Next →</button>
+                        >{t('library.page.next')}</button>
                         <button
                           className="secondary small"
                           onClick={() => void loadBooks(Math.max(1, Math.ceil(totalBooksCount / PAGE_SIZE)))}
                           disabled={currentPage >= Math.ceil(totalBooksCount / PAGE_SIZE)}
-                          title="Last page"
-                        >Last »</button>
+                          title={t('library.page.lastTitle')}
+                        >{t('library.page.last')}</button>
                       </div>
                     </>
                   )}
@@ -3492,35 +3999,35 @@ function App() {
               <>
                 <div className="section-header">
                   <div className="section-header-text">
-                    <h2>Loans</h2>
-                    <p>Track active borrowing and returns</p>
+                    <h2>{t('loans.title')}</h2>
+                    <p>{t('loans.description')}</p>
                   </div>
                 </div>
 
                 {/* Loan stats */}
                 <div className="stats-row" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
                   <div className="stat-box accent">
-                    <span className="stat-box-label">Active Loans</span>
+                    <span className="stat-box-label">{t('loans.activeKpi')}</span>
                     <span className="stat-box-value">{activeBorrows.length}</span>
                   </div>
                   <div className="stat-box danger">
-                    <span className="stat-box-label">Overdue</span>
+                    <span className="stat-box-label">{t('library.overdue')}</span>
                     <span className="stat-box-value">{overdueCount}</span>
                   </div>
                   <div className="stat-box warning">
-                    <span className="stat-box-label">Due Soon (48h)</span>
+                    <span className="stat-box-label">{t('loans.dueSoon')}</span>
                     <span className="stat-box-value">{dueSoonCount}</span>
                   </div>
                 </div>
 
                 {/* Active Loans list */}
                 <div className="card">
-                  <h3>Active Loans ({activeBorrows.length})</h3>
+                  <h3>{t('loans.activeHeading', { n: activeBorrows.length })}</h3>
                   {activeBorrows.length === 0 ? (
                     <div className="empty-state" style={{ padding: '1.5rem 0 0.5rem' }}>
                       <p style={{ fontSize: '1.75rem', marginBottom: '0.375rem' }}>✅</p>
-                      <p style={{ fontWeight: 600 }}>All clear — no active loans</p>
-                      <p className="muted small">All books are currently in the library.</p>
+                      <p style={{ fontWeight: 600 }}>{t('loans.allClear')}</p>
+                      <p className="muted small">{t('loans.allClearBody')}</p>
                     </div>
                   ) : (
                     <div className="loan-list">
@@ -3529,16 +4036,16 @@ function App() {
                           <div className="loan-item-info">
                             <strong>{loan.title}</strong>
                             <p className="meta">
-                              Borrowed by <strong>{loan.borrowerName}</strong>
+                              {t('loans.borrowedBy', { name: loan.borrowerName })}
                               {loan.borrowerContact ? ` · ${loan.borrowerContact}` : ''}
                             </p>
                             <p className="meta">
-                              Due: {new Date(loan.dueAt).toLocaleDateString()}
-                              {loan.isOverdue && <span className="overdue-tag"> · OVERDUE</span>}
+                              {t('loans.due', { date: new Date(loan.dueAt).toLocaleDateString() })}
+                              {loan.isOverdue && <span className="overdue-tag"> · {t('loans.overdueTag')}</span>}
                             </p>
                           </div>
                           <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, loan.title)}>
-                            Return
+                            {t('loans.return')}
                           </button>
                         </div>
                       ))}
@@ -3548,7 +4055,7 @@ function App() {
 
                 {/* Borrow Form */}
                 <div className="card">
-                  <h3>Borrow a Book</h3>
+                  <h3>{t('loans.borrowHeading')}</h3>
                   {selectedBook ? (
                     <form onSubmit={(e) => { e.preventDefault(); void borrowBook(selectedBook); }} className="simple-form">
                       <div style={{ padding: '0.875rem 1rem', background: 'var(--accent-light)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--accent)', marginBottom: '0.25rem' }}>
@@ -3557,7 +4064,7 @@ function App() {
                       </div>
                       <div className="form-row">
                         <div className="combobox">
-                          <label>Borrower *</label>
+                          <label>{t('loans.borrower')} *</label>
                           <input
                             value={borrowerQuery || borrowerName}
                             onChange={(e) => {
@@ -3569,7 +4076,7 @@ function App() {
                               else setBorrowerSuggestions([]);
                             }}
                             onFocus={() => { if (!borrowerSuggestions.length) void searchBorrowers(borrowerQuery); }}
-                            placeholder="Type to search existing borrowers, or enter a new name"
+                            placeholder={t('loans.borrowerPh')}
                             required
                             autoComplete="off"
                           />
@@ -3592,8 +4099,8 @@ function App() {
                                   <span className="combo-name">{b.name}</span>
                                   {b.contact && <span className="combo-contact muted small">{b.contact}</span>}
                                   <span className="combo-stats muted small">
-                                    {fmt(b.totalLoans)} loan{b.totalLoans === 1 ? '' : 's'}
-                                    {b.overdueLoans > 0 && <span className="overdue-tag"> · {fmt(b.overdueLoans)} overdue</span>}
+                                    {t(b.totalLoans === 1 ? 'loans.suggestionLoanCount' : 'loans.suggestionLoanCountPlural', { n: fmt(b.totalLoans) })}
+                                    {b.overdueLoans > 0 && <span className="overdue-tag"> · {t('loans.suggestionOverdue', { n: fmt(b.overdueLoans) })}</span>}
                                   </span>
                                 </li>
                               ))}
@@ -3601,45 +4108,50 @@ function App() {
                           )}
                           {selectedBorrowerId && (
                             <p className="muted small">
-                              ✓ Using existing borrower profile.{' '}
+                              {t('loans.borrowerProfile')}{' '}
                               <button
                                 type="button"
                                 className="link-btn"
                                 style={{ color: 'var(--accent)' }}
                                 onClick={() => { setSelectedBorrowerId(''); setBorrowerName(''); setBorrowerContact(''); }}
-                              >Change</button>
+                              >{t('loans.change')}</button>
                             </p>
                           )}
                         </div>
                         <div>
-                          <label>Contact (optional)</label>
+                          <label>{t('loans.contact', { optional: t('common.optional') })}</label>
                           <input
                             value={borrowerContact}
                             onChange={(e) => setBorrowerContact(e.target.value)}
-                            placeholder="Phone or email"
+                            placeholder={t('loans.contactPh')}
                             disabled={Boolean(selectedBorrowerId)}
                           />
                         </div>
                       </div>
                       <div className="form-field">
-                        <label>Due Date *</label>
-                        <input type="date" value={dueAt.split('T')[0]} onChange={(e) => setDueAt(e.target.value + 'T00:00:00.000Z')} required />
+                        <label>{t('loans.dueDate')} *</label>
+                        <input
+                          type="date"
+                          value={dueAt ? new Date(dueAt).toISOString().slice(0, 10) : ''}
+                          onChange={(e) => setDueAt(endOfLocalDayIso(e.target.value))}
+                          required
+                        />
                         <div className="button-group" style={{ marginTop: '0.5rem' }}>
-                          <button type="button" className="secondary small" onClick={() => setDueInDays(7)}>7 days</button>
-                          <button type="button" className="secondary small" onClick={() => setDueInDays(14)}>14 days</button>
-                          <button type="button" className="secondary small" onClick={() => setDueInDays(30)}>30 days</button>
+                          <button type="button" className="secondary small" onClick={() => setDueInDays(7)}>{t('loans.in7')}</button>
+                          <button type="button" className="secondary small" onClick={() => setDueInDays(14)}>{t('loans.in14')}</button>
+                          <button type="button" className="secondary small" onClick={() => setDueInDays(30)}>{t('loans.in30')}</button>
                         </div>
                       </div>
                       <div className="button-group">
-                        <button type="submit" className="primary">Confirm Borrow</button>
-                        <button type="button" className="secondary" onClick={() => setSelectedBook(null)}>Cancel</button>
+                        <button type="submit" className="primary">{t('loans.confirmBorrow')}</button>
+                        <button type="button" className="secondary" onClick={() => setSelectedBook(null)}>{t('common.cancel')}</button>
                       </div>
                     </form>
                   ) : (
                     <div className="empty-state" style={{ padding: '1.5rem 0 0.5rem' }}>
                       <p style={{ fontSize: '1.75rem', marginBottom: '0.375rem' }}>📖</p>
-                      <p style={{ fontWeight: 600 }}>No book selected</p>
-                      <p className="muted small">Go to the Library tab, open any available book, and click <strong>Borrow</strong>.</p>
+                      <p style={{ fontWeight: 600 }}>{t('loans.noBookSelected')}</p>
+                      <p className="muted small">{t('loans.noBookBody')} <strong>{t('detail.borrowBtn')}</strong>.</p>
                     </div>
                   )}
                 </div>
@@ -3651,65 +4163,59 @@ function App() {
               <>
                 <div className="section-header">
                   <div className="section-header-text">
-                    <h2>Import & Export</h2>
-                    <p>Add books from a spreadsheet or download your collection</p>
+                    <h2>{t('import.title')}</h2>
+                    <p>{t('import.description')}</p>
                   </div>
                 </div>
 
                 <div className="card">
-                  <h3>📥 Import from Excel (.xlsx)</h3>
+                  <h3>{t('import.heading')}</h3>
                   <p className="muted" style={{ marginBottom: '1.25rem', fontSize: '0.875rem' }}>
-                    Drop in your <strong>LIBRARY_normalized.xlsx</strong> (or any compatible catalog file).
-                    Catalog-format files are auto-detected and imported via the upsert path — re-running
-                    the same file updates existing books in place. Legacy <em>Title/Author</em> spreadsheets are
-                    still supported.
+                    {t('import.intro')}
                   </p>
                   <form onSubmit={importFromXlsx} className="simple-form">
                     <div className="import-dropzone">
                       <p style={{ fontSize: '2.25rem', marginBottom: '0.5rem' }}>📂</p>
-                      <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>Choose an Excel file</p>
-                      <p className="muted small" style={{ marginBottom: '1rem' }}>Supports .xlsx format</p>
+                      <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{t('import.choose')}</p>
+                      <p className="muted small" style={{ marginBottom: '1rem' }}>{t('import.supports')}</p>
                       <input name="xlsxFile" type="file" accept=".xlsx" required style={{ width: 'auto', display: 'block', margin: '0 auto' }} />
                     </div>
                     {importFileName && (
-                      <p className="muted small">📄 Selected: <strong>{importFileName}</strong></p>
+                      <p className="muted small">{t('import.selected')} <strong>{importFileName}</strong></p>
                     )}
                     <label className="checkbox-label">
                       <input type="checkbox" checked={importDryRun} onChange={(e) => setImportDryRun(e.target.checked)} />
-                      Test only (dry run) — preview results without saving
+                      {t('import.dryRun')}
                     </label>
                     <button type="submit" className="primary">
-                      {importDryRun ? '🔍 Test Import' : '📥 Import Books'}
+                      {importDryRun ? t('import.testBtn') : t('import.importBtn')}
                     </button>
                   </form>
                 </div>
 
                 <div className="card">
-                  <h3>📤 Export Collection</h3>
+                  <h3>{t('import.exportHeading')}</h3>
                   <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
-                    Download your entire library as a CSV file for use in Excel or other tools.
+                    {t('import.exportIntro')}
                   </p>
-                  <button className="secondary" onClick={exportCsv}>Download Full CSV</button>
+                  <button className="secondary" onClick={exportCsv}>{t('import.downloadCsv')}</button>
                 </div>
 
                 <div className="card">
-                  <h3>⚙️ Setup</h3>
+                  <h3>{t('import.setupHeading')}</h3>
                   <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
-                    Run once before your first import — these create the custom attributes that
-                    receive every column in the spreadsheet.
+                    {t('import.setupIntro')}
                   </p>
                   <div className="button-group" style={{ marginTop: 0 }}>
                     <button className="primary" onClick={() => void setupLibraryCatalog()}>
-                      Set up for LIBRARY_normalized.xlsx
+                      {t('import.setupCatalog')}
                     </button>
                     <button className="secondary" onClick={applyDefaultBookStructure}>
-                      Apply legacy Title/Author preset
+                      {t('import.setupLegacy')}
                     </button>
                   </div>
                   <p className="muted small" style={{ marginTop: '0.75rem' }}>
-                    The catalog preset adds <strong>{CATALOG_FIELD_COUNT}</strong> attributes (series,
-                    editor, place_of_publication, category_code, cover_type, copies_count, etc.) so every
-                    column from the file lands somewhere safe and searchable.
+                    {t('import.setupNote', { n: CATALOG_FIELD_COUNT })}
                   </p>
                 </div>
               </>
@@ -3720,16 +4226,16 @@ function App() {
               <>
                 <div className="section-header">
                   <div className="section-header-text">
-                    <h2>Settings</h2>
-                    <p>Custom attributes, audit log, and database hygiene tools</p>
+                    <h2>{t('settings.title')}</h2>
+                    <p>{t('settings.description')}</p>
                   </div>
                 </div>
 
                 {/* Custom field manager */}
                 <div className="card">
-                  <h3>Custom Attributes ({customFields.length})</h3>
+                  <h3>{t('settings.customAttrs', { n: customFields.length })}</h3>
                   <p className="muted small" style={{ marginBottom: '1rem' }}>
-                    Fields shown in every book's detail. Editable by admins.
+                    {t('settings.customIntro')}
                   </p>
 
                   {customFields.length > 0 && (
@@ -3739,14 +4245,14 @@ function App() {
                           <div className="cf-row-text">
                             <strong>{f.label}</strong>
                             <span className="muted small">
-                              <code>{f.key}</code> · {f.type}{f.required ? ' · required' : ''}
-                              {f.type === 'enum' && f.enumOptions.length > 0 ? ` · ${f.enumOptions.length} options` : ''}
+                              <code>{f.key}</code> · {f.type}{f.required ? ` ${t('settings.requiredSuffix')}` : ''}
+                              {f.type === 'enum' && f.enumOptions.length > 0 ? ` ${t('settings.optionsSuffix', { n: f.enumOptions.length })}` : ''}
                             </span>
                           </div>
                           {currentUser?.role === 'admin' && (
                             <div className="cf-row-actions">
-                              <button className="secondary small" onClick={() => beginCustomFieldEdit(f)}>Edit</button>
-                              <button className="danger small" onClick={() => void deleteCustomField(f)}>Delete</button>
+                              <button className="secondary small" onClick={() => beginCustomFieldEdit(f)}>{t('common.edit')}</button>
+                              <button className="danger small" onClick={() => void deleteCustomField(f)}>{t('common.delete')}</button>
                             </div>
                           )}
                         </div>
@@ -3756,67 +4262,67 @@ function App() {
 
                   {currentUser?.role === 'admin' && (
                     <details className="custom-fields-section" open={Boolean(editingCustomFieldId)} style={{ marginTop: '1rem' }}>
-                      <summary>{editingCustomFieldId ? 'Edit attribute' : '+ Add new attribute'}</summary>
+                      <summary>{editingCustomFieldId ? t('settings.editAttr') : t('settings.addAttr')}</summary>
                       <form onSubmit={saveCustomField} className="simple-form" style={{ marginTop: '0.75rem' }}>
                         <div className="form-row">
                           <div>
-                            <label>Key (snake_case)</label>
+                            <label>{t('settings.attrKey')}</label>
                             <input
                               value={fieldForm.key}
                               onChange={(e) => setFieldForm({ ...fieldForm, key: e.target.value })}
-                              placeholder="e.g. donor_name"
+                              placeholder={t('settings.attrKeyPh')}
                               required
                             />
                           </div>
                           <div>
-                            <label>Label</label>
+                            <label>{t('settings.attrLabel')}</label>
                             <input
                               value={fieldForm.label}
                               onChange={(e) => setFieldForm({ ...fieldForm, label: e.target.value })}
-                              placeholder="e.g. Donor name"
+                              placeholder={t('settings.attrLabelPh')}
                               required
                             />
                           </div>
                         </div>
                         <div className="form-row">
                           <div>
-                            <label>Type</label>
+                            <label>{t('settings.attrType')}</label>
                             <select
                               value={fieldForm.type}
                               onChange={(e) => setFieldForm({ ...fieldForm, type: e.target.value as CustomField['type'] })}
                             >
-                              <option value="text">Text</option>
-                              <option value="number">Number</option>
-                              <option value="boolean">Yes/No</option>
-                              <option value="date">Date</option>
-                              <option value="enum">Enum (dropdown)</option>
+                              <option value="text">{t('settings.attrType.text')}</option>
+                              <option value="number">{t('settings.attrType.number')}</option>
+                              <option value="boolean">{t('settings.attrType.boolean')}</option>
+                              <option value="date">{t('settings.attrType.date')}</option>
+                              <option value="enum">{t('settings.attrType.enum')}</option>
                             </select>
                           </div>
                           <div>
-                            <label>Required?</label>
+                            <label>{t('settings.attrRequired')}</label>
                             <select
                               value={fieldForm.required ? 'yes' : 'no'}
                               onChange={(e) => setFieldForm({ ...fieldForm, required: e.target.value === 'yes' })}
                             >
-                              <option value="no">No</option>
-                              <option value="yes">Yes</option>
+                              <option value="no">{t('common.no')}</option>
+                              <option value="yes">{t('common.yes')}</option>
                             </select>
                           </div>
                         </div>
                         {fieldForm.type === 'enum' && (
                           <div className="form-field">
-                            <label>Enum options (comma-separated)</label>
+                            <label>{t('settings.attrEnumOptions')}</label>
                             <input
                               value={fieldForm.enumOptionsCsv}
                               onChange={(e) => setFieldForm({ ...fieldForm, enumOptionsCsv: e.target.value })}
-                              placeholder="Excellent, Good, Fair, Poor"
+                              placeholder={t('settings.attrEnumPh')}
                             />
                           </div>
                         )}
                         <div className="button-group">
-                          <button type="submit" className="primary">{editingCustomFieldId ? 'Save changes' : 'Add attribute'}</button>
+                          <button type="submit" className="primary">{editingCustomFieldId ? t('settings.attrSave') : t('settings.attrAdd')}</button>
                           {editingCustomFieldId && (
-                            <button type="button" className="secondary" onClick={resetCustomFieldForm}>Cancel</button>
+                            <button type="button" className="secondary" onClick={resetCustomFieldForm}>{t('common.cancel')}</button>
                           )}
                         </div>
                       </form>
@@ -3826,18 +4332,18 @@ function App() {
 
                 {/* Duplicate checker */}
                 <div className="card">
-                  <h3>🔎 Duplicate Checker</h3>
+                  <h3>{t('settings.dupHeading')}</h3>
                   <p className="muted small" style={{ marginBottom: '1rem' }}>
-                    Find books that share the same title + author.
+                    {t('settings.dupIntro')}
                   </p>
-                  <button className="secondary" onClick={() => void checkDuplicates()}>Scan for duplicates</button>
+                  <button className="secondary" onClick={() => void checkDuplicates()}>{t('settings.dupScan')}</button>
                 </div>
 
                 {showDuplicatesPanel && duplicateGroups.length > 0 && (
                   <div className="card" style={{ borderLeft: '3px solid var(--warning)' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-                      <strong>⚠️ {duplicateGroups.length} duplicate group{duplicateGroups.length !== 1 ? 's' : ''} found</strong>
-                      <button className="secondary small" onClick={() => setShowDuplicatesPanel(false)}>Close</button>
+                      <strong>{t('settings.dupGroupsFound', { n: duplicateGroups.length, s: duplicateGroups.length !== 1 ? 's' : '' })}</strong>
+                      <button className="secondary small" onClick={() => setShowDuplicatesPanel(false)}>{t('common.close')}</button>
                     </div>
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
                       {duplicateGroups.map((group, i) => (
@@ -3848,7 +4354,7 @@ function App() {
                           <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                             {group.map((entry) => (
                               <li key={entry.id}>
-                                ID: {entry.id.slice(0, 8)}…{entry.isbn ? ` | ISBN: ${entry.isbn}` : ''}
+                                {t('settings.dupId')} {entry.id.slice(0, 8)}…{entry.isbn ? ` | ${t('settings.dupIsbn')} ${entry.isbn}` : ''}
                               </li>
                             ))}
                           </ul>
@@ -3858,12 +4364,220 @@ function App() {
                   </div>
                 )}
 
+                {/* User management (admin-only) */}
+                {isAdmin && (
+                  <div className="card">
+                    <h3>{t('users.title')}</h3>
+                    <p className="muted small" style={{ marginBottom: '0.75rem' }}>{t('users.description')}</p>
+
+                    {staffUsersLoading && staffUsers.length === 0 ? (
+                      <p className="muted small">{t('common.loading')}</p>
+                    ) : staffUsers.length === 0 ? (
+                      <p className="muted small">{t('users.empty')}</p>
+                    ) : (
+                      <div className="cf-list">
+                        {staffUsers.map((u) => {
+                          const isSelf = u.id === currentUser?.id;
+                          const isEditing = editingUserId === u.id;
+                          return (
+                            <div key={u.id} className="cf-row" style={{ flexWrap: 'wrap' }}>
+                              <div className="cf-row-text">
+                                <strong>{u.username}{isSelf ? ` (${t('users.you')})` : ''}</strong>
+                                <span className="muted small">
+                                  {u.active === 1 ? t('users.active') : t('users.inactive')}
+                                  {' · '}{new Date(u.created_at).toLocaleDateString()}
+                                </span>
+                                <span
+                                  className="muted small"
+                                  style={{ display: 'block', marginTop: '0.15rem', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', cursor: 'pointer' }}
+                                  title={t('users.uuidCopy')}
+                                  onClick={() => {
+                                    void navigator.clipboard?.writeText(u.id);
+                                    toast.push('success', t('users.uuidCopied'));
+                                  }}
+                                >
+                                  {t('users.uuid')}: {u.id}
+                                </span>
+                              </div>
+                              <div className="cf-row-actions" style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                                <select
+                                  value={u.role}
+                                  onChange={(e) => void updateStaffUserRole(u, e.target.value as StaffRole)}
+                                  disabled={isSelf}
+                                  aria-label={t('users.role')}
+                                >
+                                  <option value="admin">{t('users.role.admin')}</option>
+                                  <option value="librarian">{t('users.role.librarian')}</option>
+                                  <option value="viewer">{t('users.role.viewer')}</option>
+                                </select>
+                                <button
+                                  className="secondary small"
+                                  onClick={() => void toggleStaffUserActive(u)}
+                                  disabled={isSelf}
+                                >
+                                  {u.active === 1 ? t('users.deactivate') : t('users.activate')}
+                                </button>
+                                <button
+                                  className="secondary small"
+                                  onClick={() => {
+                                    setEditingUserId(isEditing ? null : u.id);
+                                    setEditUserPassword('');
+                                  }}
+                                >{isEditing ? t('common.cancel') : t('users.resetPassword')}</button>
+                                <button
+                                  className="danger small"
+                                  onClick={() => void deleteStaffUser(u)}
+                                  disabled={isSelf}
+                                  title={isSelf ? t('users.cannotDeleteSelf') : undefined}
+                                >{t('common.delete')}</button>
+                              </div>
+                              {isEditing && (
+                                <form
+                                  style={{ flex: '1 1 100%', display: 'flex', gap: '0.4rem', marginTop: '0.5rem' }}
+                                  onSubmit={(e) => { e.preventDefault(); void resetStaffUserPassword(u); }}
+                                >
+                                  <input
+                                    type="password"
+                                    placeholder={t('users.newPasswordPh')}
+                                    value={editUserPassword}
+                                    onChange={(e) => setEditUserPassword(e.target.value)}
+                                    autoComplete="new-password"
+                                    minLength={8}
+                                    required
+                                    style={{ flex: 1 }}
+                                  />
+                                  <button type="submit" className="primary small">{t('users.savePassword')}</button>
+                                </form>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <details className="custom-fields-section" style={{ marginTop: '1rem' }}>
+                      <summary>{t('users.add')}</summary>
+                      <form onSubmit={createStaffUser} className="simple-form" style={{ marginTop: '0.75rem' }}>
+                        <div className="form-row">
+                          <div>
+                            <label>{t('users.username')} *</label>
+                            <input
+                              value={newUserUsername}
+                              onChange={(e) => setNewUserUsername(e.target.value)}
+                              autoComplete="off"
+                              minLength={3}
+                              required
+                            />
+                          </div>
+                          <div>
+                            <label>{t('users.password')} *</label>
+                            <input
+                              type="password"
+                              value={newUserPassword}
+                              onChange={(e) => setNewUserPassword(e.target.value)}
+                              autoComplete="new-password"
+                              minLength={8}
+                              required
+                            />
+                          </div>
+                          <div>
+                            <label>{t('users.role')} *</label>
+                            <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as StaffRole)}>
+                              <option value="admin">{t('users.role.admin')}</option>
+                              <option value="librarian">{t('users.role.librarian')}</option>
+                              <option value="viewer">{t('users.role.viewer')}</option>
+                            </select>
+                          </div>
+                        </div>
+                        <p className="muted small" style={{ marginTop: '0.5rem' }}>{t('users.passwordHint')}</p>
+                        <button type="submit" className="primary small" style={{ marginTop: '0.5rem' }}>{t('users.create')}</button>
+                      </form>
+                    </details>
+                  </div>
+                )}
+
+                {/* Roles & permissions matrix (admin-only) */}
+                {isAdmin && (
+                  <div className="card">
+                    <h3>{t('roles.title')}</h3>
+                    <p className="muted small" style={{ marginBottom: '0.75rem' }}>{t('roles.description')}</p>
+                    {!permissionMatrix ? (
+                      <button
+                        className="secondary small"
+                        onClick={() => void loadPermissionMatrix()}
+                        disabled={permissionMatrixLoading}
+                      >
+                        {permissionMatrixLoading ? t('common.loading') : t('roles.load')}
+                      </button>
+                    ) : (
+                      <>
+                        <div style={{ overflowX: 'auto' }}>
+                          <table className="perm-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
+                            <thead>
+                              <tr>
+                                <th style={{ textAlign: 'left', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('roles.permission')}</th>
+                                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.admin')}</th>
+                                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.librarian')}</th>
+                                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.viewer')}</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {permissionMatrix.catalog.map((perm) => (
+                                <tr key={perm}>
+                                  <td style={{ padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }}>
+                                    <strong>{t(`perm.${perm}` as never)}</strong>
+                                    <div className="muted small">{t(`perm.${perm}.desc` as never)}</div>
+                                  </td>
+                                  <td style={{ textAlign: 'center', padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }} title={t('roles.adminLocked')}>
+                                    <input type="checkbox" checked disabled />
+                                  </td>
+                                  <td style={{ textAlign: 'center', padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={Boolean(permissionMatrix.matrix.librarian[perm])}
+                                      onChange={() => togglePermissionCell('librarian', perm)}
+                                    />
+                                  </td>
+                                  <td style={{ textAlign: 'center', padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={Boolean(permissionMatrix.matrix.viewer[perm])}
+                                      onChange={() => togglePermissionCell('viewer', perm)}
+                                    />
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <p className="muted small" style={{ marginTop: '0.5rem' }}>{t('roles.adminLocked')}</p>
+                        <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.75rem' }}>
+                          <button
+                            className="primary small"
+                            onClick={() => void savePermissionMatrix()}
+                            disabled={permissionMatrixSaving}
+                          >
+                            {permissionMatrixSaving ? t('common.loading') : t('roles.save')}
+                          </button>
+                          <button
+                            className="secondary small"
+                            onClick={() => void loadPermissionMatrix()}
+                            disabled={permissionMatrixSaving}
+                          >
+                            {t('roles.reload')}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
                 {/* Audit log */}
                 {currentUser?.role === 'admin' && (
                   <div className="card">
-                    <h3>📜 Recent Activity (audit log)</h3>
+                    <h3>{t('settings.auditHeading')}</h3>
                     {auditItems.length === 0 ? (
-                      <p className="muted small">No recent activity yet.</p>
+                      <p className="muted small">{t('settings.auditEmpty')}</p>
                     ) : (
                       <div className="audit-list">
                         {auditItems.map((entry) => (
@@ -3881,23 +4595,24 @@ function App() {
                 {/* Maintenance tools */}
                 {currentUser?.role === 'admin' && (
                   <div className="card">
-                    <h3>🧹 Normalize entries</h3>
+                    <h3>{t('settings.normHeading')}</h3>
                     <p className="muted small" style={{ marginBottom: '1rem' }}>
-                      Trim, collapse spaces, and uppercase ISBNs/shelf codes across the entire catalog.
+                      {t('settings.normIntro')}
                     </p>
-                    <button className="secondary" onClick={() => void normalizeAllBooks()}>Run normalization</button>
+                    <button className="secondary" onClick={() => void normalizeAllBooks()}>{t('settings.normRun')}</button>
                   </div>
                 )}
 
                 {/* System info */}
                 <div className="card">
-                  <h3>System</h3>
+                  <h3>{t('settings.system')}</h3>
                   <ul className="system-info">
-                    <li><span>API endpoint</span><code>{API_BASE}</code></li>
-                    <li><span>Signed in as</span><code>{currentUser?.username} ({currentUser?.role})</code></li>
-                    <li><span>Books loaded</span><code>{fmt(totalBooksCount)}</code></li>
-                    <li><span>Catalog field defs</span><code>{customFields.length}</code></li>
-                    <li><span>Theme</span><code>{theme}</code></li>
+                    <li><span>{t('settings.system.api')}</span><code>{API_BASE}</code></li>
+                    <li><span>{t('settings.system.user')}</span><code>{currentUser?.username} ({currentUser?.role})</code></li>
+                    <li><span>{t('settings.system.books')}</span><code>{fmt(totalBooksCount)}</code></li>
+                    <li><span>{t('settings.system.fields')}</span><code>{customFields.length}</code></li>
+                    <li><span>{t('settings.system.theme')}</span><code>{theme}</code></li>
+                    <li><span>{t('settings.system.lang')}</span><code>{lang}</code></li>
                   </ul>
                 </div>
               </>
@@ -3909,7 +4624,7 @@ function App() {
 
       {isWorking && (
         <div className="working-pill" role="status" aria-live="polite">
-          <span className="spinner" /> Working…
+          <span className="spinner" /> {t('app.working')}
         </div>
       )}
     </div>
@@ -3918,11 +4633,13 @@ function App() {
 
 function Root() {
   return (
-    <ToastProvider>
-      <ConfirmProvider>
-        <App />
-      </ConfirmProvider>
-    </ToastProvider>
+    <I18nProvider>
+      <ToastProvider>
+        <ConfirmProvider>
+          <App />
+        </ConfirmProvider>
+      </ToastProvider>
+    </I18nProvider>
   );
 }
 

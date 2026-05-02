@@ -18,7 +18,8 @@ class LibraryScreen extends StatelessWidget {
   final List<Book> books;
   final bool loading;
   final String? error;
-  final VoidCallback onRefresh;
+  // Returns a Future so RefreshIndicator can wait for it.
+  final Future<void> Function() onRefresh;
   final ValueChanged<String> onSearch;
   final VoidCallback onScan;
   final void Function(Book book) onBorrow;
@@ -35,9 +36,10 @@ class LibraryScreen extends StatelessWidget {
         ],
       ),
       body: RefreshIndicator(
-        onRefresh: () async {
-          onRefresh();
-        },
+        // RefreshIndicator's contract is to keep the spinner visible until
+        // the returned Future completes; the previous version returned
+        // immediately so the spinner vanished before refreshBooks() finished.
+        onRefresh: onRefresh,
         child: ListView(
           padding: const EdgeInsets.all(14),
           children: [

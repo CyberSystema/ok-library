@@ -3,11 +3,21 @@ import 'package:flutter/foundation.dart';
 import '../models/book.dart';
 import '../services/api_client.dart';
 import '../services/local_db.dart';
+import '../services/secure_store.dart';
 import '../services/sync_service.dart';
 
 class AppState extends ChangeNotifier {
   AppState()
-      : _apiClient = ApiClient(baseUrl: const String.fromEnvironment('API_BASE', defaultValue: 'http://127.0.0.1:8787')),
+      : _apiClient = ApiClient(
+          baseUrl: const String.fromEnvironment(
+            'API_BASE',
+            // Default to the production API rather than localhost. Local
+            // development can override via `--dart-define=API_BASE=...`. Using
+            // a localhost default in release builds left the app pointing at
+            // an unreachable host on real devices.
+            defaultValue: 'https://ok-library-api.example.workers.dev',
+          ),
+        ),
         _localDb = LocalDb() {
     _syncService = SyncService(localDb: _localDb, apiClient: _apiClient);
   }
@@ -21,21 +31,43 @@ class AppState extends ChangeNotifier {
   String? error;
   List<Book> books = const [];
 
+  /// Restores a previously-saved JWT from secure storage so a returning user
+  /// stays signed in across cold starts. Caller should `await` this before
+  /// the first widget build to avoid a flicker through the login screen.
+  Future<void> restoreSession() async {
+    final saved = await SecureStore.readToken();
+    if (saved == null || saved.isEmpty) return;
+    token = saved;
+    notifyListeners();
+    await refreshBooks();
+  }
+
   Future<void> login(String username, String password) async {
     loading = true;
     error = null;
     notifyListeners();
 
     try {
-      token = await _apiClient.login(username: username, password: password);
+      final issued = await _apiClient.login(username: username, password: password);
+      token = issued;
+      await SecureStore.writeToken(issued);
       await refreshBooks();
       await synchronize();
     } catch (e) {
-      error = e.toString();
+      error = _friendly(e);
     } finally {
       loading = false;
       notifyListeners();
     }
+  }
+
+  Future<void> logout() async {
+    token = null;
+    error = null;
+    books = const [];
+    await SecureStore.deleteToken();
+    await _localDb.clear();
+    notifyListeners();
   }
 
   Future<void> refreshBooks({String query = ''}) async {
@@ -50,6 +82,9 @@ class AppState extends ChangeNotifier {
       await _localDb.upsertBooks(remote);
       books = await _localDb.listBooks(query: query);
     } catch (_) {
+      // Offline / API failure: fall back to whatever is cached locally so the
+      // user can still browse and queue mutations. We deliberately don't
+      // surface this as a user-visible error during refresh.
       books = await _localDb.listBooks(query: query);
     } finally {
       loading = false;
@@ -65,7 +100,7 @@ class AppState extends ChangeNotifier {
       books = await _localDb.listBooks();
       notifyListeners();
     } catch (e) {
-      error = e.toString();
+      error = _friendly(e);
       notifyListeners();
     }
   }
@@ -79,7 +114,7 @@ class AppState extends ChangeNotifier {
       books = await _localDb.listBooks();
       notifyListeners();
     } catch (e) {
-      error = e.toString();
+      error = _friendly(e);
       notifyListeners();
     }
   }
@@ -92,5 +127,24 @@ class AppState extends ChangeNotifier {
   Future<void> queueBorrowBook(String id, Map<String, dynamic> payload) async {
     await _syncService.enqueueBorrowBook(id: id, payload: payload);
     await synchronize();
+  }
+
+  /// Maps low-level errors (HTTP, JSON, socket) to short user-facing strings
+  /// so the UI never surfaces stack traces or internal exception types.
+  static String _friendly(Object e) {
+    final msg = e.toString();
+    if (msg.contains('SocketException') || msg.contains('Failed host lookup')) {
+      return 'No connection. Working from local data.';
+    }
+    if (msg.contains('Login failed')) {
+      return 'Sign-in failed. Check your username and password.';
+    }
+    if (msg.contains('Sync push')) {
+      return 'Could not sync changes. They are saved locally and will retry.';
+    }
+    if (msg.contains('Fetch books')) {
+      return 'Could not refresh the catalogue.';
+    }
+    return 'Something went wrong. Please try again.';
   }
 }

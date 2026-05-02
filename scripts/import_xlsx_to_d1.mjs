@@ -43,7 +43,12 @@ function hasFlag(name) {
 
 function text(value, max = 2000) {
   if (value === null || value === undefined) return null;
-  const t = String(value).trim();
+  // NFC-normalize on entry. Korean (Hangul), Greek tonos, and Cyrillic data
+  // routinely arrive in mixed normalization forms from Excel — joining
+  // composed and decomposed forms breaks deduplication, search, and ISBN
+  // lookups. Applying NFC at the boundary keeps the database in a single
+  // canonical form so equality comparisons behave predictably.
+  const t = String(value).normalize('NFC').trim();
   if (!t) return null;
   return t.length > max ? t.slice(0, max) : t;
 }
@@ -454,7 +459,13 @@ function main() {
 
     console.log(`\n📚 Upserting ${rows.length} books in ${batches.length} batches of ~${batchSize}…`);
     for (let i = 0; i < batches.length; i += 1) {
-      const sql = batches[i].map(makeCatalogUpsertSql).join('\n');
+      // Wrap each batch in a single transaction so a malformed row in the
+      // middle of a batch rolls back the whole batch instead of leaving the
+      // database half-imported. We don't span batches with one transaction
+      // because a long-running write transaction can hit D1's per-request
+      // size limits and would also block other writers.
+      const inner = batches[i].map(makeCatalogUpsertSql).join('\n');
+      const sql = `BEGIN;\n${inner}\nCOMMIT;`;
       console.log(`  batch ${i + 1}/${batches.length}  (${batches[i].length} rows)`);
       runD1Sql(sql, remote);
     }
@@ -485,7 +496,8 @@ function main() {
   const batches = [];
   for (let i = 0; i < rows.length; i += batchSize) batches.push(rows.slice(i, i + batchSize));
   for (let i = 0; i < batches.length; i += 1) {
-    const sql = batches[i].map(makeLegacyInsertSql).join('\n');
+    const inner = batches[i].map(makeLegacyInsertSql).join('\n');
+    const sql = `BEGIN;\n${inner}\nCOMMIT;`;
     console.log(`  batch ${i + 1}/${batches.length}  (${batches[i].length} rows)`);
     runD1Sql(sql, remote);
   }
