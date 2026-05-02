@@ -391,6 +391,7 @@ label {
   font-weight: 700;
   color: white;
   flex-shrink: 0;
+  -webkit-user-select: none;
   user-select: none;
 }
 .book-card-body { flex: 1; min-width: 0; }
@@ -690,6 +691,7 @@ label {
   position: fixed;
   inset: 0;
   background: rgba(15,23,42,0.55);
+  -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
   z-index: 200;
   display: flex;
@@ -882,6 +884,7 @@ label {
   letter-spacing: 0.04em;
   color: var(--text-muted);
   padding: 0.25rem 0;
+  -webkit-user-select: none;
   user-select: none;
 }
 .custom-fields-section summary:hover { color: var(--accent); }
@@ -1010,6 +1013,7 @@ label {
   font-size: 0.8125rem;
   color: var(--text);
   transition: background-color 0.1s;
+  -webkit-user-select: none;
   user-select: none;
   background: transparent;
   border: 0;
