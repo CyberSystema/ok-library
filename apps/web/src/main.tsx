@@ -478,6 +478,10 @@ function App() {
   });
   const [attributeEditorValues, setAttributeEditorValues] = useState<Record<string, unknown>>({});
   const [selectedBookIds, setSelectedBookIds] = useState<string[]>([]);
+  // When false, per-row checkboxes are hidden. The user must click "Select"
+  // in the section header to enter selection mode. This keeps the default
+  // browsing surface uncluttered — nothing is selectable until requested.
+  const [selectionMode, setSelectionMode] = useState(false);
   const [detailBook, setDetailBook] = useState<Book | null>(null);
   const [detailMode, setDetailMode] = useState<'view' | 'edit'>('view');
   const [showAddBook, setShowAddBook] = useState(false);
@@ -3380,6 +3384,26 @@ function App() {
                         {showAddBook ? t('library.cancelAdd') : t('library.addBook')}
                       </button>
                     )}
+                    {canWrite && (
+                      <button
+                        className={`small ${selectionMode ? 'primary' : 'secondary'}`}
+                        onClick={() => {
+                          setSelectionMode((v) => {
+                            // Leaving selection mode also clears any pending
+                            // selection, so nothing lingers when the user
+                            // returns to normal browsing.
+                            if (v) setSelectedBookIds([]);
+                            return !v;
+                          });
+                        }}
+                        aria-pressed={selectionMode}
+                        title={selectionMode ? t('library.select.exit') : t('library.select.enter')}
+                      >
+                        {selectionMode
+                          ? t('library.select.done', { n: selectedBookIds.length })
+                          : t('library.select.start')}
+                      </button>
+                    )}
                     <button className="secondary small" onClick={exportFilteredBooksCsv}>{t('library.exportCsv')}</button>
                   </div>
                 </div>
@@ -3792,7 +3816,7 @@ function App() {
                 </div>
 
                 {/* Bulk action bar — only visible when at least one book is selected. */}
-                {canWrite && selectedBookIds.length > 0 && (
+                {canWrite && selectionMode && selectedBookIds.length > 0 && (
                   <div className="bulk-bar" role="region" aria-label={t('library.bulk.aria')}>
                     <div className="bulk-bar-info">
                       <strong>{selectedBookIds.length} </strong>
@@ -3880,11 +3904,27 @@ function App() {
                           return (
                             <div
                               key={book.id}
-                              className={`${density === 'compact' ? 'book-row' : 'book-card'}${isSelected ? ' is-selected' : ''}`}
-                              onClick={() => openBookDetail(book)}
+                              className={`${density === 'compact' ? 'book-row' : 'book-card'}${isSelected ? ' is-selected' : ''}${selectionMode ? ' is-selecting' : ''}`}
+                              onClick={() => {
+                                // In selection mode the whole row acts as the
+                                // checkbox so users don't have to aim for a tiny target.
+                                if (selectionMode && canWrite) {
+                                  toggleBookSelection(book.id);
+                                } else {
+                                  openBookDetail(book);
+                                }
+                              }}
                               role="button"
                               tabIndex={0}
-                              onKeyDown={(e) => e.key === 'Enter' && openBookDetail(book)}
+                              onKeyDown={(e) => {
+                                if (e.key !== 'Enter' && e.key !== ' ') return;
+                                e.preventDefault();
+                                if (selectionMode && canWrite) {
+                                  toggleBookSelection(book.id);
+                                } else {
+                                  openBookDetail(book);
+                                }
+                              }}
                             >
                               <input
                                 type="checkbox"
@@ -3893,7 +3933,7 @@ function App() {
                                 onChange={(e) => { e.stopPropagation(); toggleBookSelection(book.id); }}
                                 onClick={(e) => e.stopPropagation()}
                                 aria-label={t('library.book.selectAria', { title: displayTitle(book) })}
-                                style={canWrite ? undefined : { display: 'none' }}
+                                style={canWrite && selectionMode ? undefined : { display: 'none' }}
                               />
                               {book.coverUrl ? (
                                 <img

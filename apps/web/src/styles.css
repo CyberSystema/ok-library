@@ -1344,6 +1344,10 @@ label {
   box-shadow: 0 0 0 2px var(--accent-light);
 }
 .book-row .book-select { position: static; align-self: center; margin-right: 0.25rem; }
+.book-card.is-selecting, .book-row.is-selecting { cursor: copy; }
+.book-card.is-selecting:hover, .book-row.is-selecting:hover {
+  background: var(--surface-2);
+}
 
 /* ================== SEARCH HIGHLIGHT ================== */
 mark.hl {

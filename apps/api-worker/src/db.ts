@@ -467,8 +467,29 @@ export async function queryBooksWithFilters(
   for (const filter of opts.customFilters) {
     // json_extract validates the path; key is constrained to [a-zA-Z0-9_] in custom_field schema.
     if (!/^[a-zA-Z0-9_]+$/.test(filter.key)) continue;
-    where.push(`json_extract(b.custom_fields, '$.${filter.key}') = ?`);
-    values.push(filter.value);
+    // Normalize boolean string values so '1'/'true'/'yes' and '0'/'false'/'no'
+    // both match JSON booleans (which json_extract returns as int 0/1) and
+    // legacy text values. We CAST the extracted value to TEXT so SQLite's
+    // strict type affinity doesn't make `1 = '1'` evaluate to false.
+    const raw = String(filter.value).trim();
+    const lower = raw.toLowerCase();
+    const truthy = ['1', 'true', 'yes', 'y'].includes(lower);
+    const falsy = ['0', 'false', 'no', 'n'].includes(lower);
+    if (truthy || falsy) {
+      where.push(
+        `CAST(json_extract(b.custom_fields, '$.${filter.key}') AS TEXT) IN (?, ?)`
+      );
+      if (truthy) {
+        values.push('1', 'true');
+      } else {
+        values.push('0', 'false');
+      }
+    } else {
+      where.push(
+        `CAST(json_extract(b.custom_fields, '$.${filter.key}') AS TEXT) = ?`
+      );
+      values.push(raw);
+    }
   }
 
   const fuzzyEnabled = Boolean(opts.fuzzyTypos) && qText.length > 0 && opts.qMode !== 'exact';
