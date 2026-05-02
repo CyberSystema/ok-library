@@ -2898,27 +2898,27 @@ function App() {
               {detailMode === 'view' ? (
                 <>
                   {canWrite && (
-                    <button className="secondary small" onClick={startEditFromDetail}>✏️ {t('detail.editBtn')}</button>
+                    <button className="secondary small" onClick={startEditFromDetail}>{t('detail.editBtn')}</button>
                   )}
                   {canWrite && detailBook.status === 'available' && (
                     <button className="primary small" onClick={() => {
                       setSelectedBook(detailBook);
                       setCurrentSection('circulation');
                       closeDetail();
-                    }}>📤 {t('detail.borrowBtn')}</button>
+                    }}>{t('detail.borrowBtn')}</button>
                   )}
                   {canWrite && detailBook.status === 'borrowed' && (
                     <button className="secondary small" onClick={() => { void returnBook(detailBook); closeDetail(); }}>
-                      📥 {t('detail.returnBtn')}
+                      {t('detail.returnBtn')}
                     </button>
                   )}
-                  <button className="secondary small" onClick={() => void printLabels([detailBook])}>🖨 {t('detail.labelBtn')}</button>
+                  <button className="secondary small" onClick={() => void printLabels([detailBook])}>{t('detail.labelBtn')}</button>
                   {canDelete && (
-                    <button className="danger small" onClick={() => void deleteBook(detailBook)}>🗑 {t('detail.deleteBtn')}</button>
+                    <button className="danger small" onClick={() => void deleteBook(detailBook)}>{t('detail.deleteBtn')}</button>
                   )}
                 </>
               ) : (
-                <button className="secondary small" onClick={() => setDetailMode('view')}>← {t('detail.backBtn')}</button>
+                <button className="secondary small" onClick={() => setDetailMode('view')}>{t('detail.backBtn')}</button>
               )}
             </div>
 
