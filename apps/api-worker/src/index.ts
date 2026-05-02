@@ -1538,7 +1538,7 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 	return c.json({ importedRows, skippedRows }, 201);
 });
 
-app.get('/api/export/books.csv', async (c) => {
+app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: true }), async (c) => {
 	const where: string[] = ['deleted_at IS NULL'];
 	const values: unknown[] = [];
 
@@ -2375,6 +2375,8 @@ const PERMISSION_KEYS = [
 	'rooms.write',
 	'rooms.delete',
 	'customFields.manage',
+	'labels.print',
+	'export.csv',
 	'import',
 	'setup',
 	'circulation',
@@ -2392,7 +2394,9 @@ const DEFAULT_PERMS: Record<'librarian' | 'viewer', Record<PermissionKey, boolea
 		'books.delete': false,
 		'rooms.write': true,
 		'rooms.delete': false,
-		'customFields.manage': false,
+		'customFields.manage': true,
+		'labels.print': true,
+		'export.csv': true,
 		'import': false,
 		'setup': false,
 		'circulation': true,
@@ -2405,6 +2409,8 @@ const DEFAULT_PERMS: Record<'librarian' | 'viewer', Record<PermissionKey, boolea
 		'rooms.write': false,
 		'rooms.delete': false,
 		'customFields.manage': false,
+		'labels.print': false,
+		'export.csv': false,
 		'import': false,
 		'setup': false,
 		'circulation': false,

@@ -663,6 +663,9 @@ function App() {
   const canWrite = can('books.write');
   const canDelete = can('books.delete');
   const canImport = can('import');
+  const canPrintLabels = can('labels.print');
+  const canExportCsv = can('export.csv');
+  const canManageCustomFields = isAdmin || can('customFields.manage');
   const canSeeSettings = isAdmin || can('settings');
   const canSeeDashboard = isAdmin || can('dashboard');
   const canSeeCirculation = isAdmin || can('circulation');
@@ -2912,7 +2915,9 @@ function App() {
                       {t('detail.returnBtn')}
                     </button>
                   )}
-                  <button className="secondary small" onClick={() => void printLabels([detailBook])}>{t('detail.labelBtn')}</button>
+                  {canPrintLabels && (
+                    <button className="secondary small" onClick={() => void printLabels([detailBook])}>{t('detail.labelBtn')}</button>
+                  )}
                   {canDelete && (
                     <button className="danger small" onClick={() => void deleteBook(detailBook)}>{t('detail.deleteBtn')}</button>
                   )}
@@ -3404,7 +3409,9 @@ function App() {
                           : t('library.select.start')}
                       </button>
                     )}
-                    <button className="secondary small" onClick={exportFilteredBooksCsv}>{t('library.exportCsv')}</button>
+                    {canExportCsv && (
+                      <button className="secondary small" onClick={exportFilteredBooksCsv}>{t('library.exportCsv')}</button>
+                    )}
                   </div>
                 </div>
 
@@ -3843,13 +3850,15 @@ function App() {
                         onClick={() => void applyBulkBookChanges()}
                         disabled={!bulkStatus && !bulkShelfCode.trim()}
                       >{t('common.apply')}</button>
-                      <button
-                        className="secondary small"
-                        onClick={() => {
-                          const targets = books.filter((b) => selectedBookIds.includes(b.id));
-                          void printLabels(targets);
-                        }}
-                      >{t('library.bulk.labels')}</button>
+                      {canPrintLabels && (
+                        <button
+                          className="secondary small"
+                          onClick={() => {
+                            const targets = books.filter((b) => selectedBookIds.includes(b.id));
+                            void printLabels(targets);
+                          }}
+                        >{t('library.bulk.labels')}</button>
+                      )}
                       <button
                         className="danger small"
                         onClick={async () => {
@@ -4233,13 +4242,15 @@ function App() {
                   </form>
                 </div>
 
-                <div className="card">
-                  <h3>{t('import.exportHeading')}</h3>
-                  <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
-                    {t('import.exportIntro')}
-                  </p>
-                  <button className="secondary" onClick={exportCsv}>{t('import.downloadCsv')}</button>
-                </div>
+                {canExportCsv && (
+                  <div className="card">
+                    <h3>{t('import.exportHeading')}</h3>
+                    <p className="muted" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
+                      {t('import.exportIntro')}
+                    </p>
+                    <button className="secondary" onClick={exportCsv}>{t('import.downloadCsv')}</button>
+                  </div>
+                )}
 
                 <div className="card">
                   <h3>{t('import.setupHeading')}</h3>
@@ -4289,7 +4300,7 @@ function App() {
                               {f.type === 'enum' && f.enumOptions.length > 0 ? ` ${t('settings.optionsSuffix', { n: f.enumOptions.length })}` : ''}
                             </span>
                           </div>
-                          {currentUser?.role === 'admin' && (
+                          {canManageCustomFields && (
                             <div className="cf-row-actions">
                               <button className="secondary small" onClick={() => beginCustomFieldEdit(f)}>{t('common.edit')}</button>
                               <button className="danger small" onClick={() => void deleteCustomField(f)}>{t('common.delete')}</button>
@@ -4300,7 +4311,7 @@ function App() {
                     </div>
                   )}
 
-                  {currentUser?.role === 'admin' && (
+                  {canManageCustomFields && (
                     <details className="custom-fields-section" open={Boolean(editingCustomFieldId)} style={{ marginTop: '1rem' }}>
                       <summary>{editingCustomFieldId ? t('settings.editAttr') : t('settings.addAttr')}</summary>
                       <form onSubmit={saveCustomField} className="simple-form" style={{ marginTop: '0.75rem' }}>
