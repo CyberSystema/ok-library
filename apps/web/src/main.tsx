@@ -1711,6 +1711,12 @@ function App() {
     if (!bookId) {
       return;
     }
+    // Viewers don't have circulation access; skip the fetch (also avoids
+    // surfacing a 403 toast when opening a book detail).
+    if (!canSeeCirculation) {
+      setBookHistory([]);
+      return;
+    }
 
     // Drop responses for books the user has already navigated away from.
     // Without this guard, switching detail panes quickly can leave the wrong
@@ -3041,6 +3047,7 @@ function App() {
                   )}
 
                   {/* Borrow History */}
+                  {canSeeCirculation && (
                   <div className="detail-section">
                     <div className="detail-section-title">{t('detail.history')}</div>
                     {bookHistory.length === 0 ? (
@@ -3062,6 +3069,7 @@ function App() {
                       </div>
                     )}
                   </div>
+                  )}
                 </>
               ) : (
                 /* ── Edit Mode ── */

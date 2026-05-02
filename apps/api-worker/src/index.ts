@@ -892,7 +892,7 @@ app.post('/api/books/:id/return', requirePermission('books.write', { librarian: 
 	return c.json({ transactionId: tx.id, returnedAt: now });
 });
 
-app.get('/api/books/:id/history', async (c) => {
+app.get('/api/books/:id/history', requirePermission('circulation', { librarian: true }), async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
 		throw new HTTPException(400, { message: 'Missing book id' });
