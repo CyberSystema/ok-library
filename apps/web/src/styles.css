@@ -122,6 +122,20 @@ label {
 .app-shell { min-height: 100vh; }
 .app-shell[aria-busy="true"] { opacity: 0.65; pointer-events: none; }
 
+/* Offline banner: shown at the very top while serving cached data. */
+.offline-banner {
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+  padding: 0.5rem 1rem;
+  background: var(--warning, #f59e0b);
+  color: #1f2937;
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-align: center;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+}
+
 /* ================== SPLASH SCREEN ================== */
 .splash-overlay {
   position: fixed;

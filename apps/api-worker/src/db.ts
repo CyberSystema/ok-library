@@ -585,23 +585,61 @@ async function runFuzzyFiltered(
     useFtsJoin: boolean;
   }
 ): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
+  // Build a permissive SQL LIKE pre-filter so substring matches *always*
+  // surface even when the catalog has more rows than the candidate cap. For
+  // each query token we OR a `%token%` (catches exact-substring hits) and a
+  // `%prefix%` (catches tail typos within the configured Levenshtein
+  // threshold) across every active field. Tokens combine with AND for
+  // qMode='all' (default) or OR for qMode='any'.
+  //
+  // The Worker-side Levenshtein step still runs against the resulting set so
+  // mid-word typos are also caught — but the SQL gate prevents the previous
+  // bug where a book that matched exactly was simply outside the 5000-row
+  // window taken from the structurally-filtered candidate set.
+  const tokens = parseSearchTokens(ctx.qText.toLowerCase());
+
+  const where = [...ctx.where];
+  const values = [...ctx.values];
+  const fieldExprs = ctx.activeFields
+    .map((f) => SQL_FIELD_EXPR[f])
+    .filter((expr): expr is string => Boolean(expr));
+  if (tokens.length > 0 && fieldExprs.length > 0) {
+    const perTokenSql: string[] = [];
+    for (const token of tokens) {
+      const threshold = typoThreshold(token);
+      const prefixLen = Math.max(2, token.length - threshold);
+      const prefix = token.slice(0, prefixLen);
+      const orParts: string[] = [];
+      for (const expr of fieldExprs) {
+        orParts.push(`LOWER(${expr}) LIKE ?`);
+        values.push(`%${token}%`);
+        if (prefix && prefix !== token) {
+          orParts.push(`LOWER(${expr}) LIKE ?`);
+          values.push(`%${prefix}%`);
+        }
+      }
+      perTokenSql.push(`(${orParts.join(' OR ')})`);
+    }
+    const joiner = ctx.qMode === 'any' ? ' OR ' : ' AND ';
+    where.push(`(${perTokenSql.join(joiner)})`);
+  }
+
   // Higher cap is safe because fuzzy mode no longer rides on top of an FTS
   // MATCH constraint — the candidates here are the structurally-filtered set
-  // (status, language, year, …) and we Levenshtein-filter them in the Worker.
+  // (status, language, year, plus the per-token LIKE gate above).
   const FUZZY_CANDIDATE_CAP = 5000;
   const fromClause = ctx.useFtsJoin
     ? 'books b JOIN books_fts ON books_fts.rowid = b.ROWID'
     : 'books b';
-  const whereSql = `WHERE ${ctx.where.join(' AND ')}`;
+  const whereSql = `WHERE ${where.join(' AND ')}`;
 
   const candidateStmt = env.DB.prepare(
     `SELECT b.* FROM ${fromClause} ${whereSql}
      ORDER BY b.${ctx.sortColumn} ${ctx.sortDir}, b.id DESC LIMIT ?`
-  ).bind(...ctx.values, FUZZY_CANDIDATE_CAP);
+  ).bind(...values, FUZZY_CANDIDATE_CAP);
   const res = await candidateStmt.all();
   const rows = ((res.results ?? []) as Array<Record<string, unknown>>).map(parseBook);
 
-  const tokens = parseSearchTokens(ctx.qText.toLowerCase());
   const filtered = rows.filter((row) => fuzzyRowMatches(row, tokens, ctx.activeFields, ctx.qMode));
 
   const paged = filtered.slice(ctx.offset, ctx.offset + ctx.limit);
@@ -609,7 +647,11 @@ async function runFuzzyFiltered(
 }
 
 function splitWords(text: string): string[] {
-  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  // Split on any non-letter/non-number character. The Unicode `\p{L}` and
+  // `\p{N}` classes ensure Greek / Korean / Cyrillic / etc. tokens are
+  // preserved (the previous `[a-z0-9]` regex stripped non-ASCII entirely,
+  // which made fuzzy match silently fail on non-Latin titles).
+  return text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
 }
 
 function levenshtein(a: string, b: string): number {
@@ -677,6 +719,23 @@ export async function withTxn<T>(env: Env, fn: () => Promise<T>): Promise<T> {
     await env.DB.exec('ROLLBACK');
     throw error;
   }
+}
+
+/**
+ * D1's only guaranteed-atomic primitive. All prepared statements in the array
+ * succeed together or none do; D1 wraps them in a single SQLite transaction
+ * server-side. Prefer this over `withTxn` for any multi-statement write — the
+ * BEGIN/COMMIT pattern in `withTxn` is best-effort under the Workers binding
+ * and may not actually roll back on failure.
+ *
+ * Returns the per-statement results in the same order.
+ */
+export async function runAtomic<T = unknown>(
+  env: Env,
+  statements: D1PreparedStatement[]
+): Promise<D1Result<T>[]> {
+  if (statements.length === 0) return [];
+  return env.DB.batch<T>(statements);
 }
 
 export async function recordSyncMutation(

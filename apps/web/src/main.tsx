@@ -12,6 +12,7 @@ import {
   useToast
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
+import { cacheGet, cacheSet, cacheBustPrefixes, cacheClear } from './cache';
 import './styles.css';
 
 // Lazy-loaded only when the user opens the Import tab — saves ~1MB from the initial bundle.
@@ -264,6 +265,41 @@ class ApiRequestError extends Error {
   }
 }
 
+/**
+ * Thrown synchronously (before fetch) when the user attempts a write
+ * (POST/PUT/PATCH/DELETE) while the browser reports it is offline. We refuse
+ * to even attempt the request because queuing offline writes would risk
+ * silent conflicts and data loss in the remote D1 — the source of truth.
+ */
+class OfflineWriteBlockedError extends Error {
+  constructor(message = 'You are offline. Please reconnect before saving changes.') {
+    super(message);
+    this.name = 'OfflineWriteBlockedError';
+  }
+}
+
+function isOfflineWriteBlockedError(err: unknown): err is OfflineWriteBlockedError {
+  return err instanceof OfflineWriteBlockedError;
+}
+
+/** Generate a v4-ish UUID without crypto.randomUUID (Safari < 15.4 fallback). */
+function newMutationId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  // RFC4122 v4 fallback
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function isPayloadTooLargeError(error: unknown): boolean {
   if (!(error instanceof ApiRequestError)) {
     return false;
@@ -276,45 +312,184 @@ function isPayloadTooLargeError(error: unknown): boolean {
   return /too big|payload|entity too large|request too large/i.test(error.message);
 }
 
+// Cache-bust families: keys whose paths start with any of these are
+// invalidated after a mutation succeeds. We list both the singular and
+// related collection paths so e.g. POSTing /api/borrow/return also clears
+// /api/books and /api/stats which depend on borrow state.
+const CACHE_BUST_FAMILIES = [
+  'GET /api/books',
+  'GET /api/custom-fields',
+  'GET /api/rooms',
+  'GET /api/categories',
+  'GET /api/stats',
+  'GET /api/borrow',
+  'GET /api/borrowers',
+  'GET /api/needs-review-count',
+  'GET /api/audit-logs',
+  'GET /api/users'
+];
+
+// Simple network-status signal so the UI can surface a banner when we're
+// serving cached data instead of a fresh response. Updated whenever a GET
+// either uses the cache as a fallback or successfully revalidates.
+type NetStatus = 'online' | 'offline';
+let lastNetStatus: NetStatus = 'online';
+const netListeners = new Set<(s: NetStatus) => void>();
+function setNetStatus(next: NetStatus) {
+  if (next === lastNetStatus) return;
+  lastNetStatus = next;
+  for (const fn of netListeners) {
+    try { fn(next); } catch { /* ignore listener errors */ }
+  }
+}
+function subscribeNetStatus(fn: (s: NetStatus) => void): () => void {
+  netListeners.add(fn);
+  fn(lastNetStatus);
+  return () => netListeners.delete(fn);
+}
+
+function isLikelyNetworkError(err: unknown): boolean {
+  // `fetch` throws a TypeError when the connection itself fails (DNS, CORS
+  // preflight blocked, offline, server unreachable). HTTP error responses
+  // come back as our `ApiRequestError` and must NOT trigger cache fallback.
+  return err instanceof TypeError;
+}
+
 async function apiRequest<T>(
   path: string,
   init?: RequestInit,
   raw = false
 ): Promise<T> {
-  const response = await fetch(joinApiUrl(path), {
-    ...init,
-    credentials: 'include',
-    headers: {
-      ...(raw ? {} : { 'Content-Type': 'application/json' }),
-      ...(init?.headers ?? {})
-    }
-  });
+  const method = (init?.method ?? 'GET').toUpperCase();
+  const isWrite = method !== 'GET' && method !== 'HEAD';
+  const cacheKey = method === 'GET' && !raw ? `GET ${path}` : null;
 
-  if (!response.ok) {
-    const responseText = await response.text();
-    const errorBody = (() => {
-      try {
-        return JSON.parse(responseText) as { error?: string; requestId?: string };
-      } catch {
-        return { error: response.statusText };
+  // Hard-block writes while offline. We refuse to even attempt the fetch so
+  // the user sees an immediate, explicit error instead of a confusing
+  // "TypeError" mid-save and never has the impression a write succeeded
+  // when it did not. This is intentional: writes go to the remote D1 only.
+  if (isWrite && typeof navigator !== 'undefined' && navigator.onLine === false) {
+    setNetStatus('offline');
+    throw new OfflineWriteBlockedError();
+  }
+
+  // Idempotency: every write gets a stable client-generated id. The server
+  // stores `(id -> response)` in `mutation_log` so retries after a lost
+  // response (network drop between server commit and client ACK) return
+  // the original result instead of double-applying the mutation.
+  const mutationId = isWrite ? newMutationId() : null;
+
+  // Retry policy for writes only. GETs are handled by the cache fallback.
+  // We retry on connection failures (TypeError) and transient server states
+  // (408/425/429/5xx). We do NOT retry on 4xx (except 408/425/429) because
+  // those are deterministic client errors — retrying would just fail again.
+  const maxAttempts = isWrite ? 4 : 1;
+  const baseDelayMs = 400;
+
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(joinApiUrl(path), {
+        ...init,
+        credentials: 'include',
+        headers: {
+          ...(raw ? {} : { 'Content-Type': 'application/json' }),
+          ...(mutationId ? { 'X-Client-Mutation-Id': mutationId } : {}),
+          ...(init?.headers ?? {})
+        }
+      });
+    } catch (err) {
+      lastErr = err;
+      // Connection-level failure. For cached GETs we degrade gracefully and
+      // return the last successful response so the UI can keep working.
+      if (cacheKey && isLikelyNetworkError(err)) {
+        const cached = await cacheGet<T>(cacheKey);
+        if (cached) {
+          setNetStatus('offline');
+          return cached.value;
+        }
       }
-    })();
-
-    if (response.status === 401) {
-      throw new ApiRequestError(401, 'Session expired. Please sign in again.');
+      // For writes, retry transient connection failures with backoff.
+      if (isWrite && isLikelyNetworkError(err) && attempt < maxAttempts) {
+        await sleep(backoffDelay(baseDelayMs, attempt));
+        continue;
+      }
+      // Surface as offline before bubbling so the UI flips its banner.
+      if (isLikelyNetworkError(err)) setNetStatus('offline');
+      throw err;
     }
 
-    const message = errorBody.requestId
-      ? `${errorBody.error ?? `Request failed with status ${response.status}`} (ref: ${errorBody.requestId})`
-      : (errorBody.error ?? `Request failed with status ${response.status}`);
-    throw new ApiRequestError(response.status, message);
+    if (!response.ok) {
+      // Retry transient server errors for writes only.
+      const transient = response.status === 408 || response.status === 425
+        || response.status === 429 || response.status >= 500;
+      if (isWrite && transient && attempt < maxAttempts) {
+        // Drain body so the connection can be reused.
+        try { await response.text(); } catch { /* ignore */ }
+        await sleep(backoffDelay(baseDelayMs, attempt, response.headers.get('retry-after')));
+        continue;
+      }
+
+      const responseText = await response.text();
+      const errorBody = (() => {
+        try {
+          return JSON.parse(responseText) as { error?: string; requestId?: string };
+        } catch {
+          return { error: response.statusText };
+        }
+      })();
+
+      if (response.status === 401) {
+        throw new ApiRequestError(401, 'Session expired. Please sign in again.');
+      }
+
+      const message = errorBody.requestId
+        ? `${errorBody.error ?? `Request failed with status ${response.status}`} (ref: ${errorBody.requestId})`
+        : (errorBody.error ?? `Request failed with status ${response.status}`);
+      throw new ApiRequestError(response.status, message);
+    }
+
+    if (raw) {
+      setNetStatus('online');
+      return (await response.text()) as T;
+    }
+
+    const payload = (await response.json()) as T;
+    setNetStatus('online');
+
+    // Persist successful GETs to cache (fire-and-forget) and invalidate
+    // cached entries after any successful mutation. Both run after the value
+    // is parsed so failures here can't fail the request itself.
+    if (cacheKey) {
+      void cacheSet(cacheKey, payload);
+    } else if (isWrite) {
+      void cacheBustPrefixes(CACHE_BUST_FAMILIES);
+    }
+
+    return payload;
   }
 
-  if (raw) {
-    return (await response.text()) as T;
-  }
+  // All retries exhausted.
+  throw lastErr instanceof Error ? lastErr : new Error('Request failed');
+}
 
-  return (await response.json()) as T;
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Exponential backoff with jitter and respect for an HTTP `Retry-After`
+ * header (seconds). attempt is 1-based.
+ */
+function backoffDelay(baseMs: number, attempt: number, retryAfter?: string | null): number {
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds * 1000, 10_000);
+  }
+  const exp = baseMs * Math.pow(3, attempt - 1); // 400, 1200, 3600, 10800
+  const jitter = Math.random() * baseMs;
+  return Math.min(exp + jitter, 10_000);
 }
 
 function StatCard({ title, value, subtitle }: { title: string; value: string | number; subtitle: string }) {
@@ -498,6 +673,23 @@ function App() {
   const splashActiveRef = useRef(false);
   const [showSplash, setShowSplash] = useState(false);
   const [splashHiding, setSplashHiding] = useState(false);
+  // Reflects whether the most-recent network call hit the server (`online`)
+  // or had to fall back to the IndexedDB cache (`offline`). Drives the
+  // banner that informs librarians they're working with stale data.
+  const [netStatus, setNetStatusUI] = useState<NetStatus>('online');
+  useEffect(() => subscribeNetStatus(setNetStatusUI), []);
+  // Browser-level offline events flip us back to "offline" immediately so
+  // we don't have to wait for the next failing fetch to update the UI.
+  useEffect(() => {
+    const onOffline = () => setNetStatusUI('offline');
+    const onOnline = () => setNetStatusUI('online');
+    window.addEventListener('offline', onOffline);
+    window.addEventListener('online', onOnline);
+    return () => {
+      window.removeEventListener('offline', onOffline);
+      window.removeEventListener('online', onOnline);
+    };
+  }, []);
   const queuedToastsRef = useRef<Array<{ type: 'success' | 'error'; text: string }>>([]);
 
   const pushAppToast = useCallback((type: 'success' | 'error', text: string) => {
@@ -1172,30 +1364,35 @@ function App() {
   }
 
   async function loadStats() {
+    const cached = await cacheGet<StatsResponse>('GET /api/stats');
+    if (cached) setStats(cached.value);
     try {
       const response = await apiRequest<StatsResponse>('/api/stats');
       setStats(response);
     } catch {
-      setStats(null);
+      if (!cached) setStats(null);
     }
   }
 
   async function loadCategories() {
+    const cached = await cacheGet<{ items: CategoryItem[] }>('GET /api/categories');
+    if (cached) setCategories(cached.value.items ?? []);
     try {
       const response = await apiRequest<{ items: CategoryItem[] }>('/api/categories');
       setCategories(response.items ?? []);
     } catch {
-      // Best-effort: a stale category rail isn't worth blocking the UI for.
-      setCategories([]);
+      if (!cached) setCategories([]);
     }
   }
 
   async function loadNeedsReviewCount() {
+    const cached = await cacheGet<{ count: number }>('GET /api/needs-review-count');
+    if (cached) setNeedsReviewCount(cached.value.count ?? 0);
     try {
       const response = await apiRequest<{ count: number }>('/api/needs-review-count');
       setNeedsReviewCount(response.count ?? 0);
     } catch {
-      setNeedsReviewCount(0);
+      if (!cached) setNeedsReviewCount(0);
     }
   }
 
@@ -1224,6 +1421,10 @@ function App() {
     } catch {
       // Keep sign-out resilient even if network request fails.
     }
+
+    // Wipe the local response cache so the next user (or re-login) cannot
+    // see another account's data even briefly.
+    void cacheClear();
 
     setCurrentUser(null);
     setDidBootstrapData(false);
@@ -1344,12 +1545,21 @@ function App() {
       query.set('page', page.toString());
       query.set('pageSize', String(PAGE_SIZE));
 
-      const response = await apiRequest<{ items: Book[]; total: number }>(`/api/books?${query.toString()}`);
-      setBooks(response.items);
-      setTotalBooksCount(response.total);
-      setCurrentPage(page);
-    } catch (e) {
-      setError((e as Error).message);
+      const cacheKey = `GET /api/books?${query.toString()}`;
+      const cached = await cacheGet<{ items: Book[]; total: number }>(cacheKey);
+      if (cached) {
+        setBooks(cached.value.items);
+        setTotalBooksCount(cached.value.total);
+        setCurrentPage(page);
+      }
+      try {
+        const response = await apiRequest<{ items: Book[]; total: number }>(`/api/books?${query.toString()}`);
+        setBooks(response.items);
+        setTotalBooksCount(response.total);
+        setCurrentPage(page);
+      } catch (e) {
+        if (!cached) setError((e as Error).message);
+      }
     } finally {
       setIsLoadingBooks(false);
     }
@@ -1382,39 +1592,49 @@ function App() {
   ]);
 
   async function loadCustomFields() {
+    const cached = await cacheGet<{ items: CustomField[] }>('GET /api/custom-fields');
+    if (cached) setCustomFields(cached.value.items);
     try {
       const response = await apiRequest<{ items: CustomField[] }>('/api/custom-fields');
       setCustomFields(response.items);
     } catch (e) {
-      setError((e as Error).message);
+      if (!cached) setError((e as Error).message);
     }
   }
 
   async function loadRoomSummary() {
+    type RoomSummaryResponse = {
+      items: RoomSummaryItem[];
+      unassigned: {
+        totalBooks: number;
+        availableBooks: number;
+        borrowedBooks: number;
+        lostBooks: number;
+        maintenanceBooks: number;
+      };
+    };
+    const cached = await cacheGet<RoomSummaryResponse>('GET /api/rooms/summary');
+    if (cached) {
+      setRoomSummary(cached.value.items ?? []);
+      setUnassignedSummary(cached.value.unassigned);
+    }
     try {
-      const response = await apiRequest<{
-        items: RoomSummaryItem[];
-        unassigned: {
-          totalBooks: number;
-          availableBooks: number;
-          borrowedBooks: number;
-          lostBooks: number;
-          maintenanceBooks: number;
-        };
-      }>('/api/rooms/summary');
+      const response = await apiRequest<RoomSummaryResponse>('/api/rooms/summary');
       setRoomSummary(response.items ?? []);
       setUnassignedSummary(response.unassigned);
     } catch (e) {
-      setError((e as Error).message);
+      if (!cached) setError((e as Error).message);
     }
   }
 
   async function loadActiveBorrows() {
+    const cached = await cacheGet<{ items: ActiveBorrow[] }>('GET /api/borrow/active');
+    if (cached) setActiveBorrows(cached.value.items ?? []);
     try {
       const response = await apiRequest<{ items: ActiveBorrow[] }>('/api/borrow/active');
       setActiveBorrows(response.items ?? []);
     } catch (e) {
-      setError((e as Error).message);
+      if (!cached) setError((e as Error).message);
     }
   }
 
@@ -2775,6 +2995,13 @@ function App() {
 
   return (
     <div className="app-shell" aria-busy={isWorking}>
+
+      {/* ═══ OFFLINE BANNER ═══ */}
+      {netStatus === 'offline' && (
+        <div className="offline-banner" role="status" aria-live="polite">
+          {t('app.offlineBanner')}
+        </div>
+      )}
 
       {/* ═══ SPLASH SCREEN ═══ */}
       {showSplash && (

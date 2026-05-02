@@ -40,6 +40,7 @@ import {
 	queryBooksWithFilters,
 	replaceBookAttributeValues,
 	recordSyncMutation,
+	runAtomic,
 	validateCustomFields,
 	validateCustomFieldsAgainst,
 	withTxn
@@ -329,6 +330,81 @@ app.use('/api/*', async (c, next) => {
 		return;
 	}
 	await authMiddleware(c, next);
+});
+
+// ─── Idempotency: replay lost responses for retried writes ────────────────────
+// When the client sends a write with `X-Client-Mutation-Id`, we record the
+// final (status, body) under that id. If the same id replays — usually
+// because the response was lost on the wire and the client retried — we
+// return the recorded response verbatim instead of re-executing the
+// mutation. This is what makes our retry logic safe against double-writes.
+app.use('/api/*', async (c, next) => {
+	const method = c.req.method;
+	if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') {
+		await next();
+		return;
+	}
+	const mutationId = c.req.header('x-client-mutation-id');
+	if (!mutationId) {
+		await next();
+		return;
+	}
+
+	// 1. Replay path: did we already process this id? Return the same response.
+	try {
+		const prior = await c.env.DB.prepare(
+			'SELECT status, response_body FROM mutation_log WHERE id = ? LIMIT 1'
+		).bind(mutationId).first<{ status: number; response_body: string }>();
+		if (prior) {
+			return new Response(prior.response_body, {
+				status: prior.status,
+				headers: { 'Content-Type': 'application/json', 'X-Idempotent-Replay': '1' }
+			});
+		}
+	} catch (err) {
+		// If the lookup itself fails we proceed with the request rather than
+		// failing closed — better to risk a duplicate (which the client's own
+		// retry logic only triggers on transient errors anyway) than to block
+		// every write because a single SELECT errored.
+		console.warn('mutation_log lookup failed', err);
+	}
+
+	// 2. Run the route.
+	await next();
+
+	// 3. Persist the response if it succeeded. Only 2xx outcomes are recorded
+	// because retrying a 4xx will deterministically produce the same 4xx and
+	// caching errors would mask later code fixes.
+	const res = c.res;
+	if (!res || res.status < 200 || res.status >= 300) return;
+
+	let bodyText = '';
+	try {
+		// Clone so the original response can still be sent to the client.
+		bodyText = await res.clone().text();
+	} catch {
+		return;
+	}
+
+	const user = c.get('user');
+	try {
+		await c.env.DB.prepare(
+			`INSERT OR IGNORE INTO mutation_log (id, user_id, method, path, status, response_body, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`
+		).bind(
+			mutationId,
+			user?.sub ?? null,
+			method,
+			c.req.path,
+			res.status,
+			bodyText,
+			nowIso()
+		).run();
+	} catch (err) {
+		// Non-fatal: the mutation already committed. Worst case is a future
+		// retry repeats it. Log so we can investigate if this is frequent.
+		console.warn('mutation_log insert failed', err);
+	}
 });
 
 app.get('/api/auth/session', async (c) => {
@@ -726,14 +802,15 @@ app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) 
 		throw new HTTPException(404, { message: 'Book not in trash (must soft-delete first)' });
 	}
 
-	await withTxn(c.env, async () => {
+	await runAtomic(c.env, [
 		// Cascade in app code since SQLite ALTER TABLE can't add ON DELETE CASCADE
-		// retroactively. Order matters: kill children first.
-		await c.env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(id).run();
-		await c.env.DB.prepare('DELETE FROM code_assignments WHERE book_id = ?').bind(id).run();
-		await c.env.DB.prepare('DELETE FROM borrow_transactions WHERE book_id = ?').bind(id).run();
-		await c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id).run();
-	});
+		// retroactively. Order matters: kill children first. db.batch() guarantees
+		// all-or-nothing — a partial failure can't leave orphaned child rows.
+		c.env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(id),
+		c.env.DB.prepare('DELETE FROM code_assignments WHERE book_id = ?').bind(id),
+		c.env.DB.prepare('DELETE FROM borrow_transactions WHERE book_id = ?').bind(id),
+		c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id)
+	]);
 
 	// Best-effort R2 cleanup — failing here doesn't roll back the DB delete,
 	// orphan files would be cleaned by the maintenance sweep.
@@ -872,17 +949,14 @@ app.post('/api/books/:id/return', requirePermission('books.write', { librarian: 
 	}
 
 	const now = nowIso();
-	await withTxn(c.env, async () => {
-		await c.env.DB.prepare(
+	// Atomic: borrow row is closed AND the book becomes available, or neither.
+	await runAtomic(c.env, [
+		c.env.DB.prepare(
 			`UPDATE borrow_transactions SET returned_at = ?, notes = COALESCE(?, notes), updated_at = ? WHERE id = ?`
-		)
-			.bind(now, payload.notes ?? null, now, tx.id)
-			.run();
-
-		await c.env.DB.prepare(`UPDATE books SET status = 'available', version = version + 1, updated_at = ? WHERE id = ?`)
+		).bind(now, payload.notes ?? null, now, tx.id),
+		c.env.DB.prepare(`UPDATE books SET status = 'available', version = version + 1, updated_at = ? WHERE id = ?`)
 			.bind(now, bookId)
-			.run();
-	});
+	]);
 
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.return', 'book', bookId ?? null, {
@@ -1367,19 +1441,18 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), asyn
 
 	let renamedBooks = 0;
 
-	await withTxn(c.env, async () => {
-		await c.env.DB.prepare(
+	// Build the full set of statements (def update + per-book renames) and
+	// run them atomically. If any UPDATE fails the entire rename is rolled
+	// back so the field key on the def can never disagree with book rows.
+	const statements: D1PreparedStatement[] = [
+		c.env.DB.prepare(
 			`UPDATE custom_field_definitions
 				 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
 			 WHERE id = ? AND deleted_at IS NULL`
-		)
-			.bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id)
-			.run();
+		).bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id)
+	];
 
-		if (existing.field_key === payload.key) {
-			return;
-		}
-
+	if (existing.field_key !== payload.key) {
 		const books = await c.env.DB.prepare('SELECT id, custom_fields FROM books WHERE deleted_at IS NULL').all<{
 			id: string;
 			custom_fields: string;
@@ -1397,13 +1470,15 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), asyn
 			}
 			delete values[existing.field_key];
 
-			await c.env.DB.prepare('UPDATE books SET custom_fields = ?, updated_at = ?, version = version + 1 WHERE id = ?')
-				.bind(JSON.stringify(values), nowIso(), row.id)
-				.run();
-
+			statements.push(
+				c.env.DB.prepare('UPDATE books SET custom_fields = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+					.bind(JSON.stringify(values), nowIso(), row.id)
+			);
 			renamedBooks += 1;
 		}
-	});
+	}
+
+	await runAtomic(c.env, statements);
 
 	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id, {
 		oldKey: existing.field_key,
@@ -3036,25 +3111,28 @@ app.get('/api/borrowers/export.csv', requirePermission('circulation', { libraria
 app.post('/api/maintenance/cleanup', requireRole(['admin']), async (c) => {
 	// Wrap in a transaction so a partial failure can't leave book_attribute_values
 	// referencing a still-present book_id while code_assignments was already gone.
-	const summary = await withTxn(c.env, async () => {
-		const orphanCodesRes = await c.env.DB.prepare(
-			`DELETE FROM code_assignments
+	const summary = await (async () => {
+		// Three independent DELETEs — atomic so a half-cleaned state never leaks.
+		const results = await runAtomic(c.env, [
+			c.env.DB.prepare(
+				`DELETE FROM code_assignments
 			 WHERE book_id NOT IN (SELECT id FROM books)`
-		).run();
-		const orphanAttrsRes = await c.env.DB.prepare(
-			`DELETE FROM book_attribute_values
+			),
+			c.env.DB.prepare(
+				`DELETE FROM book_attribute_values
 			 WHERE book_id NOT IN (SELECT id FROM books)`
-		).run();
-		const orphanLoansRes = await c.env.DB.prepare(
-			`DELETE FROM borrow_transactions
+			),
+			c.env.DB.prepare(
+				`DELETE FROM borrow_transactions
 			 WHERE book_id NOT IN (SELECT id FROM books)`
-		).run();
+			)
+		]);
 		return {
-			orphanCodes: orphanCodesRes.meta?.changes ?? 0,
-			orphanAttributes: orphanAttrsRes.meta?.changes ?? 0,
-			orphanLoans: orphanLoansRes.meta?.changes ?? 0
+			orphanCodes: results[0]?.meta?.changes ?? 0,
+			orphanAttributes: results[1]?.meta?.changes ?? 0,
+			orphanLoans: results[2]?.meta?.changes ?? 0
 		};
-	});
+	})();
 	await insertAuditLog(c.env, c.get('user').sub, 'maintenance.cleanup', 'system', null, summary);
 	return c.json(summary);
 });
