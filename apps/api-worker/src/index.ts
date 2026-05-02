@@ -31,6 +31,7 @@ import {
 import {
 	booksCacheKey,
 	bumpBooksCacheVersion,
+	computeBookFolds,
 	ensureBootstrapAdmin,
 	getBookAttributeValues,
 	getBooksCacheVersion,
@@ -602,12 +603,25 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 	const id = crypto.randomUUID();
 	const customFields = await validateCustomFields(c.env, payload.customFields);
 
+	const tagsJson = JSON.stringify(payload.tags);
+	const customFieldsJson = JSON.stringify(customFields);
+	const folds = computeBookFolds({
+		title: payload.title,
+		author: payload.author,
+		isbn: payload.isbn ?? null,
+		publisher: payload.publisher ?? null,
+		description: payload.description ?? null,
+		tagsJson,
+		customFieldsJson
+	});
+
 	await c.env.DB.prepare(
 		`INSERT INTO books (
 			id, title, author, isbn, publication_year, publisher, language, description,
 			room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
-			legacy_id, created_at, updated_at, deleted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL)`
+			legacy_id, created_at, updated_at, deleted_at,
+			title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
 	)
 		.bind(
 			id,
@@ -621,12 +635,19 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			payload.roomCode ?? null,
 			payload.shelfCode ?? null,
 			payload.acquisitionDate ?? null,
-			JSON.stringify(payload.tags),
-			JSON.stringify(customFields),
+			tagsJson,
+			customFieldsJson,
 			payload.status,
 			payload.legacyId ?? null,
 			now,
-			now
+			now,
+			folds.title_fold,
+			folds.author_fold,
+			folds.isbn_fold,
+			folds.publisher_fold,
+			folds.description_fold,
+			folds.tags_fold,
+			folds.custom_fields_fold
 		)
 		.run();
 
@@ -688,11 +709,24 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 		updatedAt: now
 	};
 
+	const mergedTagsJson = JSON.stringify(merged.tags);
+	const mergedCustomFieldsJson = JSON.stringify(merged.customFields);
+	const mergedFolds = computeBookFolds({
+		title: merged.title as string | null,
+		author: merged.author as string | null,
+		isbn: (merged.isbn as string | null) ?? null,
+		publisher: (merged.publisher as string | null) ?? null,
+		description: (merged.description as string | null) ?? null,
+		tagsJson: mergedTagsJson,
+		customFieldsJson: mergedCustomFieldsJson
+	});
+
 	await c.env.DB.prepare(
 		`UPDATE books SET
 			title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?, description = ?,
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
-			legacy_id = ?, version = ?, updated_at = ?
+			legacy_id = ?, version = ?, updated_at = ?,
+			title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
 		 WHERE id = ? AND deleted_at IS NULL`
 	)
 		.bind(
@@ -706,12 +740,19 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			merged.roomCode ?? null,
 			merged.shelfCode ?? null,
 			merged.acquisitionDate ?? null,
-			JSON.stringify(merged.tags),
-			JSON.stringify(merged.customFields),
+			mergedTagsJson,
+			mergedCustomFieldsJson,
 			merged.status,
 			(merged as { legacyId?: string | null }).legacyId ?? (existingMap.legacy_id as string | null) ?? null,
 			merged.version,
 			merged.updatedAt,
+			mergedFolds.title_fold,
+			mergedFolds.author_fold,
+			mergedFolds.isbn_fold,
+			mergedFolds.publisher_fold,
+			mergedFolds.description_fold,
+			mergedFolds.tags_fold,
+			mergedFolds.custom_fields_fold,
 			id
 		)
 		.run();
@@ -1054,8 +1095,10 @@ app.put('/api/books/:id/attributes', requirePermission('books.write', { libraria
 	const normalized = await validateCustomFields(c.env, payload.values, { requireAllRequired: false });
 	await replaceBookAttributeValues(c.env, id, normalized);
 
-	await c.env.DB.prepare('UPDATE books SET custom_fields = ?, updated_at = ?, version = version + 1 WHERE id = ?')
-		.bind(JSON.stringify(normalized), nowIso(), id)
+	const normalizedJson = JSON.stringify(normalized);
+	const normalizedFold = computeBookFolds({ customFieldsJson: normalizedJson }).custom_fields_fold;
+	await c.env.DB.prepare('UPDATE books SET custom_fields = ?, custom_fields_fold = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+		.bind(normalizedJson, normalizedFold, nowIso(), id)
 		.run();
 
 	await bumpBooksCacheVersion(c.env);
@@ -1475,9 +1518,11 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), asyn
 			}
 			delete values[existing.field_key];
 
+			const valuesJson = JSON.stringify(values);
+			const valuesFold = computeBookFolds({ customFieldsJson: valuesJson }).custom_fields_fold;
 			statements.push(
-				c.env.DB.prepare('UPDATE books SET custom_fields = ?, updated_at = ?, version = version + 1 WHERE id = ?')
-					.bind(JSON.stringify(values), nowIso(), row.id)
+				c.env.DB.prepare('UPDATE books SET custom_fields = ?, custom_fields_fold = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+					.bind(valuesJson, valuesFold, nowIso(), row.id)
 			);
 			renamedBooks += 1;
 		}
@@ -1567,12 +1612,24 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 		const row = normalizeBookData(item.row);
 		try {
 			const bookId = crypto.randomUUID();
+			const importTagsJson = JSON.stringify(row.tags);
+			const importCustomFieldsJson = JSON.stringify(customFields);
+			const importFolds = computeBookFolds({
+				title: row.title,
+				author: row.author,
+				isbn: row.isbn ?? null,
+				publisher: row.publisher ?? null,
+				description: row.description ?? null,
+				tagsJson: importTagsJson,
+				customFieldsJson: importCustomFieldsJson
+			});
 			await c.env.DB.prepare(
 				`INSERT INTO books (
 					id, title, author, isbn, publication_year, publisher, language, description,
 					room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
-					created_at, updated_at, deleted_at
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)`
+					created_at, updated_at, deleted_at,
+					title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
 			)
 				.bind(
 					bookId,
@@ -1586,11 +1643,18 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 					row.roomCode ?? null,
 					row.shelfCode ?? null,
 					row.acquisitionDate ?? null,
-					JSON.stringify(row.tags),
-					JSON.stringify(customFields),
+					importTagsJson,
+					importCustomFieldsJson,
 					row.status,
 					now,
-					now
+					now,
+					importFolds.title_fold,
+					importFolds.author_fold,
+					importFolds.isbn_fold,
+					importFolds.publisher_fold,
+					importFolds.description_fold,
+					importFolds.tags_fold,
+					importFolds.custom_fields_fold
 				)
 				.run();
 

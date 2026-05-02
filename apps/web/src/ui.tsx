@@ -176,31 +176,94 @@ export function useConfirm() {
 }
 
 // ─── Search-result highlighting ───────────────────────────────────────────
-// Returns ReactNode wrapping matched substrings in <mark>. Case-insensitive.
-// Tokens come from the same parser the backend uses (whitespace + quoted phrases).
+// Returns ReactNode wrapping matched substrings in <mark>. Matching is
+// case-insensitive AND diacritic-insensitive — it uses the same fold the
+// API does (lowercase + NFKD + strip combining marks + ς→σ) so a user who
+// types `γαβριήλ` (with tonos) still gets `ΓΑΒΡΙΗΛ` highlighted in the
+// result, and vice versa. Tokens come from the same parser the backend
+// uses (whitespace + quoted phrases).
+
+function foldForHighlight(s: string): string {
+  return s.toLowerCase().normalize('NFKD').replace(/\p{M}/gu, '').replace(/ς/g, 'σ');
+}
+
+// Build a folded copy of `text` plus a map from folded-string index back to
+// the original UTF-16 index in `text`. NFKD can expand a single codepoint
+// into several characters (e.g. ﬃ → ffi) so we walk codepoints and record
+// the original start for every folded character emitted.
+function buildFoldMap(text: string): { folded: string; startMap: number[] } {
+  let folded = '';
+  const startMap: number[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const cp = text.codePointAt(i)!;
+    const ch = String.fromCodePoint(cp);
+    const f = foldForHighlight(ch);
+    for (let k = 0; k < f.length; k += 1) startMap.push(i);
+    folded += f;
+    i += ch.length;
+  }
+  startMap.push(text.length); // sentinel = end of original string
+  return { folded, startMap };
+}
 
 export function highlight(text: string | null | undefined, query: string): React.ReactNode {
   if (!text) return text ?? null;
   if (!query.trim()) return text;
-  const tokens: string[] = [];
+  const rawTokens: string[] = [];
   const regex = /"([^"]+)"|(\S+)/g;
   let m: RegExpExecArray | null = regex.exec(query);
   while (m) {
     const t = (m[1] ?? m[2] ?? '').trim();
-    if (t.length >= 2) tokens.push(t);
+    if (t.length >= 2) rawTokens.push(t);
     m = regex.exec(query);
   }
-  if (tokens.length === 0) return text;
-  const escaped = tokens
-    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  if (rawTokens.length === 0) return text;
+
+  const tokens = rawTokens
+    .map(foldForHighlight)
+    .filter((t) => t.length >= 2)
     .sort((a, b) => b.length - a.length);
-  const splitter = new RegExp(`(${escaped.join('|')})`, 'gi');
-  const parts = text.split(splitter);
-  return parts.map((part, i) =>
-    splitter.test(part)
-      ? <mark key={i} className="hl">{part}</mark>
-      : <React.Fragment key={i}>{part}</React.Fragment>
-  );
+  if (tokens.length === 0) return text;
+
+  const { folded, startMap } = buildFoldMap(text);
+
+  // Find all match ranges in folded space, then translate back to original
+  // UTF-16 ranges and merge overlapping/adjacent ones.
+  type Range = { start: number; end: number };
+  const ranges: Range[] = [];
+  for (const tok of tokens) {
+    let from = 0;
+    while (from <= folded.length - tok.length) {
+      const idx = folded.indexOf(tok, from);
+      if (idx < 0) break;
+      const origStart = startMap[idx];
+      const origEnd = startMap[idx + tok.length];
+      if (origEnd > origStart) ranges.push({ start: origStart, end: origEnd });
+      from = idx + tok.length;
+    }
+  }
+  if (ranges.length === 0) return text;
+  ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged: Range[] = [];
+  for (const r of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end) {
+      last.end = Math.max(last.end, r.end);
+    } else {
+      merged.push({ ...r });
+    }
+  }
+
+  const out: React.ReactNode[] = [];
+  let cursor = 0;
+  merged.forEach((r, i) => {
+    if (r.start > cursor) out.push(<React.Fragment key={`p${i}`}>{text.slice(cursor, r.start)}</React.Fragment>);
+    out.push(<mark key={`h${i}`} className="hl">{text.slice(r.start, r.end)}</mark>);
+    cursor = r.end;
+  });
+  if (cursor < text.length) out.push(<React.Fragment key="tail">{text.slice(cursor)}</React.Fragment>);
+  return out;
 }
 
 // ─── Sparkline / mini-bar ─────────────────────────────────────────────────

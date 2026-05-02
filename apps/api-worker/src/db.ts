@@ -325,7 +325,15 @@ function parseSearchTokens(input: string): string[] {
   const regex = /"([^"]+)"|(\S+)/g;
   let match: RegExpExecArray | null = regex.exec(input);
   while (match) {
-    const token = (match[1] ?? match[2] ?? '').trim().toLowerCase();
+    // Fold diacritics on the way in so the FTS query side matches what the
+    // FTS index stores. SQLite's `unicode61 remove_diacritics 2` tokenizer
+    // strips Latin diacritics but does NOT strip the Greek tonos from
+    // precomposed characters like ή/ά/ί — so an indexed all-caps title
+    // ΓΑΒΡΙΗΛ tokenizes to `γαβριηλ`, but a user query `γαβριήλ` stays as
+    // `γαβριήλ` and never matches. Folding the query here normalizes
+    // ή→η, ς→σ, etc., independent of FTS tokenizer quirks.
+    const raw = (match[1] ?? match[2] ?? '').trim();
+    const token = foldDiacritics(raw);
     if (token) tokens.push(token);
     match = regex.exec(input);
   }
@@ -685,12 +693,58 @@ function splitWords(text: string): string[] {
  *   • NFKD decomposition + combining-mark strip removes tonos / dialytika /
  *     accents across Greek, Latin, Cyrillic, and Vietnamese alike.
  */
-function foldDiacritics(text: string): string {
+export function foldDiacritics(text: string): string {
   return text
     .toLowerCase()
     .normalize('NFKD')
     .replace(/\p{M}/gu, '')
     .replace(/ς/g, 'σ');
+}
+
+/**
+ * Compute the seven `*_fold` column values written to `books` alongside the
+ * raw fields. The trigger in migration 0012 feeds these (with COALESCE
+ * fallback) into the `books_fts` virtual table, so that what the FTS index
+ * actually sees is already normalized — independent of FTS5's tokenizer
+ * limitations on Greek/Cyrillic precomposed accents.
+ *
+ * Inputs are the *exact* values about to be stored on the row (tags and
+ * custom_fields as their JSON-serialized strings, since that's what the
+ * raw columns hold). Returns `null` for null/empty inputs so the trigger's
+ * COALESCE falls back to the raw column.
+ */
+export function computeBookFolds(input: {
+  title?: string | null;
+  author?: string | null;
+  isbn?: string | null;
+  publisher?: string | null;
+  description?: string | null;
+  tagsJson?: string | null;
+  customFieldsJson?: string | null;
+}): {
+  title_fold: string | null;
+  author_fold: string | null;
+  isbn_fold: string | null;
+  publisher_fold: string | null;
+  description_fold: string | null;
+  tags_fold: string | null;
+  custom_fields_fold: string | null;
+} {
+  const fold = (v: string | null | undefined): string | null => {
+    if (v == null) return null;
+    const s = String(v);
+    if (!s) return null;
+    return foldDiacritics(s);
+  };
+  return {
+    title_fold: fold(input.title),
+    author_fold: fold(input.author),
+    isbn_fold: fold(input.isbn),
+    publisher_fold: fold(input.publisher),
+    description_fold: fold(input.description),
+    tags_fold: fold(input.tagsJson),
+    custom_fields_fold: fold(input.customFieldsJson)
+  };
 }
 
 function levenshtein(a: string, b: string): number {
