@@ -14,8 +14,18 @@
 //    values (functions, DOM nodes) will throw at write time and be ignored.
 
 const DB_NAME = 'ok_library_cache';
-const DB_VERSION = 1;
+// v2 adds the `cachedAt` index used for LRU-style eviction. The store
+// reads it via `IDBObjectStore.index('cachedAt')`; v1 stores survive the
+// upgrade (no data loss) because we add the index in onupgradeneeded.
+const DB_VERSION = 2;
 const STORE = 'responses';
+const CACHED_AT_INDEX = 'cachedAt';
+// Hard cap on cached entries. The cache is fail-soft, but allowing it to
+// grow forever turns "first load is instant" into "first load is a 50 MB
+// IndexedDB query." Eviction kicks in once we cross the threshold and
+// drops the oldest entries until we're back under the cap.
+const MAX_ENTRIES = 500;
+const EVICTION_BATCH = 50;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -29,8 +39,17 @@ function open(): Promise<IDBDatabase> {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
+      // Use the upgrade transaction so we can add an index on an already-
+      // existing v1 store without dropping it.
+      const txn = req.transaction;
       if (!db.objectStoreNames.contains(STORE)) {
-        db.createObjectStore(STORE);
+        const store = db.createObjectStore(STORE);
+        store.createIndex(CACHED_AT_INDEX, 'cachedAt', { unique: false });
+      } else if (txn) {
+        const store = txn.objectStore(STORE);
+        if (!store.indexNames.contains(CACHED_AT_INDEX)) {
+          store.createIndex(CACHED_AT_INDEX, 'cachedAt', { unique: false });
+        }
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -83,8 +102,45 @@ export async function cacheSet<T>(key: string, value: T): Promise<void> {
   try {
     const entry: CacheEntry<T> = { value, cachedAt: Date.now() };
     await tx<unknown>('readwrite', (s) => asPromise(s.put(entry, key)));
+    // After every write, kick a fire-and-forget eviction pass. This keeps
+    // the store bounded without blocking the caller — if multiple writes
+    // race, the worst that happens is two passes both delete the same
+    // oldest entries (idempotent), not a runaway loop.
+    void evictIfNeeded();
   } catch {
     // Quota errors etc. are non-fatal — the cache is best-effort.
+  }
+}
+
+// LRU-ish eviction. We count the entries cheaply via `count()`; if we're
+// over the cap we delete the oldest `EVICTION_BATCH + overflow` rows in
+// `cachedAt` order. Sweeping in batches amortizes the cost so writes don't
+// pay for a one-row-at-a-time deletion loop.
+async function evictIfNeeded(): Promise<void> {
+  try {
+    const total = await tx<number>('readonly', (s) => asPromise(s.count()));
+    if (total <= MAX_ENTRIES) return;
+    const overflow = total - MAX_ENTRIES;
+    const toDrop = overflow + EVICTION_BATCH;
+    await tx<unknown>('readwrite', (s) =>
+      new Promise<void>((resolve, reject) => {
+        const idx = s.index(CACHED_AT_INDEX);
+        // Open an oldest-first cursor and delete the first `toDrop` rows.
+        const req = idx.openCursor(undefined, 'next');
+        let dropped = 0;
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor || dropped >= toDrop) { resolve(); return; }
+          cursor.delete();
+          dropped += 1;
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error);
+      })
+    );
+  } catch {
+    // Eviction is best-effort. If it fails the next write triggers another
+    // pass, and the store eventually catches up.
   }
 }
 

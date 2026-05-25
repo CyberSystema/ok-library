@@ -123,37 +123,62 @@ export async function hashPassword(password: string): Promise<string> {
   return hashPasswordSha256(password);
 }
 
+// Resolves the [active, previous?] pair of signing keys with a stable `kid`
+// derived either from JWT_KIDS (CSV) or, as a fallback, from a short hash of
+// the secret itself. Verification is willing to try either secret so an
+// in-flight rotation doesn't ground every active session.
+async function resolveSigningKeys(
+  env: Env
+): Promise<Array<{ kid: string; secret: string; active: boolean }>> {
+  const active = env.JWT_SECRET;
+  if (!active) {
+    throw new HTTPException(500, { message: 'JWT_SECRET is not configured' });
+  }
+  const previous = env.JWT_SECRET_PREVIOUS;
+  const declaredKids = (env.JWT_KIDS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+
+  const kidFor = async (secret: string, index: number): Promise<string> => {
+    if (declaredKids[index]) return declaredKids[index];
+    // Stable, non-secret identifier: first 8 hex chars of SHA-256(secret).
+    // The kid travels in the JWT header in clear; using a hash (not the
+    // secret itself) keeps the key material from leaking via the kid claim.
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
+    return bytesToHex(new Uint8Array(digest)).slice(0, 8);
+  };
+
+  const keys = [{ kid: await kidFor(active, 0), secret: active, active: true }];
+  if (previous) keys.push({ kid: await kidFor(previous, 1), secret: previous, active: false });
+  return keys;
+}
+
 export async function createAccessToken(env: Env, claims: Omit<AuthClaims, 'iat' | 'exp' | 'iss'>): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const ttl = Number(env.ACCESS_TOKEN_TTL_SECONDS ?? '43200');
   const issuer = env.JWT_ISSUER ?? 'ok-library-api';
-  const secret = env.JWT_SECRET;
+  const keys = await resolveSigningKeys(env);
+  const signingKey = keys[0];
 
-  if (!secret) {
-    throw new HTTPException(500, { message: 'JWT_SECRET is not configured' });
-  }
-
-  const header = bytesToBase64Url(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+  const header = bytesToBase64Url(
+    new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid: signingKey.kid }))
+  );
   const payload = bytesToBase64Url(
     new TextEncoder().encode(
       JSON.stringify({
         ...claims,
         iat: now,
+        nbf: now,
         exp: now + ttl,
         iss: issuer
       })
     )
   );
 
-  const sig = await sign(`${header}.${payload}`, secret);
+  const sig = await sign(`${header}.${payload}`, signingKey.secret);
   return `${header}.${payload}.${sig}`;
 }
 
 export async function verifyAccessToken(env: Env, token: string): Promise<AuthClaims> {
-  const secret = env.JWT_SECRET;
-  if (!secret) {
-    throw new HTTPException(500, { message: 'JWT_SECRET is not configured' });
-  }
+  const keys = await resolveSigningKeys(env);
 
   const parts = token.split('.');
   if (parts.length !== 3) {
@@ -161,15 +186,63 @@ export async function verifyAccessToken(env: Env, token: string): Promise<AuthCl
   }
 
   const [header, payload, signature] = parts;
-  const expected = await sign(`${header}.${payload}`, secret);
-  if (signature !== expected) {
+
+  // Pin the algorithm. Without this an attacker could craft a token with
+  // `alg: none` or `alg: HS512` — the latter would still recompute fine here
+  // but reject any future migration to alg-aware libraries. We never want to
+  // accept anything but HS256 against our HMAC secret.
+  let headerObj: { alg?: string; kid?: string; typ?: string };
+  try {
+    headerObj = JSON.parse(new TextDecoder().decode(base64UrlToBytes(header))) as {
+      alg?: string;
+      kid?: string;
+      typ?: string;
+    };
+  } catch {
+    throw new HTTPException(401, { message: 'Invalid token header' });
+  }
+  if (headerObj.alg !== 'HS256') {
+    throw new HTTPException(401, { message: 'Unsupported token algorithm' });
+  }
+
+  // Prefer the kid-indexed key for direct verification; fall back to trying
+  // both. Both branches use constant-time comparison.
+  const candidates = headerObj.kid
+    ? [...keys.filter((k) => k.kid === headerObj.kid), ...keys.filter((k) => k.kid !== headerObj.kid)]
+    : keys;
+
+  let verified = false;
+  for (const candidate of candidates) {
+    const expected = await sign(`${header}.${payload}`, candidate.secret);
+    if (constantTimeEqual(signature, expected)) {
+      verified = true;
+      break;
+    }
+  }
+  if (!verified) {
     throw new HTTPException(401, { message: 'Invalid token signature' });
   }
 
-  const claims = JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload))) as AuthClaims;
+  // A malformed payload (truncated, non-JSON, etc.) would otherwise throw a
+  // SyntaxError and surface as 500 to the client. Translate to the correct
+  // 401 so monitoring isn't polluted with auth-shaped 5xx noise.
+  let claims: AuthClaims & { nbf?: number };
+  try {
+    claims = JSON.parse(new TextDecoder().decode(base64UrlToBytes(payload))) as AuthClaims & {
+      nbf?: number;
+    };
+  } catch {
+    throw new HTTPException(401, { message: 'Invalid token payload' });
+  }
   const now = Math.floor(Date.now() / 1000);
-  if (claims.exp < now) {
+  // Allow a small clock-skew window (60s) so clients with slightly-off clocks
+  // don't bounce against a freshly-issued token.
+  const SKEW_SECONDS = 60;
+  if (claims.exp < now - SKEW_SECONDS) {
     throw new HTTPException(401, { message: 'Token expired' });
+  }
+  if (typeof claims.nbf === 'number' && claims.nbf > now + SKEW_SECONDS) {
+    throw new HTTPException(401, { message: 'Token not yet valid' });
   }
 
   const issuer = env.JWT_ISSUER ?? 'ok-library-api';
@@ -208,6 +281,32 @@ export function requireRole(roles: Array<'admin' | 'librarian' | 'viewer'>) {
   };
 }
 
+// Per-request permission cache. Without this each `requirePermission(...)`
+// middleware did a fresh D1 round-trip; a route with multiple permission
+// checks (or a flow that lazily inspects permissions) burned one read per
+// check. We stash the whole role's permission map under a symbolic key on
+// the Hono context so the FIRST check loads it once and every subsequent
+// one is in-memory.
+type PermissionsCacheCtx = Context<{ Bindings: Env; Variables: Record<string, unknown> }>;
+const PERMS_CACHE_KEY = '__okPermsForRole';
+
+async function getRolePermissions(
+  c: PermissionsCacheCtx,
+  role: 'librarian' | 'viewer'
+): Promise<Map<string, boolean>> {
+  const cached = c.get(PERMS_CACHE_KEY) as Map<string, boolean> | undefined;
+  if (cached) return cached;
+  const rows = await c.env.DB.prepare(
+    'SELECT permission, allowed FROM role_permissions WHERE role = ?'
+  ).bind(role).all<{ permission: string; allowed: number }>();
+  const map = new Map<string, boolean>();
+  for (const row of rows.results ?? []) {
+    map.set(row.permission, row.allowed === 1);
+  }
+  c.set(PERMS_CACHE_KEY, map);
+  return map;
+}
+
 // Permission-based middleware. Admins always pass. For other roles, the
 // `role_permissions` table is consulted; missing rows fall back to the
 // caller-supplied default (typically `false`).
@@ -224,12 +323,11 @@ export function requirePermission(
       await next();
       return;
     }
-    const row = await c.env.DB.prepare(
-      'SELECT allowed FROM role_permissions WHERE role = ? AND permission = ? LIMIT 1'
-    ).bind(user.role, permission).first<{ allowed: number }>();
-    const allowed = row
-      ? row.allowed === 1
-      : Boolean(defaultAllowed[user.role as 'librarian' | 'viewer']);
+    const role = user.role as 'librarian' | 'viewer';
+    const map = await getRolePermissions(c as unknown as PermissionsCacheCtx, role);
+    const allowed = map.has(permission)
+      ? map.get(permission) === true
+      : Boolean(defaultAllowed[role]);
     if (!allowed) {
       throw new HTTPException(403, { message: `Permission denied: ${permission}` });
     }

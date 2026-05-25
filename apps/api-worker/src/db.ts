@@ -153,6 +153,27 @@ const SQL_FIELD_EXPR: Record<string, string> = {
   custom: "COALESCE(custom_fields, '')"
 };
 
+// Fold-aware mirror of SQL_FIELD_EXPR. The fuzzy LIKE path compares against
+// fold-normalized query tokens, so we have to compare against fold-normalized
+// columns or accented text like "Γαβριήλ" will never match a query of
+// "γαβριηλ" via SQLite's ASCII-only LOWER(). The `*_fold` columns are
+// populated by `computeBookFolds` on every write; we COALESCE through the
+// raw column for legacy rows that pre-date migration 0012.
+const SQL_FIELD_FOLD_EXPR: Record<string, string> = {
+  title: "COALESCE(title_fold, LOWER(COALESCE(title, '')))",
+  author: "COALESCE(author_fold, LOWER(COALESCE(author, '')))",
+  isbn: "COALESCE(isbn_fold, LOWER(COALESCE(isbn, '')))",
+  publisher: "COALESCE(publisher_fold, LOWER(COALESCE(publisher, '')))",
+  // No fold column exists for language / roomCode / shelfCode — these tend
+  // to be short ASCII codes anyway, so plain LOWER suffices.
+  language: "LOWER(COALESCE(language, ''))",
+  description: "COALESCE(description_fold, LOWER(COALESCE(description, '')))",
+  roomCode: "LOWER(COALESCE(room_code, ''))",
+  shelfCode: "LOWER(COALESCE(shelf_code, ''))",
+  tags: "COALESCE(tags_fold, LOWER(COALESCE(tags, '')))",
+  custom: "COALESCE(custom_fields_fold, LOWER(COALESCE(custom_fields, '')))"
+};
+
 // Friendly-name → ISO-code synonym table for the language filter.
 // Catalog rows store ISO 639-1 codes ("EN", "EL,EN,FR"), but a librarian who
 // types "English" / "Αγγλικά" / "영어" / "Английский" should all get the
@@ -608,8 +629,15 @@ async function runFuzzyFiltered(
 
   const where = [...ctx.where];
   const values = [...ctx.values];
+  // Use the fold-aware expressions: the tokens have already been folded via
+  // `parseSearchTokens` → `foldDiacritics`, so we need to compare against
+  // the fold-normalized columns. Without this the LIKE branch would fail to
+  // match accented text (e.g. "Γαβριήλ" vs query "γαβριηλ") — the previous
+  // `LOWER(COALESCE(title, ''))` only ASCII-lowercased, so Greek tonos
+  // characters slipped through. Falling through `COALESCE(_fold, LOWER(raw))`
+  // is correct for both new and legacy rows.
   const fieldExprs = ctx.activeFields
-    .map((f) => SQL_FIELD_EXPR[f])
+    .map((f) => SQL_FIELD_FOLD_EXPR[f])
     .filter((expr): expr is string => Boolean(expr));
   if (tokens.length > 0 && fieldExprs.length > 0) {
     // Per-token recall gate: a row passes if EITHER
@@ -627,10 +655,10 @@ async function runFuzzyFiltered(
       const prefix = token.slice(0, prefixLen);
       const orParts: string[] = [];
       for (const expr of fieldExprs) {
-        orParts.push(`LOWER(${expr}) LIKE ?`);
+        orParts.push(`${expr} LIKE ?`);
         values.push(`%${token}%`);
         if (prefix && prefix !== token) {
-          orParts.push(`LOWER(${expr}) LIKE ?`);
+          orParts.push(`${expr} LIKE ?`);
           values.push(`%${prefix}%`);
         }
       }
@@ -973,9 +1001,13 @@ export async function replaceBookAttributeValues(
   for (const [key, value] of Object.entries(attributeValues)) {
     const definitionId = keyToDef.get(key);
     if (!definitionId) continue;
+    // `INSERT OR REPLACE` on the (book_id, attribute_definition_id) UNIQUE
+    // constraint makes follow-up batches re-runnable: a partial failure of
+    // a later chunk can be retried without tripping the unique violation
+    // that a plain INSERT would raise.
     inserts.push(
       env.DB.prepare(
-        `INSERT INTO book_attribute_values
+        `INSERT OR REPLACE INTO book_attribute_values
           (id, book_id, attribute_definition_id, value_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?)`
       ).bind(crypto.randomUUID(), bookId, definitionId, JSON.stringify(value), now, now)
@@ -989,12 +1021,163 @@ export async function replaceBookAttributeValues(
   // chunk so the replace is atomic with the first batch of inserts; if the
   // book has more than 49 attributes the remaining inserts ride in follow-up
   // batches — non-atomic, but safe because each insert is idempotent on
-  // (book_id, attribute_definition_id).
+  // (book_id, attribute_definition_id) thanks to `INSERT OR REPLACE`.
   const BATCH_SIZE = 50;
   const firstChunkSize = Math.min(inserts.length, BATCH_SIZE - 1);
   await env.DB.batch([deleteStmt, ...inserts.slice(0, firstChunkSize)]);
   for (let i = firstChunkSize; i < inserts.length; i += BATCH_SIZE) {
     await env.DB.batch(inserts.slice(i, i + BATCH_SIZE));
+  }
+}
+
+// ─── Semantic search (Vectorize + Workers AI) ────────────────────────────
+// All of these helpers fail soft when either binding is missing — the rest
+// of the app keeps working, the relevant feature just degrades. We never
+// surface a 500 to the caller because of an optional binding.
+
+// Default embedding model. Workers AI's `@cf/baai/bge-base-en-v1.5` is
+// multilingual-friendly and gives 768-dim cosine vectors that match the
+// Vectorize index config in wrangler.toml. Switch both at the same time.
+export const EMBEDDING_MODEL = '@cf/baai/bge-base-en-v1.5';
+const EMBEDDING_DIMS = 768;
+
+// Compose the text we feed the embedding model. Mirror what users type
+// when looking for books: title + author + a short description snippet,
+// plus the top few tag/category fields. Limiting length keeps embedding
+// cheap and avoids confusing the model with structural noise from
+// custom_fields JSON blobs.
+export function bookEmbeddingText(book: {
+  title?: string | null;
+  author?: string | null;
+  description?: string | null;
+  publisher?: string | null;
+  language?: string | null;
+  publicationYear?: number | null;
+  tags?: string[] | null;
+  customFields?: Record<string, unknown> | null;
+}): string {
+  const parts: string[] = [];
+  if (book.title) parts.push(book.title);
+  if (book.author) parts.push(`by ${book.author}`);
+  if (book.publisher) parts.push(book.publisher);
+  if (book.publicationYear) parts.push(String(book.publicationYear));
+  if (book.language) parts.push(`(${book.language})`);
+  if (Array.isArray(book.tags) && book.tags.length > 0) parts.push(book.tags.slice(0, 8).join(', '));
+  const cf = book.customFields ?? {};
+  const cat = (cf as Record<string, unknown>).category_label
+    ?? (cf as Record<string, unknown>).category;
+  if (typeof cat === 'string' && cat) parts.push(cat);
+  if (book.description) parts.push(book.description.slice(0, 1500));
+  return parts.filter(Boolean).join(' — ');
+}
+
+// Stable short hash of the embedding source text so we can skip re-
+// embedding when an UPDATE doesn't change anything the model cares about.
+async function shortHash(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest))
+    .slice(0, 8)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+export function semanticSearchEnabled(env: Env): boolean {
+  return Boolean(env.VECTORIZE && env.AI);
+}
+
+async function embedSingle(env: Env, text: string): Promise<number[] | null> {
+  if (!env.AI) return null;
+  try {
+    // Workers AI returns `{ data: number[][] }` for the embedding models.
+    const result = (await env.AI.run(EMBEDDING_MODEL, { text: [text] })) as { data?: number[][] };
+    const vec = result.data?.[0];
+    return vec && vec.length === EMBEDDING_DIMS ? vec : null;
+  } catch (error) {
+    console.warn('Embedding call failed', error);
+    return null;
+  }
+}
+
+// Re-embed (or initial-embed) a single book. Safe to call on every write —
+// if AI/Vectorize is unbound we no-op, and the tracking-table row tells the
+// future backfill what's still pending.
+export async function vectorizeBook(env: Env, bookId: string, source: Parameters<typeof bookEmbeddingText>[0]): Promise<void> {
+  if (!semanticSearchEnabled(env)) return;
+  const text = bookEmbeddingText(source);
+  if (!text.trim()) {
+    // Empty text -> drop any prior embedding so search doesn't return a
+    // book that the model would have nothing to say about.
+    await unvectorizeBook(env, bookId);
+    return;
+  }
+  const hash = await shortHash(text);
+
+  // Skip work if the embedding is already current for this model + text.
+  const prior = await env.DB.prepare(
+    'SELECT model, source_hash FROM book_vectorized WHERE book_id = ? LIMIT 1'
+  ).bind(bookId).first<{ model: string; source_hash: string }>();
+  if (prior && prior.model === EMBEDDING_MODEL && prior.source_hash === hash) {
+    return;
+  }
+
+  const vector = await embedSingle(env, text);
+  if (!vector) return;
+
+  try {
+    await env.VECTORIZE!.upsert([
+      {
+        id: bookId,
+        values: vector,
+        // Metadata that the search endpoint reads back without a follow-up
+        // DB hit. Keep this small — Vectorize charges per byte of metadata.
+        metadata: {
+          title: source.title ?? '',
+          author: source.author ?? ''
+        }
+      }
+    ]);
+  } catch (error) {
+    console.warn('Vectorize upsert failed', error);
+    return;
+  }
+
+  const now = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO book_vectorized (book_id, model, source_hash, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(book_id) DO UPDATE SET
+       model = excluded.model,
+       source_hash = excluded.source_hash,
+       updated_at = excluded.updated_at`
+  ).bind(bookId, EMBEDDING_MODEL, hash, now).run();
+}
+
+export async function unvectorizeBook(env: Env, bookId: string): Promise<void> {
+  if (!semanticSearchEnabled(env)) return;
+  try { await env.VECTORIZE!.deleteByIds([bookId]); } catch { /* ignore */ }
+  try {
+    await env.DB.prepare('DELETE FROM book_vectorized WHERE book_id = ?').bind(bookId).run();
+  } catch { /* ignore */ }
+}
+
+// Embed a free-text query and return Vectorize's top-K matching book ids.
+// Returns an empty array (not an error) when the binding is missing so the
+// caller can transparently fall through to the FTS path.
+export async function semanticSearchBookIds(
+  env: Env,
+  query: string,
+  topK = 50
+): Promise<Array<{ id: string; score: number }>> {
+  if (!semanticSearchEnabled(env) || !query.trim()) return [];
+  const vector = await embedSingle(env, query);
+  if (!vector) return [];
+  try {
+    const hits = await env.VECTORIZE!.query(vector, { topK });
+    const matches = hits.matches ?? [];
+    return matches.map((m) => ({ id: m.id, score: m.score }));
+  } catch (error) {
+    console.warn('Vectorize query failed', error);
+    return [];
   }
 }
 

@@ -27,6 +27,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 
 const require = createRequire(import.meta.url);
 const XLSX = require('../apps/web/node_modules/xlsx');
@@ -81,8 +82,12 @@ function sqlJson(value) {
 }
 
 function uuidExpr() {
-  // Stable D1-side UUIDv4 emitter so each row gets its own id without a separate round-trip.
-  return "lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || substr(lower(hex(randomblob(2))), 2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6)))";
+  // Pre-generated UUIDv4 from Node's crypto. The previous SQL-side expression
+  // emitted near-UUIDs but didn't set the RFC 4122 v4 version/variant bits
+  // correctly (the version nibble was hardcoded to '4' but the variant nibble
+  // walked an odd `abs(random()) % 4 + 1` index into '89ab'). Generating in
+  // Node keeps the on-disk IDs spec-compliant and easier to debug.
+  return `'${randomUUID()}'`;
 }
 
 function nowExpr() {

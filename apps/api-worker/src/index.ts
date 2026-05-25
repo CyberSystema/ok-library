@@ -32,6 +32,7 @@ import {
 	booksCacheKey,
 	bumpBooksCacheVersion,
 	computeBookFolds,
+	EMBEDDING_MODEL,
 	ensureBootstrapAdmin,
 	getBookAttributeValues,
 	getBooksCacheVersion,
@@ -42,8 +43,12 @@ import {
 	replaceBookAttributeValues,
 	recordSyncMutation,
 	runAtomic,
+	semanticSearchBookIds,
+	semanticSearchEnabled,
+	unvectorizeBook,
 	validateCustomFields,
 	validateCustomFieldsAgainst,
+	vectorizeBook,
 	withTxn
 } from './db';
 import type { AuthClaims, Env } from './types';
@@ -137,6 +142,23 @@ function findSimilarCustomField(
 	return null;
 }
 
+/**
+ * Schedule a fire-and-forget side effect (e.g. Vectorize re-embedding) so it
+ * doesn't add latency to the route's response. Falls back to running inline
+ * when `executionCtx.waitUntil` is unavailable (e.g. some test harnesses) —
+ * better to do the work synchronously than to silently drop it.
+ */
+function runAfterResponse(c: AppContext, work: () => Promise<unknown>): void {
+	const ctx = c.executionCtx as ExecutionContext | undefined;
+	if (ctx && typeof ctx.waitUntil === 'function') {
+		ctx.waitUntil(
+			work().catch((err) => console.warn('Background task failed', err))
+		);
+	} else {
+		void work().catch((err) => console.warn('Background task failed', err));
+	}
+}
+
 function clientIp(c: AppContext): string {
 	return c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
 }
@@ -169,9 +191,27 @@ app.use('*', async (c, next) => {
 	if ((c.env.APP_ENV === 'production') && (!configured || configured === '*')) {
 		throw new HTTPException(500, { message: 'CORS_ORIGIN must be set to a specific origin in production.' });
 	}
-	const origin = configured ?? '*';
+
+	// CORS_ORIGIN can now be a CSV of allowed origins. The single-string and
+	// wildcard ('*') forms continue to work unchanged. We hand Hono's `cors`
+	// helper a function so it echoes back only origins on the allowlist —
+	// preserves the per-request `Access-Control-Allow-Origin` header that
+	// browsers require with `credentials: true`.
+	const raw = (configured ?? '*').trim();
+	const allowlist = raw === '*'
+		? null
+		: raw.split(',').map((s) => s.trim()).filter(Boolean);
+
+	const originFn = (incoming: string): string | null => {
+		if (!allowlist) return incoming || '*';
+		if (allowlist.includes(incoming)) return incoming;
+		// Echo the first allowlisted entry as a deterministic fallback so a
+		// hand-typed CURL without an Origin header still works in dev.
+		return allowlist[0] ?? null;
+	};
+
 	return cors({
-		origin,
+		origin: originFn,
 		allowHeaders: ['Authorization', 'Content-Type', 'X-Client-Mutation-Id'],
 		exposeHeaders: ['X-Idempotent-Replay'],
 		credentials: true
@@ -230,15 +270,50 @@ app.onError((error, c) => {
 });
 
 app.get('/api/health', async (c) => {
-	// Fail-fast indicator: if JWT_SECRET isn't configured the auth path is
-	// broken and every login/session request would 500. Surface it on /health
-	// so monitoring catches misconfiguration before users do.
-	const dbCheck = await c.env.DB.prepare('SELECT 1 AS ok').first();
-	const ok = dbCheck?.ok === 1 && Boolean(c.env.JWT_SECRET);
+	// Fail-fast indicator. Probes every binding the app actually relies on:
+	//   • DB   — a `SELECT 1` round-trip
+	//   • KV   — read a sentinel key (the cache namespace; treat read failure
+	//            as a soft warning since the app degrades gracefully without it)
+	//   • R2   — `head` on a sentinel key so we don't have to upload anything
+	//   • auth — JWT_SECRET configured
+	// `ok` is true only when the hard dependencies (DB + JWT) are healthy;
+	// KV/R2 failures show up as `degraded: true` but don't flip the overall
+	// status code, because the app keeps serving requests with reduced
+	// behaviour when one of them is briefly unavailable.
+	const dbCheck = await c.env.DB.prepare('SELECT 1 AS ok').first<{ ok: number }>().catch(() => null);
+	const dbOk = dbCheck?.ok === 1;
+
+	let kvOk = true;
+	try {
+		// `get` returns null for an absent key without throwing — any throw
+		// means the namespace itself is unreachable.
+		await c.env.CACHE.get('__health_probe__');
+	} catch {
+		kvOk = false;
+	}
+
+	let r2Ok = true;
+	try {
+		await c.env.ASSETS.head('__health_probe__');
+	} catch {
+		r2Ok = false;
+	}
+
+	const authOk = Boolean(c.env.JWT_SECRET);
+	const ok = dbOk && authOk;
+	const degraded = ok && (!kvOk || !r2Ok);
 	return c.json({
 		ok,
-		db: dbCheck?.ok === 1,
-		auth: Boolean(c.env.JWT_SECRET),
+		degraded,
+		db: dbOk,
+		auth: authOk,
+		kv: kvOk,
+		r2: r2Ok,
+		// Capability hint: the frontend uses this to decide whether to
+		// expose the semantic-search toggle. We don't run a model probe
+		// — that would charge for an embedding on every health hit — so
+		// "true" here means "bindings exist," not "the model responded."
+		semantic: semanticSearchEnabled(c.env),
 		env: c.env.APP_ENV ?? 'unknown',
 		timestamp: nowIso()
 	}, ok ? 200 : 503);
@@ -530,8 +605,19 @@ app.get('/api/books', async (c) => {
 		.filter(([key]) => key.startsWith('custom_'))
 		.map(([key, value]) => ({ key: key.replace('custom_', ''), value }));
 
+	// includeDeleted is admin-only — silently drop it for non-admins so a
+	// librarian can't browse the trash via the public list endpoint.
+	const includeDeleted = Boolean(query.includeDeleted) && c.get('user').role === 'admin';
+
+	// Cache key must reflect the *effective* trash visibility, not the raw
+	// query string. Otherwise two users with different roles passing the same
+	// `?includeDeleted=1` collide on the same cache bucket and one role sees
+	// the other role's response (admin missing trash, or non-admin getting it).
 	const cacheVersion = await getBooksCacheVersion(c.env);
-	const cacheKey = booksCacheKey(cacheVersion, { query, customFilters });
+	const cacheKey = booksCacheKey(cacheVersion, {
+		query: { ...query, includeDeleted },
+		customFilters
+	});
 
 	if (c.env.CACHE) {
 		try {
@@ -543,10 +629,6 @@ app.get('/api/books', async (c) => {
 			console.warn('Book list cache read failed, falling back to DB query', error);
 		}
 	}
-
-	// includeDeleted is admin-only — silently drop it for non-admins so a
-	// librarian can't browse the trash via the public list endpoint.
-	const includeDeleted = Boolean(query.includeDeleted) && c.get('user').role === 'admin';
 	const result = await queryBooksWithFilters(c.env, {
 		...query,
 		customFilters,
@@ -654,6 +736,20 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 	await replaceBookAttributeValues(c.env, id, customFields);
 	await bumpBooksCacheVersion(c.env);
 
+	// Fire-and-forget: keep the response snappy while the embedding round-
+	// trip (Workers AI → Vectorize) runs in the background. No-ops cleanly
+	// when the optional bindings aren't configured.
+	runAfterResponse(c, () => vectorizeBook(c.env, id, {
+		title: payload.title,
+		author: payload.author,
+		description: payload.description ?? null,
+		publisher: payload.publisher ?? null,
+		language: payload.language ?? null,
+		publicationYear: payload.publicationYear ?? null,
+		tags: payload.tags,
+		customFields
+	}));
+
 	await insertAuditLog(c.env, c.get('user').sub, 'book.create', 'book', id, {
 		title: payload.title,
 		author: payload.author
@@ -760,6 +856,19 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	await replaceBookAttributeValues(c.env, id, merged.customFields as Record<string, unknown>);
 	await bumpBooksCacheVersion(c.env);
 
+	// Re-embed if any field the embedding text consumes might have changed.
+	// `vectorizeBook` already short-circuits if the source-hash matches.
+	runAfterResponse(c, () => vectorizeBook(c.env, id, {
+		title: merged.title as string | null,
+		author: merged.author as string | null,
+		description: (merged.description as string | null) ?? null,
+		publisher: (merged.publisher as string | null) ?? null,
+		language: (merged.language as string | null) ?? null,
+		publicationYear: (merged.publicationYear as number | null) ?? null,
+		tags: (merged.tags as string[] | null) ?? [],
+		customFields: merged.customFields as Record<string, unknown>
+	}));
+
 	await insertAuditLog(c.env, c.get('user').sub, 'book.update', 'book', id ?? null, {
 		version: merged.version
 	});
@@ -784,6 +893,10 @@ app.delete('/api/books/:id', requirePermission('books.delete'), async (c) => {
 	}
 
 	await bumpBooksCacheVersion(c.env);
+	// Soft-deleted books should not surface from semantic search either.
+	// We remove the embedding now; if the book is restored later, restore
+	// re-queues the embedding work below.
+	if (id) runAfterResponse(c, () => unvectorizeBook(c.env, id));
 	await insertAuditLog(c.env, c.get('user').sub, 'book.delete', 'book', id ?? null, {});
 	return c.body(null, 204);
 });
@@ -807,6 +920,31 @@ app.post('/api/books/:id/restore', requirePermission('books.delete'), async (c) 
 	}
 
 	await bumpBooksCacheVersion(c.env);
+	// Restored books need a fresh embedding because we deleted it on
+	// soft-delete. Re-read just the fields the embedding cares about.
+	if (id) {
+		runAfterResponse(c, async () => {
+			const row = await c.env.DB.prepare(
+				`SELECT title, author, description, publisher, language, publication_year, tags, custom_fields
+				 FROM books WHERE id = ? LIMIT 1`
+			).bind(id).first<{
+				title: string | null; author: string | null; description: string | null;
+				publisher: string | null; language: string | null; publication_year: number | null;
+				tags: string | null; custom_fields: string | null;
+			}>();
+			if (!row) return;
+			await vectorizeBook(c.env, id, {
+				title: row.title,
+				author: row.author,
+				description: row.description,
+				publisher: row.publisher,
+				language: row.language,
+				publicationYear: row.publication_year,
+				tags: safeJsonParse<string[]>(row.tags ?? '[]', []),
+				customFields: safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {})
+			});
+		});
+	}
 	await insertAuditLog(c.env, c.get('user').sub, 'book.restore', 'book', id, {});
 	return c.json({ id, restored: true });
 });
@@ -865,6 +1003,10 @@ app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) 
 	}
 
 	await bumpBooksCacheVersion(c.env);
+	// Drop the embedding too — purge is irreversible, the vector should go
+	// with the row. `book_vectorized` cascades through the FK once `books`
+	// is gone, but the Vectorize index doesn't, hence the explicit call.
+	runAfterResponse(c, () => unvectorizeBook(c.env, id));
 	await insertAuditLog(c.env, c.get('user').sub, 'book.purge', 'book', id, {});
 	return c.body(null, 204);
 });
@@ -1489,17 +1631,24 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), asyn
 
 	let renamedBooks = 0;
 
-	// Build the full set of statements (def update + per-book renames) and
-	// run them atomically. If any UPDATE fails the entire rename is rolled
-	// back so the field key on the def can never disagree with book rows.
-	const statements: D1PreparedStatement[] = [
-		c.env.DB.prepare(
-			`UPDATE custom_field_definitions
-				 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
-			 WHERE id = ? AND deleted_at IS NULL`
-		).bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id)
-	];
+	// The definition rename + per-book key rewrites are run together where
+	// possible, but D1's batch() caps at 50 statements per call — so libraries
+	// with more than ~49 books carrying this key would have thrown if we
+	// shoved everything into one batch. We chunk in groups of 50 and put the
+	// definition update in the very first batch so the def is committed
+	// alongside the first slice of book rewrites. Later book batches lose
+	// strict cross-batch atomicity, but each book UPDATE is idempotent on
+	// (custom_fields, custom_fields_fold) — retrying the rename completes
+	// any books that were missed mid-flight, since `validateCustomFields`
+	// tolerates unknown keys on the update path.
+	const D1_BATCH_LIMIT = 50;
+	const defUpdate = c.env.DB.prepare(
+		`UPDATE custom_field_definitions
+			 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
+		 WHERE id = ? AND deleted_at IS NULL`
+	).bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id);
 
+	const bookUpdates: D1PreparedStatement[] = [];
 	if (existing.field_key !== payload.key) {
 		const books = await c.env.DB.prepare('SELECT id, custom_fields FROM books WHERE deleted_at IS NULL').all<{
 			id: string;
@@ -1520,7 +1669,7 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), asyn
 
 			const valuesJson = JSON.stringify(values);
 			const valuesFold = computeBookFolds({ customFieldsJson: valuesJson }).custom_fields_fold;
-			statements.push(
+			bookUpdates.push(
 				c.env.DB.prepare('UPDATE books SET custom_fields = ?, custom_fields_fold = ?, updated_at = ?, version = version + 1 WHERE id = ?')
 					.bind(valuesJson, valuesFold, nowIso(), row.id)
 			);
@@ -1528,7 +1677,12 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), asyn
 		}
 	}
 
-	await runAtomic(c.env, statements);
+	// First batch: def update + as many book updates as will fit alongside it.
+	const firstChunk = bookUpdates.slice(0, D1_BATCH_LIMIT - 1);
+	await runAtomic(c.env, [defUpdate, ...firstChunk]);
+	for (let i = firstChunk.length; i < bookUpdates.length; i += D1_BATCH_LIMIT) {
+		await runAtomic(c.env, bookUpdates.slice(i, i + D1_BATCH_LIMIT));
+	}
 
 	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id, {
 		oldKey: existing.field_key,
@@ -1683,39 +1837,40 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 });
 
 app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: true }), async (c) => {
-	const where: string[] = ['deleted_at IS NULL'];
-	const values: unknown[] = [];
+	// Route the export through the same query path the list endpoint uses
+	// so FTS5, fold-aware accent-insensitive matching, fuzzy mode, and every
+	// `custom_*` filter all work consistently. The previous home-grown
+	// `title LIKE ?` clause silently stripped `%` and `_` and missed any
+	// accent-stripped search — exporting "γαβριήλ" wouldn't include rows
+	// titled "Γαβριήλ".
+	const query = BookFilterQuerySchema.parse(c.req.query());
+	const customFilters = Object.entries(c.req.query())
+		.filter(([key]) => key.startsWith('custom_'))
+		.map(([key, value]) => ({ key: key.replace('custom_', ''), value }));
 
-	const q = c.req.query('q');
-	const status = c.req.query('status');
-	const roomCode = c.req.query('roomCode');
-	const shelfCode = c.req.query('shelfCode');
-
-	if (q) {
-		const qValue = `%${q.replaceAll('%', '').replaceAll('_', '')}%`;
-		where.push('(title LIKE ? OR author LIKE ? OR isbn LIKE ?)');
-		values.push(qValue, qValue, qValue);
+	// Walk the full result set page by page so we can stream an export of
+	// arbitrary size without holding the whole table in memory or tripping
+	// any single-query result cap. Using a generous pageSize keeps the
+	// round-trip count low; the loop terminates as soon as we hit a short page.
+	const PAGE_SIZE = 100;
+	const aggregatedRows: Array<Record<string, unknown>> = [];
+	for (let page = 1; ; page += 1) {
+		const slice = await queryBooksWithFilters(c.env, {
+			...query,
+			customFilters,
+			page,
+			pageSize: PAGE_SIZE,
+			includeDeleted: false
+		});
+		for (const row of slice.rows) aggregatedRows.push(row);
+		if (slice.rows.length < PAGE_SIZE) break;
+		// Safety stop so a malformed loop can't run forever. 200K rows is
+		// well above the realistic library size; if anyone exports past
+		// that, the result is still useful — just truncated with a header.
+		if (aggregatedRows.length >= 200_000) break;
 	}
 
-	if (status) {
-		where.push('status = ?');
-		values.push(status);
-	}
-
-	if (roomCode) {
-		where.push('room_code = ?');
-		values.push(roomCode);
-	}
-
-	if (shelfCode) {
-		where.push('shelf_code = ?');
-		values.push(shelfCode);
-	}
-
-	const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
-	const rowsResult = await c.env.DB.prepare(`SELECT * FROM books ${whereSql} ORDER BY title ASC, id ASC`).bind(...values).all();
-	const rows = (rowsResult.results ?? []).map((row) => parseBook(row as Record<string, unknown>));
-	const exportRows = rows.map((row) => {
+	const exportRows = aggregatedRows.map((row) => {
 		const customFields = (row.customFields as Record<string, unknown> | undefined) ?? {};
 		const shaped: Record<string, unknown> = {};
 
@@ -1770,12 +1925,28 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				const customFields = await validateCustomFields(c.env, row.customFields);
 				const now = nowIso();
 				const id = crypto.randomUUID();
+				const tagsJson = JSON.stringify(row.tags);
+				const customFieldsJson = JSON.stringify(customFields);
+				// Sync-pushed books need the same fold columns as direct creates,
+				// otherwise the books_fts trigger indexes the unfolded raw text
+				// (COALESCE falls through to the raw column) and accent-stripped
+				// searches silently fail to match. Mirror the POST /api/books path.
+				const folds = computeBookFolds({
+					title: row.title,
+					author: row.author,
+					isbn: row.isbn ?? null,
+					publisher: row.publisher ?? null,
+					description: row.description ?? null,
+					tagsJson,
+					customFieldsJson
+				});
 				await c.env.DB.prepare(
 					`INSERT INTO books (
 						id, title, author, isbn, publication_year, publisher, language, description,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
-						created_at, updated_at, deleted_at
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)`
+						created_at, updated_at, deleted_at,
+						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						id,
@@ -1789,11 +1960,18 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						row.roomCode ?? null,
 						row.shelfCode ?? null,
 						row.acquisitionDate ?? null,
-						JSON.stringify(row.tags),
-						JSON.stringify(customFields),
+						tagsJson,
+						customFieldsJson,
 						row.status,
 						now,
-						now
+						now,
+						folds.title_fold,
+						folds.author_fold,
+						folds.isbn_fold,
+						folds.publisher_fold,
+						folds.description_fold,
+						folds.tags_fold,
+						folds.custom_fields_fold
 					)
 					.run();
 				await replaceBookAttributeValues(c.env, id, customFields);
@@ -1830,11 +2008,29 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					updatedAt: nowIso()
 				};
 
+				const mergedTagsJson = JSON.stringify(merged.tags);
+				const mergedCustomFieldsJson = JSON.stringify(merged.customFields);
+				// Same reason as create_book above — without writing the fold
+				// columns, an edit via sync push would leave the fts trigger
+				// indexing whatever fold was there before the edit (or the raw
+				// values via COALESCE), making the updated row's accented text
+				// silently unsearchable.
+				const mergedFolds = computeBookFolds({
+					title: (merged.title as string | null) ?? null,
+					author: (merged.author as string | null) ?? null,
+					isbn: (merged.isbn as string | null) ?? null,
+					publisher: (merged.publisher as string | null) ?? null,
+					description: (merged.description as string | null) ?? null,
+					tagsJson: mergedTagsJson,
+					customFieldsJson: mergedCustomFieldsJson
+				});
+
 				await c.env.DB.prepare(
 					`UPDATE books SET
 						 title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?, description = ?,
 						 room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
-						 version = ?, updated_at = ?
+						 version = ?, updated_at = ?,
+						 title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
 					 WHERE id = ? AND deleted_at IS NULL`
 				)
 					.bind(
@@ -1848,11 +2044,18 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						merged.roomCode ?? null,
 						merged.shelfCode ?? null,
 						merged.acquisitionDate ?? null,
-						JSON.stringify(merged.tags),
-						JSON.stringify(merged.customFields),
+						mergedTagsJson,
+						mergedCustomFieldsJson,
 						merged.status,
 						merged.version,
 						merged.updatedAt,
+						mergedFolds.title_fold,
+						mergedFolds.author_fold,
+						mergedFolds.isbn_fold,
+						mergedFolds.publisher_fold,
+						mergedFolds.description_fold,
+						mergedFolds.tags_fold,
+						mergedFolds.custom_fields_fold,
 						row.id
 					)
 					.run();
@@ -1965,22 +2168,37 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 	const limit = Math.max(1, Math.min(200, Number(c.req.query('limit') ?? 50)));
 	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
 
-	const groupsRes = await c.env.DB.prepare(
-		`SELECT
-			LOWER(TRIM(title)) AS title_key,
-			LOWER(TRIM(author)) AS author_key,
-			COUNT(*) AS dup_count
-		 FROM books
-		 WHERE deleted_at IS NULL
-		 GROUP BY title_key, author_key
-		 HAVING COUNT(*) > 1
-		 ORDER BY dup_count DESC, title_key ASC
-		 LIMIT ? OFFSET ?`
-	).bind(limit, offset).all<{ title_key: string; author_key: string; dup_count: number }>();
+	// Get the global count of duplicate groups in parallel with the paged
+	// slice. The previous `total` was just the count of returned groups,
+	// which made UI pagination misleading once more than `limit` groups
+	// existed.
+	const [groupsRes, totalRes] = await Promise.all([
+		c.env.DB.prepare(
+			`SELECT
+				LOWER(TRIM(title)) AS title_key,
+				LOWER(TRIM(author)) AS author_key,
+				COUNT(*) AS dup_count
+			 FROM books
+			 WHERE deleted_at IS NULL
+			 GROUP BY title_key, author_key
+			 HAVING COUNT(*) > 1
+			 ORDER BY dup_count DESC, title_key ASC
+			 LIMIT ? OFFSET ?`
+		).bind(limit, offset).all<{ title_key: string; author_key: string; dup_count: number }>(),
+		c.env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM (
+				SELECT 1 FROM books
+				 WHERE deleted_at IS NULL
+				 GROUP BY LOWER(TRIM(title)), LOWER(TRIM(author))
+				HAVING COUNT(*) > 1
+			)`
+		).first<{ n: number }>()
+	]);
 
+	const totalGroups = Number(totalRes?.n ?? 0);
 	const groups = groupsRes.results ?? [];
 	if (groups.length === 0) {
-		return c.json({ total: 0, groups: [] });
+		return c.json({ total: totalGroups, groups: [], page: { limit, offset } });
 	}
 
 	// Step 2: bulk-fetch only the rows in those duplicate buckets via OR predicates.
@@ -2019,7 +2237,118 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 		.map((g) => groupMap.get(`${g.title_key}|||${g.author_key}`) ?? [])
 		.filter((list) => list.length > 1);
 
-	return c.json({ total: orderedGroups.length, groups: orderedGroups, page: { limit, offset } });
+	return c.json({ total: totalGroups, groups: orderedGroups, page: { limit, offset } });
+});
+
+// ─── Semantic search ─────────────────────────────────────────────────────
+// Free-text → embedding → Vectorize ANN lookup → hydrate book rows.
+// Falls back to a 503 when either binding is missing so the frontend can
+// gracefully fall back to FTS without speculating about whether the feature
+// is wired up.
+
+app.get('/api/books/semantic', async (c) => {
+	if (!semanticSearchEnabled(c.env)) {
+		throw new HTTPException(503, { message: 'Semantic search is not enabled on this deployment.' });
+	}
+	const q = (c.req.query('q') ?? '').trim();
+	if (!q) {
+		return c.json({ items: [], total: 0, model: EMBEDDING_MODEL });
+	}
+	const topK = Math.max(1, Math.min(100, Number(c.req.query('topK') ?? 24)));
+
+	const matches = await semanticSearchBookIds(c.env, q, topK);
+	if (matches.length === 0) {
+		return c.json({ items: [], total: 0, model: EMBEDDING_MODEL });
+	}
+
+	// Hydrate by id while preserving Vectorize's score order. The IN clause
+	// is bounded by topK ≤ 100, well within D1 parameter limits.
+	const placeholders = matches.map(() => '?').join(',');
+	const rowsRes = await c.env.DB.prepare(
+		`SELECT * FROM books WHERE id IN (${placeholders}) AND deleted_at IS NULL`
+	).bind(...matches.map((m) => m.id)).all();
+	const byId = new Map<string, Record<string, unknown>>();
+	for (const row of rowsRes.results ?? []) {
+		const r = row as Record<string, unknown>;
+		const id = r.id as string;
+		byId.set(id, parseBook(r));
+	}
+
+	const items = matches
+		.map((m) => {
+			const book = byId.get(m.id);
+			return book ? { ...book, _score: m.score } : null;
+		})
+		.filter(Boolean);
+
+	return c.json({ items, total: items.length, model: EMBEDDING_MODEL });
+});
+
+// Backfill / re-embed pass. Admin-only. Pages through books that either
+// have no embedding yet OR were embedded with a different model than the
+// one in code (allowing migration after EMBEDDING_MODEL changes). Designed
+// to be re-runnable from the UI or a cron.
+app.post('/api/admin/vectorize-backfill', requireRole(['admin']), async (c) => {
+	if (!semanticSearchEnabled(c.env)) {
+		throw new HTTPException(503, { message: 'Semantic search is not enabled on this deployment.' });
+	}
+	const limit = Math.min(100, Math.max(1, Number(c.req.query('limit') ?? 50)));
+
+	// Books missing an embedding, or with a stale model identifier. We
+	// LEFT JOIN so a brand-new install with an empty book_vectorized table
+	// gets every book picked up on the first pass.
+	const rowsRes = await c.env.DB.prepare(
+		`SELECT b.id, b.title, b.author, b.description, b.publisher, b.language,
+		        b.publication_year, b.tags, b.custom_fields
+		   FROM books b
+		   LEFT JOIN book_vectorized v ON v.book_id = b.id
+		  WHERE b.deleted_at IS NULL
+		    AND (v.book_id IS NULL OR v.model != ?)
+		  ORDER BY b.updated_at DESC
+		  LIMIT ?`
+	).bind(EMBEDDING_MODEL, limit).all<{
+		id: string; title: string | null; author: string | null;
+		description: string | null; publisher: string | null; language: string | null;
+		publication_year: number | null; tags: string | null; custom_fields: string | null;
+	}>();
+
+	let embedded = 0;
+	let skipped = 0;
+	for (const row of rowsRes.results ?? []) {
+		try {
+			await vectorizeBook(c.env, row.id, {
+				title: row.title,
+				author: row.author,
+				description: row.description,
+				publisher: row.publisher,
+				language: row.language,
+				publicationYear: row.publication_year,
+				tags: safeJsonParse<string[]>(row.tags ?? '[]', []),
+				customFields: safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {})
+			});
+			embedded += 1;
+		} catch (error) {
+			console.warn('Backfill embed failed for book', row.id, error);
+			skipped += 1;
+		}
+	}
+
+	const remaining = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM books b
+		   LEFT JOIN book_vectorized v ON v.book_id = b.id
+		  WHERE b.deleted_at IS NULL AND (v.book_id IS NULL OR v.model != ?)`
+	).bind(EMBEDDING_MODEL).first<{ n: number }>();
+
+	await insertAuditLog(c.env, c.get('user').sub, 'admin.vectorize.backfill', 'system', null, {
+		embedded, skipped, remaining: Number(remaining?.n ?? 0)
+	});
+
+	return c.json({
+		embedded,
+		skipped,
+		remaining: Number(remaining?.n ?? 0),
+		model: EMBEDDING_MODEL
+	});
 });
 
 app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => {
@@ -3202,8 +3531,23 @@ app.post('/api/maintenance/cleanup', requireRole(['admin']), async (c) => {
 			orphanLoans: results[2]?.meta?.changes ?? 0
 		};
 	})();
-	await insertAuditLog(c.env, c.get('user').sub, 'maintenance.cleanup', 'system', null, summary);
-	return c.json(summary);
+
+	// Mutation log retention: the idempotency table grows monotonically as
+	// every write punches a new row. Without this sweep a busy library would
+	// see the table swell indefinitely. 7 days is well past the longest
+	// realistic client retry window, so anything older can be safely dropped
+	// — re-running the exact same mutation id after that point is no longer
+	// guarded by the replay logic, but a 7-day-old client retry is already
+	// an anomaly we'd want to investigate, not silently coalesce.
+	const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+	const sweepRes = await c.env.DB.prepare(
+		'DELETE FROM mutation_log WHERE created_at < ?'
+	).bind(cutoff).run();
+	const purgedMutationLog = sweepRes.meta?.changes ?? 0;
+
+	const fullSummary = { ...summary, purgedMutationLog };
+	await insertAuditLog(c.env, c.get('user').sub, 'maintenance.cleanup', 'system', null, fullSummary);
+	return c.json(fullSummary);
 });
 
 // ─── Cover images (R2) ────────────────────────────────────────────────────
@@ -3295,6 +3639,197 @@ app.get('/api/books/:id/cover', async (c) => {
 		}
 	}
 	throw new HTTPException(404, { message: 'No cover image' });
+});
+
+// ─── ISBN enrichment (OpenLibrary + Google Books) ────────────────────────
+// Looks up bibliographic metadata for an ISBN via two public APIs, normalizes
+// the response into the same shape our `BookCoreSchema` accepts, and caches
+// the merged result in KV for a week. Results are deliberately conservative —
+// we only return fields the librarian would otherwise have to type by hand.
+//
+// Source semantics:
+//   • openlibrary  — Open Library Books API (https://openlibrary.org/dev/docs/api/books)
+//   • googlebooks  — Google Books Volume API (https://developers.google.com/books)
+//   • both         — merge with OpenLibrary as primary source
+//
+// We hit both endpoints in parallel, prefer non-empty values from OpenLibrary
+// (it's typically richer for older books and has multilingual data), and fall
+// back to Google Books for whatever's still missing. Both APIs are unauth'd
+// and rate-limited at the network layer; the KV cache keeps us well under any
+// realistic limit during normal use.
+
+type EnrichedBookFields = {
+	isbn: string;
+	title?: string | null;
+	subTitle?: string | null;
+	author?: string | null;
+	publisher?: string | null;
+	publicationYear?: number | null;
+	language?: string | null;
+	description?: string | null;
+	pages?: number | null;
+	coverUrl?: string | null;
+	source: 'openlibrary' | 'googlebooks' | 'both' | 'none';
+};
+
+function sanitizeIsbn(raw: string): string {
+	// Strip everything but digits and X (some ISBN-10 end in 'X'), upper-case.
+	// Keeps the cache key tight and protects us from someone passing a URL
+	// fragment or a quoted string in.
+	return raw.replace(/[^0-9Xx]/g, '').toUpperCase();
+}
+
+function isValidIsbn(isbn: string): boolean {
+	// We don't checksum-validate (some catalogue ISBNs in the wild are typo'd).
+	// 10- and 13-digit lengths cover the legitimate cases; anything else is
+	// almost certainly junk and we shouldn't burn an upstream call on it.
+	return /^(\d{9}[\dX]|\d{13})$/.test(isbn);
+}
+
+async function fetchOpenLibrary(isbn: string): Promise<Partial<EnrichedBookFields> | null> {
+	try {
+		const res = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`, {
+			cf: { cacheEverything: true, cacheTtl: 86400 }
+		} as RequestInit);
+		if (!res.ok) return null;
+		const data = (await res.json()) as Record<string, unknown>;
+		const entry = data[`ISBN:${isbn}`] as Record<string, unknown> | undefined;
+		if (!entry) return null;
+		const authors = (entry.authors as Array<{ name?: string }> | undefined) ?? [];
+		const publishers = (entry.publishers as Array<{ name?: string }> | undefined) ?? [];
+		const yearRaw = (entry.publish_date as string | undefined) ?? '';
+		const yearMatch = yearRaw.match(/\b(\d{4})\b/);
+		const cover = entry.cover as Record<string, string> | undefined;
+		return {
+			title: typeof entry.title === 'string' ? entry.title : null,
+			subTitle: typeof entry.subtitle === 'string' ? (entry.subtitle as string) : null,
+			author: authors.map((a) => a.name).filter(Boolean).join(', ') || null,
+			publisher: publishers.map((p) => p.name).filter(Boolean).join(', ') || null,
+			publicationYear: yearMatch ? Number(yearMatch[1]) : null,
+			pages: typeof entry.number_of_pages === 'number' ? entry.number_of_pages : null,
+			coverUrl: cover?.large ?? cover?.medium ?? cover?.small ?? null
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function fetchGoogleBooks(isbn: string): Promise<Partial<EnrichedBookFields> | null> {
+	try {
+		const res = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}&maxResults=1`, {
+			cf: { cacheEverything: true, cacheTtl: 86400 }
+		} as RequestInit);
+		if (!res.ok) return null;
+		const data = (await res.json()) as {
+			items?: Array<{
+				volumeInfo?: {
+					title?: string;
+					subtitle?: string;
+					authors?: string[];
+					publisher?: string;
+					publishedDate?: string;
+					description?: string;
+					language?: string;
+					pageCount?: number;
+					imageLinks?: { thumbnail?: string; smallThumbnail?: string };
+				};
+			}>;
+		};
+		const info = data.items?.[0]?.volumeInfo;
+		if (!info) return null;
+		const yearMatch = (info.publishedDate ?? '').match(/\b(\d{4})\b/);
+		const rawCover = info.imageLinks?.thumbnail ?? info.imageLinks?.smallThumbnail ?? null;
+		return {
+			title: info.title ?? null,
+			subTitle: info.subtitle ?? null,
+			author: info.authors?.join(', ') ?? null,
+			publisher: info.publisher ?? null,
+			publicationYear: yearMatch ? Number(yearMatch[1]) : null,
+			language: info.language ?? null,
+			description: info.description ?? null,
+			pages: typeof info.pageCount === 'number' ? info.pageCount : null,
+			// Google's thumbnails come back as http://; upgrade so mixed-content
+			// blocking doesn't shoot the image down on the frontend.
+			coverUrl: rawCover ? rawCover.replace(/^http:\/\//, 'https://') : null
+		};
+	} catch {
+		return null;
+	}
+}
+
+function mergeEnrichment(
+	primary: Partial<EnrichedBookFields> | null,
+	fallback: Partial<EnrichedBookFields> | null
+): Partial<EnrichedBookFields> {
+	const out: Partial<EnrichedBookFields> = {};
+	for (const key of [
+		'title', 'subTitle', 'author', 'publisher', 'publicationYear',
+		'language', 'description', 'pages', 'coverUrl'
+	] as Array<keyof EnrichedBookFields>) {
+		const p = primary?.[key];
+		const f = fallback?.[key];
+		// Pick the non-empty/non-null value; primary wins ties.
+		const chosen = (p !== null && p !== undefined && p !== '') ? p : f;
+		if (chosen !== undefined && chosen !== null && chosen !== '') {
+			(out as Record<string, unknown>)[key] = chosen;
+		}
+	}
+	return out;
+}
+
+app.get('/api/lookup/isbn/:isbn', async (c) => {
+	const sourceParam = (c.req.query('source') ?? 'both').toLowerCase();
+	if (!['openlibrary', 'googlebooks', 'both'].includes(sourceParam)) {
+		throw new HTTPException(400, { message: 'source must be openlibrary, googlebooks, or both' });
+	}
+	const isbn = sanitizeIsbn(c.req.param('isbn') ?? '');
+	if (!isValidIsbn(isbn)) {
+		throw new HTTPException(400, { message: 'Invalid ISBN (need 10 or 13 digits).' });
+	}
+
+	const cacheKey = `enrich:isbn:${sourceParam}:${isbn}`;
+	if (c.env.CACHE) {
+		try {
+			const cached = await c.env.CACHE.get(cacheKey, 'json');
+			if (cached) return c.json(cached);
+		} catch (error) {
+			console.warn('ISBN enrichment cache read failed', error);
+		}
+	}
+
+	let merged: Partial<EnrichedBookFields> = {};
+	let source: EnrichedBookFields['source'] = 'none';
+	if (sourceParam === 'openlibrary') {
+		const ol = await fetchOpenLibrary(isbn);
+		merged = ol ?? {};
+		source = ol ? 'openlibrary' : 'none';
+	} else if (sourceParam === 'googlebooks') {
+		const gb = await fetchGoogleBooks(isbn);
+		merged = gb ?? {};
+		source = gb ? 'googlebooks' : 'none';
+	} else {
+		const [ol, gb] = await Promise.all([fetchOpenLibrary(isbn), fetchGoogleBooks(isbn)]);
+		merged = mergeEnrichment(ol, gb);
+		if (ol && gb) source = 'both';
+		else if (ol) source = 'openlibrary';
+		else if (gb) source = 'googlebooks';
+		else source = 'none';
+	}
+
+	const response: EnrichedBookFields = { isbn, source, ...merged };
+
+	if (c.env.CACHE && source !== 'none') {
+		try {
+			// 7 days. We cache positive hits aggressively because they're
+			// effectively static; negative hits are NOT cached so a typo'd
+			// ISBN can self-correct as soon as the user fixes it.
+			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 7 * 24 * 60 * 60 });
+		} catch (error) {
+			console.warn('ISBN enrichment cache write failed', error);
+		}
+	}
+
+	return c.json(response);
 });
 
 export default app;

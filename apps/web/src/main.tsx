@@ -266,6 +266,20 @@ class ApiRequestError extends Error {
 }
 
 /**
+ * Thrown by `normalizeSpreadsheetRow` when a row has no title/author. The
+ * import loop catches it by class — we used to match the localized error
+ * message via `String.includes(...)`, which silently broke for non-English
+ * UI languages (Korean/Greek/Russian) and let the whole import die on the
+ * first missing-title row instead of skipping that row.
+ */
+class SpreadsheetRowMissingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SpreadsheetRowMissingError';
+  }
+}
+
+/**
  * Thrown synchronously (before fetch) when the user attempts a write
  * (POST/PUT/PATCH/DELETE) while the browser reports it is offline. We refuse
  * to even attempt the request because queuing offline writes would risk
@@ -559,6 +573,15 @@ function App() {
   const [qMode, setQMode] = useState<SearchMode>('all');
   const [partialWords, setPartialWords] = useState(true);
   const [fuzzyTypos, setFuzzyTypos] = useState(true);
+  // Lexical = the existing FTS + fuzzy stack. Semantic = ANN over book
+  // embeddings (Workers AI + Vectorize). The toggle is in advanced search;
+  // when semantic mode is on we bypass the filter chips/sort UI and send
+  // only `q` to the dedicated `/api/books/semantic` endpoint.
+  const [searchEngine, setSearchEngine] = useState<'lexical' | 'semantic'>('lexical');
+  // Health probe tells us whether the deployment has Vectorize+AI bound,
+  // so we can disable the semantic option in the UI rather than offer a
+  // mode that would only ever return 503.
+  const [semanticAvailable, setSemanticAvailable] = useState<boolean | null>(null);
   const [searchFields, setSearchFields] = useState<SearchField[]>(['title', 'author', 'isbn']);
   const [showAdvancedSearch, setShowAdvancedSearch] = useState(false);
   const [status, setStatus] = useState('');
@@ -579,6 +602,15 @@ function App() {
   // commit results. Prevents stale responses from overwriting a newer
   // search when responses arrive out of order on slow networks.
   const borrowerSearchSeqRef = useRef(0);
+  // Debounce handle for borrower search. We still fire only the latest
+  // request via the sequence counter, but coalescing keystrokes into a
+  // single network call lowers the cost per typed name and reduces backend
+  // pressure on the API + KV rate limiter.
+  const borrowerDebounceRef = useRef<number | null>(null);
+  // Keyboard-navigation cursor inside the suggestion dropdown. -1 means
+  // "no selection yet" — Enter on -1 doesn't pick anything (preserves the
+  // existing "submit the typed value" behavior).
+  const [borrowerHighlight, setBorrowerHighlight] = useState(-1);
   const bookHistorySeqRef = useRef(0);
   const [borrowerQuery, setBorrowerQuery] = useState('');
   const [selectedBorrowerId, setSelectedBorrowerId] = useState<string>('');
@@ -623,7 +655,6 @@ function App() {
   });
   const [editingCustomFieldId, setEditingCustomFieldId] = useState<string | null>(null);
 
-  const [importJson, setImportJson] = useState('[]');
   const [importDryRun, setImportDryRun] = useState(true);
   const [importFileName, setImportFileName] = useState('');
 
@@ -1176,7 +1207,7 @@ function App() {
     const title = toNullableText(firstSpreadsheetValue(row, ['title']));
     const author = toNullableText(firstSpreadsheetValue(row, ['author', 'writer', 'writers']));
     if (!title || !author) {
-      throw new Error(t('toast.rowMissing', { row: index + 2 }));
+      throw new SpreadsheetRowMissingError(t('toast.rowMissing', { row: index + 2 }));
     }
 
     const statusInput = toNullableText(firstSpreadsheetValue(row, ['status']))?.toLowerCase();
@@ -1285,10 +1316,38 @@ function App() {
       const response = await apiRequest<{ items: Borrower[] }>(`/api/borrowers?${params.toString()}`);
       if (seq !== borrowerSearchSeqRef.current) return;
       setBorrowerSuggestions(response.items ?? []);
+      setBorrowerHighlight(-1);
     } catch {
       if (seq !== borrowerSearchSeqRef.current) return;
       setBorrowerSuggestions([]);
+      setBorrowerHighlight(-1);
     }
+  }
+
+  // Debounced wrapper. Coalesces a burst of keystrokes into a single
+  // request while the sequence counter inside `searchBorrowers` still
+  // guards against out-of-order responses. 180 ms is short enough to feel
+  // instant while collapsing typical fast-typing bursts.
+  function scheduleBorrowerSearch(query: string): void {
+    if (borrowerDebounceRef.current !== null) {
+      window.clearTimeout(borrowerDebounceRef.current);
+    }
+    borrowerDebounceRef.current = window.setTimeout(() => {
+      borrowerDebounceRef.current = null;
+      void searchBorrowers(query);
+    }, 180);
+  }
+
+  // Apply a suggestion picked via keyboard or pointer. Shared between the
+  // dropdown's onMouseDown and the input's keyboard handler so Enter and
+  // click do exactly the same thing.
+  function applyBorrowerSuggestion(b: Borrower) {
+    setSelectedBorrowerId(b.id);
+    setBorrowerName(b.name);
+    setBorrowerContact(b.contact ?? '');
+    setBorrowerQuery('');
+    setBorrowerSuggestions([]);
+    setBorrowerHighlight(-1);
   }
 
   async function uploadBookCover(book: Book, file: File): Promise<void> {
@@ -1518,6 +1577,50 @@ function App() {
     setIsLoadingBooks(true);
     try {
       const page = pageOverride ?? currentPage;
+
+      // ── Semantic mode ─────────────────────────────────────────────────
+      // Vectorize doesn't speak filters/sort/pagination the same way SQL
+      // does, so when the user is in semantic mode we send only `q` and
+      // render the ANN-ranked result list. Filters/sort still apply
+      // client-side once we have the rows. Empty query short-circuits.
+      if (searchEngine === 'semantic') {
+        if (!q.trim()) {
+          setBooks([]);
+          setTotalBooksCount(0);
+          setCurrentPage(1);
+          return;
+        }
+        const semanticParams = new URLSearchParams({ q, topK: '50' });
+        const cacheKey = `GET /api/books/semantic?${semanticParams.toString()}`;
+        const cached = await cacheGet<{ items: Book[]; total: number }>(cacheKey);
+        if (cached) {
+          setBooks(cached.value.items);
+          setTotalBooksCount(cached.value.total);
+          setCurrentPage(1);
+        }
+        try {
+          const response = await apiRequest<{ items: Book[]; total: number }>(
+            `/api/books/semantic?${semanticParams.toString()}`
+          );
+          setBooks(response.items);
+          setTotalBooksCount(response.total);
+          setCurrentPage(1);
+        } catch (e) {
+          // 503 indicates the server doesn't have Vectorize+AI bound; flip
+          // the availability flag and fall back to lexical so the user
+          // isn't stuck on a broken mode.
+          const err = e as Error & { status?: number };
+          if (err.status === 503) {
+            setSemanticAvailable(false);
+            setSearchEngine('lexical');
+            setError(t('library.adv.semanticOff'));
+          } else if (!cached) {
+            setError(err.message);
+          }
+        }
+        return;
+      }
+
       const query = new URLSearchParams();
       if (q) query.set('q', q);
       if (qExclude) query.set('qExclude', qExclude);
@@ -1566,7 +1669,7 @@ function App() {
   }, [
     currentPage, q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
     status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
-    shelfFilter, sortBy, sortDir, smartListKey
+    shelfFilter, sortBy, sortDir, smartListKey, searchEngine, t, setError
   ]);
 
   // Debounced auto-search: any change to query/filters/sort re-fetches books on page 1.
@@ -1575,7 +1678,7 @@ function App() {
     const signature = JSON.stringify({
       q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
       status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
-      shelfFilter, sortBy, sortDir, smartListKey
+      shelfFilter, sortBy, sortDir, smartListKey, searchEngine
     });
     if (signature === lastSearchSignatureRef.current) return;
     lastSearchSignatureRef.current = signature;
@@ -1587,9 +1690,31 @@ function App() {
     loggedIn, didBootstrapData,
     q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
     status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
-    shelfFilter, sortBy, sortDir, smartListKey,
+    shelfFilter, sortBy, sortDir, smartListKey, searchEngine,
     loadBooks
   ]);
+
+  // Probe the server's /api/health on first login to learn whether the
+  // optional Vectorize + AI bindings are configured. We don't have a
+  // dedicated capability endpoint, but health already reports DB/KV/R2 and
+  // adding a hint keeps the network surface small.
+  useEffect(() => {
+    if (!loggedIn) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiRequest<{ ok: boolean; semantic?: boolean }>('/api/health');
+        if (cancelled) return;
+        // The server tells us via an explicit flag (added below). Until the
+        // flag rolls out we leave the toggle enabled and let the loadBooks
+        // 503 handler flip it off after the first attempt.
+        setSemanticAvailable(res.semantic ?? null);
+      } catch {
+        if (!cancelled) setSemanticAvailable(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [loggedIn]);
 
   async function loadCustomFields() {
     const cached = await cacheGet<{ items: CustomField[] }>('GET /api/custom-fields');
@@ -1812,6 +1937,89 @@ function App() {
       await loadStaffUsers();
     } catch (e) {
       toast.push('error', (e as Error).message);
+    }
+  }
+
+  // ── ISBN enrichment ─────────────────────────────────────────────────────
+  // Pulls metadata from OpenLibrary + Google Books via the worker proxy and
+  // fills any EMPTY fields in the Add Book form. We never overwrite a field
+  // the librarian has already filled in — the lookup is a convenience, not a
+  // policy enforcer.
+  const [isbnLookupBusy, setIsbnLookupBusy] = useState(false);
+
+  type IsbnLookupResult = {
+    isbn: string;
+    title?: string | null;
+    subTitle?: string | null;
+    author?: string | null;
+    publisher?: string | null;
+    publicationYear?: number | null;
+    language?: string | null;
+    description?: string | null;
+    pages?: number | null;
+    coverUrl?: string | null;
+    source: 'openlibrary' | 'googlebooks' | 'both' | 'none';
+  };
+
+  async function enrichFromIsbn(): Promise<void> {
+    const isbnRaw = createForm.isbn.trim();
+    if (!isbnRaw) {
+      pushAppToast('error', t('library.add.lookupNoIsbn'));
+      return;
+    }
+    setIsbnLookupBusy(true);
+    try {
+      // Strip everything but digits/X — same sanitization the server does,
+      // but doing it on the client too means the URL is clean and the
+      // browser cache key stable for repeat lookups.
+      const clean = isbnRaw.replace(/[^0-9Xx]/g, '');
+      const res = await apiRequest<IsbnLookupResult>(`/api/lookup/isbn/${encodeURIComponent(clean)}?source=both`);
+      if (res.source === 'none') {
+        pushAppToast('error', t('library.add.lookupNone'));
+        return;
+      }
+      let filled = 0;
+      setCreateForm((prev) => {
+        const next = { ...prev };
+        const set = (k: keyof typeof prev, v: string | null | undefined) => {
+          if (!v) return;
+          if (prev[k] && prev[k].toString().trim().length > 0) return; // don't overwrite
+          (next as Record<string, string>)[k] = String(v);
+          filled += 1;
+        };
+        set('title', res.title);
+        set('author', res.author);
+        set('publisher', res.publisher);
+        set('language', res.language);
+        set('description', res.description);
+        if (res.publicationYear) {
+          if (!prev.publicationYear || prev.publicationYear.trim() === '') {
+            next.publicationYear = String(res.publicationYear);
+            filled += 1;
+          }
+        }
+        return next;
+      });
+      // Bonus: if there's a `pages` custom field defined and it's currently
+      // blank, prefill it too. Keeps the catalog UX consistent with the
+      // existing pages field used by the LIBRARY catalogue import.
+      if (res.pages !== null && res.pages !== undefined) {
+        const pagesField = customFields.find((f) => f.key === 'pages' && f.type === 'number');
+        if (pagesField && (createAttrValues[pagesField.key] === undefined || createAttrValues[pagesField.key] === '')) {
+          setCreateAttrValues((prev) => ({ ...prev, [pagesField.key]: res.pages as number }));
+          filled += 1;
+        }
+      }
+      if (filled === 0) {
+        // Found a record but every field was already filled in.
+        pushAppToast('success', t('library.add.lookupOk', { n: 0, source: res.source }));
+      } else {
+        pushAppToast('success', t('library.add.lookupOk', { n: filled, source: res.source }));
+      }
+    } catch (e) {
+      pushAppToast('error', t('library.add.lookupError', { message: (e as Error).message }));
+    } finally {
+      setIsbnLookupBusy(false);
     }
   }
 
@@ -2142,6 +2350,21 @@ function App() {
     return new Date(y, m - 1, d, 23, 59, 59, 999).toISOString();
   }
 
+  // Inverse of endOfLocalDayIso for the <input type="date"> value. We must NOT
+  // use `toISOString().slice(0,10)` here — that converts to UTC first, so a
+  // local end-of-day stored as `2026-05-31T06:59:59Z` (UTC-7 user picked
+  // May 30) would render back as May 31. Use the *local* Y-M-D so the date
+  // shown in the input is the same date the user originally chose.
+  function isoToLocalDateInput(iso: string): string {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
   function setDueInDays(days: number) {
     const target = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
     target.setHours(23, 59, 59, 999);
@@ -2422,50 +2645,6 @@ function App() {
       }
       await loadCustomFields();
       setMessage(t('toast.customFieldRemoved', { key: field.key }));
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
-  async function runImport(event: FormEvent) {
-    event.preventDefault();
-    clearStatus();
-
-    try {
-      const parsedRows = JSON.parse(importJson) as Array<Record<string, unknown>>;
-      if (!Array.isArray(parsedRows)) {
-        throw new Error(t('toast.xlsxRowsRequired'));
-      }
-      const rows = parsedRows.map((row) => ({
-        title: String(row.title ?? ''),
-        author: String(row.author ?? ''),
-        isbn: row.isbn ? String(row.isbn) : null,
-        publicationYear: row.publicationYear ? Number(row.publicationYear) : null,
-        publisher: row.publisher ? String(row.publisher) : null,
-        language: row.language ? String(row.language) : null,
-        description: row.description ? String(row.description) : null,
-        roomCode: row.roomCode ? String(row.roomCode) : null,
-        shelfCode: row.shelfCode ? String(row.shelfCode) : null,
-        acquisitionDate: row.acquisitionDate ? String(row.acquisitionDate) : null,
-        tags: Array.isArray(row.tags) ? row.tags.map((x) => String(x)) : [],
-        customFields: (row.customFields as Record<string, unknown> | undefined) ?? {},
-        status: (row.status as BookStatus | undefined) ?? 'available'
-      }));
-
-      const result = await runAction(() => apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>(
-        '/api/import/books',
-        {
-          method: 'POST',
-          body: JSON.stringify({ dryRun: importDryRun, rows })
-        }
-      ));
-
-      if (result.dryRun) {
-        setMessage(t('toast.dryRunDone', { n: result.acceptedRows ?? 0 }));
-      } else {
-        setMessage(t('toast.importDone', { n: result.importedRows ?? 0 }));
-      }
-      await loadBooks();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -2783,8 +2962,9 @@ function App() {
 
           rows.push(normalized);
         } catch (error) {
-          const message = (error as Error).message;
-          if (message.includes('title and writer/author are required')) {
+          // Locale-safe: detect the row-missing case by class, not by
+          // matching a translated string.
+          if (error instanceof SpreadsheetRowMissingError) {
             skippedInvalidRows.push(index + 2);
             continue;
           }
@@ -3792,7 +3972,33 @@ function App() {
                       <div className="form-row">
                         <div>
                           <label>{t('library.add.isbn')}</label>
-                          <input value={createForm.isbn} onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })} placeholder={t('library.add.isbnPh')} />
+                          <div style={{ display: 'flex', gap: '0.4rem' }}>
+                            <input
+                              value={createForm.isbn}
+                              onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })}
+                              placeholder={t('library.add.isbnPh')}
+                              style={{ flex: 1 }}
+                              onKeyDown={(e) => {
+                                // Enter inside the ISBN field triggers lookup rather than
+                                // submitting the (likely incomplete) form. The librarian
+                                // can still click "Add Book" once they're satisfied.
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  if (!isbnLookupBusy) void enrichFromIsbn();
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="secondary small"
+                              onClick={() => void enrichFromIsbn()}
+                              disabled={isbnLookupBusy || !createForm.isbn.trim()}
+                              title={t('library.add.lookupHint')}
+                            >
+                              {isbnLookupBusy ? t('library.add.lookupSearching') : t('library.add.lookupIsbn')}
+                            </button>
+                          </div>
+                          <p className="muted small" style={{ marginTop: '0.25rem' }}>{t('library.add.lookupHint')}</p>
                         </div>
                         <div>
                           <label>{t('library.add.year')}</label>
@@ -3974,6 +4180,7 @@ function App() {
                         setPartialWords(true);
                         setFuzzyTypos(true);
                         setSearchFields(['title', 'author', 'isbn']);
+                        setSearchEngine('lexical');
                         setStatus('');
                         setFilterLanguage('');
                         setFilterYear('');
@@ -3990,16 +4197,41 @@ function App() {
                     <div style={{ marginTop: '0.75rem', borderTop: '1px solid var(--border)', paddingTop: '0.75rem' }}>
                       <div className="form-row">
                         <div>
+                          <label>{t('library.adv.engine')}</label>
+                          <select
+                            value={searchEngine}
+                            onChange={(e) => setSearchEngine(e.target.value as 'lexical' | 'semantic')}
+                            disabled={semanticAvailable === false}
+                            title={semanticAvailable === false ? t('library.adv.semanticOff') : undefined}
+                          >
+                            <option value="lexical">{t('library.adv.engineLexical')}</option>
+                            <option value="semantic" disabled={semanticAvailable === false}>
+                              {t('library.adv.engineSemantic')}
+                            </option>
+                          </select>
+                          {searchEngine === 'semantic' && (
+                            <p className="muted small" style={{ marginTop: '0.25rem' }}>{t('library.adv.semanticHint')}</p>
+                          )}
+                          {semanticAvailable === false && (
+                            <p className="muted small" style={{ marginTop: '0.25rem' }}>{t('library.adv.semanticOff')}</p>
+                          )}
+                        </div>
+                        <div>
                           <label>{t('library.adv.exclude')}</label>
                           <input
                             value={qExclude}
                             onChange={(e) => setQExclude(e.target.value)}
                             placeholder={t('library.adv.excludePh')}
+                            disabled={searchEngine === 'semantic'}
                           />
                         </div>
                         <div>
                           <label>{t('library.adv.matchMode')}</label>
-                          <select value={qMode} onChange={(e) => setQMode(e.target.value as SearchMode)}>
+                          <select
+                            value={qMode}
+                            onChange={(e) => setQMode(e.target.value as SearchMode)}
+                            disabled={searchEngine === 'semantic'}
+                          >
                             <option value="all">{t('library.adv.modeAll')}</option>
                             <option value="any">{t('library.adv.modeAny')}</option>
                             <option value="exact">{t('library.adv.modeExact')}</option>
@@ -4007,14 +4239,22 @@ function App() {
                         </div>
                         <div>
                           <label>{t('library.adv.partialWords')}</label>
-                          <select value={partialWords ? 'yes' : 'no'} onChange={(e) => setPartialWords(e.target.value === 'yes')}>
+                          <select
+                            value={partialWords ? 'yes' : 'no'}
+                            onChange={(e) => setPartialWords(e.target.value === 'yes')}
+                            disabled={searchEngine === 'semantic'}
+                          >
                             <option value="yes">{t('library.adv.partialYes')}</option>
                             <option value="no">{t('library.adv.partialNo')}</option>
                           </select>
                         </div>
                         <div>
                           <label>{t('library.adv.fuzzy')}</label>
-                          <select value={fuzzyTypos ? 'on' : 'off'} onChange={(e) => setFuzzyTypos(e.target.value === 'on')}>
+                          <select
+                            value={fuzzyTypos ? 'on' : 'off'}
+                            onChange={(e) => setFuzzyTypos(e.target.value === 'on')}
+                            disabled={searchEngine === 'semantic'}
+                          >
                             <option value="on">{t('library.adv.fuzzyOn')}</option>
                             <option value="off">{t('library.adv.fuzzyOff')}</option>
                           </select>
@@ -4356,28 +4596,53 @@ function App() {
                               setBorrowerQuery(v);
                               setBorrowerName(v);
                               setSelectedBorrowerId('');
-                              if (v.trim().length >= 2) void searchBorrowers(v);
-                              else setBorrowerSuggestions([]);
+                              if (v.trim().length >= 2) scheduleBorrowerSearch(v);
+                              else { setBorrowerSuggestions([]); setBorrowerHighlight(-1); }
                             }}
                             onFocus={() => { if (!borrowerSuggestions.length) void searchBorrowers(borrowerQuery); }}
+                            onKeyDown={(e) => {
+                              // Arrow keys move through the suggestion list, Enter
+                              // picks the highlighted row (or submits the form when
+                              // nothing is highlighted), Escape closes the dropdown.
+                              if (borrowerSuggestions.length === 0 || selectedBorrowerId) return;
+                              if (e.key === 'ArrowDown') {
+                                e.preventDefault();
+                                setBorrowerHighlight((i) => (i + 1) % borrowerSuggestions.length);
+                              } else if (e.key === 'ArrowUp') {
+                                e.preventDefault();
+                                setBorrowerHighlight((i) => (i <= 0 ? borrowerSuggestions.length - 1 : i - 1));
+                              } else if (e.key === 'Enter' && borrowerHighlight >= 0) {
+                                e.preventDefault();
+                                const picked = borrowerSuggestions[borrowerHighlight];
+                                if (picked) applyBorrowerSuggestion(picked);
+                              } else if (e.key === 'Escape') {
+                                e.preventDefault();
+                                setBorrowerSuggestions([]);
+                                setBorrowerHighlight(-1);
+                              }
+                            }}
                             placeholder={t('loans.borrowerPh')}
                             required
                             autoComplete="off"
+                            role="combobox"
+                            aria-autocomplete="list"
+                            aria-expanded={borrowerSuggestions.length > 0}
+                            aria-controls="borrower-suggestion-list"
+                            aria-activedescendant={borrowerHighlight >= 0 ? `borrower-opt-${borrowerSuggestions[borrowerHighlight]?.id}` : undefined}
                           />
                           {borrowerSuggestions.length > 0 && !selectedBorrowerId && (
-                            <ul className="combobox-list" role="listbox">
-                              {borrowerSuggestions.map((b) => (
+                            <ul className="combobox-list" role="listbox" id="borrower-suggestion-list">
+                              {borrowerSuggestions.map((b, i) => (
                                 <li
                                   key={b.id}
+                                  id={`borrower-opt-${b.id}`}
                                   role="option"
-                                  aria-selected={selectedBorrowerId === b.id}
+                                  aria-selected={borrowerHighlight === i}
+                                  className={borrowerHighlight === i ? 'is-active' : undefined}
+                                  onMouseEnter={() => setBorrowerHighlight(i)}
                                   onMouseDown={(e) => {
                                     e.preventDefault();
-                                    setSelectedBorrowerId(b.id);
-                                    setBorrowerName(b.name);
-                                    setBorrowerContact(b.contact ?? '');
-                                    setBorrowerQuery('');
-                                    setBorrowerSuggestions([]);
+                                    applyBorrowerSuggestion(b);
                                   }}
                                 >
                                   <span className="combo-name">{b.name}</span>
@@ -4416,7 +4681,7 @@ function App() {
                         <label>{t('loans.dueDate')} *</label>
                         <input
                           type="date"
-                          value={dueAt ? new Date(dueAt).toISOString().slice(0, 10) : ''}
+                          value={isoToLocalDateInput(dueAt)}
                           onChange={(e) => setDueAt(endOfLocalDayIso(e.target.value))}
                           required
                         />

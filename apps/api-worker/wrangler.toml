@@ -19,6 +19,21 @@ id = "6faf64c9dffb407985dc58d180b4eb99"
 binding = "ASSETS"
 bucket_name = "ok-library-assets"
 
+# ── Optional: semantic search (Vectorize + Workers AI) ───────────────────
+# Uncomment after creating the index, e.g.:
+#   wrangler vectorize create ok-library-books \
+#     --dimensions=768 --metric=cosine
+# The dimension MUST match the embedding model. We default to BGE base
+# (`@cf/baai/bge-base-en-v1.5`, 768 dims). Switch model + dims together.
+# When either binding is missing the semantic endpoints respond 503 and
+# the rest of the app keeps working unchanged.
+# [[vectorize]]
+# binding = "VECTORIZE"
+# index_name = "ok-library-books"
+#
+# [ai]
+# binding = "AI"
+
 [vars]
 APP_ENV = "production"
 JWT_ISSUER = "ok-library-api"
