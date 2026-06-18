@@ -277,6 +277,73 @@ function setUnauthorizedHandler(fn: (() => void) | null): void {
   onUnauthorized = fn;
 }
 
+// ─── Desktop app downloads ────────────────────────────────────────────────────
+// Installers are published to GitHub Releases; `latest/download/<asset>` always
+// resolves to the newest release's asset, so the button never needs updating.
+// Override the base via VITE_DESKTOP_DL_BASE if you host the installers elsewhere.
+const DESKTOP_DL_BASE = (import.meta.env.VITE_DESKTOP_DL_BASE as string | undefined)
+  ?? 'https://github.com/CyberSystema/ok-library/releases/latest/download';
+const DESKTOP_RELEASES_URL = (import.meta.env.VITE_DESKTOP_RELEASES_URL as string | undefined)
+  ?? 'https://github.com/CyberSystema/ok-library/releases/latest';
+const DESKTOP_DOWNLOADS = {
+  mac: `${DESKTOP_DL_BASE}/OK-Library-macOS.dmg`,
+  windows: `${DESKTOP_DL_BASE}/OK-Library-Windows-x64.zip`,
+  windowsArm: `${DESKTOP_DL_BASE}/OK-Library-Windows-arm64.zip`
+};
+
+type DesktopOS = 'mac' | 'windows' | 'other';
+
+/** Best-effort OS detection for picking the right installer. */
+function detectDesktopOS(): DesktopOS {
+  if (typeof navigator === 'undefined') return 'other';
+  const uaData = (navigator as unknown as { userAgentData?: { platform?: string } }).userAgentData;
+  const platform = (uaData?.platform || navigator.platform || '').toLowerCase();
+  const ua = (navigator.userAgent || '').toLowerCase();
+  const hay = `${platform} ${ua}`;
+  // Note: iPadOS reports as "Mac"; harmless here since the link still points at
+  // the releases page fallback only for the 'other' bucket.
+  if (hay.includes('mac')) return 'mac';
+  if (hay.includes('win')) return 'windows';
+  return 'other';
+}
+
+/**
+ * Auto-detecting "Download desktop app" button. Picks the installer for the
+ * visitor's OS; on an unrecognized OS it links to the releases page (all
+ * platforms). The small "other platforms" link is always available so e.g. a
+ * Mac user can still grab the Windows build.
+ */
+function DownloadDesktopButton() {
+  const t = useT();
+  const os = useMemo(detectDesktopOS, []);
+
+  const target =
+    os === 'mac'
+      ? { href: DESKTOP_DOWNLOADS.mac, label: t('desktop.downloadMac') }
+      : os === 'windows'
+        ? { href: DESKTOP_DOWNLOADS.windows, label: t('desktop.downloadWin') }
+        : { href: DESKTOP_RELEASES_URL, label: t('desktop.downloadApp') };
+
+  return (
+    <span className="desktop-download">
+      <a className="secondary small" href={target.href} title={t('desktop.tooltip')}>
+        {target.label}
+      </a>
+      {os !== 'other' && (
+        <a
+          className="muted small desktop-download-other"
+          href={DESKTOP_RELEASES_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={t('desktop.otherTooltip')}
+        >
+          {t('desktop.other')}
+        </a>
+      )}
+    </span>
+  );
+}
+
 const RESERVED_ATTRIBUTE_KEYS = new Set([
   'title',
   'subtitle',
@@ -3702,6 +3769,7 @@ function App() {
               <h1>{t('app.brand')}</h1>
             </div>
             <div className="navbar-right">
+              <DownloadDesktopButton />
               <LanguageSwitcher />
               <button
                 className="theme-toggle"

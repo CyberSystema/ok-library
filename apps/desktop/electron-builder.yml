@@ -2,6 +2,11 @@ appId: dev.leontg.oklibrary
 productName: OK Library
 copyright: Copyright © OK Library
 
+# `electron` is hoisted to the repo-root node_modules in this npm workspace, so
+# electron-builder can't auto-detect the version from apps/desktop. Pin it here.
+# Keep in sync with the electron devDependency in package.json.
+electronVersion: 33.4.11
+
 directories:
   output: release
   buildResources: build
