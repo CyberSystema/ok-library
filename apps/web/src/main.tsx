@@ -326,12 +326,26 @@ function DownloadDesktopButton() {
 
   return (
     <span className="desktop-download">
-      <a className="secondary small" href={target.href} title={t('desktop.tooltip')}>
-        {target.label}
+      <a className="btn-download" href={target.href} title={t('desktop.tooltip')}>
+        <svg
+          className="btn-download-icon"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 3v12" />
+          <path d="m7 11 5 5 5-5" />
+          <path d="M5 21h14" />
+        </svg>
+        <span>{target.label}</span>
       </a>
       {os !== 'other' && (
         <a
-          className="muted small desktop-download-other"
+          className="desktop-download-other"
           href={DESKTOP_RELEASES_URL}
           target="_blank"
           rel="noopener noreferrer"
