@@ -1,0 +1,44 @@
+appId: dev.leontg.oklibrary
+productName: OK Library
+copyright: Copyright © OK Library
+
+directories:
+  output: release
+  buildResources: build
+
+# Ship the Electron main/preload plus the already-built web SPA. `dist` runs
+# `build:web` first (see package.json), which populates apps/web/dist.
+files:
+  - src/**/*
+  - package.json
+extraResources:
+  - from: ../web/dist
+    to: web/dist
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - dmg
+    - zip
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # Notarization: set APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID in the
+  # environment and signing identity via CSC_LINK / CSC_KEY_PASSWORD.
+  notarize: false
+
+win:
+  target:
+    - nsis
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+# Auto-update feed (electron-updater). Point at GitHub Releases or an R2 bucket
+# and uncomment once code signing is configured.
+# publish:
+#   provider: github
+#   owner: <you>
+#   repo: ok-library

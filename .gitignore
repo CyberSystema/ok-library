@@ -6,6 +6,9 @@ node_modules/
 # Web
 apps/web/dist/
 
+# Desktop (Electron)
+apps/desktop/release/
+
 # Cloudflare local state
 .apps/
 .wrangler/

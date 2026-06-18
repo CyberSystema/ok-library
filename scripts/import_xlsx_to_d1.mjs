@@ -30,7 +30,10 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 
 const require = createRequire(import.meta.url);
-const XLSX = require('../apps/web/node_modules/xlsx');
+// Bare specifier: Node resolves it up the tree to the hoisted root
+// node_modules/xlsx. The old hard-coded apps/web/node_modules path broke once
+// the workspace hoisted xlsx to the repo root (MODULE_NOT_FOUND).
+const XLSX = require('xlsx');
 
 function arg(name, fallback = null) {
   const i = process.argv.indexOf(name);

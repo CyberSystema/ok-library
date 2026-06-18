@@ -179,6 +179,10 @@ async function enforceRateLimit(c: AppContext, bucket: string, perMinuteLimit: n
 
 		await c.env.CACHE.put(key, String(count + 1), { expirationTtl: 70 });
 	} catch (error) {
+		// A real limit breach (the 429 we threw above) must propagate — only KV
+		// I/O failures are allowed to fail open. Without this re-throw the catch
+		// would swallow our own HTTPException and the limiter would never block.
+		if (error instanceof HTTPException) throw error;
 		console.warn('Rate limiter unavailable, continuing without KV enforcement', error);
 	}
 }
@@ -391,7 +395,12 @@ app.post('/api/auth/login', async (c) => {
 		`ok_library_session=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=${ttl}`
 	);
 
-	return c.json({ user: { id: user.id, username: user.username, role: user.role } });
+	// Return the token in the body as well as the HttpOnly cookie. Browsers that
+	// block the cross-site cookie (Safari/WebKit ITP — pages.dev and workers.dev
+	// are different registrable sites) can fall back to sending it as a bearer
+	// token, which authMiddleware already accepts. Native clients (mobile) read
+	// it from here too.
+	return c.json({ user: { id: user.id, username: user.username, role: user.role }, token });
 });
 
 app.post('/api/auth/logout', async (c) => {
@@ -431,18 +440,27 @@ app.use('/api/*', async (c, next) => {
 		return;
 	}
 
-	// 1. Replay path: did we already process this id? Return the same response.
+	// 1. Replay path: did we already process this id? Return the same response —
+	// but only to the user who originally made the mutation. A client-generated
+	// id colliding across users (or a stolen id) must not let one user read
+	// another user's mutation result.
 	try {
 		const prior = await c.env.DB.prepare(
-			'SELECT status, response_body FROM mutation_log WHERE id = ? LIMIT 1'
-		).bind(mutationId).first<{ status: number; response_body: string }>();
+			'SELECT status, response_body, user_id FROM mutation_log WHERE id = ? LIMIT 1'
+		).bind(mutationId).first<{ status: number; response_body: string; user_id: string | null }>();
 		if (prior) {
+			const currentUserId = c.get('user')?.sub ?? null;
+			if ((prior.user_id ?? null) !== currentUserId) {
+				throw new HTTPException(409, { message: 'This request id was already used by another session.' });
+			}
 			return new Response(prior.response_body, {
 				status: prior.status,
 				headers: { 'Content-Type': 'application/json', 'X-Idempotent-Replay': '1' }
 			});
 		}
 	} catch (err) {
+		// Let an intentional conflict propagate; only swallow lookup I/O errors.
+		if (err instanceof HTTPException) throw err;
 		// If the lookup itself fails we proceed with the request rather than
 		// failing closed — better to risk a duplicate (which the client's own
 		// retry logic only triggers on transient errors anyway) than to block
@@ -582,13 +600,16 @@ app.patch('/api/me', async (c) => {
 	const finalUsername = (changes.username as { to: string } | undefined)?.to ?? me.username;
 
 	// If the username changed, the JWT still encodes the old one. Reissue the
-	// session cookie so the client sees the up-to-date identity right away.
+	// session cookie (and hand back a fresh bearer token) so the client sees the
+	// up-to-date identity right away.
+	let refreshedToken: string | undefined;
 	if (changes.username) {
 		const token = await createAccessToken(c.env, {
 			sub: me.id,
 			username: finalUsername,
 			role: me.role
 		});
+		refreshedToken = token;
 		const ttl = Number(c.env.ACCESS_TOKEN_TTL_SECONDS ?? '43200');
 		c.header(
 			'Set-Cookie',
@@ -596,7 +617,10 @@ app.patch('/api/me', async (c) => {
 		);
 	}
 
-	return c.json({ user: { id: me.id, username: finalUsername, role: me.role } });
+	return c.json({
+		user: { id: me.id, username: finalUsername, role: me.role },
+		...(refreshedToken ? { token: refreshedToken } : {})
+	});
 });
 
 app.get('/api/books', async (c) => {
@@ -2398,17 +2422,36 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 
 		if (!changed) continue;
 
+		const tagsJson = JSON.stringify(n.tags);
+		const customFieldsJson = JSON.stringify(n.customFields);
+		// Recompute diacritic folds in lock-step with the normalized text so the
+		// books_fts trigger doesn't re-index against the pre-normalization values.
+		const folds = computeBookFolds({
+			title: n.title,
+			author: n.author,
+			isbn: n.isbn ?? null,
+			publisher: n.publisher ?? null,
+			description: n.description ?? null,
+			tagsJson,
+			customFieldsJson
+		});
+
 		updates.push(
 			c.env.DB.prepare(
 				`UPDATE books SET
 				   title=?, author=?, isbn=?, publisher=?, language=?, description=?,
 				   room_code=?, shelf_code=?, acquisition_date=?, tags=?, custom_fields=?,
-				   updated_at=?, version=version+1
+				   updated_at=?, version=version+1,
+				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
+				   description_fold=?, tags_fold=?, custom_fields_fold=?
 				 WHERE id=?`
 			).bind(
 				n.title, n.author, n.isbn ?? null, n.publisher ?? null, n.language ?? null, n.description ?? null,
 				n.roomCode ?? null, n.shelfCode ?? null, n.acquisitionDate ?? null,
-				JSON.stringify(n.tags), JSON.stringify(n.customFields), now, row.id as string
+				tagsJson, customFieldsJson, now,
+				folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
+				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
+				row.id as string
 			)
 		);
 
@@ -2433,6 +2476,108 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 	});
 
 	return c.json({ processed, updated, unchanged: processed - updated, offset, nextOffset: offset + processed, totalBooks });
+});
+
+// ─── Rebuild the full-text search index ───────────────────────────────────────
+// `books_fts` is a contentless FTS5 table kept in sync by triggers that read the
+// pre-folded `*_fold` columns (see migration 0012). If those folds ever drift
+// from the raw text — e.g. a catalog re-import or normalize pass that predates
+// the fold-write fix — accent-insensitive (Greek) search silently misses rows.
+//
+// This endpoint recomputes every non-deleted book's folds from its CURRENT raw
+// columns and writes them back. The UPDATE fires `books_fts_au`, which deletes
+// the stale FTS entry (keyed by the old folds, which still match what's indexed)
+// and re-inserts the corrected one — so the index is rebuilt as a side effect,
+// and the underlying fold data is healed too. Only fold columns are touched, so
+// `version`/`updated_at` are left alone (this is derived data, not a content
+// edit — no mobile re-sync churn).
+//
+// Paginated (limit/offset) so large libraries can be rebuilt in chunks within
+// Worker CPU/D1 limits; loop with `nextOffset` until `done`. By default only
+// rows whose folds actually changed are rewritten; pass `?force=1` to re-emit
+// every row (a true FTS rebuild, useful if the index itself is suspected out of
+// sync even when the folds happen to match).
+app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c) => {
+	const limit = Math.min(500, Math.max(1, Number(c.req.query('limit') ?? 500)));
+	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
+	const force = c.req.query('force') === '1' || c.req.query('force') === 'true';
+
+	const rows = await c.env.DB.prepare(
+		`SELECT id, title, author, isbn, publisher, description, tags, custom_fields,
+		        title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
+		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
+	).bind(limit, offset).all<Record<string, unknown>>();
+
+	const processed = rows.results?.length ?? 0;
+	let rebuilt = 0;
+	const updates: D1PreparedStatement[] = [];
+
+	for (const row of rows.results ?? []) {
+		const folds = computeBookFolds({
+			title: (row.title as string) ?? null,
+			author: (row.author as string) ?? null,
+			isbn: (row.isbn as string) ?? null,
+			publisher: (row.publisher as string) ?? null,
+			description: (row.description as string) ?? null,
+			tagsJson: (row.tags as string) ?? null,
+			customFieldsJson: (row.custom_fields as string) ?? null
+		});
+
+		const changed =
+			folds.title_fold !== ((row.title_fold as string | null) ?? null) ||
+			folds.author_fold !== ((row.author_fold as string | null) ?? null) ||
+			folds.isbn_fold !== ((row.isbn_fold as string | null) ?? null) ||
+			folds.publisher_fold !== ((row.publisher_fold as string | null) ?? null) ||
+			folds.description_fold !== ((row.description_fold as string | null) ?? null) ||
+			folds.tags_fold !== ((row.tags_fold as string | null) ?? null) ||
+			folds.custom_fields_fold !== ((row.custom_fields_fold as string | null) ?? null);
+
+		if (!force && !changed) continue;
+
+		updates.push(
+			c.env.DB.prepare(
+				`UPDATE books SET
+				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
+				   description_fold=?, tags_fold=?, custom_fields_fold=?
+				 WHERE id=?`
+			).bind(
+				folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
+				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
+				row.id as string
+			)
+		);
+
+		rebuilt++;
+	}
+
+	// D1 batch caps at 50 statements per call.
+	const BATCH_SIZE = 50;
+	for (let i = 0; i < updates.length; i += BATCH_SIZE) {
+		await c.env.DB.batch(updates.slice(i, i + BATCH_SIZE));
+	}
+
+	if (rebuilt > 0) {
+		await bumpBooksCacheVersion(c.env);
+	}
+
+	const countResult = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL').first<{ n: number }>();
+	const totalBooks = countResult?.n ?? 0;
+	const nextOffset = offset + processed;
+	const done = nextOffset >= totalBooks;
+
+	await insertAuditLog(c.env, c.get('user').sub, 'admin.rebuildSearchIndex', 'book', null, {
+		processed, rebuilt, offset, limit, force
+	});
+
+	return c.json({
+		processed,
+		rebuilt,
+		unchanged: processed - rebuilt,
+		offset,
+		nextOffset: done ? null : nextOffset,
+		totalBooks,
+		done
+	});
 });
 
 // Category browser: aggregates books by their `category_code` custom field.
@@ -3151,6 +3296,19 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 	for (const p of prepared) {
 		const tags = '[]';
 		const customJson = JSON.stringify(p.customFields);
+		// Diacritic-fold the searchable fields so accent-insensitive (e.g. Greek)
+		// FTS keeps working after a catalog re-import. The books_fts trigger reads
+		// these *_fold columns; if we leave them stale the index re-indexes old
+		// text and updated books silently drop out of search.
+		const folds = computeBookFolds({
+			title: p.title,
+			author: p.author,
+			isbn: p.isbn,
+			publisher: p.publisher,
+			description: p.description,
+			tagsJson: tags,
+			customFieldsJson: customJson
+		});
 		try {
 			let bookId: string;
 			let didUpdate = false;
@@ -3170,7 +3328,9 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 					`UPDATE books SET
 						title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?,
 						description = ?, shelf_code = ?, custom_fields = ?, updated_at = ?,
-						version = version + 1, deleted_at = NULL
+						version = version + 1, deleted_at = NULL,
+						title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?,
+						description_fold = ?, custom_fields_fold = ?
 					 WHERE id = ?`
 				)
 					.bind(
@@ -3184,6 +3344,12 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 						p.shelfCode,
 						customJson,
 						now,
+						folds.title_fold,
+						folds.author_fold,
+						folds.isbn_fold,
+						folds.publisher_fold,
+						folds.description_fold,
+						folds.custom_fields_fold,
 						bookId
 					)
 					.run();
@@ -3194,8 +3360,9 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 					`INSERT INTO books (
 						id, title, author, isbn, publication_year, publisher, language, description,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
-						legacy_id, created_at, updated_at, deleted_at
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, 'available', 0, ?, ?, ?, NULL)`
+						legacy_id, created_at, updated_at, deleted_at,
+						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, 'available', 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						bookId,
@@ -3211,7 +3378,14 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 						customJson,
 						p.legacyId,
 						now,
-						now
+						now,
+						folds.title_fold,
+						folds.author_fold,
+						folds.isbn_fold,
+						folds.publisher_fold,
+						folds.description_fold,
+						folds.tags_fold,
+						folds.custom_fields_fold
 					)
 					.run();
 			}
@@ -3617,6 +3791,15 @@ app.get('/api/books/:id/cover', async (c) => {
 	const bookId = c.req.param('id') ?? '';
 	if (!/^[a-zA-Z0-9-]{1,64}$/.test(bookId)) {
 		throw new HTTPException(400, { message: 'Invalid book id' });
+	}
+	// This endpoint is intentionally public (so <img> tags load without the
+	// session cookie), but it must not serve covers for soft-deleted/trashed
+	// books. One indexed point lookup; covers are cached for an hour anyway.
+	const live = await c.env.DB.prepare(
+		'SELECT 1 AS ok FROM books WHERE id = ? AND deleted_at IS NULL LIMIT 1'
+	).bind(bookId).first<{ ok: number }>();
+	if (!live) {
+		throw new HTTPException(404, { message: 'No cover image' });
 	}
 	const ifNoneMatch = c.req.header('if-none-match');
 	for (const ext of ['jpg', 'png', 'webp', 'gif']) {

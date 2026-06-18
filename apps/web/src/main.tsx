@@ -84,6 +84,9 @@ type CustomField = {
 
 type LoginResponse = {
   user: { id: string; username: string; role: string };
+  // Present so clients on browsers that block the cross-site auth cookie
+  // (Safari/WebKit ITP) can authenticate via an Authorization: Bearer header.
+  token?: string;
 };
 
 type SessionResponse = {
@@ -232,6 +235,46 @@ function displayAuthor(book: { author: string }): string {
 function joinApiUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   return `${API_BASE}${normalizedPath}`;
+}
+
+// ─── Bearer-token auth (Safari/cross-site-cookie fallback) ────────────────────
+// The API issues an HttpOnly session cookie, but it is a *cross-site* cookie
+// (the web app and API are on different registrable sites — pages.dev vs
+// workers.dev). Safari/WebKit ITP blocks/purges cross-site cookies, so the
+// cookie never rides along and every request comes back 401 → "no books".
+// The API also accepts `Authorization: Bearer <token>` and returns the token in
+// the login body, so we persist it and send it on every request. This works in
+// every browser (and inside the Electron desktop shell) regardless of cookies.
+const AUTH_TOKEN_KEY = 'ok-library-token-v1';
+
+function readStoredToken(): string | null {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY);
+  } catch {
+    // Safari Private Browsing / disabled storage — degrade to in-memory only.
+    return null;
+  }
+}
+
+let authToken: string | null = readStoredToken();
+
+function setAuthToken(token: string | null): void {
+  authToken = token;
+  try {
+    if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
+    else localStorage.removeItem(AUTH_TOKEN_KEY);
+  } catch {
+    // In-memory `authToken` still works for the rest of the session.
+  }
+}
+
+// Invoked by apiRequest whenever the server rejects auth (401). The App wires
+// this to drop back to the login screen. Guarded by the App so the first-load
+// session probe (which 401s for anonymous visitors) doesn't show a spurious
+// "session expired" message.
+let onUnauthorized: (() => void) | null = null;
+function setUnauthorizedHandler(fn: (() => void) | null): void {
+  onUnauthorized = fn;
 }
 
 const RESERVED_ATTRIBUTE_KEYS = new Set([
@@ -406,10 +449,15 @@ async function apiRequest<T>(
     try {
       response = await fetch(joinApiUrl(path), {
         ...init,
+        // Keep sending the cookie for browsers that accept it; the API prefers
+        // the bearer token when both are present, so this is a harmless dual path.
         credentials: 'include',
         headers: {
           ...(raw ? {} : { 'Content-Type': 'application/json' }),
           ...(mutationId ? { 'X-Client-Mutation-Id': mutationId } : {}),
+          // Bearer fallback — the only auth that survives Safari's cross-site
+          // cookie blocking. No-op until we have a token (i.e. before login).
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
           ...(init?.headers ?? {})
         }
       });
@@ -455,6 +503,14 @@ async function apiRequest<T>(
       })();
 
       if (response.status === 401) {
+        // The stored bearer token (if any) is no longer valid — drop it so we
+        // don't keep overriding a possibly-valid cookie with a dead token, and
+        // notify the app so it can return to the login screen instead of leaving
+        // the user on a stale "logged-in" shell with no data.
+        setAuthToken(null);
+        if (onUnauthorized) {
+          try { onUnauthorized(); } catch { /* ignore handler errors */ }
+        }
         throw new ApiRequestError(401, 'Session expired. Please sign in again.');
       }
 
@@ -564,6 +620,9 @@ function App() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
 
   const [books, setBooks] = useState<Book[]>([]);
+  // Distinguishes a failed books fetch from a genuinely empty library so the UI
+  // can show a real error + retry instead of a misleading "no books" panel.
+  const [booksError, setBooksError] = useState<string | null>(null);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [currentPage, setCurrentPage] = useState(1);
   const [totalBooksCount, setTotalBooksCount] = useState(0);
@@ -761,7 +820,26 @@ function App() {
 
   const loggedIn = Boolean(currentUser);
 
-  // Restore session from HttpOnly cookie on first load
+  // Mirror `loggedIn` into a ref so the module-level 401 handler can tell a real
+  // session expiry from the anonymous first-load probe without re-subscribing.
+  const loggedInRef = useRef(false);
+  useEffect(() => { loggedInRef.current = loggedIn; }, [loggedIn]);
+
+  // Centralized 401 handling: when the server rejects auth after we believed we
+  // were signed in (expired token/cookie), drop to the login screen with a clear
+  // message instead of leaving the user on a stale shell showing "no books".
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      if (!loggedInRef.current) return; // ignore the anonymous session probe
+      setCurrentUser(null);
+      setDidBootstrapData(false);
+      setMessage(t('login.sessionExpired'));
+    });
+    return () => setUnauthorizedHandler(null);
+  }, [t]);
+
+  // Restore session on first load. Uses the stored bearer token (Safari) or the
+  // session cookie (other browsers), whichever is available.
   useEffect(() => {
     apiRequest<SessionResponse>('/api/auth/session')
       .then((res) => {
@@ -1464,6 +1542,9 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ username, password })
       }));
+      // Persist the bearer token so authenticated requests work even when the
+      // cross-site session cookie is blocked (Safari/WebKit).
+      if (response.token) setAuthToken(response.token);
       beginSplash();
       setCurrentUser(response.user);
       setDidBootstrapData(false);
@@ -1481,8 +1562,9 @@ function App() {
       // Keep sign-out resilient even if network request fails.
     }
 
-    // Wipe the local response cache so the next user (or re-login) cannot
-    // see another account's data even briefly.
+    // Drop the bearer token and wipe the local response cache so the next user
+    // (or re-login) cannot see another account's data even briefly.
+    setAuthToken(null);
     void cacheClear();
 
     setCurrentUser(null);
@@ -1575,6 +1657,7 @@ function App() {
 
   const loadBooks = useCallback(async (pageOverride?: number) => {
     setIsLoadingBooks(true);
+    setBooksError(null);
     try {
       const page = pageOverride ?? currentPage;
 
@@ -1615,6 +1698,7 @@ function App() {
             setSearchEngine('lexical');
             setError(t('library.adv.semanticOff'));
           } else if (!cached) {
+            setBooksError(err.message);
             setError(err.message);
           }
         }
@@ -1661,7 +1745,11 @@ function App() {
         setTotalBooksCount(response.total);
         setCurrentPage(page);
       } catch (e) {
-        if (!cached) setError((e as Error).message);
+        // Don't let a failed fetch masquerade as an empty library: record a
+        // dedicated error so the list area can render a retry affordance. The
+        // cache fallback (if any) still populated `books` above.
+        if (!cached) setBooksError((e as Error).message);
+        setError((e as Error).message);
       }
     } finally {
       setIsLoadingBooks(false);
@@ -2111,6 +2199,35 @@ function App() {
 
       setMessage(t('toast.normalizedAll', { updated: totalUpdated, total: totalBooks }));
       if (totalUpdated > 0) await loadBooks();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // Rebuild the full-text search index. Recomputes the diacritic folds for every
+  // book so accent-insensitive search is correct again after a catalog import.
+  // Loops the paginated endpoint until the server reports `done`.
+  async function rebuildSearchIndex() {
+    clearStatus();
+    try {
+      let offset = 0;
+      let totalRebuilt = 0;
+      let totalBooks = 0;
+
+      while (true) {
+        const result = await apiRequest<{
+          processed: number; rebuilt: number; offset: number; nextOffset: number | null; totalBooks: number; done: boolean;
+        }>(`/api/admin/rebuild-search-index?limit=500&offset=${offset}`, { method: 'POST' });
+
+        totalRebuilt += result.rebuilt;
+        totalBooks = result.totalBooks;
+
+        if (result.done || result.nextOffset === null) break;
+        offset = result.nextOffset;
+      }
+
+      setMessage(t('toast.rebuiltSearchIndex', { rebuilt: totalRebuilt, total: totalBooks }));
+      if (totalRebuilt > 0) await loadBooks();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -4370,6 +4487,17 @@ function App() {
                 <div className="card">
                   {isLoadingBooks && books.length === 0 ? (
                     <BookCardSkeleton count={6} />
+                  ) : booksError && books.length === 0 ? (
+                    <div className="empty-state">
+                      <p style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>⚠️</p>
+                      <p style={{ fontWeight: 600 }}>{t('library.error.title')}</p>
+                      <p className="muted small">{booksError}</p>
+                      <button
+                        className="secondary"
+                        style={{ marginTop: '0.75rem' }}
+                        onClick={() => { void loadBooks(currentPage); }}
+                      >{t('library.error.retry')}</button>
+                    </div>
                   ) : books.length === 0 ? (
                     <div className="empty-state">
                       <p style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>📚</p>
@@ -5151,6 +5279,10 @@ function App() {
                       {t('settings.normIntro')}
                     </p>
                     <button className="secondary" onClick={() => void normalizeAllBooks()}>{t('settings.normRun')}</button>
+                    <p className="muted small" style={{ margin: '1.25rem 0 1rem' }}>
+                      {t('settings.searchIndexIntro')}
+                    </p>
+                    <button className="secondary" onClick={() => void rebuildSearchIndex()}>{t('settings.searchIndexRun')}</button>
                   </div>
                 )}
 

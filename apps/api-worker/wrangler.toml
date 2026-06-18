@@ -38,4 +38,7 @@ bucket_name = "ok-library-assets"
 APP_ENV = "production"
 JWT_ISSUER = "ok-library-api"
 ACCESS_TOKEN_TTL_SECONDS = "43200"
-CORS_ORIGIN = "https://ok-library.pages.dev"
+# CSV of allowed origins. `app://ok-library` is the Electron desktop shell's
+# renderer origin (see apps/desktop). The Pages web app uses bearer-token auth,
+# so cross-site cookies are no longer required for it to work on Safari.
+CORS_ORIGIN = "https://ok-library.pages.dev,app://ok-library"

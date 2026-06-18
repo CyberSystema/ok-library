@@ -15,7 +15,7 @@ class AppState extends ChangeNotifier {
             // development can override via `--dart-define=API_BASE=...`. Using
             // a localhost default in release builds left the app pointing at
             // an unreachable host on real devices.
-            defaultValue: 'https://ok-library-api.example.workers.dev',
+            defaultValue: 'https://ok-library-api.leontg.workers.dev',
           ),
         ),
         _localDb = LocalDb() {

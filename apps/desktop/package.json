@@ -1,0 +1,19 @@
+{
+  "name": "@ok-library/desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Electron desktop shell for the OK Library web app",
+  "main": "src/main.js",
+  "scripts": {
+    "build:web": "npm --workspace @ok-library/web run build",
+    "start": "electron .",
+    "dev": "OK_DESKTOP_DEV_URL=http://localhost:5173 electron .",
+    "dist": "npm run build:web && electron-builder --config electron-builder.yml",
+    "dist:mac": "npm run build:web && electron-builder --mac --config electron-builder.yml",
+    "dist:win": "npm run build:web && electron-builder --win --config electron-builder.yml"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}

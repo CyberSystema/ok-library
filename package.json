@@ -19,6 +19,7 @@
     "import:xlsx:d1:remote": "node scripts/import_xlsx_to_d1.mjs --remote"
   },
   "devDependencies": {
-    "wrangler": "^4.84.1"
+    "wrangler": "^4.84.1",
+    "xlsx": "^0.18.5"
   }
 }
