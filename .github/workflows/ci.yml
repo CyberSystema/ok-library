@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+        env:
+          # CI only typechecks/builds the web + worker; no need for the ~100MB
+          # Electron binary that apps/desktop's devDeps would otherwise download.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+
+      - name: Build shared package
+        run: npm run build:shared
+
+      - name: Typecheck (all workspaces)
+        run: npm run typecheck
+
+      - name: Build web app
+        run: npm --workspace apps/web run build
+
+      - name: Security audit (production deps; advisory only)
+        run: npm audit --omit=dev || true
