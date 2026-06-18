@@ -307,15 +307,25 @@ function detectDesktopOS(): DesktopOS {
   return 'other';
 }
 
+/** True when running inside the Electron desktop shell (preload sets this). */
+function isDesktopShell(): boolean {
+  return typeof window !== 'undefined'
+    && Boolean((window as unknown as { okDesktop?: { isDesktop?: boolean } }).okDesktop?.isDesktop);
+}
+
 /**
  * Auto-detecting "Download desktop app" button. Picks the installer for the
  * visitor's OS; on an unrecognized OS it links to the releases page (all
  * platforms). The small "other platforms" link is always available so e.g. a
  * Mac user can still grab the Windows build.
+ *
+ * Hidden inside the desktop app itself — only the web app offers the download.
  */
 function DownloadDesktopButton() {
   const t = useT();
   const os = useMemo(detectDesktopOS, []);
+
+  if (isDesktopShell()) return null;
 
   const target =
     os === 'mac'
