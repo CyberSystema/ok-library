@@ -169,6 +169,14 @@ function createWindow() {
 app.whenReady().then(() => {
   registerAppProtocol();
   applySecurityHeaders();
+
+  // macOS dock icon. The packaged .app uses the bundled .icns, but in dev
+  // (`npm start`) the dock would otherwise show the default Electron icon —
+  // set it at runtime so dev matches the web app's book logo too.
+  if (process.platform === 'darwin' && app.dock) {
+    try { app.dock.setIcon(path.join(__dirname, 'icon.png')); } catch { /* non-fatal */ }
+  }
+
   createWindow();
 
   app.on('activate', () => {
