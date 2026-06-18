@@ -57,7 +57,7 @@ const CSP = [
 
 // Register the custom scheme as a standard, secure, fetch-capable origin. Must
 // run before `app.ready`.
-protocol.registerSchemeAsPrivileged([
+protocol.registerSchemesAsPrivileged([
   {
     scheme: APP_SCHEME,
     privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true },
