@@ -1,6 +1,6 @@
-appId: dev.leontg.oklibrary
+appId: com.cybersystema.oklibrary
 productName: OK Library
-copyright: Copyright © OK Library
+copyright: Copyright © CyberSystema
 
 # `electron` is hoisted to the repo-root node_modules in this npm workspace, so
 # electron-builder can't auto-detect the version from apps/desktop. Pin it here.

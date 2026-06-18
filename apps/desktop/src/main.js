@@ -21,6 +21,10 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
 
+// Brand name — keep the dock/menu/About consistent with the web app ("OK
+// Library") even in dev, where productName from electron-builder doesn't apply.
+app.setName('OK Library');
+
 const APP_SCHEME = 'app';
 const APP_HOST = 'ok-library';
 const APP_ORIGIN = `${APP_SCHEME}://${APP_HOST}`;
@@ -137,6 +141,9 @@ function createWindow() {
     minHeight: 600,
     backgroundColor: '#0f172a',
     title: 'OK Library',
+    // Runtime window/taskbar icon (Windows + Linux). macOS uses the bundled
+    // .icns from electron-builder. Matches the web app's book logo.
+    icon: path.join(__dirname, 'icon.png'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

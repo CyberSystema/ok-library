@@ -3,7 +3,8 @@
   "private": true,
   "version": "0.1.0",
   "description": "Electron desktop shell for the OK Library web app",
-  "author": "OK Library <leontg@proton.me>",
+  "author": "CyberSystema <support@cybersystema.com>",
+  "homepage": "https://cybersystema.com",
   "main": "src/main.js",
   "scripts": {
     "build:web": "npm --workspace @ok-library/web run build",
