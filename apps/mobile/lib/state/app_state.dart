@@ -180,6 +180,11 @@ class AppState extends ChangeNotifier {
     if (msg.contains('Login failed')) {
       return 'Sign-in failed. Check your username and password.';
     }
+    if (msg.contains('could not be applied')) {
+      // Per-mutation rejections were dropped from the queue — surface the
+      // server's reasons so the user knows what didn't sync.
+      return msg.replaceFirst('Exception: ', '');
+    }
     if (msg.contains('Sync push')) {
       return 'Could not sync changes. They are saved locally and will retry.';
     }

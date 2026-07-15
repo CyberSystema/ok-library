@@ -2602,9 +2602,13 @@ function App() {
   }
 
   // One-click resolve for the needs-review queue: strip the needs_review flag
-  // from the book's stored custom fields. Uses the book's persisted customFields
-  // as-is (not buildCustomFieldsPayload, which would enforce required fields and
-  // could block resolving a book that's missing an unrelated required value).
+  // from the book's stored custom fields and PUT the book. We send the book's
+  // persisted customFields as-is (not buildCustomFieldsPayload, so we don't
+  // invent values). NOTE: because the server enforces required custom fields
+  // whenever a customFields payload is present, resolving is blocked if the book
+  // is missing an admin-added required field — the user then gets the server's
+  // actionable "Required custom field missing" error and fills it via Edit
+  // first. This is rare (the default catalog fields are all optional).
   async function markReviewed(book: Book) {
     clearStatus();
     const cf: Record<string, unknown> = { ...(book.customFields ?? {}) };

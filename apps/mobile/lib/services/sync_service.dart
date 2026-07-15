@@ -40,11 +40,18 @@ class SyncService {
   Future<void> sync(String token) async {
     final pending = await localDb.listPendingMutations();
 
-    // Push mutations one-at-a-time so a server-side rejection of mutation N
-    // doesn't cause us to drop the still-unsent N+1..end. Each successful
-    // push is acked locally before moving on; failures abort the loop and
-    // leave the offending mutation on the queue for the next attempt (or
-    // for manual triage in a future "stuck mutations" UI).
+    // Push mutations one-at-a-time. A TRANSPORT failure (network / 401 / whole-
+    // request >=400) makes pushMutations THROW, which propagates out and leaves
+    // the current mutation queued for a later retry — correct for transient
+    // problems. A per-mutation SERVER REJECTION, by contrast, arrives as HTTP
+    // 200 with results[0].status == 'error' and is DETERMINISTIC (e.g. the book
+    // is no longer available, or validation failed): re-running it every sync
+    // would jam the queue forever and block the pull below. So we remove the
+    // mutation from the queue either way, but a rejection is collected and
+    // surfaced to the user afterwards — the original bug was dropping rejections
+    // *silently*; blocking on them (a previous fix) merely traded silent loss
+    // for a permanent jam whose only escape wiped the whole queue.
+    final rejected = <String>[];
     for (final row in pending) {
       final id = row['id'] as String;
       final mutation = {
@@ -54,21 +61,13 @@ class SyncService {
         'clientTimestamp': row['created_at'] as String,
       };
       final results = await apiClient.pushMutations(token: token, mutations: [mutation]);
-      // ACK (delete) the mutation ONLY if the server actually applied it. The
-      // server returns 200 with a per-mutation status even when it REJECTS a
-      // mutation (e.g. a borrow of an unavailable book, or a permission-denied
-      // borrow); deleting unconditionally silently dropped that offline change.
-      // On rejection we leave it on the queue and STOP the loop so later
-      // mutations aren't applied out of order — a genuinely permanent failure
-      // then surfaces to the user instead of vanishing.
       final applied = results.isNotEmpty && results.first['status'] == 'success';
-      if (applied) {
-        await localDb.deleteMutation(id);
-      } else {
+      await localDb.deleteMutation(id);
+      if (!applied) {
         final reason = results.isNotEmpty
             ? ((results.first['result'] as Map<String, dynamic>?)?['error'] ?? 'rejected')
             : 'no result';
-        throw Exception('Sync push rejected mutation: $reason');
+        rejected.add('${row['operation']}: $reason');
       }
     }
 
@@ -76,6 +75,12 @@ class SyncService {
     if (changes.isNotEmpty) {
       await localDb.upsertBooks(changes);
       _lastSyncCursor = changes.last.updatedAt.toUtc().toIso8601String();
+    }
+
+    // Surface rejected mutations (after pulls have run) so they aren't lost
+    // silently. app_state.synchronize maps this to a user-visible message.
+    if (rejected.isNotEmpty) {
+      throw Exception('Some offline changes could not be applied and were dropped: ${rejected.join('; ')}');
     }
   }
 }
