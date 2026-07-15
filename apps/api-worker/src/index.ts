@@ -682,6 +682,66 @@ app.get('/api/books', async (c) => {
 	return c.json(response);
 });
 
+// Distinct catalog values used to power the add/edit form autocomplete
+// (title, author, publisher, language, shelf code). Ordered by frequency so
+// the values a librarian actually reuses surface first, then capped to keep the
+// payload small. Cached per books-cache-version so it refreshes after any write.
+// NOTE: registered before `/api/books/:id` so "facets" isn't captured as an id.
+// Gated to writers: the values only feed the add/edit form autocomplete, which
+// viewers can't open, so there's no reason to expose the full catalog value
+// enumeration to read-only accounts.
+app.get('/api/books/facets', requirePermission('books.write', { librarian: true }), async (c) => {
+	const cacheVersion = await getBooksCacheVersion(c.env);
+	const cacheKey = `facets:${cacheVersion}`;
+
+	if (c.env.CACHE) {
+		try {
+			const cached = await c.env.CACHE.get(cacheKey, 'json');
+			if (cached) return c.json(cached);
+		} catch (error) {
+			console.warn('Facets cache read failed, falling back to DB query', error);
+		}
+	}
+
+	// `column` is always one of the hard-coded literals below — never user
+	// input — so interpolating it into the SQL is safe from injection.
+	async function distinctValues(column: string, limit: number): Promise<string[]> {
+		const { results } = await c.env.DB.prepare(
+			`SELECT ${column} AS v, COUNT(*) AS n
+			   FROM books
+			  WHERE deleted_at IS NULL AND ${column} IS NOT NULL AND TRIM(${column}) != ''
+			  GROUP BY ${column}
+			  ORDER BY n DESC, ${column} ASC
+			  LIMIT ?`
+		)
+			.bind(limit)
+			.all<{ v: string; n: number }>();
+		return (results ?? [])
+			.map((r) => r.v)
+			.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
+	}
+
+	const [titles, authors, publishers, languages, shelfCodes] = await Promise.all([
+		distinctValues('title', 1000),
+		distinctValues('author', 1000),
+		distinctValues('publisher', 1000),
+		distinctValues('language', 200),
+		distinctValues('shelf_code', 1000)
+	]);
+
+	const response = { titles, authors, publishers, languages, shelfCodes };
+
+	if (c.env.CACHE) {
+		try {
+			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 300 });
+		} catch (error) {
+			console.warn('Facets cache write failed, continuing without cache', error);
+		}
+	}
+
+	return c.json(response);
+});
+
 app.get('/api/books/:id', async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
@@ -1758,8 +1818,8 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 
 	for (let index = 0; index < payload.rows.length; index += 1) {
 		const row = payload.rows[index];
-		if (!row.title || !row.author) {
-			skippedRows.push({ index, reason: 'title and author are required' });
+		if (!row.title) {
+			skippedRows.push({ index, reason: 'title is required' });
 			continue;
 		}
 
@@ -2675,7 +2735,7 @@ app.get('/api/stats', async (c) => {
 				SUM(CASE WHEN publisher IS NOT NULL AND TRIM(publisher) != '' THEN 1 ELSE 0 END) AS with_publisher,
 				SUM(CASE WHEN publication_year IS NOT NULL THEN 1 ELSE 0 END) AS with_year,
 				SUM(CASE WHEN title = '(Untitled)' THEN 1 ELSE 0 END) AS untitled,
-				SUM(CASE WHEN author = '(Unknown)' THEN 1 ELSE 0 END) AS unknown_author
+				SUM(CASE WHEN author = '(Unknown)' OR author IS NULL OR TRIM(author) = '' THEN 1 ELSE 0 END) AS unknown_author
 			 FROM books WHERE deleted_at IS NULL`
 		).first<{
 			total: number; with_isbn: number; with_shelf: number; with_publisher: number;

@@ -697,6 +697,18 @@ label {
 }
 .form-row > div { display: flex; flex-direction: column; }
 .form-field { display: flex; flex-direction: column; margin-bottom: 0.875rem; }
+
+/* ISBN row: the input takes all remaining width so a full 13-digit ISBN stays
+   visible while typing; the lookup button never wraps or shrinks it away. */
+.isbn-row { display: flex; gap: 0.4rem; align-items: stretch; }
+.isbn-row > button { flex: 0 0 auto; white-space: nowrap; }
+.isbn-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
 .button-group { display: flex; gap: 0.625rem; flex-wrap: wrap; margin-top: 1rem; }
 .button-group button { flex: 0 0 auto; }
 .checkbox-label {

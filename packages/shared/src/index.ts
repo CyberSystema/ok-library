@@ -46,7 +46,10 @@ export const ISODateTimeSchema = z
 
 export const BookCoreSchema = z.object({
   title: z.string().min(1).max(300),
-  author: z.string().min(1).max(200),
+  // Author is optional: many works legitimately have none (liturgical books,
+  // service books, anonymous editions). Stored as an empty string when absent
+  // so the NOT NULL column and the "unknown author" placeholder both hold.
+  author: z.string().max(200).default(''),
   isbn: z.string().max(32).optional().nullable(),
   publicationYear: z.number().int().min(1000).max(3000).optional().nullable(),
   publisher: z.string().max(200).optional().nullable(),

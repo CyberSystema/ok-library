@@ -197,6 +197,13 @@ const SMART_LISTS: Array<SmartList & { labelKey: string }> = [
 
 type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
 type DuplicateGroup = DuplicateEntry[];
+type CatalogFacets = {
+  titles: string[];
+  authors: string[];
+  publishers: string[];
+  languages: string[];
+  shelfCodes: string[];
+};
 type SearchMode = 'all' | 'any' | 'exact';
 type SearchField = 'title' | 'author' | 'isbn' | 'publisher' | 'language' | 'description' | 'roomCode' | 'shelfCode' | 'tags' | 'custom';
 
@@ -686,6 +693,21 @@ function SectionHeader({
   );
 }
 
+// Autocomplete option lists for the add/edit book forms. Memoized on `facets`
+// so the ~4000 <option> nodes are only rebuilt when the catalog values change —
+// never on every keystroke in the (frequently re-rendering) parent form.
+const CatalogDatalists = React.memo(function CatalogDatalists({ facets }: { facets: CatalogFacets }) {
+  return (
+    <>
+      <datalist id="suggest-title">{facets.titles.map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-author">{facets.authors.map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-publisher">{facets.publishers.map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-language">{facets.languages.map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-shelf">{facets.shelfCodes.map((v) => <option key={v} value={v} />)}</datalist>
+    </>
+  );
+});
+
 function App() {
   const toast = useToast();
   const confirm = useConfirm();
@@ -715,6 +737,12 @@ function App() {
   // can show a real error + retry instead of a misleading "no books" panel.
   const [booksError, setBooksError] = useState<string | null>(null);
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
+  // Distinct catalog values that feed the add/edit form autocomplete so a
+  // librarian rarely retypes a repeated title, author, publisher, language, or
+  // shelf code. Loaded from GET /api/books/facets and refreshed after writes.
+  const [facets, setFacets] = useState<CatalogFacets>({
+    titles: [], authors: [], publishers: [], languages: [], shelfCodes: []
+  });
   const [currentPage, setCurrentPage] = useState(1);
   const [totalBooksCount, setTotalBooksCount] = useState(0);
 
@@ -781,6 +809,12 @@ function App() {
     description: ''
   });
   const [createAttrValues, setCreateAttrValues] = useState<Record<string, unknown>>({});
+  // Cover image chosen in the add-book form. It can only be uploaded once the
+  // book row exists (the cover endpoint keys on the book id), so we hold the
+  // File here and PUT it right after the book is created. The object-URL
+  // preview is revoked by an effect when it changes / on unmount.
+  const [createCoverFile, setCreateCoverFile] = useState<File | null>(null);
+  const [createCoverPreview, setCreateCoverPreview] = useState<string | null>(null);
 
   const [editForm, setEditForm] = useState({
     id: '',
@@ -859,6 +893,12 @@ function App() {
   // banner that informs librarians they're working with stale data.
   const [netStatus, setNetStatusUI] = useState<NetStatus>('online');
   useEffect(() => subscribeNetStatus(setNetStatusUI), []);
+  // Release the add-book cover preview's object URL when it is replaced or the
+  // component unmounts, so staging several covers doesn't leak blobs.
+  useEffect(() => {
+    if (!createCoverPreview) return;
+    return () => URL.revokeObjectURL(createCoverPreview);
+  }, [createCoverPreview]);
   // Browser-level offline events flip us back to "offline" immediately so
   // we don't have to wait for the next failing fetch to update the UI.
   useEffect(() => {
@@ -1374,8 +1414,11 @@ function App() {
     }
 
     const title = toNullableText(firstSpreadsheetValue(row, ['title']));
+    // Author is optional (anonymous / liturgical editions). Only the title is
+    // required. A blank author is sent as '' so the server schema accepts it
+    // (it rejects null) and the row imports instead of being skipped.
     const author = toNullableText(firstSpreadsheetValue(row, ['author', 'writer', 'writers']));
-    if (!title || !author) {
+    if (!title) {
       throw new SpreadsheetRowMissingError(t('toast.rowMissing', { row: index + 2 }));
     }
 
@@ -1442,7 +1485,7 @@ function App() {
 
     return {
       title,
-      author,
+      author: author ?? '',
       isbn: toNullableText(firstSpreadsheetValue(row, ['isbn'])),
       publicationYear,
       publisher: toNullableText(firstSpreadsheetValue(row, ['publisher'])),
@@ -1566,6 +1609,28 @@ function App() {
     } catch (e) {
       setError((e as Error).message);
     }
+  }
+
+  // Validate + stage a cover chosen in the add-book form. The same JPEG/PNG/
+  // WebP/GIF + 4 MB limits as the server (and the detail-view uploader) are
+  // enforced up front so the librarian gets immediate feedback.
+  function selectCreateCover(file: File): void {
+    if (!['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.type)) {
+      setError(t('toast.coverInvalidType'));
+      return;
+    }
+    if (file.size > 4 * 1024 * 1024) {
+      setError(t('toast.coverTooLarge'));
+      return;
+    }
+    setCreateCoverFile(file);
+    // Effect below revokes the previous object URL when this value changes.
+    setCreateCoverPreview(URL.createObjectURL(file));
+  }
+
+  function clearCreateCover(): void {
+    setCreateCoverFile(null);
+    setCreateCoverPreview(null);
   }
 
   async function printLabels(targets: Book[]): Promise<void> {
@@ -1906,6 +1971,32 @@ function App() {
     }
   }
 
+  // Load the distinct catalog values behind the add/edit form autocomplete.
+  // Only writers ever open those forms and the endpoint is writer-gated, so we
+  // skip the fetch for viewers entirely. Called lazily when a form opens (see
+  // the effect below) rather than eagerly on load or after every write, so the
+  // suggestions stay fresh (a re-open re-fetches after imports/bulk edits)
+  // without triggering the endpoint's full recompute on every save.
+  // Suggestions are a pure convenience, so a fetch failure is swallowed.
+  const loadFacets = useCallback(async () => {
+    if (!canWrite) return;
+    const cached = await cacheGet<CatalogFacets>('GET /api/books/facets');
+    if (cached) setFacets(cached.value);
+    try {
+      const response = await apiRequest<CatalogFacets>('/api/books/facets');
+      setFacets(response);
+    } catch {
+      /* ignore — autocomplete degrades gracefully to no suggestions */
+    }
+  }, [canWrite]);
+
+  // Refresh autocomplete suggestions whenever a book form opens (the add panel
+  // or the detail editor). Re-opening after an import or bulk edit re-fetches,
+  // so new values show up without a page reload.
+  useEffect(() => {
+    if (showAddBook || detailMode === 'edit') void loadFacets();
+  }, [showAddBook, detailMode, loadFacets]);
+
   async function loadRoomSummary() {
     type RoomSummaryResponse = {
       items: RoomSummaryItem[];
@@ -2227,6 +2318,9 @@ function App() {
         })
       }));
 
+      // Grab the staged cover before we reset the form state below.
+      const coverFile = createCoverFile;
+
       setCreateForm({
         title: '',
         author: '',
@@ -2238,6 +2332,7 @@ function App() {
         description: ''
       });
       setCreateAttrValues({});
+      clearCreateCover();
       setShowAddBook(false);
 
       if (result.duplicateOf && result.duplicateOf.length > 0) {
@@ -2245,6 +2340,21 @@ function App() {
         setMessage(t('toast.bookAddedDuplicate'));
       } else {
         setMessage(t('toast.bookAdded'));
+      }
+
+      // Upload the cover now that the book row exists. Failure here is
+      // non-fatal — the book was created — so we keep the success message and
+      // add a soft warning toast instead of throwing the whole flow away.
+      if (coverFile) {
+        try {
+          await apiRequest<{ ok: boolean; coverUrl: string }>(`/api/books/${result.id}/cover`, {
+            method: 'PUT',
+            headers: { 'Content-Type': coverFile.type },
+            body: coverFile
+          }, false);
+        } catch (e) {
+          pushAppToast('error', t('toast.bookAddedCoverFailed', { message: (e as Error).message }));
+        }
       }
 
       await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadNeedsReviewCount()]);
@@ -3384,6 +3494,13 @@ function App() {
   return (
     <div className="app-shell" aria-busy={isWorking}>
 
+      {/* Autocomplete suggestions for the add/edit book forms, sourced from the
+          catalog's existing values so a librarian rarely retypes a repeated
+          title, author, publisher, language, or shelf code. Datalists render
+          nothing themselves; inputs opt in via a matching `list` attribute.
+          Memoized so keystrokes don't rebuild the option lists. */}
+      <CatalogDatalists facets={facets} />
+
       {/* ═══ OFFLINE BANNER ═══ */}
       {netStatus === 'offline' && (
         <div className="offline-banner" role="status" aria-live="polite">
@@ -3692,17 +3809,17 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label>{t('detail.title')} *</label>
-                      <input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} required />
+                      <input list="suggest-title" value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} required />
                     </div>
                     <div>
-                      <label>{t('detail.author')} *</label>
-                      <input value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} required />
+                      <label>{t('detail.author')}</label>
+                      <input list="suggest-author" value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} />
                     </div>
                   </div>
                   <div className="form-row">
                     <div>
                       <label>{t('detail.isbn')}</label>
-                      <input value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder={t('detail.isbnPh')} />
+                      <input className="isbn-input" value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder={t('detail.isbnPh')} inputMode="text" autoComplete="off" autoCapitalize="characters" spellCheck={false} />
                     </div>
                     <div>
                       <label>{t('detail.yearPublished')}</label>
@@ -3712,7 +3829,7 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label>{t('detail.shelfRow')}</label>
-                      <input value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder={t('detail.shelfPh')} />
+                      <input list="suggest-shelf" value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder={t('detail.shelfPh')} />
                     </div>
                     <div>
                       <label>{t('detail.statusRow')}</label>
@@ -3727,11 +3844,11 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label>{t('detail.publisher')}</label>
-                      <input value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder={t('detail.publisherPh')} />
+                      <input list="suggest-publisher" value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder={t('detail.publisherPh')} />
                     </div>
                     <div>
                       <label>{t('detail.language')}</label>
-                      <input value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder={t('detail.languagePh')} />
+                      <input list="suggest-language" value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder={t('detail.languagePh')} />
                     </div>
                   </div>
                   <div className="form-field">
@@ -4171,61 +4288,68 @@ function App() {
                       <div className="form-row">
                         <div>
                           <label>{t('library.add.bookTitle')} *</label>
-                          <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} required />
+                          <input list="suggest-title" value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} required />
                         </div>
                         <div>
-                          <label>{t('library.add.author')} *</label>
-                          <input value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder={t('library.add.authorPh')} required />
+                          <label>{t('library.add.author')}</label>
+                          <input list="suggest-author" value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder={t('library.add.authorPh')} />
                         </div>
                       </div>
-                      <div className="form-row">
-                        <div>
-                          <label>{t('library.add.isbn')}</label>
-                          <div style={{ display: 'flex', gap: '0.4rem' }}>
-                            <input
-                              value={createForm.isbn}
-                              onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })}
-                              placeholder={t('library.add.isbnPh')}
-                              style={{ flex: 1 }}
-                              onKeyDown={(e) => {
-                                // Enter inside the ISBN field triggers lookup rather than
-                                // submitting the (likely incomplete) form. The librarian
-                                // can still click "Add Book" once they're satisfied.
-                                if (e.key === 'Enter') {
-                                  e.preventDefault();
-                                  if (!isbnLookupBusy) void enrichFromIsbn();
-                                }
-                              }}
-                            />
-                            <button
-                              type="button"
-                              className="secondary small"
-                              onClick={() => void enrichFromIsbn()}
-                              disabled={isbnLookupBusy || !createForm.isbn.trim()}
-                              title={t('library.add.lookupHint')}
-                            >
-                              {isbnLookupBusy ? t('library.add.lookupSearching') : t('library.add.lookupIsbn')}
-                            </button>
-                          </div>
-                          <p className="muted small" style={{ marginTop: '0.25rem' }}>{t('library.add.lookupHint')}</p>
+                      {/* ISBN spans its own full-width row so the number stays fully
+                          visible while typing and the lookup button sits beside it
+                          without squeezing the field into a few characters. */}
+                      <div className="form-field">
+                        <label>{t('library.add.isbn')}</label>
+                        <div className="isbn-row">
+                          <input
+                            className="isbn-input"
+                            value={createForm.isbn}
+                            onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })}
+                            placeholder={t('library.add.isbnPh')}
+                            inputMode="text"
+                            autoComplete="off"
+                            autoCapitalize="characters"
+                            spellCheck={false}
+                            onKeyDown={(e) => {
+                              // Enter inside the ISBN field triggers lookup rather than
+                              // submitting the (likely incomplete) form. The librarian
+                              // can still click "Add Book" once they're satisfied.
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                if (!isbnLookupBusy) void enrichFromIsbn();
+                              }
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="secondary small"
+                            onClick={() => void enrichFromIsbn()}
+                            disabled={isbnLookupBusy || !createForm.isbn.trim()}
+                            title={t('library.add.lookupHint')}
+                          >
+                            {isbnLookupBusy ? t('library.add.lookupSearching') : t('library.add.lookupIsbn')}
+                          </button>
                         </div>
+                        <p className="muted small" style={{ marginTop: '0.25rem' }}>{t('library.add.lookupHint')}</p>
+                      </div>
+                      <div className="form-row">
                         <div>
                           <label>{t('library.add.year')}</label>
                           <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder={t('library.add.yearPh')} />
                         </div>
                         <div>
                           <label>{t('library.add.shelf')}</label>
-                          <input value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder={t('library.add.shelfPh')} />
+                          <input list="suggest-shelf" value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder={t('library.add.shelfPh')} />
                         </div>
                       </div>
                       <div className="form-row">
                         <div>
                           <label>{t('library.add.publisher')}</label>
-                          <input value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder={t('library.add.publisherPh')} />
+                          <input list="suggest-publisher" value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder={t('library.add.publisherPh')} />
                         </div>
                         <div>
                           <label>{t('library.add.language')}</label>
-                          <input value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder={t('library.add.languagePh')} />
+                          <input list="suggest-language" value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder={t('library.add.languagePh')} />
                         </div>
                       </div>
                       <div className="form-field">
@@ -4236,6 +4360,40 @@ function App() {
                           rows={2}
                           placeholder={t('library.add.descriptionPh')}
                         />
+                      </div>
+
+                      {/* Cover image — staged here, uploaded right after the book row
+                          is created (the cover endpoint keys on the book id). */}
+                      <div className="form-field">
+                        <label>{t('library.add.cover')}</label>
+                        <div className="cover-section">
+                          {createCoverPreview ? (
+                            <img className="detail-cover" src={createCoverPreview} alt={t('library.add.coverPreviewAlt')} />
+                          ) : (
+                            <div className="detail-cover detail-cover-placeholder">
+                              <span>{t('detail.noCover')}</span>
+                            </div>
+                          )}
+                          <div className="cover-actions">
+                            <label className="secondary small button-like">
+                              {createCoverFile ? t('detail.replaceCover') : t('detail.uploadCover')}
+                              <input
+                                type="file"
+                                accept="image/png,image/jpeg,image/webp,image/gif"
+                                style={{ display: 'none' }}
+                                onChange={(e) => {
+                                  const f = e.target.files?.[0];
+                                  e.target.value = '';
+                                  if (f) selectCreateCover(f);
+                                }}
+                              />
+                            </label>
+                            {createCoverFile && (
+                              <button type="button" className="danger small" onClick={clearCreateCover}>{t('detail.removeCover')}</button>
+                            )}
+                            <span className="muted small">{t('detail.coverHint')}</span>
+                          </div>
+                        </div>
                       </div>
 
                       <details className="custom-fields-section" open={customFields.length > 0 && customFields.length <= 6}>
@@ -4253,6 +4411,7 @@ function App() {
                           onClick={() => {
                             setShowAddBook(false);
                             setCreateAttrValues({});
+                            clearCreateCover();
                           }}
                         >{t('common.cancel')}</button>
                       </div>

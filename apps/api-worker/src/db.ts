@@ -482,7 +482,11 @@ export async function queryBooksWithFilters(
     where.push("b.title = '(Untitled)'");
   }
   if (opts.unknownAuthor) {
-    where.push("b.author = '(Unknown)'");
+    // Author-less books exist in two on-disk forms: the catalog-import
+    // placeholder '(Unknown)' and the empty string written when the add/edit
+    // form or a JSON/sync import leaves author blank. Match both (plus NULL for
+    // safety) so every author-less book surfaces in this smart list.
+    where.push("(b.author = '(Unknown)' OR b.author IS NULL OR TRIM(b.author) = '')");
   }
   if (opts.roomCode) {
     // Substring + case-insensitive so "06" matches "06-005", "06-105", etc.
