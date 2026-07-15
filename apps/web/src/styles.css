@@ -966,6 +966,41 @@ label {
   gap: 0.5rem;
   margin-bottom: 1rem;
 }
+/* ===== Value-consistency (variant merge) tool ===== */
+.variant-group {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  background: var(--surface-2, var(--surface));
+}
+.variant-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.6rem; }
+.variant-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.5rem 0.25rem 0.65rem;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 100px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+.variant-chip:hover { border-color: var(--accent); }
+.variant-chip.is-canonical { border-color: var(--accent); background: var(--accent-light); font-weight: 600; }
+.variant-chip-count {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  background: var(--bg);
+  border-radius: 100px;
+  padding: 0.05rem 0.4rem;
+  font-variant-numeric: tabular-nums;
+}
+.variant-merge-row { display: flex; gap: 0.5rem; align-items: center; }
+.variant-merge-row input { flex: 1 1 auto; min-width: 0; }
+.variant-merge-row button { flex: 0 0 auto; }
+
 .chip {
   display: inline-flex;
   align-items: center;

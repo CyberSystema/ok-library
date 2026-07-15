@@ -716,6 +716,47 @@ const CatalogDatalists = React.memo(function CatalogDatalists({ facets }: { face
   );
 });
 
+type ValueVariantGroup = { canonical: string; total: number; variants: Array<{ value: string; count: number }> };
+
+// One row of the "value consistency" tool: shows the fold-equivalent spellings
+// of a value with their book counts, lets the librarian pick (or type) the
+// canonical form, and merge the rest into it.
+function VariantGroupCard({ group, mergeLabel, keepLabel, onMerge }: {
+  group: ValueVariantGroup;
+  mergeLabel: string;
+  keepLabel: string;
+  onMerge: (canonical: string) => void;
+}) {
+  const [canonical, setCanonical] = useState(group.canonical);
+  return (
+    <div className="variant-group">
+      <div className="variant-chips">
+        {group.variants.map((v) => (
+          <button
+            type="button"
+            key={v.value}
+            className={`variant-chip${v.value === canonical ? ' is-canonical' : ''}`}
+            title={keepLabel}
+            onClick={() => setCanonical(v.value)}
+          >
+            <span className="variant-chip-value">{v.value}</span>
+            <span className="variant-chip-count">{v.count}</span>
+          </button>
+        ))}
+      </div>
+      <div className="variant-merge-row">
+        <input value={canonical} onChange={(e) => setCanonical(e.target.value)} />
+        <button
+          type="button"
+          className="primary small"
+          disabled={!canonical.trim() || group.variants.every((v) => v.value === canonical)}
+          onClick={() => onMerge(canonical.trim())}
+        >{mergeLabel}</button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const toast = useToast();
   const confirm = useConfirm();
@@ -891,6 +932,12 @@ function App() {
   const [bulkStatus, setBulkStatus] = useState<string>('');
   const [bulkShelfCode, setBulkShelfCode] = useState('');
   const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
+  // Value-consistency tool: fold-equivalent spelling variants of a field.
+  type VariantField = 'author' | 'publisher' | 'language' | 'shelfCode' | 'title';
+  const [variantField, setVariantField] = useState<VariantField>('publisher');
+  const [valueVariants, setValueVariants] = useState<ValueVariantGroup[]>([]);
+  const [variantsScanned, setVariantsScanned] = useState(false);
+  const [variantsLoading, setVariantsLoading] = useState(false);
   const [showDuplicatesPanel, setShowDuplicatesPanel] = useState(false);
   const [duplicateWarning, setDuplicateWarning] = useState<DuplicateEntry[]>([]);
   const [isWorking, setIsWorking] = useState(false);
@@ -2424,6 +2471,50 @@ function App() {
       if (result.total === 0) {
         setMessage(t('toast.noDuplicates'));
       }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // Scan a field for spelling variants that fold to the same value (the
+  // librarians' natural casing/accent inconsistencies).
+  async function loadValueVariants(field: VariantField) {
+    clearStatus();
+    setVariantField(field);
+    setVariantsLoading(true);
+    try {
+      const res = await apiRequest<{ field: string; groups: ValueVariantGroup[] }>(
+        `/api/books/value-variants?field=${encodeURIComponent(field)}`
+      );
+      setValueVariants(res.groups ?? []);
+      setVariantsScanned(true);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setVariantsLoading(false);
+    }
+  }
+
+  // Merge every spelling in a group into the chosen canonical form.
+  async function consolidateVariantGroup(field: VariantField, group: ValueVariantGroup, canonical: string) {
+    const to = canonical.trim();
+    const from = group.variants.map((v) => v.value).filter((v) => v !== to);
+    if (!to || from.length === 0) return;
+    const affected = group.variants.filter((v) => v.value !== to).reduce((sum, v) => sum + v.count, 0);
+    const ok = await confirm({
+      title: t('settings.vc.confirmTitle'),
+      body: t('settings.vc.confirmBody', { n: affected, to }),
+      confirmLabel: t('settings.vc.merge')
+    });
+    if (!ok) return;
+    clearStatus();
+    try {
+      const res = await runAction(() => apiRequest<{ updated: number }>('/api/admin/consolidate-value', {
+        method: 'POST',
+        body: JSON.stringify({ field, from, to })
+      }));
+      setMessage(t('settings.vc.merged', { n: res.updated, to }));
+      await Promise.all([loadValueVariants(field), loadBooks(), loadFacets()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -5680,6 +5771,53 @@ function App() {
                       {t('settings.searchIndexIntro')}
                     </p>
                     <button className="secondary" onClick={() => void rebuildSearchIndex()}>{t('settings.searchIndexRun')}</button>
+                  </div>
+                )}
+
+                {/* Value consistency: consolidate the librarians' spelling variants */}
+                {canWrite && (
+                  <div className="card">
+                    <h3>{t('settings.vc.heading')}</h3>
+                    <p className="muted small" style={{ marginBottom: '1rem' }}>{t('settings.vc.intro')}</p>
+                    <div className="search-bar" style={{ alignItems: 'flex-end' }}>
+                      <div className="filter-field">
+                        <label>{t('settings.vc.field')}</label>
+                        <select
+                          value={variantField}
+                          onChange={(e) => { setVariantField(e.target.value as VariantField); setVariantsScanned(false); setValueVariants([]); }}
+                        >
+                          <option value="publisher">{t('library.add.publisher')}</option>
+                          <option value="author">{t('library.add.author')}</option>
+                          <option value="language">{t('library.add.language')}</option>
+                          <option value="shelfCode">{t('library.add.shelf')}</option>
+                          <option value="title">{t('library.add.bookTitle')}</option>
+                        </select>
+                      </div>
+                      <div className="search-actions">
+                        <label>.</label>
+                        <button className="secondary" disabled={variantsLoading} onClick={() => void loadValueVariants(variantField)}>
+                          {variantsLoading ? t('settings.vc.scanning') : t('settings.vc.scan')}
+                        </button>
+                      </div>
+                    </div>
+                    {variantsScanned && !variantsLoading && (
+                      valueVariants.length === 0 ? (
+                        <p className="muted small" style={{ marginTop: '0.75rem' }}>{t('settings.vc.none')}</p>
+                      ) : (
+                        <div style={{ marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                          <p className="muted small">{t('settings.vc.foundNote', { n: valueVariants.length })}</p>
+                          {valueVariants.map((g) => (
+                            <VariantGroupCard
+                              key={g.canonical + g.total}
+                              group={g}
+                              mergeLabel={t('settings.vc.merge')}
+                              keepLabel={t('settings.vc.useAsCanonical')}
+                              onMerge={(canon) => void consolidateVariantGroup(variantField, g, canon)}
+                            />
+                          ))}
+                        </div>
+                      )
+                    )}
                   </div>
                 )}
 

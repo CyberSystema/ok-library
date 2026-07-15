@@ -717,31 +717,46 @@ app.get('/api/books/facets', requirePermission('books.write', { librarian: true 
 		}
 	}
 
-	// `column` is always one of the hard-coded literals below — never user
-	// input — so interpolating it into the SQL is safe from injection.
-	async function distinctValues(column: string, limit: number): Promise<string[]> {
+	// Distinct catalog values for autocomplete, deduplicated by their fold key so
+	// case/accent variants of the SAME value (e.g. "ΕΚΔΟΣΕΙΣ ΑΘΩΣ" / "Εκδόσεις
+	// Άθως") collapse to ONE suggestion — the most-frequently-used spelling. This
+	// actively steers new manual entries toward the existing canonical form
+	// instead of minting yet another spelling, without touching stored data.
+	// `column`/`foldKey` are always the hard-coded literals below — never user
+	// input — so interpolating them into the SQL is safe from injection.
+	async function distinctValues(column: string, foldKey: string, limit: number): Promise<string[]> {
 		const { results } = await c.env.DB.prepare(
-			`SELECT ${column} AS v, COUNT(*) AS n
-			   FROM books
-			  WHERE deleted_at IS NULL AND ${column} IS NOT NULL AND TRIM(${column}) != ''
-			    AND ${column} NOT IN ('(Unknown)', '(Untitled)')
-			  GROUP BY ${column}
-			  ORDER BY n DESC, ${column} ASC
-			  LIMIT ?`
+			`WITH counts AS (
+				SELECT ${column} AS v, ${foldKey} AS k, COUNT(*) AS n
+				  FROM books
+				 WHERE deleted_at IS NULL AND ${column} IS NOT NULL AND TRIM(${column}) != ''
+				   AND ${column} NOT IN ('(Unknown)', '(Untitled)')
+				 GROUP BY ${column}
+			 ),
+			 ranked AS (
+				SELECT v,
+				       ROW_NUMBER() OVER (PARTITION BY k ORDER BY n DESC, v ASC) AS rn,
+				       SUM(n) OVER (PARTITION BY k) AS total
+				  FROM counts
+			 )
+			 SELECT v FROM ranked WHERE rn = 1 ORDER BY total DESC, v ASC LIMIT ?`
 		)
 			.bind(limit)
-			.all<{ v: string; n: number }>();
+			.all<{ v: string }>();
 		return (results ?? [])
 			.map((r) => r.v)
 			.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
 	}
 
+	// Fold key per column: the *_fold columns (accent+case folded) for the
+	// FTS-indexed text fields; a plain LOWER(TRIM()) for the short code fields
+	// that have no fold column.
 	const [titles, authors, publishers, languages, shelfCodes] = await Promise.all([
-		distinctValues('title', 1000),
-		distinctValues('author', 1000),
-		distinctValues('publisher', 1000),
-		distinctValues('language', 200),
-		distinctValues('shelf_code', 1000)
+		distinctValues('title', "COALESCE(title_fold, LOWER(title))", 1000),
+		distinctValues('author', "COALESCE(author_fold, LOWER(author))", 1000),
+		distinctValues('publisher', "COALESCE(publisher_fold, LOWER(publisher))", 1000),
+		distinctValues('language', "LOWER(TRIM(language))", 200),
+		distinctValues('shelf_code', "LOWER(TRIM(shelf_code))", 1000)
 	]);
 
 	const response = { titles, authors, publishers, languages, shelfCodes };
@@ -755,6 +770,129 @@ app.get('/api/books/facets', requirePermission('books.write', { librarian: true 
 	}
 
 	return c.json(response);
+});
+
+// Which normalizable text fields the consistency tools operate on, mapped to
+// their column, optional accent+case fold column, and computeBookFolds input
+// key. Whitelist — the keys are the only accepted `field` values, so the
+// interpolated column names below can never be user-controlled.
+const CONSISTENCY_FIELDS: Record<string, { column: string; foldColumn: string | null; foldInput: 'title' | 'author' | 'publisher' | null }> = {
+	title: { column: 'title', foldColumn: 'title_fold', foldInput: 'title' },
+	author: { column: 'author', foldColumn: 'author_fold', foldInput: 'author' },
+	publisher: { column: 'publisher', foldColumn: 'publisher_fold', foldInput: 'publisher' },
+	language: { column: 'language', foldColumn: null, foldInput: null },
+	shelfCode: { column: 'shelf_code', foldColumn: null, foldInput: null }
+};
+
+function consistencyFoldKey(f: { column: string; foldColumn: string | null }): string {
+	// Group by the accent+case fold where we have one, else a plain case-fold.
+	return f.foldColumn ? `COALESCE(${f.foldColumn}, LOWER(${f.column}))` : `LOWER(TRIM(${f.column}))`;
+}
+
+// Value-consistency review: surface groups of values that fold to the SAME key
+// but are spelled differently (e.g. "ΕΚΔΟΣΕΙΣ ΑΘΩΣ" vs "Εκδόσεις Άθως") so a
+// librarian can consolidate the librarians' natural casing/accent variants into
+// one canonical spelling. Read-only.
+app.get('/api/books/value-variants', requirePermission('books.write', { librarian: true }), async (c) => {
+	const field = c.req.query('field') ?? '';
+	const meta = CONSISTENCY_FIELDS[field];
+	if (!meta) {
+		throw new HTTPException(400, { message: `Unknown field: ${field}` });
+	}
+	const { column } = meta;
+	const foldKey = consistencyFoldKey(meta);
+
+	const { results } = await c.env.DB.prepare(
+		`WITH counts AS (
+			SELECT ${column} AS v, ${foldKey} AS k, COUNT(*) AS n
+			  FROM books
+			 WHERE deleted_at IS NULL AND ${column} IS NOT NULL AND TRIM(${column}) != ''
+			   AND ${column} NOT IN ('(Unknown)', '(Untitled)')
+			 GROUP BY ${column}
+		 ),
+		 grp AS (
+			SELECT k, COUNT(*) AS spellings, SUM(n) AS total
+			  FROM counts GROUP BY k HAVING COUNT(*) > 1
+		 )
+		 SELECT c.k AS k, c.v AS v, c.n AS n, g.total AS total
+		   FROM counts c JOIN grp g ON g.k = c.k
+		  ORDER BY g.total DESC, c.k ASC, c.n DESC, c.v ASC
+		  LIMIT 2000`
+	).all<{ k: string; v: string; n: number; total: number }>();
+
+	// Fold the flat rows into groups; the first variant per group is the most
+	// frequent (already ordered n DESC), which we suggest as the canonical form.
+	const groupMap = new Map<string, { canonical: string; total: number; variants: Array<{ value: string; count: number }> }>();
+	for (const row of results ?? []) {
+		let g = groupMap.get(row.k);
+		if (!g) {
+			g = { canonical: row.v, total: Number(row.total), variants: [] };
+			groupMap.set(row.k, g);
+		}
+		g.variants.push({ value: row.v, count: Number(row.n) });
+	}
+
+	return c.json({ field, groups: [...groupMap.values()] });
+});
+
+// Consolidate the librarians' spelling variants of a value into one canonical
+// form: rewrite every non-deleted book whose `field` matches one of `from` to
+// `to`, recomputing the fold column so search + the fold-group stay correct.
+const ConsolidateValueSchema = z.object({
+	field: z.string().min(1),
+	from: z.array(z.string().min(1)).min(1).max(100),
+	to: z.string().min(1).max(500)
+});
+
+app.post('/api/admin/consolidate-value', requirePermission('books.write', { librarian: true }), async (c) => {
+	const payload = ConsolidateValueSchema.parse(await c.req.json());
+	const meta = CONSISTENCY_FIELDS[payload.field];
+	if (!meta) {
+		throw new HTTPException(400, { message: `Unknown field: ${payload.field}` });
+	}
+	const to = payload.to.trim();
+	if (!to) {
+		throw new HTTPException(400, { message: 'Target value cannot be blank.' });
+	}
+	// Don't rewrite the canonical rows onto themselves; only the OTHER spellings.
+	const fromValues = payload.from.map((v) => v).filter((v) => v !== to);
+	if (fromValues.length === 0) {
+		return c.json({ updated: 0 });
+	}
+
+	const { column, foldColumn, foldInput } = meta;
+	const placeholders = fromValues.map(() => '?').join(', ');
+	const now = nowIso();
+
+	// Count the affected books explicitly — meta.changes can over-report because
+	// the books_fts triggers fire on each UPDATE and (on some D1 backends) their
+	// row changes are included in the count.
+	const countRow = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL AND ${column} IN (${placeholders})`
+	).bind(...fromValues).first<{ n: number }>();
+	const updated = Number(countRow?.n ?? 0);
+
+	if (updated > 0) {
+		if (foldColumn && foldInput) {
+			// computeBookFolds returns keys like `publisher_fold`, matching foldColumn.
+			const newFold = computeBookFolds({ [foldInput]: to })[foldColumn as keyof ReturnType<typeof computeBookFolds>];
+			await c.env.DB.prepare(
+				`UPDATE books SET ${column} = ?, ${foldColumn} = ?, updated_at = ?, version = version + 1
+				 WHERE deleted_at IS NULL AND ${column} IN (${placeholders})`
+			).bind(to, newFold, now, ...fromValues).run();
+		} else {
+			await c.env.DB.prepare(
+				`UPDATE books SET ${column} = ?, updated_at = ?, version = version + 1
+				 WHERE deleted_at IS NULL AND ${column} IN (${placeholders})`
+			).bind(to, now, ...fromValues).run();
+		}
+		await bumpBooksCacheVersion(c.env);
+	}
+	await insertAuditLog(c.env, c.get('user').sub, 'value.consolidate', 'books', null, {
+		field: payload.field, to, fromCount: fromValues.length, updated
+	});
+
+	return c.json({ updated });
 });
 
 app.get('/api/books/:id', async (c) => {
