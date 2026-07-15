@@ -798,6 +798,10 @@ function App() {
   // existing "submit the typed value" behavior).
   const [borrowerHighlight, setBorrowerHighlight] = useState(-1);
   const bookHistorySeqRef = useRef(0);
+  // Drops results from an earlier loadBooks() call that resolves after a newer
+  // one (fast typing / rapid filter changes) so a slow response can't clobber
+  // the current results, total, and page.
+  const loadBooksSeqRef = useRef(0);
   const [borrowerQuery, setBorrowerQuery] = useState('');
   const [selectedBorrowerId, setSelectedBorrowerId] = useState<string>('');
   const [needsReviewCount, setNeedsReviewCount] = useState(0);
@@ -1581,19 +1585,22 @@ function App() {
       return;
     }
     try {
-      await runAction(() =>
-        apiRequest<{ ok: boolean; coverUrl: string }>(`/api/books/${book.id}/cover`, {
+      const res = await runAction(() =>
+        apiRequest<{ ok: boolean; coverUrl: string; version: number }>(`/api/books/${book.id}/cover`, {
           method: 'PUT',
           headers: { 'Content-Type': file.type },
           body: file
         }, false)
       );
       setMessage(t('toast.coverUpdated', { title: book.title }));
+      // Keep the in-memory book's version in step with the server bump so a
+      // subsequent metadata edit doesn't send a stale version and 409.
       setDetailBook((prev) =>
         prev && prev.id === book.id
-          ? { ...prev, coverUrl: `/api/books/${book.id}/cover?v=${Date.now()}` }
+          ? { ...prev, coverUrl: `/api/books/${book.id}/cover?v=${Date.now()}`, version: res.version ?? prev.version }
           : prev
       );
+      setEditForm((prev) => (prev.id === book.id && res.version !== undefined ? { ...prev, version: res.version } : prev));
       await loadBooks();
     } catch (e) {
       setError((e as Error).message);
@@ -1610,9 +1617,10 @@ function App() {
     if (!ok) return;
     clearStatus();
     try {
-      await runAction(() => apiRequest<void>(`/api/books/${book.id}/cover`, { method: 'DELETE' }));
+      const res = await runAction(() => apiRequest<{ ok: boolean; version: number }>(`/api/books/${book.id}/cover`, { method: 'DELETE' }));
       setMessage(t('toast.coverRemoved'));
-      setDetailBook((prev) => (prev && prev.id === book.id ? { ...prev, coverUrl: null } : prev));
+      setDetailBook((prev) => (prev && prev.id === book.id ? { ...prev, coverUrl: null, version: res?.version ?? prev.version } : prev));
+      setEditForm((prev) => (prev.id === book.id && res?.version !== undefined ? { ...prev, version: res.version } : prev));
       await loadBooks();
     } catch (e) {
       setError((e as Error).message);
@@ -1820,6 +1828,8 @@ function App() {
   }
 
   const loadBooks = useCallback(async (pageOverride?: number) => {
+    const seq = ++loadBooksSeqRef.current;
+    const isStale = () => seq !== loadBooksSeqRef.current;
     setIsLoadingBooks(true);
     setBooksError(null);
     try {
@@ -1840,7 +1850,7 @@ function App() {
         const semanticParams = new URLSearchParams({ q, topK: '50' });
         const cacheKey = `GET /api/books/semantic?${semanticParams.toString()}`;
         const cached = await cacheGet<{ items: Book[]; total: number }>(cacheKey);
-        if (cached) {
+        if (cached && !isStale()) {
           setBooks(cached.value.items);
           setTotalBooksCount(cached.value.total);
           setCurrentPage(1);
@@ -1849,6 +1859,7 @@ function App() {
           const response = await apiRequest<{ items: Book[]; total: number }>(
             `/api/books/semantic?${semanticParams.toString()}`
           );
+          if (isStale()) return;
           setBooks(response.items);
           setTotalBooksCount(response.total);
           setCurrentPage(1);
@@ -1878,7 +1889,13 @@ function App() {
       query.set('searchFields', searchFields.join(','));
       if (status) query.set('status', status);
       if (filterLanguage) query.set('language', filterLanguage);
-      if (filterYear) query.set('year', filterYear);
+      // Only send a complete, in-range year — otherwise every keystroke ("1",
+      // "19", "190") would post a year the schema rejects (1000–3000) and pop a
+      // 400 toast mid-typing. Partial input simply doesn't filter yet.
+      if (filterYear) {
+        const yr = Number(filterYear);
+        if (Number.isInteger(yr) && yr >= 1000 && yr <= 3000) query.set('year', filterYear);
+      }
       if (categoryFilter) query.set('custom_category_code', categoryFilter);
       if (needsReviewFilter) query.set('custom_needs_review', '1');
       if (shelfFilter) query.set('shelfCode', shelfFilter);
@@ -1898,13 +1915,22 @@ function App() {
 
       const cacheKey = `GET /api/books?${query.toString()}`;
       const cached = await cacheGet<{ items: Book[]; total: number }>(cacheKey);
-      if (cached) {
+      if (cached && !isStale()) {
         setBooks(cached.value.items);
         setTotalBooksCount(cached.value.total);
         setCurrentPage(page);
       }
       try {
         const response = await apiRequest<{ items: Book[]; total: number }>(`/api/books?${query.toString()}`);
+        if (isStale()) return;
+        // Clamp: if deleting the last row(s) on the last page left `page` beyond
+        // the end, re-fetch the now-last page instead of showing an empty grid
+        // with a "Page N of N-1" footer.
+        const lastPage = Math.max(1, Math.ceil(response.total / PAGE_SIZE));
+        if (page > lastPage && response.total > 0) {
+          void loadBooks(lastPage);
+          return;
+        }
         setBooks(response.items);
         setTotalBooksCount(response.total);
         setCurrentPage(page);
@@ -2541,8 +2567,23 @@ function App() {
           : prev
       );
       setDetailMode('view');
-      await Promise.all([loadBooks(), loadCategories(), loadNeedsReviewCount()]);
+      await Promise.all([loadBooks(), loadCategories(), loadNeedsReviewCount(), loadRoomSummary()]);
     } catch (e) {
+      // Version conflict: the book changed since it was opened. Re-fetch the
+      // latest and refresh the form's version + baseline so a second save
+      // succeeds, instead of dead-ending on a stale version that loops forever.
+      if (e instanceof ApiRequestError && e.status === 409 && editForm.id) {
+        try {
+          const fresh = await apiRequest<Book>(`/api/books/${editForm.id}`);
+          setDetailBook((prev) => (prev && prev.id === fresh.id ? { ...prev, ...fresh } : prev));
+          setEditForm((prev) => (prev.id === fresh.id ? { ...prev, version: fresh.version } : prev));
+          setError(t('toast.versionConflictReloaded'));
+          await loadBooks();
+          return;
+        } catch {
+          /* fall through to the generic error below */
+        }
+      }
       setError((e as Error).message);
     }
   }
@@ -2575,7 +2616,10 @@ function App() {
   async function borrowBook(book: Book) {
     clearStatus();
 
-    if (!borrowerName || !dueAt) {
+    // Trim so a whitespace-only name can't create an anonymous loan (the server
+    // schema's min(1) would otherwise accept "   ").
+    const trimmedBorrowerName = borrowerName.trim();
+    if ((!selectedBorrowerId && !trimmedBorrowerName) || !dueAt) {
       setError(t('toast.borrowerRequired'));
       return;
     }
@@ -2585,8 +2629,8 @@ function App() {
       if (selectedBorrowerId) {
         body.borrowerId = selectedBorrowerId;
       } else {
-        body.borrowerName = borrowerName;
-        body.borrowerContact = borrowerContact || null;
+        body.borrowerName = trimmedBorrowerName;
+        body.borrowerContact = borrowerContact.trim() || null;
       }
       await runAction(() => apiRequest(`/api/books/${book.id}/borrow`, {
         method: 'POST',
@@ -3825,8 +3869,8 @@ function App() {
                 <form onSubmit={saveBookEdit} className="simple-form">
                   <div className="form-row">
                     <div>
-                      <label>{t('detail.title')} *</label>
-                      <input list="suggest-title" value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} required />
+                      <label>{t('detail.title')}</label>
+                      <input list="suggest-title" value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} />
                     </div>
                     <div>
                       <label>{t('detail.author')}</label>
@@ -3840,7 +3884,7 @@ function App() {
                     </div>
                     <div>
                       <label>{t('detail.yearPublished')}</label>
-                      <input type="number" value={editForm.publicationYear} onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })} placeholder={t('detail.yearPh')} />
+                      <input type="number" min={1000} max={3000} value={editForm.publicationYear} onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })} placeholder={t('detail.yearPh')} />
                     </div>
                   </div>
                   <div className="form-row">
@@ -3851,8 +3895,13 @@ function App() {
                     <div>
                       <label>{t('detail.statusRow')}</label>
                       <select value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
-                        <option value="available">{t('status.available')}</option>
-                        <option value="borrowed">{t('status.borrowed')}</option>
+                        {/* 'borrowed' is owned by the borrow/return actions — the
+                            server rejects setting it manually (or clearing it to
+                            available). Offer only the transitions the edit path is
+                            allowed to make from the book's real current state. */}
+                        {detailBook?.status === 'borrowed'
+                          ? <option value="borrowed">{t('status.borrowed')}</option>
+                          : <option value="available">{t('status.available')}</option>}
                         <option value="lost">{t('status.lost')}</option>
                         <option value="maintenance">{t('status.maintenance')}</option>
                       </select>
@@ -4187,10 +4236,15 @@ function App() {
                     <span className="stat-box-label">{t('status.borrowed')}</span>
                     <span className="stat-box-value">{borrowedBooksDisplay}</span>
                   </div>
-                  <div className="stat-box danger">
-                    <span className="stat-box-label">{t('library.overdue')}</span>
-                    <span className="stat-box-value">{overdueCount}</span>
-                  </div>
+                  {/* Overdue is derived from active-loan data, which only
+                      circulation users can load — hide it for viewers rather
+                      than show a misleading permanent 0. */}
+                  {canSeeCirculation && (
+                    <div className="stat-box danger">
+                      <span className="stat-box-label">{t('library.overdue')}</span>
+                      <span className="stat-box-value">{overdueCount}</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Quick filter chips: pinned shortcuts that toggle filters without opening Advanced. */}
@@ -4212,7 +4266,18 @@ function App() {
                         key={list.key}
                         type="button"
                         className={`chip${active ? ' is-active' : ''}`}
-                        onClick={() => setSmartListKey(active ? '' : list.key)}
+                        onClick={() => {
+                          if (active) { setSmartListKey(''); return; }
+                          setSmartListKey(list.key);
+                          // Reflect any control-backed params into their bound
+                          // state so the visible Status/Sort controls agree with
+                          // what the chip actually queries (e.g. "Currently
+                          // borrowed" sets Status, "Recently added" sets Sort).
+                          const p = list.params as Record<string, string>;
+                          if (p.status !== undefined) setStatus(p.status);
+                          if (p.sortBy !== undefined) setSortBy(p.sortBy as SortBy);
+                          if (p.sortDir !== undefined) setSortDir(p.sortDir as SortDir);
+                        }}
                         title={t('library.smartListTitle', { label })}
                       >
                         <span className="chip-icon">{list.icon}</span> {label}
@@ -4304,8 +4369,8 @@ function App() {
                     <form onSubmit={createBook} className="simple-form">
                       <div className="form-row">
                         <div>
-                          <label>{t('library.add.bookTitle')} *</label>
-                          <input list="suggest-title" value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} required />
+                          <label>{t('library.add.bookTitle')}</label>
+                          <input list="suggest-title" value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} />
                         </div>
                         <div>
                           <label>{t('library.add.author')}</label>
@@ -4352,7 +4417,7 @@ function App() {
                       <div className="form-row">
                         <div>
                           <label>{t('library.add.year')}</label>
-                          <input type="number" value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder={t('library.add.yearPh')} />
+                          <input type="number" min={1000} max={3000} value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder={t('library.add.yearPh')} />
                         </div>
                         <div>
                           <label>{t('library.add.shelf')}</label>
@@ -4523,7 +4588,7 @@ function App() {
                     </div>
                     <div className="filter-field">
                       <label>{t('library.search.year')}</label>
-                      <input type="number" value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder={t('library.search.yearPh')} />
+                      <input type="number" min={1000} max={3000} value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder={t('library.search.yearPh')} />
                     </div>
                     <div className="filter-field">
                       <label>{t('library.search.sort')}</label>
@@ -4695,7 +4760,8 @@ function App() {
                       <select value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)} aria-label={t('library.bulk.setStatusAria')}>
                         <option value="">{t('library.bulk.setStatus')}</option>
                         <option value="available">{t('status.available')}</option>
-                        <option value="borrowed">{t('status.borrowed')}</option>
+                        {/* No 'borrowed' — lending goes through the borrow action so
+                            book.status never desyncs from the loan record. */}
                         <option value="lost">{t('status.lost')}</option>
                         <option value="maintenance">{t('status.maintenance')}</option>
                       </select>
@@ -4771,7 +4837,7 @@ function App() {
                       <p style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>📚</p>
                       <p style={{ fontWeight: 600 }}>{t('library.empty.title')}</p>
                       <p className="muted small">
-                        {q || categoryFilter || needsReviewFilter || status || filterLanguage || filterYear || shelfFilter
+                        {q || categoryFilter || needsReviewFilter || status || filterLanguage || filterYear || shelfFilter || smartListKey
                           ? t('library.empty.filtered')
                           : t('library.empty.bare')}
                       </p>
@@ -4954,7 +5020,7 @@ function App() {
                       {activeBorrows.map((loan) => (
                         <div key={loan.id} className={`loan-item${loan.isOverdue ? ' overdue' : ''}`}>
                           <div className="loan-item-info">
-                            <strong>{loan.title}</strong>
+                            <strong>{displayTitle({ title: loan.title }, t('common.untitled'))}</strong>
                             <p className="meta">
                               {t('loans.borrowedBy', { name: loan.borrowerName })}
                               {loan.borrowerContact ? ` · ${loan.borrowerContact}` : ''}
@@ -4964,7 +5030,7 @@ function App() {
                               {loan.isOverdue && <span className="overdue-tag"> · {t('loans.overdueTag')}</span>}
                             </p>
                           </div>
-                          <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, loan.title)}>
+                          <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, displayTitle({ title: loan.title }, t('common.untitled')))}>
                             {t('loans.return')}
                           </button>
                         </div>

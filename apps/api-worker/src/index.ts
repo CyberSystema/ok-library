@@ -26,7 +26,8 @@ import {
 	hashPasswordPbkdf2,
 	hashPasswordSha256,
 	requirePermission,
-	requireRole
+	requireRole,
+	userHasPermission
 } from './auth';
 import {
 	booksCacheKey,
@@ -889,6 +890,31 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 		throw new HTTPException(409, { message: 'Version conflict. Refresh and retry.' });
 	}
 
+	// Circulation invariant: the 'borrowed' status must always own an open loan
+	// row, so the generic metadata edit may not move a book INTO or OUT OF the
+	// borrowed state — that belongs to the borrow/return actions. Without this
+	// guard, a status <select> edit desyncs book.status from borrow_transactions
+	// (phantom loans, an unreturnable "borrowed" book, and a later opaque 500 when
+	// the next borrow trips the unique active-loan index). The one legitimate
+	// exception is marking a book lost/maintenance while it is on loan (it left
+	// the shelf physically); we allow that but close the open loan in the same
+	// transaction so the borrower's open/overdue counts stay accurate.
+	const currentStatus = String(existingMap.status ?? 'available');
+	const incomingStatus = payload.status;
+	let closeOpenLoanOnWrite = false;
+	if (incomingStatus && incomingStatus !== currentStatus) {
+		if (incomingStatus === 'borrowed') {
+			throw new HTTPException(409, { message: 'Use the borrow action to lend a book.' });
+		}
+		if (currentStatus === 'borrowed') {
+			if (incomingStatus === 'available') {
+				throw new HTTPException(409, { message: 'Return the book before marking it available.' });
+			}
+			// borrowed → lost/maintenance: allowed, but the open loan must be closed too.
+			closeOpenLoanOnWrite = true;
+		}
+	}
+
 	const now = nowIso();
 	// Lenient mode: tolerate keys whose custom field definition was deleted,
 	// so a legacy value on the book doesn't block an unrelated edit.
@@ -918,7 +944,7 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 		customFieldsJson: mergedCustomFieldsJson
 	});
 
-	await c.env.DB.prepare(
+	const updateBookStmt = c.env.DB.prepare(
 		`UPDATE books SET
 			title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?, description = ?,
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
@@ -951,8 +977,22 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			mergedFolds.tags_fold,
 			mergedFolds.custom_fields_fold,
 			id
-		)
-		.run();
+		);
+
+	if (closeOpenLoanOnWrite) {
+		// Atomically close the open loan when a borrowed book is marked lost/
+		// maintenance, so no phantom active loan is left behind.
+		await runAtomic(c.env, [
+			c.env.DB.prepare(
+				`UPDATE borrow_transactions
+				    SET returned_at = ?, notes = TRIM(COALESCE(notes, '') || ' [auto-closed: marked ' || ? || ']')
+				  WHERE book_id = ? AND returned_at IS NULL`
+			).bind(now, merged.status, id),
+			updateBookStmt
+		]);
+	} else {
+		await updateBookStmt.run();
+	}
 
 	await replaceBookAttributeValues(c.env, id, merged.customFields as Record<string, unknown>);
 	await bumpBooksCacheVersion(c.env);
@@ -980,16 +1020,38 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 app.delete('/api/books/:id', requirePermission('books.delete'), async (c) => {
 	const id = c.req.param('id');
 	const now = nowIso();
+	// Refuse to delete a book that is still on loan — otherwise the open
+	// borrow_transactions row is stranded (the book vanishes from the shelf but
+	// the loan stays "active" forever, permanently inflating the borrower's
+	// open/overdue counts). Only OPEN loans block; a book whose loans are all
+	// returned is fine to delete. The partial unique active-loan index means this
+	// is at most one row.
 	const result = await c.env.DB.prepare(
-		`UPDATE books SET deleted_at = ?, updated_at = ?, version = version + 1 WHERE id = ? AND deleted_at IS NULL`
+		`UPDATE books SET deleted_at = ?, updated_at = ?, version = version + 1
+		 WHERE id = ? AND deleted_at IS NULL
+		   AND NOT EXISTS (
+		     SELECT 1 FROM borrow_transactions
+		      WHERE book_id = books.id AND returned_at IS NULL
+		   )`
 	)
 		.bind(now, now, id)
 		.run();
 
 	// D1's `success` is true for any well-formed statement, even if zero rows
 	// matched. The accurate signal that something was actually deleted is
-	// `meta.changes`.
+	// `meta.changes`. Zero changes means either the book doesn't exist / is
+	// already trashed, OR it has an open loan — disambiguate so the librarian
+	// gets an actionable message instead of a misleading 404.
 	if ((result.meta?.changes ?? 0) === 0) {
+		const openLoan = await c.env.DB.prepare(
+			`SELECT 1 FROM borrow_transactions bt
+			   JOIN books b ON b.id = bt.book_id
+			  WHERE bt.book_id = ? AND bt.returned_at IS NULL AND b.deleted_at IS NULL
+			  LIMIT 1`
+		).bind(id).first();
+		if (openLoan) {
+			throw new HTTPException(409, { message: 'Cannot delete: the book is on loan. Return it first.' });
+		}
 		throw new HTTPException(404, { message: 'Book not found' });
 	}
 
@@ -1452,7 +1514,7 @@ app.post('/api/books/:id/codes', requirePermission('books.write', { librarian: t
 
 app.get('/api/scan/:value', async (c) => {
 	const codeValue = c.req.param('value');
-	const row = await c.env.DB.prepare(
+	let row = await c.env.DB.prepare(
 		`SELECT b.*, ca.code_type, ca.code_value
 		 FROM code_assignments ca
 		 JOIN books b ON b.id = ca.book_id
@@ -1461,6 +1523,20 @@ app.get('/api/scan/:value', async (c) => {
 	)
 		.bind(codeValue)
 		.first();
+
+	// Fallback: printed labels (labels.ts) encode /api/scan/<legacy_id | book id>,
+	// NOT a generated code_value, so scanning a printed label would otherwise
+	// always 404. If no code assignment matches, resolve the value directly
+	// against the book's legacy_id or id. Generated codes still take priority.
+	if (!row) {
+		row = await c.env.DB.prepare(
+			`SELECT b.* FROM books b
+			 WHERE (b.legacy_id = ? OR b.id = ?) AND b.deleted_at IS NULL
+			 LIMIT 1`
+		)
+			.bind(codeValue, codeValue)
+			.first();
+	}
 
 	if (!row) {
 		throw new HTTPException(404, { message: 'No book found for this code' });
@@ -1785,6 +1861,12 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 		await runAtomic(c.env, bookUpdates.slice(i, i + D1_BATCH_LIMIT));
 	}
 
+	// A rename rewrites many books' custom_fields; without bumping the cache
+	// version the 60s KV books-list cache keeps serving the old key/value shape.
+	if (renamedBooks > 0) {
+		await bumpBooksCacheVersion(c.env);
+	}
+
 	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id, {
 		oldKey: existing.field_key,
 		key: payload.key,
@@ -2082,9 +2164,23 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 			} else if (mutation.operation === 'delete_book') {
 				const row = z.object({ id: z.string().min(1) }).parse(mutation.payload);
 				const now = nowIso();
-				await c.env.DB.prepare(`UPDATE books SET deleted_at = ?, updated_at = ?, version = version + 1 WHERE id = ?`)
+				// Don't strand an open loan (mirror the direct DELETE guard).
+				const del = await c.env.DB.prepare(
+					`UPDATE books SET deleted_at = ?, updated_at = ?, version = version + 1
+					 WHERE id = ? AND deleted_at IS NULL
+					   AND NOT EXISTS (SELECT 1 FROM borrow_transactions WHERE book_id = books.id AND returned_at IS NULL)`
+				)
 					.bind(now, now, row.id)
 					.run();
+				if ((del.meta?.changes ?? 0) === 0) {
+					const openLoan = await c.env.DB.prepare(
+						`SELECT 1 FROM borrow_transactions bt JOIN books b ON b.id = bt.book_id
+						  WHERE bt.book_id = ? AND bt.returned_at IS NULL AND b.deleted_at IS NULL LIMIT 1`
+					).bind(row.id).first();
+					if (openLoan) {
+						throw new HTTPException(409, { message: 'Cannot delete: the book is on loan. Return it first.' });
+					}
+				}
 				resultData = { id: row.id };
 			} else if (mutation.operation === 'update_book') {
 				const row = z.object({ id: z.string().min(1), data: UpdateBookSchema }).parse(mutation.payload);
@@ -2097,6 +2193,14 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				const currentVersion = Number((current as Record<string, unknown>).version ?? 0);
 				if (incoming.version !== currentVersion) {
 					throw new HTTPException(409, { message: 'Version conflict' });
+				}
+				// Same circulation invariant as the direct PUT: never let a generic
+				// update move a book into or out of 'borrowed' (that desyncs the loan
+				// row). Offline clients should use the borrow/return operations.
+				const curStatus = String((current as Record<string, unknown>).status ?? 'available');
+				if (incoming.status && incoming.status !== curStatus
+					&& (incoming.status === 'borrowed' || curStatus === 'borrowed')) {
+					throw new HTTPException(409, { message: 'Change loan status via the borrow/return actions.' });
 				}
 
 				const merged = {
@@ -2166,6 +2270,12 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				await replaceBookAttributeValues(c.env, row.id, merged.customFields as Record<string, unknown>);
 				resultData = { id: row.id, version: merged.version };
 			} else if (mutation.operation === 'borrow_book') {
+				// Lending is a 'circulation' action — enforce it here too, otherwise
+				// /api/sync/push (gated only by the coarse books.write) would bypass
+				// the circulation gate the direct borrow endpoint requires.
+				if (!(await userHasPermission(c, 'circulation', { librarian: true }))) {
+					throw new HTTPException(403, { message: 'Permission denied: circulation' });
+				}
 				const row = z.object({ id: z.string().min(1), data: BorrowBookSchema }).parse(mutation.payload);
 				if (Date.parse(row.data.dueAt) <= Date.now()) {
 					throw new HTTPException(400, { message: 'dueAt must be in the future.' });
@@ -2210,6 +2320,9 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 
 				resultData = { transactionId: txId, borrowerId };
 			} else if (mutation.operation === 'return_book') {
+				if (!(await userHasPermission(c, 'circulation', { librarian: true }))) {
+					throw new HTTPException(403, { message: 'Permission denied: circulation' });
+				}
 				const row = z.object({ id: z.string().min(1), data: ReturnBookSchema }).parse(mutation.payload);
 				const tx = await c.env.DB.prepare(
 					`SELECT id FROM borrow_transactions WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at DESC LIMIT 1`
@@ -3379,47 +3492,61 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 
 	let inserted = 0;
 	let updated = 0;
+	let skippedTrashed = 0;
 	let attributeFailures = 0;
 
 	for (const p of prepared) {
 		const tags = '[]';
-		const customJson = JSON.stringify(p.customFields);
-		// Diacritic-fold the searchable fields so accent-insensitive (e.g. Greek)
-		// FTS keeps working after a catalog re-import. The books_fts trigger reads
-		// these *_fold columns; if we leave them stale the index re-indexes old
-		// text and updated books silently drop out of search.
-		const folds = computeBookFolds({
-			title: p.title,
-			author: p.author,
-			isbn: p.isbn,
-			publisher: p.publisher,
-			description: p.description,
-			tagsJson: tags,
-			customFieldsJson: customJson
-		});
 		try {
 			let bookId: string;
 			let didUpdate = false;
-			let existingRow: { id: string } | null = null;
+			// Fetch deleted_at + existing custom_fields so we can (a) refuse to
+			// resurrect a soft-deleted book and (b) merge rather than clobber the
+			// librarian's manually-entered custom fields on re-import.
+			let existingRow: { id: string; deleted_at: string | null; custom_fields: string | null } | null = null;
 
 			if (p.legacyId) {
 				existingRow = await c.env.DB.prepare(
-					'SELECT id FROM books WHERE legacy_id = ? LIMIT 1'
+					'SELECT id, deleted_at, custom_fields FROM books WHERE legacy_id = ? LIMIT 1'
 				)
 					.bind(p.legacyId)
-					.first<{ id: string } | null>();
+					.first<{ id: string; deleted_at: string | null; custom_fields: string | null } | null>();
 			}
 
+			// The book to write into custom_fields / attribute values. For an
+			// UPDATE this is the merge below; for an INSERT it's the source row.
+			let effectiveCf: Record<string, unknown> = p.customFields;
+
 			if (existingRow) {
+				// A librarian deliberately trashed this book; a source re-import must
+				// not silently bring it back. Leave it in the trash untouched.
+				if (existingRow.deleted_at) {
+					skippedTrashed += 1;
+					continue;
+				}
+
 				bookId = existingRow.id;
+				// Merge custom fields: preserve keys the librarian added that aren't
+				// in the source sheet; source values win for overlapping keys. Never
+				// re-raise needs_review on an existing book (the reviewer may have
+				// cleared it) — only a fresh insert carries the source flag.
+				const existingCf = safeJsonParse<Record<string, unknown>>(existingRow.custom_fields ?? '{}', {});
+				const sourceCf = { ...p.customFields };
+				delete (sourceCf as Record<string, unknown>).needs_review;
+				effectiveCf = { ...existingCf, ...sourceCf };
+				const mergedCustomJson = JSON.stringify(effectiveCf);
+				const folds = computeBookFolds({
+					title: p.title, author: p.author, isbn: p.isbn, publisher: p.publisher,
+					description: p.description, tagsJson: tags, customFieldsJson: mergedCustomJson
+				});
 				await c.env.DB.prepare(
 					`UPDATE books SET
 						title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?,
 						description = ?, shelf_code = ?, custom_fields = ?, updated_at = ?,
-						version = version + 1, deleted_at = NULL,
+						version = version + 1,
 						title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?,
 						description_fold = ?, custom_fields_fold = ?
-					 WHERE id = ?`
+					 WHERE id = ? AND deleted_at IS NULL`
 				)
 					.bind(
 						p.title,
@@ -3430,7 +3557,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 						p.language,
 						p.description,
 						p.shelfCode,
-						customJson,
+						mergedCustomJson,
 						now,
 						folds.title_fold,
 						folds.author_fold,
@@ -3444,6 +3571,11 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 				didUpdate = true;
 			} else {
 				bookId = crypto.randomUUID();
+				const customJson = JSON.stringify(p.customFields);
+				const folds = computeBookFolds({
+					title: p.title, author: p.author, isbn: p.isbn, publisher: p.publisher,
+					description: p.description, tagsJson: tags, customFieldsJson: customJson
+				});
 				await c.env.DB.prepare(
 					`INSERT INTO books (
 						id, title, author, isbn, publication_year, publisher, language, description,
@@ -3479,7 +3611,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 			}
 
 			try {
-				await replaceBookAttributeValues(c.env, bookId, p.customFields);
+				await replaceBookAttributeValues(c.env, bookId, effectiveCf);
 			} catch {
 				attributeFailures += 1;
 			}
@@ -3511,6 +3643,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 		dryRun: false,
 		inserted,
 		updated,
+		skippedTrashed,
 		skippedRows,
 		attributeFailures
 	}, 201);
@@ -3857,12 +3990,15 @@ app.put('/api/books/:id/cover', requirePermission('books.write', { librarian: tr
 		try { await c.env.ASSETS.delete(`covers/${bookId}.${otherExt}`); } catch { /* ignore */ }
 	}
 	const coverUrl = `/api/books/${bookId}/cover?v=${Date.now()}`;
-	await c.env.DB.prepare(
-		'UPDATE books SET cover_url = ?, updated_at = ?, version = version + 1 WHERE id = ?'
-	).bind(coverUrl, nowIso(), bookId).run();
+	// Return the new version so the client keeps its copy authoritative — a cover
+	// upload bumps version, and without this the next metadata edit would send a
+	// stale version and spuriously 409.
+	const bumped = await c.env.DB.prepare(
+		'UPDATE books SET cover_url = ?, updated_at = ?, version = version + 1 WHERE id = ? RETURNING version'
+	).bind(coverUrl, nowIso(), bookId).first<{ version: number }>();
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.cover.upload', 'book', bookId, { contentType, bytes: buffer.byteLength });
-	return c.json({ ok: true, coverUrl });
+	return c.json({ ok: true, coverUrl, version: Number(bumped?.version ?? 0) });
 });
 
 app.delete('/api/books/:id/cover', requirePermission('books.write', { librarian: true }), async (c) => {
@@ -3878,12 +4014,12 @@ app.delete('/api/books/:id/cover', requirePermission('books.write', { librarian:
 	for (const ext of ['jpg', 'png', 'webp', 'gif']) {
 		try { await c.env.ASSETS.delete(`covers/${bookId}.${ext}`); } catch { /* ignore */ }
 	}
-	await c.env.DB.prepare(
-		'UPDATE books SET cover_url = NULL, updated_at = ?, version = version + 1 WHERE id = ?'
-	).bind(nowIso(), bookId).run();
+	const bumped = await c.env.DB.prepare(
+		'UPDATE books SET cover_url = NULL, updated_at = ?, version = version + 1 WHERE id = ? RETURNING version'
+	).bind(nowIso(), bookId).first<{ version: number }>();
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.cover.delete', 'book', bookId, {});
-	return c.body(null, 204);
+	return c.json({ ok: true, version: Number(bumped?.version ?? 0) });
 });
 
 app.get('/api/books/:id/cover', async (c) => {

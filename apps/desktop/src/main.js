@@ -122,6 +122,18 @@ function lockDownNavigation(contents) {
   });
 
   contents.setWindowOpenHandler(({ url }) => {
+    // The in-app label printer opens a blank window and writes its HTML into it
+    // (window.open('', '_blank') → about:blank). Denying that broke printing
+    // entirely in the desktop shell. Allow the blank popup but keep it
+    // sandboxed with no Node access.
+    if (url === 'about:blank') {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+        },
+      };
+    }
     // Open http(s) links externally; deny everything else.
     if (/^https?:\/\//i.test(url)) {
       void shell.openExternal(url);

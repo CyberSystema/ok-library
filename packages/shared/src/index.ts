@@ -45,7 +45,12 @@ export const ISODateTimeSchema = z
   .refine((v) => !Number.isNaN(Date.parse(v)), 'Invalid ISO datetime');
 
 export const BookCoreSchema = z.object({
-  title: z.string().min(1).max(300),
+  // Title is optional at the schema level: the catalog legitimately contains
+  // untitled entries, and since blank title/author both canonicalize to '' (see
+  // normalizeBookData), a blank-title book must remain editable — a min(1) here
+  // would 400 every save of such a book. The UI still nudges toward a title via
+  // the "untitled" smart list and a localized placeholder.
+  title: z.string().max(300).default(''),
   // Author is optional: many works legitimately have none (liturgical books,
   // service books, anonymous editions). Stored as an empty string when absent
   // so the NOT NULL column and the "unknown author" placeholder both hold.

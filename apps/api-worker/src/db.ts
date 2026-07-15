@@ -30,12 +30,21 @@ export async function insertAuditLog(
   entityId: string | null,
   metadata: Record<string, unknown>
 ): Promise<void> {
-  await env.DB.prepare(
-    `INSERT INTO audit_logs (id, actor_id, action, entity_type, entity_id, metadata, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(crypto.randomUUID(), actorId, action, entityType, entityId, JSON.stringify(metadata), nowIso())
-    .run();
+  // The audit write is best-effort and almost always runs AFTER the primary
+  // mutation has committed. If it throws (e.g. audit_logs contention), we must
+  // NOT turn a succeeded write into a 500 — that both misleads the user and, on
+  // the web client, trips the transient-5xx retry which re-applies the mutation.
+  // Swallow and log instead; every call site relies on this being non-fatal.
+  try {
+    await env.DB.prepare(
+      `INSERT INTO audit_logs (id, actor_id, action, entity_type, entity_id, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(crypto.randomUUID(), actorId, action, entityType, entityId, JSON.stringify(metadata), nowIso())
+      .run();
+  } catch (err) {
+    console.warn('audit log insert failed, continuing', { action, entityType, entityId, err });
+  }
 }
 
 export async function getBooksCacheVersion(env: Env): Promise<string> {
@@ -373,7 +382,13 @@ function buildFtsQuery(opts: {
   partialWords: boolean;
   fields: string[];
 }): string | null {
-  const tokens = opts.qMode === 'exact' ? [opts.q] : parseSearchTokens(opts.q);
+  // Exact mode must diacritic-fold the phrase the same way the tokenized path
+  // does (parseSearchTokens → foldDiacritics), otherwise an accented Greek query
+  // like "ψυχή" never matches the folded FTS index and exact search silently
+  // returns nothing for accented titles.
+  const tokens = opts.qMode === 'exact'
+    ? [foldDiacritics(opts.q)].filter(Boolean)
+    : parseSearchTokens(opts.q);
   if (tokens.length === 0) return null;
 
   const ftsCols = opts.fields.map((f) => FIELD_TO_FTS_COLUMN[f]).filter(Boolean);
@@ -538,30 +553,34 @@ export async function queryBooksWithFilters(
   // Path A: fuzzy mode — skip the FTS MATCH constraint so severe typos still
   // get candidates. The post-filter Levenshtein step runs in the Worker, on
   // the structurally-filtered candidate set (capped at 5000).
-  if (!fuzzyEnabled) {
-    if (qText && opts.qMode !== 'exact') {
+  if (!fuzzyEnabled && qText) {
+    // Only some fields are FTS-indexed (title/author/isbn/publisher/description/
+    // tags/custom). If the user restricts the search to a NON-FTS field
+    // (language / shelf / room code), FTS can't target it — previously the
+    // empty column list collapsed to an unrestricted all-column match, silently
+    // ignoring the restriction. Split the fields and handle each kind properly.
+    const ftsFields = activeFields.filter((f) => FIELD_TO_FTS_COLUMN[f]);
+    const nonFtsFields = activeFields.filter((f) => !FIELD_TO_FTS_COLUMN[f] && SQL_FIELD_FOLD_EXPR[f]);
+
+    if (ftsFields.length > 0) {
       const ftsQuery = buildFtsQuery({
         q: qText,
         qMode: opts.qMode ?? 'all',
-        partialWords: opts.partialWords ?? true,
-        fields: activeFields
+        partialWords: opts.qMode === 'exact' ? false : (opts.partialWords ?? true),
+        fields: ftsFields
       });
       if (ftsQuery) {
         useFtsJoin = true;
         where.push('books_fts MATCH ?');
         values.push(ftsQuery);
       }
-    } else if (qText && opts.qMode === 'exact') {
-      const ftsQuery = buildFtsQuery({
-        q: qText,
-        qMode: 'exact',
-        partialWords: false,
-        fields: activeFields
-      });
-      if (ftsQuery) {
-        useFtsJoin = true;
-        where.push('books_fts MATCH ?');
-        values.push(ftsQuery);
+    } else if (nonFtsFields.length > 0) {
+      // Fold-aware substring match on the selected non-FTS field(s).
+      const folded = foldDiacritics(qText).trim();
+      if (folded) {
+        const likeConds = nonFtsFields.map((f) => `${SQL_FIELD_FOLD_EXPR[f]} LIKE ?`);
+        where.push(`(${likeConds.join(' OR ')})`);
+        for (let i = 0; i < nonFtsFields.length; i += 1) values.push(`%${folded}%`);
       }
     }
   }
@@ -699,9 +718,15 @@ async function runFuzzyFiltered(
     : 'books b';
   const whereSql = `WHERE ${where.join(' AND ')}`;
 
+  // Same blanks-last rule as the primary list query so author/title sorts don't
+  // bury real values under empty/placeholder rows (the candidate order is
+  // preserved through the JS fuzzy filter + slice below).
+  const fuzzyBlankLast = (ctx.sortColumn === 'author' || ctx.sortColumn === 'title')
+    ? `CASE WHEN b.${ctx.sortColumn} IS NULL OR TRIM(b.${ctx.sortColumn}) = '' OR b.${ctx.sortColumn} IN ('(Unknown)', '(Untitled)') THEN 1 ELSE 0 END, `
+    : '';
   const candidateStmt = env.DB.prepare(
     `SELECT b.* FROM ${fromClause} ${whereSql}
-     ORDER BY b.${ctx.sortColumn} ${ctx.sortDir}, b.id DESC LIMIT ?`
+     ORDER BY ${fuzzyBlankLast}b.${ctx.sortColumn} ${ctx.sortDir}, b.id DESC LIMIT ?`
   ).bind(...values, FUZZY_CANDIDATE_CAP);
   const res = await candidateStmt.all();
   const rows = ((res.results ?? []) as Array<Record<string, unknown>>).map(parseBook);

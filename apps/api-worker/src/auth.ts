@@ -310,6 +310,23 @@ async function getRolePermissions(
 // Permission-based middleware. Admins always pass. For other roles, the
 // `role_permissions` table is consulted; missing rows fall back to the
 // caller-supplied default (typically `false`).
+// Programmatic permission check with the same semantics as requirePermission
+// (admin always allowed; otherwise the role_permissions table, falling back to
+// the caller-supplied default). Use this to gate individual operations that
+// don't have their own middleware — e.g. the per-mutation branches of
+// /api/sync/push, which would otherwise inherit only the endpoint's coarse gate.
+export async function userHasPermission(
+  c: Context<{ Bindings: Env; Variables: { user: AuthClaims } }>,
+  permission: string,
+  defaultAllowed: { librarian?: boolean; viewer?: boolean } = {}
+): Promise<boolean> {
+  const user = c.get('user');
+  if (user.role === 'admin') return true;
+  const role = user.role as 'librarian' | 'viewer';
+  const map = await getRolePermissions(c as unknown as PermissionsCacheCtx, role);
+  return map.has(permission) ? map.get(permission) === true : Boolean(defaultAllowed[role]);
+}
+
 export function requirePermission(
   permission: string,
   defaultAllowed: { librarian?: boolean; viewer?: boolean } = {}
@@ -318,17 +335,7 @@ export function requirePermission(
     c: Context<{ Bindings: Env; Variables: { user: AuthClaims } }>,
     next: Next
   ): Promise<void> => {
-    const user = c.get('user');
-    if (user.role === 'admin') {
-      await next();
-      return;
-    }
-    const role = user.role as 'librarian' | 'viewer';
-    const map = await getRolePermissions(c as unknown as PermissionsCacheCtx, role);
-    const allowed = map.has(permission)
-      ? map.get(permission) === true
-      : Boolean(defaultAllowed[role]);
-    if (!allowed) {
+    if (!(await userHasPermission(c, permission, defaultAllowed))) {
       throw new HTTPException(403, { message: `Permission denied: ${permission}` });
     }
     await next();
