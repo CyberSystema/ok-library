@@ -198,11 +198,14 @@ const SMART_LISTS: Array<SmartList & { labelKey: string }> = [
 type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
 type DuplicateGroup = DuplicateEntry[];
 type CatalogFacets = {
-  titles: string[];
+  // No `titles`: title is intentionally excluded from autocomplete (unique-ish
+  // values, and suggesting them risks picking an existing book's title).
   authors: string[];
   publishers: string[];
   languages: string[];
   shelfCodes: string[];
+  // Per-custom-field distinct values (text fields only), keyed by field key.
+  customFields: Record<string, string[]>;
 };
 type SearchMode = 'all' | 'any' | 'exact';
 type SearchField = 'title' | 'author' | 'isbn' | 'publisher' | 'language' | 'description' | 'roomCode' | 'shelfCode' | 'tags' | 'custom';
@@ -707,11 +710,15 @@ function SectionHeader({
 const CatalogDatalists = React.memo(function CatalogDatalists({ facets }: { facets: CatalogFacets }) {
   return (
     <>
-      <datalist id="suggest-title">{facets.titles.map((v) => <option key={v} value={v} />)}</datalist>
-      <datalist id="suggest-author">{facets.authors.map((v) => <option key={v} value={v} />)}</datalist>
-      <datalist id="suggest-publisher">{facets.publishers.map((v) => <option key={v} value={v} />)}</datalist>
-      <datalist id="suggest-language">{facets.languages.map((v) => <option key={v} value={v} />)}</datalist>
-      <datalist id="suggest-shelf">{facets.shelfCodes.map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-author">{(facets.authors ?? []).map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-publisher">{(facets.publishers ?? []).map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-language">{(facets.languages ?? []).map((v) => <option key={v} value={v} />)}</datalist>
+      <datalist id="suggest-shelf">{(facets.shelfCodes ?? []).map((v) => <option key={v} value={v} />)}</datalist>
+      {/* One datalist per free-text custom field, referenced by suggest-cf-<key>.
+          Guard against a stale cached facets shape that predates customFields. */}
+      {Object.entries(facets.customFields ?? {}).map(([key, values]) => (
+        <datalist id={`suggest-cf-${key}`} key={key}>{(values ?? []).map((v) => <option key={v} value={v} />)}</datalist>
+      ))}
     </>
   );
 });
@@ -790,7 +797,7 @@ function App() {
   // librarian rarely retypes a repeated title, author, publisher, language, or
   // shelf code. Loaded from GET /api/books/facets and refreshed after writes.
   const [facets, setFacets] = useState<CatalogFacets>({
-    titles: [], authors: [], publishers: [], languages: [], shelfCodes: []
+    authors: [], publishers: [], languages: [], shelfCodes: [], customFields: {}
   });
   const [currentPage, setCurrentPage] = useState(1);
   const [totalBooksCount, setTotalBooksCount] = useState(0);
@@ -1573,6 +1580,7 @@ function App() {
       loadBooks(),
       loadRoomSummary(),
       loadCustomFields(),
+      loadFacets(),
       loadActiveBorrows(),
       loadAuditLogs(),
       loadStaffUsers(),
@@ -2061,15 +2069,13 @@ function App() {
     }
   }
 
-  // Load the distinct catalog values behind the add/edit form autocomplete.
-  // Only writers ever open those forms and the endpoint is writer-gated, so we
-  // skip the fetch for viewers entirely. Called lazily when a form opens (see
-  // the effect below) rather than eagerly on load or after every write, so the
-  // suggestions stay fresh (a re-open re-fetches after imports/bulk edits)
-  // without triggering the endpoint's full recompute on every save.
-  // Suggestions are a pure convenience, so a fetch failure is swallowed.
+  // Load the distinct catalog values that power predictive autocomplete on the
+  // cataloguing forms AND the search filters. Read-economical: cached server-side
+  // (KV, version-keyed) and client-side (IndexedDB), so it's ~one request per
+  // session and zero requests per keystroke (the datalist filters client-side).
+  // Available to all roles now (search helps viewers too). A fetch failure is
+  // swallowed — autocomplete just degrades to no suggestions.
   const loadFacets = useCallback(async () => {
-    if (!canWrite) return;
     const cached = await cacheGet<CatalogFacets>('GET /api/books/facets');
     if (cached) setFacets(cached.value);
     try {
@@ -2078,7 +2084,7 @@ function App() {
     } catch {
       /* ignore — autocomplete degrades gracefully to no suggestions */
     }
-  }, [canWrite]);
+  }, []);
 
   // Refresh autocomplete suggestions whenever a book form opens (the add panel
   // or the detail editor). Re-opening after an import or bulk edit re-fetches,
@@ -3668,6 +3674,9 @@ function App() {
                 value={displayValue === null || displayValue === undefined ? '' : String(displayValue)}
                 onChange={(e) => setValue(field.key, e.target.value)}
                 placeholder={field.key}
+                // Predictive autocomplete for free-text custom fields, drawn from
+                // existing values for this field (title-like uniqueness aside).
+                list={field.type === 'text' ? `suggest-cf-${field.key}` : undefined}
               />
             </div>
           );
@@ -4024,7 +4033,7 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label>{t('detail.title')}</label>
-                      <input list="suggest-title" value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} />
+                      <input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} />
                     </div>
                     <div>
                       <label>{t('detail.author')}</label>
@@ -4524,7 +4533,7 @@ function App() {
                       <div className="form-row">
                         <div>
                           <label>{t('library.add.bookTitle')}</label>
-                          <input list="suggest-title" value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} />
+                          <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} />
                         </div>
                         <div>
                           <label>{t('library.add.author')}</label>
@@ -4687,6 +4696,7 @@ function App() {
                         value={q}
                         onChange={(e) => setQ(e.target.value)}
                         placeholder={t('library.search.placeholder')}
+                        list="suggest-author"
                       />
                     </div>
                     <div className="filter-field">
@@ -4706,6 +4716,7 @@ function App() {
                         onChange={(e) => setShelfFilter(e.target.value)}
                         placeholder={t('library.search.shelfPh')}
                         title={t('library.search.shelfTitle')}
+                        list="suggest-shelf"
                       />
                     </div>
                     <div className="filter-field">
@@ -4924,6 +4935,7 @@ function App() {
                         onChange={(e) => setBulkShelfCode(e.target.value)}
                         placeholder={t('library.bulk.setShelf')}
                         aria-label={t('library.bulk.setShelfAria')}
+                        list="suggest-shelf"
                       />
                       <button
                         className="primary small"

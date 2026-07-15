@@ -701,10 +701,14 @@ app.get('/api/books', async (c) => {
 // the values a librarian actually reuses surface first, then capped to keep the
 // payload small. Cached per books-cache-version so it refreshes after any write.
 // NOTE: registered before `/api/books/:id` so "facets" isn't captured as an id.
-// Gated to writers: the values only feed the add/edit form autocomplete, which
-// viewers can't open, so there's no reason to expose the full catalog value
-// enumeration to read-only accounts.
-app.get('/api/books/facets', requirePermission('books.write', { librarian: true }), async (c) => {
+// Distinct catalog values that power predictive autocomplete on BOTH the
+// cataloguing forms and the search filters — for everyone, since search helps
+// viewers too and these are the same non-sensitive values GET /api/books already
+// returns. Read-economy is critical (free tier): the result is cached in KV
+// keyed on the books-cache-version, so the DB is only re-queried after a WRITE
+// (the long TTL is just a backstop), and the browser then filters the datalist
+// client-side with ZERO further requests per keystroke.
+app.get('/api/books/facets', async (c) => {
 	const cacheVersion = await getBooksCacheVersion(c.env);
 	const cacheKey = `facets:${cacheVersion}`;
 
@@ -748,22 +752,76 @@ app.get('/api/books/facets', requirePermission('books.write', { librarian: true 
 			.filter((v): v is string => typeof v === 'string' && v.trim() !== '');
 	}
 
+	// Distinct values for the free-text CUSTOM fields, aggregated in the Worker
+	// from ONE scan of the books.custom_fields JSON (book_attribute_values is
+	// empty for the imported catalogue, and a per-field json_extract GROUP BY
+	// would be N table scans — this is a single scan + cheap CPU). Only text
+	// fields get autocomplete; enum has its own dropdown, number/date/bool don't
+	// need it. Deduped case-insensitively to the most-common spelling, capped.
+	async function customFieldFacets(): Promise<Record<string, string[]>> {
+		const defs = await loadCustomFieldDefs(c.env);
+		const textKeys = new Set(defs.filter((d) => d.field_type === 'text').map((d) => d.field_key));
+		if (textKeys.size === 0) return {};
+
+		const { results } = await c.env.DB.prepare(
+			`SELECT custom_fields FROM books
+			  WHERE deleted_at IS NULL AND custom_fields IS NOT NULL AND custom_fields NOT IN ('', '{}')`
+		).all<{ custom_fields: string }>();
+
+		// key -> foldKey -> { value, count } (keep the most-frequent spelling).
+		const acc = new Map<string, Map<string, { value: string; count: number }>>();
+		for (const row of results ?? []) {
+			const obj = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
+			for (const key of textKeys) {
+				const raw = obj[key];
+				if (typeof raw !== 'string') continue;
+				const v = raw.trim();
+				if (!v) continue;
+				const fold = v.toLowerCase();
+				let byFold = acc.get(key);
+				if (!byFold) { byFold = new Map(); acc.set(key, byFold); }
+				const cur = byFold.get(fold);
+				if (cur) cur.count += 1;
+				else byFold.set(fold, { value: v, count: 1 });
+			}
+		}
+
+		const out: Record<string, string[]> = {};
+		for (const [key, byFold] of acc) {
+			out[key] = [...byFold.values()]
+				.sort((a, b) => b.count - a.count || a.value.localeCompare(b.value))
+				.slice(0, 500)
+				.map((e) => e.value);
+		}
+		return out;
+	}
+
 	// Fold key per column: the *_fold columns (accent+case folded) for the
 	// FTS-indexed text fields; a plain LOWER(TRIM()) for the short code fields
 	// that have no fold column.
-	const [titles, authors, publishers, languages, shelfCodes] = await Promise.all([
-		distinctValues('title', "COALESCE(title_fold, LOWER(title))", 1000),
-		distinctValues('author', "COALESCE(author_fold, LOWER(author))", 1000),
-		distinctValues('publisher', "COALESCE(publisher_fold, LOWER(publisher))", 1000),
+	// NOTE: title is intentionally NOT aggregated — titles are ~unique, so
+	// autocompleting them is low-value and risks a librarian picking an existing
+	// book's title. Skipping it also saves one aggregation + ~1000 strings.
+	// Author/publisher use a LOOSE fold key (accent+case fold, then strip spaces,
+	// dots and dashes) so "J.-P.MIGNE" / "J. -P. MIGNE" / "J.P. MIGNE" collapse to
+	// ONE suggestion. This only chooses which spelling to SUGGEST — stored data
+	// and search are untouched.
+	const [authors, publishers, languages, shelfCodes, customFields] = await Promise.all([
+		distinctValues('author', looseFold('COALESCE(author_fold, LOWER(author))'), 1000),
+		distinctValues('publisher', looseFold('COALESCE(publisher_fold, LOWER(publisher))'), 1000),
 		distinctValues('language', "LOWER(TRIM(language))", 200),
-		distinctValues('shelf_code', "LOWER(TRIM(shelf_code))", 1000)
+		distinctValues('shelf_code', "LOWER(TRIM(shelf_code))", 1000),
+		customFieldFacets()
 	]);
 
-	const response = { titles, authors, publishers, languages, shelfCodes };
+	const response = { authors, publishers, languages, shelfCodes, customFields };
 
 	if (c.env.CACHE) {
 		try {
-			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 300 });
+			// Long TTL: correctness comes from the version-keyed cacheKey (a write
+			// bumps the version → a fresh key → recompute), so the DB is not
+			// re-queried on a timer. The TTL only bounds stale-key cleanup.
+			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 86400 });
 		} catch (error) {
 			console.warn('Facets cache write failed, continuing without cache', error);
 		}
@@ -784,9 +842,18 @@ const CONSISTENCY_FIELDS: Record<string, { column: string; foldColumn: string | 
 	shelfCode: { column: 'shelf_code', foldColumn: null, foldInput: null }
 };
 
+// Wrap a fold expression to also strip spaces, dots and dashes, so spelling
+// variants that differ only in punctuation/spacing ("J.-P.MIGNE" vs
+// "J. -P. MIGNE") share a grouping key. Used only to pick a canonical
+// suggestion / group variants — never to rewrite stored values or to search.
+function looseFold(expr: string): string {
+	return `REPLACE(REPLACE(REPLACE(${expr}, ' ', ''), '.', ''), '-', '')`;
+}
+
 function consistencyFoldKey(f: { column: string; foldColumn: string | null }): string {
-	// Group by the accent+case fold where we have one, else a plain case-fold.
-	return f.foldColumn ? `COALESCE(${f.foldColumn}, LOWER(${f.column}))` : `LOWER(TRIM(${f.column}))`;
+	// Name fields (with a fold column) use the LOOSE fold so punctuation/spacing
+	// variants group together; short code fields use a plain case-fold.
+	return f.foldColumn ? looseFold(`COALESCE(${f.foldColumn}, LOWER(${f.column}))`) : `LOWER(TRIM(${f.column}))`;
 }
 
 // Value-consistency review: surface groups of values that fold to the SAME key
