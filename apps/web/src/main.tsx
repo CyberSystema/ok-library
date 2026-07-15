@@ -221,22 +221,30 @@ type Density = 'comfortable' | 'compact';
 
 // Kept in sync with CATALOG_CUSTOM_FIELDS in apps/api-worker/src/index.ts.
 const CATALOG_FIELD_COUNT = 25;
+// Legacy English sentinels historically minted by catalog imports. New writes
+// store '' instead (see normalizeBookData), but existing rows may still hold
+// these until re-normalized, so the UI must treat both as "no value".
 const TITLE_PLACEHOLDER = '(Untitled)';
 const AUTHOR_PLACEHOLDER = '(Unknown)';
 
+// A book field is "empty" if it's blank OR holds the legacy sentinel.
 function isPlaceholder(value: string | null | undefined, kind: 'title' | 'author'): boolean {
   const text = (value ?? '').trim();
-  return kind === 'title' ? text === TITLE_PLACEHOLDER : text === AUTHOR_PLACEHOLDER;
+  const sentinel = kind === 'title' ? TITLE_PLACEHOLDER : AUTHOR_PLACEHOLDER;
+  return text === '' || text === sentinel;
 }
 
-function displayTitle(book: { title: string }): string {
+// Render the title/author, substituting a caller-supplied (localized) placeholder
+// for empty or legacy-sentinel values. The placeholder defaults to the English
+// sentinel so non-React callers keep working, but every UI call passes t(...).
+function displayTitle(book: { title: string }, placeholder: string = TITLE_PLACEHOLDER): string {
   const trimmed = book.title?.trim() ?? '';
-  return trimmed === '' ? TITLE_PLACEHOLDER : trimmed;
+  return trimmed === '' || trimmed === TITLE_PLACEHOLDER ? placeholder : trimmed;
 }
 
-function displayAuthor(book: { author: string }): string {
+function displayAuthor(book: { author: string }, placeholder: string = AUTHOR_PLACEHOLDER): string {
   const trimmed = book.author?.trim() ?? '';
-  return trimmed === '' ? AUTHOR_PLACEHOLDER : trimmed;
+  return trimmed === '' || trimmed === AUTHOR_PLACEHOLDER ? placeholder : trimmed;
 }
 
 function joinApiUrl(path: string): string {
@@ -2023,6 +2031,13 @@ function App() {
   }
 
   async function loadActiveBorrows() {
+    // Active-loan data is patron PII and the endpoint is now circulation-gated;
+    // viewers (no circulation) would get a 403. Skip the fetch for them so login
+    // doesn't surface a spurious error and we don't hammer a forbidden endpoint.
+    if (!canSeeCirculation) {
+      setActiveBorrows([]);
+      return;
+    }
     const cached = await cacheGet<{ items: ActiveBorrow[] }>('GET /api/borrow/active');
     if (cached) setActiveBorrows(cached.value.items ?? []);
     try {
@@ -2842,7 +2857,11 @@ function App() {
       }
 
       const response = await runAction(() => apiRequest<{ book: Book }>(`/api/scan/${encodeURIComponent(value)}`));
-      setScanResult(`${response.book.title} by ${response.book.author}`);
+      // Localized, blank-safe: show the title and append the author only when
+      // there is a real one (no hardcoded English "by", no dangling separator).
+      const scanTitle = displayTitle(response.book, t('common.untitled'));
+      const scanAuthor = displayAuthor(response.book, '');
+      setScanResult(scanAuthor ? `${scanTitle} — ${scanAuthor}` : scanTitle);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -3408,9 +3427,7 @@ function App() {
   ): React.ReactNode {
     if (customFields.length === 0) {
       return (
-        <p className="muted small">
-          No custom attributes defined yet. Open <strong>Import & Export → Setup</strong> to add the catalog preset.
-        </p>
+        <p className="muted small">{t('settings.customFieldsEmpty')}</p>
       );
     }
     return (
@@ -3441,7 +3458,7 @@ function App() {
                   value={(v as string) ?? ''}
                   onChange={(e) => setValue(field.key, e.target.value || null)}
                 >
-                  <option value="">— none —</option>
+                  <option value="">{t('common.none')}</option>
                   {field.enumOptions.map((opt) => (
                     <option key={opt} value={opt}>{opt}</option>
                   ))}
@@ -3610,13 +3627,13 @@ function App() {
 
             {/* Header */}
             <div className="modal-header">
-              <div className="modal-avatar">{(displayTitle(detailBook).charAt(0) || '?').toUpperCase()}</div>
+              <div className="modal-avatar">{(displayTitle(detailBook, t('common.untitled')).charAt(0) || '?').toUpperCase()}</div>
               <div className="modal-title-block">
                 <h2 className={isPlaceholder(detailBook.title, 'title') || !detailBook.title ? 'is-placeholder' : ''}>
-                  {displayTitle(detailBook)}
+                  {displayTitle(detailBook, t('common.untitled'))}
                 </h2>
                 <p className={`modal-author${isPlaceholder(detailBook.author, 'author') || !detailBook.author ? ' is-placeholder' : ''}`}>
-                  {displayAuthor(detailBook)}
+                  {displayAuthor(detailBook, t('common.unknownAuthor'))}
                 </p>
                 <div className="modal-pills">
                   <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
@@ -3641,14 +3658,14 @@ function App() {
                   {canWrite && (
                     <button className="secondary small" onClick={startEditFromDetail}>{t('detail.editBtn')}</button>
                   )}
-                  {canWrite && detailBook.status === 'available' && (
+                  {canSeeCirculation && detailBook.status === 'available' && (
                     <button className="primary small" onClick={() => {
                       setSelectedBook(detailBook);
                       setCurrentSection('circulation');
                       closeDetail();
                     }}>{t('detail.borrowBtn')}</button>
                   )}
-                  {canWrite && detailBook.status === 'borrowed' && (
+                  {canSeeCirculation && detailBook.status === 'borrowed' && (
                     <button className="secondary small" onClick={() => { void returnBook(detailBook); closeDetail(); }}>
                       {t('detail.returnBtn')}
                     </button>
@@ -3675,7 +3692,7 @@ function App() {
                       <img
                         className="detail-cover"
                         src={joinApiUrl(detailBook.coverUrl)}
-                        alt={t('detail.coverAlt', { title: displayTitle(detailBook) })}
+                        alt={t('detail.coverAlt', { title: displayTitle(detailBook, t('common.untitled')) })}
                         loading="lazy"
                       />
                     ) : (
@@ -4430,7 +4447,7 @@ function App() {
                         </p>
                         <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.875rem' }}>
                           {duplicateWarning.map((d) => (
-                            <li key={d.id}><em>{d.title}</em> — {d.author}{d.isbn ? ` (${t('library.add.isbn')}: ${d.isbn})` : ''}</li>
+                            <li key={d.id}><em>{displayTitle(d, t('common.untitled'))}</em> — {displayAuthor(d, t('common.unknownAuthor'))}{d.isbn ? ` (${t('library.add.isbn')}: ${d.isbn})` : ''}</li>
                           ))}
                         </ul>
                       </div>
@@ -4795,29 +4812,29 @@ function App() {
                                 checked={isSelected}
                                 onChange={(e) => { e.stopPropagation(); toggleBookSelection(book.id); }}
                                 onClick={(e) => e.stopPropagation()}
-                                aria-label={t('library.book.selectAria', { title: displayTitle(book) })}
+                                aria-label={t('library.book.selectAria', { title: displayTitle(book, t('common.untitled')) })}
                                 style={canWrite && selectionMode ? undefined : { display: 'none' }}
                               />
                               {book.coverUrl ? (
                                 <img
                                   className="book-avatar book-cover"
                                   src={joinApiUrl(book.coverUrl)}
-                                  alt={`Cover of ${displayTitle(book)}`}
+                                  alt={`Cover of ${displayTitle(book, t('common.untitled'))}`}
                                   loading="lazy"
                                   decoding="async"
                                   onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
                                 />
                               ) : (
                                 <div className="book-avatar" aria-hidden="true">
-                                  {(displayTitle(book).charAt(0) || '?').toUpperCase()}
+                                  {(displayTitle(book, t('common.untitled')).charAt(0) || '?').toUpperCase()}
                                 </div>
                               )}
                               <div className="book-card-body">
                                 <span className={`book-card-title${isPlaceholder(book.title, 'title') || !book.title ? ' is-placeholder' : ''}`}>
-                                  {q ? highlight(displayTitle(book), q) : displayTitle(book)}
+                                  {q ? highlight(displayTitle(book, t('common.untitled')), q) : displayTitle(book, t('common.untitled'))}
                                 </span>
                                 <p className={`book-card-author${isPlaceholder(book.author, 'author') || !book.author ? ' is-placeholder' : ''}`}>
-                                  {q ? highlight(displayAuthor(book), q) : displayAuthor(book)}
+                                  {q ? highlight(displayAuthor(book, t('common.unknownAuthor')), q) : displayAuthor(book, t('common.unknownAuthor'))}
                                 </p>
                                 <div className="book-card-meta">
                                   {book.publicationYear && <span className="meta-chip">{book.publicationYear}</span>}
@@ -4962,8 +4979,8 @@ function App() {
                   {selectedBook ? (
                     <form onSubmit={(e) => { e.preventDefault(); void borrowBook(selectedBook); }} className="simple-form">
                       <div style={{ padding: '0.875rem 1rem', background: 'var(--accent-light)', borderRadius: 'var(--radius-sm)', border: '1px solid var(--accent)', marginBottom: '0.25rem' }}>
-                        <p style={{ fontWeight: 600 }}>{selectedBook.title}</p>
-                        <p className="muted small">{selectedBook.author}</p>
+                        <p style={{ fontWeight: 600 }}>{displayTitle(selectedBook, t('common.untitled'))}</p>
+                        <p className="muted small">{displayAuthor(selectedBook, t('common.unknownAuthor'))}</p>
                       </div>
                       <div className="form-row">
                         <div className="combobox">
@@ -5279,7 +5296,7 @@ function App() {
                       {duplicateGroups.map((group, i) => (
                         <div key={i} style={{ background: 'var(--surface-2)', borderRadius: '6px', padding: '0.75rem' }}>
                           <p style={{ margin: '0 0 0.4rem', fontWeight: 600, fontSize: '0.875rem' }}>
-                            "{group[0].title}" — {group[0].author}
+                            "{displayTitle(group[0], t('common.untitled'))}" — {displayAuthor(group[0], t('common.unknownAuthor'))}
                           </p>
                           <ul style={{ margin: 0, paddingLeft: '1.2rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
                             {group.map((entry) => (

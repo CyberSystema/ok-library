@@ -263,6 +263,19 @@ app.onError((error, c) => {
 		return c.json({ error: error.message }, error.status);
 	}
 
+	// Input validation failures are CLIENT errors (400), not server errors.
+	// Without this they fall through to the generic 500 below, which (a) reports
+	// a bogus "Internal server error" for what is really a bad field, and (b)
+	// trips the web client's transient-error retry (it retries 5xx writes up to
+	// 4×), so e.g. a too-long title is retried repeatedly and then surfaced as an
+	// opaque server error instead of an actionable "title too long" message.
+	if (error instanceof z.ZodError) {
+		const issue = error.issues[0];
+		const path = issue?.path?.length ? issue.path.join('.') : 'input';
+		const message = issue ? `${path}: ${issue.message}` : 'Invalid request.';
+		return c.json({ error: message, issues: error.issues }, 400);
+	}
+
 	const requestId = crypto.randomUUID();
 	console.error('Unhandled error', {
 		requestId,
@@ -710,6 +723,7 @@ app.get('/api/books/facets', requirePermission('books.write', { librarian: true 
 			`SELECT ${column} AS v, COUNT(*) AS n
 			   FROM books
 			  WHERE deleted_at IS NULL AND ${column} IS NOT NULL AND TRIM(${column}) != ''
+			    AND ${column} NOT IN ('(Unknown)', '(Untitled)')
 			  GROUP BY ${column}
 			  ORDER BY n DESC, ${column} ASC
 			  LIMIT ?`
@@ -839,12 +853,15 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 		author: payload.author
 	});
 
-	// Duplicate check: warn if another non-deleted book has the same title+author
+	// Duplicate check: warn if another non-deleted book has the same title+author.
+	// Canonicalize the legacy '(Unknown)'/'(Untitled)' sentinels to '' on both
+	// sides so a re-catalogued legacy book (author '(Unknown)') is still detected
+	// as a duplicate of the same title added blank (author '') and vice versa.
 	const dupCheck = await c.env.DB.prepare(
 		`SELECT id, title, author FROM books
 		 WHERE deleted_at IS NULL AND id != ?
-		   AND LOWER(TRIM(title)) = LOWER(TRIM(?))
-		   AND LOWER(TRIM(author)) = LOWER(TRIM(?))`
+		   AND CASE WHEN LOWER(TRIM(title)) = '(untitled)' THEN '' ELSE LOWER(TRIM(title)) END = LOWER(TRIM(?))
+		   AND CASE WHEN LOWER(TRIM(author)) = '(unknown)' THEN '' ELSE LOWER(TRIM(author)) END = LOWER(TRIM(?))`
 	)
 		.bind(id, payload.title, payload.author)
 		.all<{ id: string; title: string; author: string }>();
@@ -1136,7 +1153,7 @@ async function resolveBorrower(
 	return { borrowerId: null, borrowerName, borrowerContact };
 }
 
-app.post('/api/books/:id/borrow', requirePermission('books.write', { librarian: true }), async (c) => {
+app.post('/api/books/:id/borrow', requirePermission('circulation', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = BorrowBookSchema.parse(await c.req.json());
 
@@ -1206,7 +1223,7 @@ app.post('/api/books/:id/borrow', requirePermission('books.write', { librarian: 
 	return c.json({ transactionId: txId, borrowerId }, 201);
 });
 
-app.post('/api/books/:id/return', requirePermission('books.write', { librarian: true }), async (c) => {
+app.post('/api/books/:id/return', requirePermission('circulation', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = ReturnBookSchema.parse(await c.req.json());
 
@@ -1335,7 +1352,7 @@ app.put('/api/books/:id/attributes', requirePermission('books.write', { libraria
 	return c.json({ bookId: id, values: normalized });
 });
 
-app.get('/api/borrow/active', async (c) => {
+app.get('/api/borrow/active', requirePermission('circulation', { librarian: true }), async (c) => {
 	try {
 		const overdueOnly = c.req.query('overdueOnly') === 'true';
 		const now = nowIso();
@@ -1674,7 +1691,7 @@ app.get('/api/custom-fields', async (c) => {
 	}
 });
 
-app.post('/api/custom-fields', requirePermission('customFields.manage'), async (c) => {
+app.post('/api/custom-fields', requirePermission('customFields.manage', { librarian: true }), async (c) => {
 	const payload = UpsertCustomFieldSchema.parse(await c.req.json());
 	const id = crypto.randomUUID();
 	const now = nowIso();
@@ -1694,7 +1711,7 @@ app.post('/api/custom-fields', requirePermission('customFields.manage'), async (
 	return c.json({ id }, 201);
 });
 
-app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), async (c) => {
+app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { librarian: true }), async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
 		throw new HTTPException(400, { message: 'Missing custom field id' });
@@ -1777,7 +1794,7 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage'), asyn
 	return c.json({ id });
 });
 
-app.delete('/api/custom-fields/:id', requirePermission('customFields.manage'), async (c) => {
+app.delete('/api/custom-fields/:id', requirePermission('customFields.manage', { librarian: true }), async (c) => {
 	const id = c.req.param('id');
 	const now = nowIso();
 	await c.env.DB.prepare('UPDATE custom_field_definitions SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
@@ -1976,7 +1993,9 @@ app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: tr
 
 	c.header('Content-Type', 'text/csv; charset=utf-8');
 	c.header('Content-Disposition', 'attachment; filename="books.csv"');
-	return c.body(csv);
+	// Prepend a UTF-8 BOM so Excel (which otherwise assumes the legacy locale
+	// codepage) renders Greek/Korean/Cyrillic titles correctly on double-click.
+	return c.body('﻿' + csv);
 });
 
 app.get('/api/sync/pull', async (c) => {
@@ -2252,6 +2271,13 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 	const limit = Math.max(1, Math.min(200, Number(c.req.query('limit') ?? 50)));
 	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
 
+	// Canonical grouping keys: fold the legacy '(Unknown)'/'(Untitled)' sentinels
+	// to '' so a re-catalogued blank-author book and its legacy '(Unknown)' twin
+	// land in the SAME duplicate group. Must be identical in the GROUP BY, the
+	// match predicates, and the details projection or the buckets won't line up.
+	const TITLE_KEY = "CASE WHEN LOWER(TRIM(title)) = '(untitled)' THEN '' ELSE LOWER(TRIM(title)) END";
+	const AUTHOR_KEY = "CASE WHEN LOWER(TRIM(author)) = '(unknown)' THEN '' ELSE LOWER(TRIM(author)) END";
+
 	// Get the global count of duplicate groups in parallel with the paged
 	// slice. The previous `total` was just the count of returned groups,
 	// which made UI pagination misleading once more than `limit` groups
@@ -2259,8 +2285,8 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 	const [groupsRes, totalRes] = await Promise.all([
 		c.env.DB.prepare(
 			`SELECT
-				LOWER(TRIM(title)) AS title_key,
-				LOWER(TRIM(author)) AS author_key,
+				${TITLE_KEY} AS title_key,
+				${AUTHOR_KEY} AS author_key,
 				COUNT(*) AS dup_count
 			 FROM books
 			 WHERE deleted_at IS NULL
@@ -2273,7 +2299,7 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 			`SELECT COUNT(*) AS n FROM (
 				SELECT 1 FROM books
 				 WHERE deleted_at IS NULL
-				 GROUP BY LOWER(TRIM(title)), LOWER(TRIM(author))
+				 GROUP BY ${TITLE_KEY}, ${AUTHOR_KEY}
 				HAVING COUNT(*) > 1
 			)`
 		).first<{ n: number }>()
@@ -2287,7 +2313,7 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 
 	// Step 2: bulk-fetch only the rows in those duplicate buckets via OR predicates.
 	const orClauses = groups
-		.map(() => '(LOWER(TRIM(title)) = ? AND LOWER(TRIM(author)) = ?)')
+		.map(() => `(${TITLE_KEY} = ? AND ${AUTHOR_KEY} = ?)`)
 		.join(' OR ');
 	const params: unknown[] = [];
 	for (const g of groups) {
@@ -2296,7 +2322,7 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 
 	const detailsRes = await c.env.DB.prepare(
 		`SELECT id, title, author, isbn,
-				LOWER(TRIM(title)) AS title_key, LOWER(TRIM(author)) AS author_key
+				${TITLE_KEY} AS title_key, ${AUTHOR_KEY} AS author_key
 		 FROM books
 		 WHERE deleted_at IS NULL AND (${orClauses})
 		 ORDER BY title_key ASC, author_key ASC, id ASC`
@@ -2734,7 +2760,7 @@ app.get('/api/stats', async (c) => {
 				SUM(CASE WHEN shelf_code IS NOT NULL AND TRIM(shelf_code) != '' THEN 1 ELSE 0 END) AS with_shelf,
 				SUM(CASE WHEN publisher IS NOT NULL AND TRIM(publisher) != '' THEN 1 ELSE 0 END) AS with_publisher,
 				SUM(CASE WHEN publication_year IS NOT NULL THEN 1 ELSE 0 END) AS with_year,
-				SUM(CASE WHEN title = '(Untitled)' THEN 1 ELSE 0 END) AS untitled,
+				SUM(CASE WHEN title = '(Untitled)' OR title IS NULL OR TRIM(title) = '' THEN 1 ELSE 0 END) AS untitled,
 				SUM(CASE WHEN author = '(Unknown)' OR author IS NULL OR TRIM(author) = '' THEN 1 ELSE 0 END) AS unknown_author
 			 FROM books WHERE deleted_at IS NULL`
 		).first<{
@@ -3307,10 +3333,12 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 
 			prepared.push({
 				legacyId: row.legacyId ? row.legacyId.trim() : null,
-				// Preserve catalog faithfulness: empty title/author become muted placeholders
-				// the UI knows how to render, while still satisfying NOT NULL + min(1).
-				title: (normalized.title ?? '').trim() || '(Untitled)',
-				author: (normalized.author ?? '').trim() || '(Unknown)',
+				// Blank title/author are stored as the empty string (the canonical
+				// "no value" form — see normalizeBookData). The NOT NULL columns are
+				// satisfied and the UI renders '' as a localized placeholder; we no
+				// longer mint the raw English '(Untitled)'/'(Unknown)' sentinels.
+				title: normalized.title ?? '',
+				author: normalized.author ?? '',
 				isbn: normalized.isbn ?? null,
 				publicationYear: row.publicationYear ?? null,
 				publisher: normalized.publisher ?? null,
@@ -3493,7 +3521,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 // is overdue, and who to contact. The autocomplete endpoint backs the borrow
 // form's combobox.
 
-app.get('/api/borrowers', async (c) => {
+app.get('/api/borrowers', requirePermission('circulation', { librarian: true }), async (c) => {
 	const q = (c.req.query('q') ?? '').trim();
 	const limit = Math.max(1, Math.min(50, Number(c.req.query('limit') ?? 20)));
 	const params: unknown[] = [];
@@ -3543,7 +3571,7 @@ app.get('/api/borrowers', async (c) => {
 	});
 });
 
-app.get('/api/borrowers/:id', async (c) => {
+app.get('/api/borrowers/:id', requirePermission('circulation', { librarian: true }), async (c) => {
 	const id = c.req.param('id');
 	const row = await c.env.DB.prepare('SELECT * FROM borrowers WHERE id = ? LIMIT 1').bind(id).first<{
 		id: string; name: string; contact: string | null; notes: string | null;
@@ -3732,7 +3760,8 @@ app.get('/api/borrowers/export.csv', requirePermission('circulation', { libraria
 
 	c.header('Content-Type', 'text/csv; charset=utf-8');
 	c.header('Content-Disposition', 'attachment; filename="borrowers.csv"');
-	return c.body(csv);
+	// UTF-8 BOM so Excel renders non-Latin borrower names correctly (see books.csv).
+	return c.body('﻿' + csv);
 });
 
 // Maintenance endpoint: orphan cleanup. Sweeps:
@@ -3817,6 +3846,16 @@ app.put('/api/books/:id/cover', requirePermission('books.write', { librarian: tr
 		: contentType === 'image/webp' ? 'webp' : 'gif';
 	const key = `covers/${bookId}.${ext}`;
 	await c.env.ASSETS.put(key, buffer, { httpMetadata: { contentType } });
+	// Purge any previously-stored cover for this book under a DIFFERENT extension.
+	// Covers are keyed by content-type-derived extension, and the GET handler
+	// serves the first extension it finds in a fixed order (jpg, png, webp, gif).
+	// Without this cleanup, replacing e.g. a JPG cover with a PNG would leave the
+	// old covers/<id>.jpg behind — orphaning storage AND making GET serve the
+	// STALE image (jpg is tried before png), so the new cover never appears.
+	for (const otherExt of ['jpg', 'png', 'webp', 'gif']) {
+		if (otherExt === ext) continue;
+		try { await c.env.ASSETS.delete(`covers/${bookId}.${otherExt}`); } catch { /* ignore */ }
+	}
 	const coverUrl = `/api/books/${bookId}/cover?v=${Date.now()}`;
 	await c.env.DB.prepare(
 		'UPDATE books SET cover_url = ?, updated_at = ?, version = version + 1 WHERE id = ?'

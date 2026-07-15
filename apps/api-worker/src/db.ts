@@ -436,6 +436,14 @@ export async function queryBooksWithFilters(
 
   const sortColumn = SORT_COLUMN[opts.sortBy] ?? 'updated_at';
   const sortDir = opts.sortDir === 'asc' ? 'ASC' : 'DESC';
+  // When sorting by author or title, keep the "no value" rows (empty string or
+  // the legacy '(Unknown)'/'(Untitled)' sentinels) at the END regardless of
+  // direction — otherwise an A→Z author sort buries every real author under
+  // pages of placeholders. `sortColumn` is from a fixed whitelist, so it is safe
+  // to interpolate here.
+  const blankLastSort = (opts.sortBy === 'author' || opts.sortBy === 'title')
+    ? `CASE WHEN b.${sortColumn} IS NULL OR TRIM(b.${sortColumn}) = '' OR b.${sortColumn} IN ('(Unknown)', '(Untitled)') THEN 1 ELSE 0 END, `
+    : '';
   const limit = Math.max(1, Math.min(100, opts.pageSize));
   const offset = (Math.max(1, opts.page) - 1) * limit;
 
@@ -479,7 +487,7 @@ export async function queryBooksWithFilters(
     where.push("(b.shelf_code IS NULL OR TRIM(b.shelf_code) = '')");
   }
   if (opts.untitled) {
-    where.push("b.title = '(Untitled)'");
+    where.push("(b.title = '(Untitled)' OR b.title IS NULL OR TRIM(b.title) = '')");
   }
   if (opts.unknownAuthor) {
     // Author-less books exist in two on-disk forms: the catalog-import
@@ -591,7 +599,7 @@ export async function queryBooksWithFilters(
   const countStmt = env.DB.prepare(`SELECT COUNT(*) as count FROM ${fromClause} ${whereSql}`).bind(...values);
   const rowsStmt = env.DB.prepare(
     `SELECT b.* FROM ${fromClause} ${whereSql}
-     ORDER BY b.${sortColumn} ${sortDir}, b.id DESC LIMIT ? OFFSET ?`
+     ORDER BY ${blankLastSort}b.${sortColumn} ${sortDir}, b.id DESC LIMIT ? OFFSET ?`
   ).bind(...values, limit, offset);
 
   const [countRes, rowsRes] = await Promise.all([countStmt.first<{ count: number }>(), rowsStmt.all()]);
@@ -1061,8 +1069,10 @@ export function bookEmbeddingText(book: {
   customFields?: Record<string, unknown> | null;
 }): string {
   const parts: string[] = [];
-  if (book.title) parts.push(book.title);
-  if (book.author) parts.push(`by ${book.author}`);
+  // Skip the "no value" placeholders so embeddings don't carry a spurious
+  // "(Untitled)" / "by (Unknown)" that pollutes semantic-search relevance.
+  if (book.title && book.title !== '(Untitled)') parts.push(book.title);
+  if (book.author && book.author !== '(Unknown)') parts.push(`by ${book.author}`);
   if (book.publisher) parts.push(book.publisher);
   if (book.publicationYear) parts.push(String(book.publicationYear));
   if (book.language) parts.push(`(${book.language})`);

@@ -40,6 +40,14 @@ const DEFAULT_LABEL_STRINGS: LabelStrings = {
   htmlLang: 'en'
 };
 
+// Treat a blank value OR the legacy English sentinel ('(Untitled)'/'(Unknown)')
+// as "no value" so stickers never carry a raw English placeholder under a Greek
+// title — the caller supplies a localized fallback instead.
+function labelValue(value: string | null | undefined, sentinel: string): string {
+  const t = (value ?? '').trim();
+  return t === sentinel ? '' : t;
+}
+
 function escapeHtml(s: string): string {
   return s
     .replaceAll('&', '&amp;')
@@ -83,8 +91,8 @@ export async function openPrintLabels(
         <article class="tile">
           <img src="${dataUrl}" alt="QR" />
           <div class="text">
-            <div class="title">${escapeHtml(book.title || s.untitled)}</div>
-            <div class="author">${escapeHtml(book.author || s.unknown)}</div>
+            <div class="title">${escapeHtml(labelValue(book.title, '(Untitled)') || s.untitled)}</div>
+            <div class="author">${escapeHtml(labelValue(book.author, '(Unknown)') || s.unknown)}</div>
             ${book.legacyId ? `<div class="lid">${escapeHtml(book.legacyId)}</div>` : ''}
             ${metaHtml}
           </div>

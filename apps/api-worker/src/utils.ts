@@ -60,8 +60,22 @@ function collapseSpaces(s: string): string {
 export function normalizeBookData<T extends NormalizableBook>(input: T): T {
   const out = { ...input } as Record<string, unknown>;
 
-  if (typeof out.title === 'string') out.title = collapseSpaces(out.title);
-  if (typeof out.author === 'string') out.author = collapseSpaces(out.author);
+  // Converge the two historical representations of "no value" into one canonical
+  // form: the empty string. Legacy catalog imports minted the English sentinels
+  // '(Untitled)'/'(Unknown)', while the forms/JSON import store ''. Keeping both
+  // split duplicate detection, autocomplete, sorting, and (worst) leaked raw
+  // English placeholders into the localized UI. Normalizing on every write means
+  // any edit/import/sync heals the row; the UI renders '' as a translated
+  // placeholder. We match ONLY the exact system-minted sentinels so a real book
+  // legitimately titled "Unknown" is never clobbered.
+  if (typeof out.title === 'string') {
+    const t = collapseSpaces(out.title);
+    out.title = t === '(Untitled)' ? '' : t;
+  }
+  if (typeof out.author === 'string') {
+    const a = collapseSpaces(out.author);
+    out.author = a === '(Unknown)' ? '' : a;
+  }
   if (typeof out.isbn === 'string') {
     const cleaned = out.isbn.replace(/[\s-]/g, '').toUpperCase();
     out.isbn = cleaned || null;
@@ -112,7 +126,16 @@ export function toCsv(rows: Array<Record<string, unknown>>, orderedColumns: stri
     if (value === null || value === undefined) {
       return '';
     }
-    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    let text = typeof value === 'string' ? value : JSON.stringify(value);
+    // CSV formula-injection defense: a cell that begins with =, +, -, @, or a
+    // leading tab/CR is interpreted as a formula by Excel/LibreOffice/Sheets, so
+    // a book title like `=HYPERLINK(...)` or `+cmd|...` would execute when the
+    // librarian opens the export. Neutralize by prefixing a single quote, which
+    // spreadsheets treat as "force text" and hide. (This export is opened in a
+    // spreadsheet, not re-imported — the app imports XLSX — so no round-trip drift.)
+    if (/^[=+\-@\t\r]/.test(text)) {
+      text = `'${text}`;
+    }
     if (text.includes(',') || text.includes('"') || text.includes('\n')) {
       return `"${text.replaceAll('"', '""')}"`;
     }

@@ -61,8 +61,8 @@ class LibraryScreen extends StatelessWidget {
             ...books.map(
               (book) => Card(
                 child: ListTile(
-                  title: Text(book.title),
-                  subtitle: Text('${book.author}\n${book.roomCode ?? '-'} / ${book.shelfCode ?? '-'}'),
+                  title: Text(book.title.trim().isEmpty || book.title == '(Untitled)' ? '(Untitled)' : book.title),
+                  subtitle: Text('${book.author.trim().isEmpty || book.author == '(Unknown)' ? '(Unknown author)' : book.author}\n${book.roomCode ?? '-'} / ${book.shelfCode ?? '-'}'),
                   trailing: FilledButton.tonal(
                     onPressed: () => onBorrow(book),
                     child: const Text('Borrow'),

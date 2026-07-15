@@ -78,6 +78,7 @@ const en: Dict = {
   'common.unknown': '(Unknown)',
   'common.optional': 'optional',
   'common.none': '— none —',
+  'common.unknownAuthor': '(Unknown author)',
   'common.yes': 'Yes',
   'common.no': 'No',
 
@@ -615,6 +616,7 @@ const ko: Dict = {
   'common.unknown': '(미상)',
   'common.optional': '선택사항',
   'common.none': '— 없음 —',
+  'common.unknownAuthor': '(작자 미상)',
   'common.yes': '예',
   'common.no': '아니오',
 
@@ -1142,6 +1144,7 @@ const ru: Dict = {
   'common.unknown': '(Неизвестно)',
   'common.optional': 'необязательно',
   'common.none': '— нет —',
+  'common.unknownAuthor': '(Автор неизвестен)',
   'common.yes': 'Да',
   'common.no': 'Нет',
 
@@ -1669,6 +1672,7 @@ const el: Dict = {
   'common.unknown': '(Άγνωστο)',
   'common.optional': 'προαιρετικό',
   'common.none': '— κανένα —',
+  'common.unknownAuthor': '(Άγνωστος συγγραφέας)',
   'common.yes': 'Ναι',
   'common.no': 'Όχι',
 
