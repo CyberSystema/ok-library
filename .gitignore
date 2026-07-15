@@ -5,6 +5,9 @@ node_modules/
 
 # Web
 apps/web/dist/
+# Local env overrides (e.g. VITE_API_BASE pointing at a dev worker)
+.env.local
+*.local
 
 # Desktop (Electron)
 apps/desktop/release/

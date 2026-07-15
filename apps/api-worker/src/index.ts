@@ -53,7 +53,7 @@ import {
 	withTxn
 } from './db';
 import type { AuthClaims, Env } from './types';
-import { generateCodeValue, normalizeBookData, nowIso, safeJsonParse, toCsv } from './utils';
+import { deterministicUuid, generateCodeValue, normalizeBookData, nowIso, safeJsonParse, toCsv } from './utils';
 
 type App = Hono<{ Bindings: Env; Variables: { user: AuthClaims } }>;
 type AppContext = Context<{ Bindings: Env; Variables: { user: AuthClaims } }>;
@@ -226,20 +226,37 @@ app.use('*', async (c, next) => {
 app.use('/api/*', async (c, next) => {
   const path = c.req.path;
   const method = c.req.method;
-  // Tighter buckets for high-cost operations:
-  //   • login (brute-force surface)            → 20/min
-  //   • cover uploads (payload up to 4 MB)     → 30/min
-  //   • everything else                        → 180/min
+  // The rate limiter is backed by KV, whose FREE-TIER WRITE budget (1,000/day)
+  // is the tightest limit in the whole system. Writing a limiter counter on
+  // EVERY request would have capped the app at ~1,000 requests/day. So we only
+  // spend a KV limiter write where abuse actually has a cost:
+  //   • login            → brute-force surface (pre-auth)              20/min
+  //   • cover upload      → up to 4 MB payload + R2 write              30/min
+  //   • any mutation      → protects the D1-write budget from a flood  180/min
+  //   • expensive GETs    → Workers AI (semantic), external fetch      60/min
+  //                          (ISBN lookup) and full-table CSV export
+  // Cheap authenticated GETs (list/detail/facets/stats/…) are already read-
+  // through cached and cannot mutate state, so they skip the limiter entirely —
+  // this is what makes normal browsing/searching effectively free on KV writes.
   const isAuthLogin = path === '/api/auth/login';
   const isCoverWrite =
     /^\/api\/books\/[^/]+\/cover$/.test(path) && (method === 'PUT' || method === 'DELETE');
+  const isMutating = method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH';
+  const isExpensiveGet = method === 'GET' && (
+    path === '/api/books/semantic'
+    || path.startsWith('/api/lookup/isbn/')
+    || path.endsWith('/export.csv')
+    || /\/export$/.test(path)
+  );
 
   if (isAuthLogin) {
     await enforceRateLimit(c, 'login', 20);
   } else if (isCoverWrite) {
     await enforceRateLimit(c, 'cover', 30);
-  } else {
+  } else if (isMutating) {
     await enforceRateLimit(c, 'api', 180);
+  } else if (isExpensiveGet) {
+    await enforceRateLimit(c, 'read', 60);
   }
   await next();
 });
@@ -667,6 +684,26 @@ app.get('/api/books', async (c) => {
 			console.warn('Book list cache read failed, falling back to DB query', error);
 		}
 	}
+
+	// The COUNT(*) for a fully-unfiltered list scans every non-deleted row
+	// (~12,500 D1 reads). That total is identical across pages and sort orders,
+	// so memoize it under a version-keyed KV key: pagination and re-sorting of
+	// the default browse then reuse one count instead of re-scanning per view.
+	// Version-keyed → any write self-invalidates it, so it can't drift.
+	const isFullyUnfiltered = !(query.q ?? '').trim() && !(query.qExclude ?? '').trim()
+		&& !query.status && !query.language && !query.year
+		&& query.yearMin === undefined && query.yearMax === undefined
+		&& !query.roomCode && !query.shelfCode && !query.missingIsbn && !query.missingShelf
+		&& !query.untitled && !query.unknownAuthor && customFilters.length === 0 && !includeDeleted;
+	const totalKey = `books:total:${cacheVersion}`;
+	let cachedTotal: number | undefined;
+	if (isFullyUnfiltered && c.env.CACHE) {
+		try {
+			const t = await c.env.CACHE.get(totalKey);
+			if (t !== null && t !== undefined) cachedTotal = Number(t);
+		} catch { /* fall back to counting */ }
+	}
+
 	const result = await queryBooksWithFilters(c.env, {
 		...query,
 		customFilters,
@@ -676,19 +713,27 @@ app.get('/api/books', async (c) => {
 		missingShelf: query.missingShelf,
 		untitled: query.untitled,
 		unknownAuthor: query.unknownAuthor,
-		includeDeleted
+		includeDeleted,
+		skipCount: cachedTotal !== undefined
 	});
+
+	const total = cachedTotal !== undefined ? cachedTotal : result.total;
 
 	const response = {
 		page: query.page,
 		pageSize: query.pageSize,
-		total: result.total,
+		total,
 		items: result.rows
 	};
 
 	if (c.env.CACHE) {
 		try {
 			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+			// Store the freshly-computed unfiltered total for the pages/sorts that
+			// follow (skip if we already had it, to avoid a redundant KV write).
+			if (isFullyUnfiltered && cachedTotal === undefined) {
+				await c.env.CACHE.put(totalKey, String(total), { expirationTtl: 3600 });
+			}
 		} catch (error) {
 			console.warn('Book list cache write failed, continuing without cache', error);
 		}
@@ -985,6 +1030,10 @@ app.get('/api/books/:id', async (c) => {
 
 app.post('/api/books', requirePermission('books.write', { librarian: true }), async (c) => {
 	const payload = normalizeBookData(CreateBookSchema.parse(await c.req.json()));
+	// No create path establishes a loan row, so 'borrowed' at create time is
+	// always a phantom (dashboard borrowed-counts would diverge from open loans).
+	// Coerce to available; lending is done via the borrow action.
+	if (payload.status === 'borrowed') payload.status = 'available';
 	const now = nowIso();
 	const id = crypto.randomUUID();
 	const customFields = await validateCustomFields(c.env, payload.customFields);
@@ -1856,6 +1905,20 @@ app.post('/api/setup/default-book-structure', requirePermission('setup'), async 
 });
 
 app.get('/api/rooms/summary', async (c) => {
+	// Version-keyed KV cache: this endpoint aggregates the WHOLE books table
+	// twice (~25k D1 rows read) and is called on every login + after every book
+	// write, so caching it saves a large share of the D1 read budget. Any book
+	// or room write bumps the version and invalidates it, so it never drifts.
+	const cacheVersion = await getBooksCacheVersion(c.env);
+	const cacheKey = `rooms:summary:${cacheVersion}`;
+	if (c.env.CACHE) {
+		try {
+			const cached = await c.env.CACHE.get(cacheKey, 'json');
+			if (cached) return c.json(cached);
+		} catch (error) {
+			console.warn('rooms/summary cache read failed, falling back to DB', error);
+		}
+	}
 	try {
 		const rows = await c.env.DB.prepare(
 			`SELECT
@@ -1886,7 +1949,7 @@ app.get('/api/rooms/summary', async (c) => {
 		).first<Record<string, unknown>>();
 
 		const ua = unassigned ?? {};
-		return c.json({
+		const payload = {
 			items: rows.results ?? [],
 			unassigned: {
 				totalBooks: Number(ua.total_books ?? 0),
@@ -1895,7 +1958,15 @@ app.get('/api/rooms/summary', async (c) => {
 				lostBooks: Number(ua.lost_books ?? 0),
 				maintenanceBooks: Number(ua.maintenance_books ?? 0)
 			}
-		});
+		};
+		if (c.env.CACHE) {
+			try {
+				await c.env.CACHE.put(cacheKey, JSON.stringify(payload), { expirationTtl: 3600 });
+			} catch (error) {
+				console.warn('rooms/summary cache write failed, continuing', error);
+			}
+		}
+		return c.json(payload);
 	} catch (error) {
 		console.error('Error in /api/rooms/summary:', error);
 		throw error;
@@ -1914,6 +1985,7 @@ app.post('/api/rooms', requirePermission('rooms.write', { librarian: true }), as
 		.bind(id, payload.code, payload.name, payload.description ?? null, JSON.stringify(payload.mapMetadata), now, now)
 		.run();
 
+	await bumpBooksCacheVersion(c.env); // invalidate the version-keyed rooms/summary cache
 	await insertAuditLog(c.env, c.get('user').sub, 'room.create', 'room', id, {
 		code: payload.code
 	});
@@ -1932,6 +2004,7 @@ app.put('/api/rooms/:id', requirePermission('rooms.write', { librarian: true }),
 		.bind(payload.code, payload.name, payload.description ?? null, JSON.stringify(payload.mapMetadata), now, id)
 		.run();
 
+	await bumpBooksCacheVersion(c.env); // rooms/summary + list cache invalidation
 	await insertAuditLog(c.env, c.get('user').sub, 'room.update', 'room', id ?? null, {
 		code: payload.code
 	});
@@ -1946,6 +2019,7 @@ app.delete('/api/rooms/:id', requirePermission('rooms.delete'), async (c) => {
 		throw new HTTPException(404, { message: 'Room not found' });
 	}
 
+	await bumpBooksCacheVersion(c.env); // rooms/summary + list cache invalidation
 	await insertAuditLog(c.env, c.get('user').sub, 'room.delete', 'room', id ?? null, {});
 	return c.body(null, 204);
 });
@@ -2211,6 +2285,8 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 	for (const item of readyRows) {
 		const { index, customFields } = item;
 		const row = normalizeBookData(item.row);
+		// A newly-imported book can't already be on loan — never create it 'borrowed'.
+		if (row.status === 'borrowed') row.status = 'available';
 		try {
 			const bookId = crypto.randomUUID();
 			const importTagsJson = JSON.stringify(row.tags);
@@ -2307,7 +2383,10 @@ app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: tr
 			customFilters,
 			page,
 			pageSize: PAGE_SIZE,
-			includeDeleted: false
+			includeDeleted: false,
+			// The export walks every page and discards the total, so skip the
+			// per-page COUNT(*) scan (~12,500 D1 rows read each otherwise).
+			skipCount: true
 		});
 		for (const row of slice.rows) aggregatedRows.push(row);
 		if (slice.rows.length < PAGE_SIZE) break;
@@ -2394,9 +2473,17 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 		try {
 			if (mutation.operation === 'create_book') {
 				const row = normalizeBookData(CreateBookSchema.parse(mutation.payload));
+				// A newly-created book can't be on loan yet — never create it 'borrowed'.
+				if (row.status === 'borrowed') row.status = 'available';
 				const customFields = await validateCustomFields(c.env, row.customFields);
 				const now = nowIso();
-				const id = crypto.randomUUID();
+				// Deterministic id from the client mutation id: if a prior attempt
+				// committed the INSERT but its response (or the sync_mutations log)
+				// was lost, the retry lands on the SAME id and the INSERT OR IGNORE
+				// below no-ops instead of creating a duplicate book. Belt-and-braces
+				// on top of the sync_mutations replay above (which only fires when the
+				// log itself was written).
+				const id = await deterministicUuid(`create_book:${mutation.clientMutationId}`);
 				const tagsJson = JSON.stringify(row.tags);
 				const customFieldsJson = JSON.stringify(customFields);
 				// Sync-pushed books need the same fold columns as direct creates,
@@ -2413,7 +2500,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					customFieldsJson
 				});
 				await c.env.DB.prepare(
-					`INSERT INTO books (
+					`INSERT OR IGNORE INTO books (
 						id, title, author, isbn, publication_year, publisher, language, description,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 						created_at, updated_at, deleted_at,
@@ -2622,12 +2709,15 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				}
 
 				const now = nowIso();
-				await c.env.DB.prepare(`UPDATE borrow_transactions SET returned_at = ?, updated_at = ? WHERE id = ?`)
-					.bind(now, now, tx.id)
-					.run();
-				await c.env.DB.prepare(`UPDATE books SET status = 'available', version = version + 1, updated_at = ? WHERE id = ?`)
-					.bind(now, row.id)
-					.run();
+				// Atomic: close the loan AND flip the book to available together, so a
+				// mid-request failure can't leave the book stuck 'borrowed' with no
+				// open loan (mirrors the direct /return endpoint).
+				await runAtomic(c.env, [
+					c.env.DB.prepare(`UPDATE borrow_transactions SET returned_at = ?, notes = COALESCE(?, notes), updated_at = ? WHERE id = ?`)
+						.bind(now, row.data.notes ?? null, now, tx.id),
+					c.env.DB.prepare(`UPDATE books SET status = 'available', version = version + 1, updated_at = ? WHERE id = ?`)
+						.bind(now, row.id)
+				]);
 
 				resultData = { transactionId: tx.id };
 			}

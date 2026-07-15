@@ -67,8 +67,13 @@ export async function bumpBooksCacheVersion(env: Env): Promise<void> {
     // same version, so neither will reuse a stale cache key.
     const v = `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}`;
     await env.CACHE.put(BOOKS_CACHE_VERSION_KEY, v, { expirationTtl: 86400 });
-  } catch {
-    // Ignore cache invalidation errors — stale entries expire within seconds anyway.
+  } catch (err) {
+    // A failed bump leaves the version key pointing at the OLD value, so every
+    // version-keyed cache (books list, facets, rooms/summary) keeps serving the
+    // pre-write snapshot until each entry's own TTL lapses (up to 24h) — not
+    // "seconds". KV writes almost never fail, but when one does we want it in
+    // the logs rather than silently masking stale reads.
+    console.warn('bumpBooksCacheVersion failed — caches may serve stale data until TTL', err);
   }
 }
 
@@ -438,6 +443,10 @@ export async function queryBooksWithFilters(
     page: number;
     pageSize: number;
     customFilters: Array<{ key: string; value: string }>;
+    // Callers that don't need the total (e.g. the full-catalogue CSV export,
+    // which walks every page and discards `total`) set this to skip the
+    // COUNT(*) scan — that's ~12,500 D1 rows read PER page otherwise.
+    skipCount?: boolean;
   }
 ): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
   const qText = (opts.q ?? '').trim();
@@ -615,12 +624,20 @@ export async function queryBooksWithFilters(
     : 'books b';
   const whereSql = `WHERE ${where.join(' AND ')}`;
 
-  const countStmt = env.DB.prepare(`SELECT COUNT(*) as count FROM ${fromClause} ${whereSql}`).bind(...values);
   const rowsStmt = env.DB.prepare(
     `SELECT b.* FROM ${fromClause} ${whereSql}
      ORDER BY ${blankLastSort}b.${sortColumn} ${sortDir}, b.id DESC LIMIT ? OFFSET ?`
   ).bind(...values, limit, offset);
 
+  // Skip the COUNT(*) entirely when the caller doesn't need the total — it's a
+  // full index scan of every matching row on each call.
+  if (opts.skipCount) {
+    const rowsRes = await rowsStmt.all();
+    const rows = ((rowsRes.results ?? []) as Array<Record<string, unknown>>).map(parseBook);
+    return { total: rows.length, rows };
+  }
+
+  const countStmt = env.DB.prepare(`SELECT COUNT(*) as count FROM ${fromClause} ${whereSql}`).bind(...values);
   const [countRes, rowsRes] = await Promise.all([countStmt.first<{ count: number }>(), rowsStmt.all()]);
   const rows = ((rowsRes.results ?? []) as Array<Record<string, unknown>>).map(parseBook);
 

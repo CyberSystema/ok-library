@@ -1576,14 +1576,16 @@ function App() {
   }
 
   async function refreshEverything() {
+    const isAdminUser = currentUser?.role === 'admin';
     await Promise.all([
       loadBooks(),
       loadRoomSummary(),
       loadCustomFields(),
       loadFacets(),
       loadActiveBorrows(),
-      loadAuditLogs(),
-      loadStaffUsers(),
+      // audit logs + staff users are admin-only endpoints — loading them for a
+      // librarian/viewer is a guaranteed 403 + a wasted Workers request each.
+      ...(isAdminUser ? [loadAuditLogs(), loadStaffUsers()] : []),
       loadCategories(),
       loadNeedsReviewCount(),
       loadStats(),
@@ -2922,6 +2924,34 @@ function App() {
     setSelectedBookIds([]);
   }
 
+  // Batch a set of book mutations into ONE /api/sync/push request instead of
+  // firing N separate PUT/DELETE calls. On the free Cloudflare tier the tightest
+  // limit is KV writes (1,000/day) and every book write bumps the cache version
+  // = 1 KV write; N direct calls = N KV writes, whereas the whole sync batch
+  // bumps the version exactly once. Each mutation carries a FRESH clientMutationId
+  // so the server dedups per-row on retry (the body is built once, so ids stay
+  // stable across apiRequest's internal retries). Returns per-row success/fail.
+  async function pushBulkMutations(
+    mutations: Array<{ operation: 'update_book' | 'delete_book'; payload: Record<string, unknown> }>
+  ): Promise<{ success: number; failed: number }> {
+    const clientTimestamp = new Date().toISOString();
+    const res = await runAction(() =>
+      apiRequest<{ results: Array<{ status: string }> }>(`/api/sync/push`, {
+        method: 'POST',
+        body: JSON.stringify({
+          mutations: mutations.map((m) => ({
+            operation: m.operation,
+            payload: m.payload,
+            clientMutationId: newMutationId(),
+            clientTimestamp
+          }))
+        })
+      })
+    );
+    const failed = res.results.filter((r) => r.status !== 'success').length;
+    return { success: res.results.length - failed, failed };
+  }
+
   async function applyBulkBookChanges() {
     clearStatus();
 
@@ -2943,22 +2973,14 @@ function App() {
       }
 
       const selectedBooks = books.filter((book) => selectedBookIds.includes(book.id));
-      const results = await runAction(() =>
-        Promise.allSettled(
-          selectedBooks.map((book) =>
-            apiRequest<{ id: string; version: number }>(`/api/books/${book.id}`, {
-              method: 'PUT',
-              body: JSON.stringify({
-                ...updates,
-                version: book.version
-              })
-            })
-          )
-        )
+      const { success, failed } = await pushBulkMutations(
+        selectedBooks.map((book) => ({
+          operation: 'update_book',
+          // sync update_book expects { id, data } and enforces the same version
+          // check + borrowed-status guard as the direct PUT.
+          payload: { id: book.id, data: { ...updates, version: book.version } }
+        }))
       );
-
-      const failed = results.filter((result) => result.status === 'rejected').length;
-      const success = results.length - failed;
 
       if (failed > 0) {
         setMessage(t('toast.bulkPartial', { success, failed }));
@@ -4964,11 +4986,10 @@ function App() {
                           clearStatus();
                           try {
                             const ids = [...selectedBookIds];
-                            const results = await runAction(() =>
-                              Promise.allSettled(ids.map((id) => apiRequest<void>(`/api/books/${id}`, { method: 'DELETE' })))
+                            // One batched sync push (1 KV write) instead of N deletes.
+                            const { success, failed } = await pushBulkMutations(
+                              ids.map((id) => ({ operation: 'delete_book', payload: { id } }))
                             );
-                            const failed = results.filter((r) => r.status === 'rejected').length;
-                            const success = results.length - failed;
                             setMessage(failed === 0
                               ? t('toast.deletedAll', { n: success, s: success === 1 ? '' : 's' })
                               : t('toast.deletedMixed', { success, failed }));

@@ -6,6 +6,23 @@ export function newId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replaceAll('-', '')}`;
 }
 
+/**
+ * Derive a stable UUID-shaped id from a seed string (SHA-256 → first 16 bytes,
+ * formatted as a UUID). Same seed always yields the same id, so a create that
+ * commits but whose response is lost can be safely retried: the retry produces
+ * the identical id and an `INSERT OR IGNORE` becomes a no-op instead of a
+ * duplicate row. Not RFC-4122-strict (we don't set version/variant bits) — it
+ * only needs to be deterministic and collision-free for our seeds.
+ */
+export async function deterministicUuid(seed: string): Promise<string> {
+  const data = new TextEncoder().encode(seed);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  const hex = Array.from(digest.slice(0, 16))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 export function safeJsonParse<T>(value: string, fallback: T): T {
   try {
     return JSON.parse(value) as T;
