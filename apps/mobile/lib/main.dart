@@ -55,6 +55,7 @@ class _OkLibraryAppState extends State<OkLibraryApp> {
               books: appState.books,
               loading: appState.loading,
               error: appState.error,
+              canCirculate: appState.canCirculate,
               onRefresh: () => appState.refreshBooks(),
               onSearch: (query) => appState.refreshBooks(query: query),
               onSync: () => appState.synchronize(),

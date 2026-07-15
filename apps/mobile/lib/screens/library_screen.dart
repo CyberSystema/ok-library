@@ -12,6 +12,7 @@ class LibraryScreen extends StatelessWidget {
     required this.onScan,
     required this.onBorrow,
     required this.onSync,
+    this.canCirculate = false,
     super.key,
   });
 
@@ -24,6 +25,9 @@ class LibraryScreen extends StatelessWidget {
   final VoidCallback onScan;
   final void Function(Book book) onBorrow;
   final VoidCallback onSync;
+  // Only roles with circulation may lend — otherwise the server rejects the
+  // borrow and (before role-awareness) the offline mutation jammed the queue.
+  final bool canCirculate;
 
   @override
   Widget build(BuildContext context) {
@@ -63,10 +67,12 @@ class LibraryScreen extends StatelessWidget {
                 child: ListTile(
                   title: Text(book.title.trim().isEmpty || book.title == '(Untitled)' ? '(Untitled)' : book.title),
                   subtitle: Text('${book.author.trim().isEmpty || book.author == '(Unknown)' ? '(Unknown author)' : book.author}\n${book.roomCode ?? '-'} / ${book.shelfCode ?? '-'}'),
-                  trailing: FilledButton.tonal(
-                    onPressed: () => onBorrow(book),
-                    child: const Text('Borrow'),
-                  ),
+                  trailing: canCirculate
+                      ? FilledButton.tonal(
+                          onPressed: () => onBorrow(book),
+                          child: const Text('Borrow'),
+                        )
+                      : null,
                   isThreeLine: true,
                 ),
               ),

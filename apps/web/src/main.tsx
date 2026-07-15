@@ -870,6 +870,7 @@ function App() {
   const [editingUserId, setEditingUserId] = useState<string | null>(null);
   const [editUserPassword, setEditUserPassword] = useState('');
   const [bookHistory, setBookHistory] = useState<BorrowHistoryItem[]>([]);
+  const [bookHistoryHasMore, setBookHistoryHasMore] = useState(false);
   const [roomSummary, setRoomSummary] = useState<RoomSummaryItem[]>([]);
   const [unassignedSummary, setUnassignedSummary] = useState({
     totalBooks: 0,
@@ -911,6 +912,14 @@ function App() {
     if (!createCoverPreview) return;
     return () => URL.revokeObjectURL(createCoverPreview);
   }, [createCoverPreview]);
+  // Clear the book selection whenever the page actually changes. A selection
+  // can't span pages — bulk status/shelf/labels only have the loaded page's
+  // rows (they need each book's version), while bulk delete used the raw id
+  // list, so a cross-page selection silently applied inconsistently. Confining
+  // selection to the visible page makes every bulk action act on the same set.
+  useEffect(() => {
+    setSelectedBookIds([]);
+  }, [currentPage]);
   // Browser-level offline events flip us back to "offline" immediately so
   // we don't have to wait for the next failing fetch to update the UI.
   useEffect(() => {
@@ -2494,7 +2503,7 @@ function App() {
     void loadBookHistory(book.id);
   }
 
-  async function loadBookHistory(bookId: string) {
+  async function loadBookHistory(bookId: string, offset = 0) {
     if (!bookId) {
       return;
     }
@@ -2502,6 +2511,7 @@ function App() {
     // surfacing a 403 toast when opening a book detail).
     if (!canSeeCirculation) {
       setBookHistory([]);
+      setBookHistoryHasMore(false);
       return;
     }
 
@@ -2510,14 +2520,17 @@ function App() {
     // book's history rendered against a different book's data.
     const seq = ++bookHistorySeqRef.current;
     try {
-      const response = await apiRequest<{ bookId: string; items: BorrowHistoryItem[] }>(
-        `/api/books/${bookId}/history?limit=20`
+      const response = await apiRequest<{ bookId: string; items: BorrowHistoryItem[]; hasMore?: boolean }>(
+        `/api/books/${bookId}/history?limit=20&offset=${offset}`
       );
       if (seq !== bookHistorySeqRef.current) return;
-      setBookHistory(response.items ?? []);
+      // offset 0 replaces (fresh open); a later offset appends (load more).
+      setBookHistory((prev) => (offset > 0 ? [...prev, ...(response.items ?? [])] : (response.items ?? [])));
+      setBookHistoryHasMore(Boolean(response.hasMore));
     } catch {
       if (seq !== bookHistorySeqRef.current) return;
-      setBookHistory([]);
+      if (offset === 0) setBookHistory([]);
+      setBookHistoryHasMore(false);
     }
   }
 
@@ -2584,6 +2597,29 @@ function App() {
           /* fall through to the generic error below */
         }
       }
+      setError((e as Error).message);
+    }
+  }
+
+  // One-click resolve for the needs-review queue: strip the needs_review flag
+  // from the book's stored custom fields. Uses the book's persisted customFields
+  // as-is (not buildCustomFieldsPayload, which would enforce required fields and
+  // could block resolving a book that's missing an unrelated required value).
+  async function markReviewed(book: Book) {
+    clearStatus();
+    const cf: Record<string, unknown> = { ...(book.customFields ?? {}) };
+    delete cf.needs_review;
+    try {
+      const result = await runAction(() => apiRequest<{ id: string; version: number }>(`/api/books/${book.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ customFields: cf, version: book.version })
+      }));
+      setMessage(t('toast.markedReviewed'));
+      setDetailBook((prev) => (prev && prev.id === book.id
+        ? { ...prev, customFields: cf as Record<string, string | number | boolean | null>, version: result.version }
+        : prev));
+      await Promise.all([loadBooks(), loadNeedsReviewCount()]);
+    } catch (e) {
       setError((e as Error).message);
     }
   }
@@ -3291,6 +3327,9 @@ function App() {
               blank: blankSkipped
             })
           );
+          // The dry-run is a safety check — don't hide the rows the server would
+          // reject. Surface the count so it's visible before the real import.
+          if (result.allSkipped.length > 0) pushAppToast('error', t('toast.importServerSkipped', { n: result.allSkipped.length }));
         } else {
           const result = await importCatalogRows(catalogRows, false);
           setMessage(
@@ -3369,6 +3408,7 @@ function App() {
         let chunkSize = IMPORT_CHUNK_SIZE;
         let cursor = 0;
         let totalAccepted = 0;
+        let serverSkipped = 0;
 
         while (cursor < rows.length) {
           const end = Math.min(cursor + chunkSize, rows.length);
@@ -3378,13 +3418,14 @@ function App() {
 
           try {
             const result = await runAction(() =>
-              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>('/api/import/books', {
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number; skippedRows?: Array<{ index: number; reason: string }> }>('/api/import/books', {
                 method: 'POST',
                 body: JSON.stringify({ dryRun: true, rows: chunk })
               })
             );
 
             totalAccepted += result.acceptedRows ?? chunk.length;
+            serverSkipped += result.skippedRows?.length ?? 0;
             cursor = end;
           } catch (error) {
             if (isPayloadTooLargeError(error) && chunkSize > IMPORT_MIN_CHUNK_SIZE) {
@@ -3396,10 +3437,15 @@ function App() {
         }
 
         setMessage(t('toast.xlsxDryRunDone', { n: totalAccepted, skippedNote }));
+        // Rows the SERVER rejected (missing title, bad custom field) are separate
+        // from client-side parse skips — surface them so the count isn't silently
+        // inflated.
+        if (serverSkipped > 0) pushAppToast('error', t('toast.importServerSkipped', { n: serverSkipped }));
       } else {
         let chunkSize = IMPORT_CHUNK_SIZE;
         let cursor = 0;
         let totalImported = 0;
+        let serverSkipped = 0;
         const uploadSkippedRows: number[] = [];
 
         while (cursor < rows.length) {
@@ -3410,13 +3456,14 @@ function App() {
 
           try {
             const result = await runAction(() =>
-              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number }>('/api/import/books', {
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number; skippedRows?: Array<{ index: number; reason: string }> }>('/api/import/books', {
                 method: 'POST',
                 body: JSON.stringify({ dryRun: false, rows: chunk })
               })
             );
 
             totalImported += result.importedRows ?? 0;
+            serverSkipped += result.skippedRows?.length ?? 0;
             cursor = end;
           } catch (error) {
             if (isPayloadTooLargeError(error)) {
@@ -3442,6 +3489,7 @@ function App() {
         setMessage(
           t('toast.xlsxImportDone', { n: totalImported, skippedNote, uploadSkippedNote })
         );
+        if (serverSkipped > 0) pushAppToast('error', t('toast.importServerSkipped', { n: serverSkipped }));
       }
 
       await loadBooks();
@@ -3702,6 +3750,9 @@ function App() {
                   {canWrite && (
                     <button className="secondary small" onClick={startEditFromDetail}>{t('detail.editBtn')}</button>
                   )}
+                  {canWrite && Boolean((detailBook.customFields as Record<string, unknown> | undefined)?.needs_review) && (
+                    <button className="primary small" onClick={() => void markReviewed(detailBook)}>{t('detail.markReviewed')}</button>
+                  )}
                   {canSeeCirculation && detailBook.status === 'available' && (
                     <button className="primary small" onClick={() => {
                       setSelectedBook(detailBook);
@@ -3859,6 +3910,14 @@ function App() {
                             {h.wasOverdue && <span className="history-overdue-badge">{t('detail.overdueBadge')}</span>}
                           </div>
                         ))}
+                        {bookHistoryHasMore && detailBook && (
+                          <button
+                            type="button"
+                            className="secondary small"
+                            style={{ alignSelf: 'flex-start' }}
+                            onClick={() => void loadBookHistory(detailBook.id, bookHistory.length)}
+                          >{t('detail.loadMoreHistory')}</button>
+                        )}
                       </div>
                     )}
                   </div>

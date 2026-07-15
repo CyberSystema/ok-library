@@ -923,6 +923,17 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 		(payload.customFields ?? JSON.parse((existingMap.custom_fields as string) ?? '{}')) as Record<string, unknown>,
 		{ requireAllRequired: payload.customFields !== undefined, rejectUnknownKeys: false }
 	);
+	// Preserve values whose custom-field DEFINITION was soft-deleted. validate…
+	// strips keys with no live definition, so without this an unrelated edit
+	// would silently destroy the book's stored value and make definition
+	// deletion irreversible. Re-merge orphaned keys from the existing row.
+	{
+		const existingCustom = JSON.parse((existingMap.custom_fields as string) ?? '{}') as Record<string, unknown>;
+		const liveKeys = new Set((await loadCustomFieldDefs(c.env)).map((d) => d.field_key));
+		for (const [k, v] of Object.entries(existingCustom)) {
+			if (!liveKeys.has(k) && !(k in customFields)) customFields[k] = v;
+		}
+	}
 	const merged = {
 		...parseBook(existingMap),
 		...payload,
@@ -1324,6 +1335,7 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 	}
 
 	const limit = Math.max(1, Math.min(100, Number(c.req.query('limit') ?? 20)));
+	const offset = Math.max(0, Math.floor(Number(c.req.query('offset') ?? 0) || 0));
 	const now = nowIso();
 
 	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
@@ -1331,6 +1343,8 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 		throw new HTTPException(404, { message: 'Book not found' });
 	}
 
+	// Over-fetch one row to detect whether more history exists past this page,
+	// so the client can offer a "load more" without a second count query.
 	const rows = await c.env.DB.prepare(
 		`SELECT
 			id,
@@ -1347,14 +1361,20 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 		 FROM borrow_transactions
 		 WHERE book_id = ?
 		 ORDER BY borrowed_at DESC
-		 LIMIT ?`
+		 LIMIT ? OFFSET ?`
 	)
-		.bind(now, id, limit)
+		.bind(now, id, limit + 1, offset)
 		.all();
+
+	const allRows = rows.results ?? [];
+	const hasMore = allRows.length > limit;
 
 	return c.json({
 		bookId: id,
-		items: (rows.results ?? []).map((row) => ({
+		limit,
+		offset,
+		hasMore,
+		items: allRows.slice(0, limit).map((row) => ({
 			id: (row as Record<string, unknown>).id,
 			bookId: (row as Record<string, unknown>).book_id,
 			borrowerName: (row as Record<string, unknown>).borrower_name,
@@ -1797,10 +1817,10 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 	const now = nowIso();
 
 	const existing = await c.env.DB.prepare(
-		'SELECT id, field_key FROM custom_field_definitions WHERE id = ? AND deleted_at IS NULL LIMIT 1'
+		'SELECT id, field_key, field_type, enum_options FROM custom_field_definitions WHERE id = ? AND deleted_at IS NULL LIMIT 1'
 	)
 		.bind(id)
-		.first<{ id: string; field_key: string }>();
+		.first<{ id: string; field_key: string; field_type: string; enum_options: string | null }>();
 
 	if (!existing) {
 		throw new HTTPException(404, { message: 'Custom field not found' });
@@ -1867,10 +1887,49 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 		await bumpBooksCacheVersion(c.env);
 	}
 
+	// Enum-option removal migration: if this edit dropped one or more enum
+	// options, any book still holding a removed value would fail validation on
+	// its next edit ("must be one of …") and become un-editable, while the UI
+	// shows a valid-looking selection. Clear the orphaned value from those books
+	// so they stay editable. Runs AFTER the rename rewrites, so books already
+	// carry the final key.
+	let clearedEnumBooks = 0;
+	if (payload.type === 'enum') {
+		const oldOpts = existing.field_type === 'enum'
+			? safeJsonParse<string[]>(existing.enum_options ?? '[]', [])
+			: [];
+		const removed = oldOpts.filter((o) => !payload.enumOptions.includes(o));
+		if (removed.length > 0) {
+			const key = payload.key; // post-rename key the books now hold
+			const books = await c.env.DB.prepare('SELECT id, custom_fields FROM books WHERE deleted_at IS NULL').all<{
+				id: string; custom_fields: string;
+			}>();
+			const clearUpdates: D1PreparedStatement[] = [];
+			for (const row of books.results ?? []) {
+				const cf = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
+				if (typeof cf[key] === 'string' && removed.includes(cf[key] as string)) {
+					delete cf[key];
+					const json = JSON.stringify(cf);
+					const fold = computeBookFolds({ customFieldsJson: json }).custom_fields_fold;
+					clearUpdates.push(
+						c.env.DB.prepare('UPDATE books SET custom_fields = ?, custom_fields_fold = ?, updated_at = ?, version = version + 1 WHERE id = ?')
+							.bind(json, fold, nowIso(), row.id)
+					);
+					clearedEnumBooks += 1;
+				}
+			}
+			for (let i = 0; i < clearUpdates.length; i += D1_BATCH_LIMIT) {
+				await runAtomic(c.env, clearUpdates.slice(i, i + D1_BATCH_LIMIT));
+			}
+			if (clearedEnumBooks > 0) await bumpBooksCacheVersion(c.env);
+		}
+	}
+
 	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id, {
 		oldKey: existing.field_key,
 		key: payload.key,
-		renamedBooks
+		renamedBooks,
+		clearedEnumBooks
 	});
 
 	return c.json({ id });
@@ -2100,9 +2159,32 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 
 	const results: Array<Record<string, unknown>> = [];
 
+	const embedUpsertIds = new Set<string>();
+	const embedDeleteIds = new Set<string>();
+
 	for (const mutation of payload.mutations) {
 		let status: 'success' | 'error' = 'success';
 		let resultData: Record<string, unknown> = {};
+
+		// Idempotency: replay a prior SUCCESS for this clientMutationId+actor
+		// instead of re-executing. The mobile client sends no
+		// X-Client-Mutation-Id header, so the whole-request mutation-log
+		// middleware never dedups it; without this a mutation that committed but
+		// whose HTTP response was lost gets re-run on the next push and silently
+		// duplicates (a second borrow, a second created book, …).
+		const prior = await c.env.DB.prepare(
+			`SELECT result_data FROM sync_mutations
+			  WHERE client_mutation_id = ? AND actor_id = ? AND result_status = 'success' LIMIT 1`
+		).bind(mutation.clientMutationId, actor.sub).first<{ result_data: string | null }>();
+		if (prior) {
+			results.push({
+				clientMutationId: mutation.clientMutationId,
+				operation: mutation.operation,
+				status: 'success',
+				result: safeJsonParse<Record<string, unknown>>(prior.result_data ?? '{}', {})
+			});
+			continue;
+		}
 
 		try {
 			if (mutation.operation === 'create_book') {
@@ -2351,6 +2433,14 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 			};
 		}
 
+		// Track affected book ids so semantic-search embeddings can be refreshed
+		// once after the whole batch (re-reading from the DB), rather than per
+		// mutation with a stale in-memory snapshot.
+		if (status === 'success' && typeof resultData.id === 'string') {
+			if (mutation.operation === 'delete_book') embedDeleteIds.add(resultData.id);
+			else if (mutation.operation === 'create_book' || mutation.operation === 'update_book') embedUpsertIds.add(resultData.id);
+		}
+
 		await recordSyncMutation(
 			c.env,
 			actor,
@@ -2372,6 +2462,38 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 	if (payload.mutations.length > 0) {
 		await bumpBooksCacheVersion(c.env);
 	}
+
+	// Refresh semantic-search embeddings for books touched by this sync so
+	// offline-synced creates/edits don't leave Vectorize permanently stale
+	// (the direct endpoints already do this; the sync path previously skipped
+	// it). Re-read each book from the DB so we embed the final committed state,
+	// and delete embeddings for removed books. No-op when semantic search is off.
+	if (semanticSearchEnabled(c.env) && (embedUpsertIds.size > 0 || embedDeleteIds.size > 0)) {
+		runAfterResponse(c, async () => {
+			for (const bookId of embedDeleteIds) {
+				try { await unvectorizeBook(c.env, bookId); } catch { /* best-effort */ }
+			}
+			for (const bookId of embedUpsertIds) {
+				if (embedDeleteIds.has(bookId)) continue;
+				try {
+					const row = await c.env.DB.prepare('SELECT * FROM books WHERE id = ? AND deleted_at IS NULL').bind(bookId).first();
+					if (!row) continue;
+					const b = parseBook(row as Record<string, unknown>);
+					await vectorizeBook(c.env, bookId, {
+						title: b.title as string | null,
+						author: b.author as string | null,
+						description: (b.description as string | null) ?? null,
+						publisher: (b.publisher as string | null) ?? null,
+						language: (b.language as string | null) ?? null,
+						publicationYear: (b.publicationYear as number | null) ?? null,
+						tags: (b.tags as string[] | null) ?? [],
+						customFields: (b.customFields as Record<string, unknown>) ?? {}
+					});
+				} catch { /* best-effort */ }
+			}
+		});
+	}
+
 	await insertAuditLog(c.env, actor.sub, 'sync.push', 'sync', null, {
 		mutations: payload.mutations.length
 	});
@@ -3941,7 +4063,33 @@ app.post('/api/maintenance/cleanup', requireRole(['admin']), async (c) => {
 	).bind(cutoff).run();
 	const purgedMutationLog = sweepRes.meta?.changes ?? 0;
 
-	const fullSummary = { ...summary, purgedMutationLog };
+	// R2 orphan-cover sweep: reclaim covers/<id>.<ext> objects whose book row no
+	// longer exists at all (a purge whose best-effort cover delete failed on a
+	// transient R2 error). Soft-deleted books are KEPT in `books`, so their
+	// restorable covers are never swept. Best-effort in its own try/catch — a
+	// sweep failure must never turn this admin endpoint into a 500.
+	let orphanCovers = 0;
+	try {
+		const surviving = new Set<string>();
+		const bookRows = await c.env.DB.prepare('SELECT id FROM books').all<{ id: string }>();
+		for (const r of bookRows.results ?? []) surviving.add(r.id);
+		let cursor: string | undefined;
+		do {
+			const listed = await c.env.ASSETS.list({ prefix: 'covers/', cursor });
+			for (const obj of listed.objects) {
+				const m = obj.key.match(/^covers\/(.+)\.(?:jpg|png|webp|gif)$/);
+				const bookId = m?.[1];
+				if (bookId && !surviving.has(bookId)) {
+					try { await c.env.ASSETS.delete(obj.key); orphanCovers += 1; } catch { /* ignore one */ }
+				}
+			}
+			cursor = listed.truncated ? listed.cursor : undefined;
+		} while (cursor);
+	} catch {
+		/* best-effort — leave orphanCovers at whatever we managed to reclaim */
+	}
+
+	const fullSummary = { ...summary, purgedMutationLog, orphanCovers };
 	await insertAuditLog(c.env, c.get('user').sub, 'maintenance.cleanup', 'system', null, fullSummary);
 	return c.json(fullSummary);
 });

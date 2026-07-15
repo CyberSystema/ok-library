@@ -53,8 +53,23 @@ class SyncService {
         'clientMutationId': id,
         'clientTimestamp': row['created_at'] as String,
       };
-      await apiClient.pushMutations(token: token, mutations: [mutation]);
-      await localDb.deleteMutation(id);
+      final results = await apiClient.pushMutations(token: token, mutations: [mutation]);
+      // ACK (delete) the mutation ONLY if the server actually applied it. The
+      // server returns 200 with a per-mutation status even when it REJECTS a
+      // mutation (e.g. a borrow of an unavailable book, or a permission-denied
+      // borrow); deleting unconditionally silently dropped that offline change.
+      // On rejection we leave it on the queue and STOP the loop so later
+      // mutations aren't applied out of order — a genuinely permanent failure
+      // then surfaces to the user instead of vanishing.
+      final applied = results.isNotEmpty && results.first['status'] == 'success';
+      if (applied) {
+        await localDb.deleteMutation(id);
+      } else {
+        final reason = results.isNotEmpty
+            ? ((results.first['result'] as Map<String, dynamic>?)?['error'] ?? 'rejected')
+            : 'no result';
+        throw Exception('Sync push rejected mutation: $reason');
+      }
     }
 
     final changes = await apiClient.pullChanges(token: token, since: _lastSyncCursor);

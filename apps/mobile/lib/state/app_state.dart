@@ -31,6 +31,11 @@ class AppState extends ChangeNotifier {
   String? error;
   List<Book> books = const [];
 
+  /// Whether the signed-in role may lend/return books (parity with the web's
+  /// canSeeCirculation). Gates the Borrow action so a viewer can't queue a
+  /// borrow the server will reject and jam the sync queue with.
+  bool canCirculate = false;
+
   /// Restores a previously-saved JWT from secure storage so a returning user
   /// stays signed in across cold starts. Caller should `await` this before
   /// the first widget build to avoid a flicker through the login screen.
@@ -39,6 +44,16 @@ class AppState extends ChangeNotifier {
     if (saved == null || saved.isEmpty) return;
     token = saved;
     notifyListeners();
+    // Role isn't persisted, so resolve circulation ability from the server.
+    // An expired restored token surfaces as AuthException → back to login.
+    try {
+      canCirculate = await _apiClient.fetchCanCirculate(token: saved);
+    } on AuthException {
+      await _sessionExpired();
+      return;
+    } catch (_) {
+      canCirculate = false; // offline: default to the safe (no-circulation) state
+    }
     await refreshBooks();
   }
 
@@ -49,8 +64,13 @@ class AppState extends ChangeNotifier {
 
     try {
       final issued = await _apiClient.login(username: username, password: password);
-      token = issued;
-      await SecureStore.writeToken(issued);
+      token = issued.token;
+      canCirculate = issued.role == 'admin' || issued.role == 'librarian';
+      await SecureStore.writeToken(issued.token);
+      // Authoritative check (covers custom role permission overrides).
+      try {
+        canCirculate = await _apiClient.fetchCanCirculate(token: issued.token);
+      } catch (_) {/* keep the role-based default if the check fails */}
       await refreshBooks();
       await synchronize();
     } catch (e) {
@@ -61,8 +81,21 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// A 401 on an authenticated request: end the session and return to login,
+  /// but KEEP the local DB (and its queued offline mutations) so nothing is
+  /// lost — the user re-signs in and the queue flushes.
+  Future<void> _sessionExpired() async {
+    token = null;
+    canCirculate = false;
+    books = const [];
+    error = 'Session expired. Please sign in again.';
+    await SecureStore.deleteToken();
+    notifyListeners();
+  }
+
   Future<void> logout() async {
     token = null;
+    canCirculate = false;
     error = null;
     books = const [];
     await SecureStore.deleteToken();
@@ -81,6 +114,10 @@ class AppState extends ChangeNotifier {
       final remote = await _apiClient.fetchBooks(token: token!, query: query);
       await _localDb.upsertBooks(remote);
       books = await _localDb.listBooks(query: query);
+    } on AuthException {
+      loading = false;
+      await _sessionExpired();
+      return;
     } catch (_) {
       // Offline / API failure: fall back to whatever is cached locally so the
       // user can still browse and queue mutations. We deliberately don't
@@ -99,6 +136,8 @@ class AppState extends ChangeNotifier {
       await _syncService.sync(token!);
       books = await _localDb.listBooks();
       notifyListeners();
+    } on AuthException {
+      await _sessionExpired();
     } catch (e) {
       error = _friendly(e);
       notifyListeners();
@@ -113,6 +152,8 @@ class AppState extends ChangeNotifier {
       await _localDb.upsertBooks([book]);
       books = await _localDb.listBooks();
       notifyListeners();
+    } on AuthException {
+      await _sessionExpired();
     } catch (e) {
       error = _friendly(e);
       notifyListeners();
