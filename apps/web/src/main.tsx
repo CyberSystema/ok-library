@@ -935,6 +935,9 @@ function App() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [detailBook, setDetailBook] = useState<Book | null>(null);
   const [detailMode, setDetailMode] = useState<'view' | 'edit'>('view');
+  // Full-screen cover zoom (lightbox). Holds the resolved cover URL while open,
+  // null while closed. Opened by clicking the large cover in the detail view.
+  const [coverZoom, setCoverZoom] = useState<string | null>(null);
   const [showAddBook, setShowAddBook] = useState(false);
   const [bulkStatus, setBulkStatus] = useState<string>('');
   const [bulkShelfCode, setBulkShelfCode] = useState('');
@@ -1122,15 +1125,23 @@ function App() {
         searchInputRef.current?.select();
         return;
       }
-      if (event.key === 'Escape' && detailBook) {
-        setDetailBook(null);
-        setDetailMode('view');
-        setBookHistory([]);
+      if (event.key === 'Escape') {
+        // The cover lightbox sits on top of the detail modal, so Escape must
+        // close the lightbox FIRST and leave the detail modal open.
+        if (coverZoom) {
+          setCoverZoom(null);
+          return;
+        }
+        if (detailBook) {
+          setDetailBook(null);
+          setDetailMode('view');
+          setBookHistory([]);
+        }
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [loggedIn, detailBook]);
+  }, [loggedIn, detailBook, coverZoom]);
 
   // Lock the body scroll while any full-screen modal is open. Without this a
   // long detail/profile modal lets the underlying list scroll on touch+wheel,
@@ -3634,6 +3645,7 @@ function App() {
     setDetailBook(null);
     setDetailMode('view');
     setBookHistory([]);
+    setCoverZoom(null); // never leave the cover lightbox open without its book
   }
 
   function renderCustomFieldsForm(
@@ -3910,12 +3922,24 @@ function App() {
                   {/* Cover image */}
                   <div className="detail-section cover-section">
                     {detailBook.coverUrl ? (
-                      <img
-                        className="detail-cover"
-                        src={joinApiUrl(detailBook.coverUrl)}
-                        alt={t('detail.coverAlt', { title: displayTitle(detailBook, t('common.untitled')) })}
-                        loading="lazy"
-                      />
+                      <button
+                        type="button"
+                        className="detail-cover-zoom"
+                        onClick={() => setCoverZoom(joinApiUrl(detailBook.coverUrl!))}
+                        title={t('detail.coverZoomHint')}
+                        aria-label={t('detail.coverZoomHint')}
+                      >
+                        <img
+                          className="detail-cover"
+                          src={joinApiUrl(detailBook.coverUrl)}
+                          alt={t('detail.coverAlt', { title: displayTitle(detailBook, t('common.untitled')) })}
+                          loading="lazy"
+                        />
+                        <span className="cover-zoom-hint" aria-hidden="true">
+                          <span className="cover-zoom-icon">🔍</span>
+                          {t('detail.coverZoomHint')}
+                        </span>
+                      </button>
                     ) : (
                       <div className="detail-cover detail-cover-placeholder">
                         <span>{t('detail.noCover')}</span>
@@ -4126,6 +4150,27 @@ function App() {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ═══ COVER ZOOM LIGHTBOX ═══ */}
+      {coverZoom && (
+        <div
+          className="lightbox-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t('detail.coverZoomAria')}
+          onClick={() => setCoverZoom(null)}
+        >
+          <button
+            type="button"
+            className="lightbox-close"
+            onClick={() => setCoverZoom(null)}
+            title={t('common.close')}
+            aria-label={t('common.close')}
+          >✕</button>
+          {/* Clicking anywhere (backdrop or the image) closes — matches the hint. */}
+          <img className="lightbox-img" src={coverZoom} alt={t('detail.coverZoomAria')} />
         </div>
       )}
 
