@@ -1813,6 +1813,115 @@ mark.hl {
 .ctx-icon { width: 1.15rem; flex-shrink: 0; text-align: center; font-size: 0.9rem; }
 .ctx-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .ctx-sep { height: 1px; background: var(--border); margin: 0.25rem 0.3rem; }
+
+/* ── Onboarding course (librarian guide) ──────────────────────────────────── */
+.ob-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000; /* above modals/lightbox/menus; below the splash (9999) */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: linear-gradient(145deg, rgba(30, 58, 138, 0.92), rgba(37, 99, 235, 0.92));
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  animation: fadeIn 0.2s ease;
+}
+.ob-panel {
+  width: 100%;
+  max-width: 980px;
+  height: min(88vh, 760px);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  animation: slideUp 0.25s ease;
+}
+.ob-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+.ob-header-title { display: flex; align-items: center; gap: 0.6rem; min-width: 0; }
+.ob-logo { font-size: 1.5rem; line-height: 1; }
+.ob-header-title > div { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
+.ob-header-title strong { font-size: 1rem; }
+.ob-progress-text { font-size: 0.72rem; color: var(--text-muted); }
+.ob-header-right { display: flex; align-items: center; gap: 0.5rem; flex-shrink: 0; }
+.ob-lang { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0; }
+.ob-lang select { width: auto; padding: 0.3rem 0.5rem; font-size: 0.8rem; }
+.ob-x {
+  width: 34px; height: 34px; border-radius: 50%;
+  background: var(--surface-2, var(--bg)); color: var(--text-muted);
+  border: 1px solid var(--border); font-size: 0.9rem; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.ob-x:hover { background: var(--danger-bg); color: var(--danger); }
+.ob-progress-bar { height: 4px; background: var(--border); flex-shrink: 0; }
+.ob-progress-fill { height: 100%; background: var(--accent); transition: width 0.3s ease; }
+.ob-main { flex: 1; display: flex; min-height: 0; }
+.ob-toc {
+  width: 240px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 0.85rem 0.6rem;
+  overflow-y: auto;
+  background: var(--surface-2, var(--bg));
+}
+.ob-toc-title {
+  font-size: 0.62rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--text-light); padding: 0 0.5rem 0.4rem;
+}
+.ob-toc ol { list-style: none; margin: 0; padding: 0; }
+.ob-toc-item {
+  display: flex; align-items: center; gap: 0.55rem; width: 100%;
+  padding: 0.5rem 0.6rem; border: none; background: none; border-radius: var(--radius-sm);
+  text-align: left; font-size: 0.82rem; color: var(--text); cursor: pointer;
+}
+.ob-toc-item:hover { background: var(--accent-light); }
+.ob-toc-item.is-active { background: var(--accent); color: #fff; font-weight: 600; }
+.ob-toc-item.is-active .ob-toc-icon { filter: none; }
+.ob-toc-item.is-done .ob-toc-icon { color: var(--success); }
+.ob-toc-icon { width: 1.2rem; text-align: center; flex-shrink: 0; }
+.ob-toc-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ob-body { flex: 1; overflow-y: auto; padding: 2rem 2.25rem; min-width: 0; }
+.ob-chapter-icon { font-size: 2.75rem; line-height: 1; margin-bottom: 0.5rem; }
+.ob-chapter-title { font-size: 1.5rem; margin-bottom: 0.4rem; }
+.ob-lead { font-size: 1.02rem; color: var(--text-muted); margin-bottom: 1.4rem; line-height: 1.55; }
+.ob-p { font-size: 0.95rem; line-height: 1.65; margin-bottom: 1rem; color: var(--text); }
+.ob-steps { margin: 0 0 1rem; padding-left: 1.3rem; }
+.ob-steps li { font-size: 0.95rem; line-height: 1.6; margin-bottom: 0.6rem; }
+.ob-callout {
+  border-radius: var(--radius-sm); padding: 0.75rem 0.9rem; margin-bottom: 1rem;
+  font-size: 0.92rem; line-height: 1.55; border-left: 3px solid var(--accent);
+  background: var(--accent-light);
+}
+.ob-callout-label {
+  display: block; font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.05em; margin-bottom: 0.25rem; color: var(--accent);
+}
+.ob-rule { border-left-color: var(--warning); background: var(--warning-bg); }
+.ob-rule .ob-callout-label { color: var(--warning); }
+.ob-footer {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  padding: 0.85rem 1.25rem; border-top: 1px solid var(--border); flex-shrink: 0;
+}
+.ob-mandatory-note { font-size: 0.76rem; color: var(--text-muted); max-width: 60%; }
+.ob-footer-actions { display: flex; gap: 0.6rem; margin-left: auto; }
+
+@media (max-width: 720px) {
+  .ob-overlay { padding: 0; }
+  .ob-panel { height: 100%; max-width: 100%; border-radius: 0; }
+  .ob-toc { display: none; }
+  .ob-body { padding: 1.5rem 1.25rem; }
+  .ob-mandatory-note { display: none; }
+}
 .button-like {
   display: inline-flex;
   align-items: center;

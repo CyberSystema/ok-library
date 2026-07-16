@@ -13,6 +13,7 @@ import {
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
 import { cacheGet, cacheSet, cacheBustPrefixes, cacheClear } from './cache';
+import { OnboardingCourse } from './onboarding';
 import './styles.css';
 
 // Lazy-loaded only when the user opens the Import tab — saves ~1MB from the initial bundle.
@@ -82,15 +83,17 @@ type CustomField = {
   enumOptions: string[];
 };
 
+type SessionUser = { id: string; username: string; role: string; needsOnboarding?: boolean };
+
 type LoginResponse = {
-  user: { id: string; username: string; role: string };
+  user: SessionUser;
   // Present so clients on browsers that block the cross-site auth cookie
   // (Safari/WebKit ITP) can authenticate via an Authorization: Bearer header.
   token?: string;
 };
 
 type SessionResponse = {
-  user: { id: string; username: string; role: string };
+  user: SessionUser;
 };
 
 type ActiveBorrow = {
@@ -927,7 +930,10 @@ function App() {
   const toast = useToast();
   const confirm = useConfirm();
   const { t, lang } = useI18n();
-  const [currentUser, setCurrentUser] = useState<{ id: string; username: string; role: string } | null>(null);
+  const [currentUser, setCurrentUser] = useState<SessionUser | null>(null);
+  // Onboarding course: `showOnboarding` opens it as a replay overlay (from
+  // Settings); the mandatory first-run gate is derived from currentUser below.
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(true);
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileUsername, setProfileUsername] = useState('');
@@ -1350,6 +1356,11 @@ function App() {
 
   const role = currentUser?.role ?? null;
   const isAdmin = role === 'admin';
+  // The onboarding course is MANDATORY (no bypass) on first sign-in for the
+  // librarian role — the people who catalogue. Gate on `role` (synchronous from
+  // currentUser) rather than a permission so it can't flicker while the
+  // permission matrix is still loading. Everyone can replay it from Settings.
+  const mustOnboard = role === 'librarian' && Boolean(currentUser?.needsOnboarding);
   // Permission helper: admins always have everything; for other roles consult
   // the matrix fetched from /api/me/permissions. Falls back to `false` until
   // the permissions are loaded.
@@ -2009,7 +2020,23 @@ function App() {
     setCategories([]);
     setMyPermissions(null);
     setPermissionMatrix(null);
+    setShowOnboarding(false);
     setMessage(t('login.signedOut'));
+  }
+
+  // Mark the onboarding course complete server-side and clear the mandatory
+  // gate locally so the librarian lands in the app. Best-effort: even if the
+  // POST fails we let them through (they can replay from Settings), but we keep
+  // needsOnboarding true so it retries next login rather than silently skipping.
+  async function completeOnboarding() {
+    try {
+      await apiRequest<{ ok: boolean }>('/api/me/onboarding-complete', { method: 'POST' });
+      setCurrentUser((prev) => (prev ? { ...prev, needsOnboarding: false } : prev));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setShowOnboarding(false);
+    }
   }
 
   function openProfile() {
@@ -4628,6 +4655,11 @@ function App() {
         }}
       />
 
+      {/* ═══ ONBOARDING COURSE (replay from Settings — closable) ═══ */}
+      {showOnboarding && !mustOnboard && (
+        <OnboardingCourse onFinish={() => void completeOnboarding()} onClose={() => setShowOnboarding(false)} />
+      )}
+
       {/* ═══ LOGIN ═══ */}
       {sessionLoading ? null : !loggedIn ? (
         <div className="simple-center">
@@ -4651,6 +4683,10 @@ function App() {
             </form>
           </div>
         </div>
+      ) : mustOnboard ? (
+        /* Mandatory first-run librarian course — no bypass; the app below is
+           unreachable until it's finished (which flips needsOnboarding false). */
+        <OnboardingCourse mandatory onFinish={() => void completeOnboarding()} />
       ) : (
         <>
           {/* ─── Navbar ─── */}
@@ -5961,6 +5997,15 @@ function App() {
                     <h2>{t('settings.title')}</h2>
                     <p>{t('settings.description')}</p>
                   </div>
+                </div>
+
+                {/* Training / Start guide — replay the onboarding course anytime */}
+                <div className="card">
+                  <h3>🎓 {t('settings.training.heading')}</h3>
+                  <p className="muted small" style={{ marginBottom: '1rem' }}>
+                    {t('settings.training.intro')}
+                  </p>
+                  <button className="secondary" onClick={() => setShowOnboarding(true)}>{t('settings.training.start')}</button>
                 </div>
 
                 {/* Custom field manager */}

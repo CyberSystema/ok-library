@@ -354,6 +354,12 @@ app.get('/api/health', async (c) => {
 	}, ok ? 200 : 503);
 });
 
+// Current version of the librarian onboarding course. A user whose
+// staff_users.onboarding_completed_version is below this is shown the mandatory
+// course on next sign-in. Bump this to re-trigger the course for everyone after
+// a major change to the cataloguing workflow.
+const ONBOARDING_VERSION = 1;
+
 app.post('/api/auth/login', async (c) => {
 	await ensureBootstrapAdmin(c.env);
 
@@ -362,7 +368,7 @@ app.post('/api/auth/login', async (c) => {
 	const parsed = schema.parse(body);
 
 	const user = await c.env.DB.prepare(
-		`SELECT id, username, role, password_hash, password_salt, password_iterations, active
+		`SELECT id, username, role, password_hash, password_salt, password_iterations, active, onboarding_completed_version
 		 FROM staff_users WHERE username = ? LIMIT 1`
 	)
 		.bind(parsed.username)
@@ -374,6 +380,7 @@ app.post('/api/auth/login', async (c) => {
 			password_salt: string | null;
 			password_iterations: number;
 			active: number;
+			onboarding_completed_version: number;
 		}>();
 
 	if (!user || user.active !== 1) {
@@ -431,7 +438,15 @@ app.post('/api/auth/login', async (c) => {
 	// are different registrable sites) can fall back to sending it as a bearer
 	// token, which authMiddleware already accepts. Native clients (mobile) read
 	// it from here too.
-	return c.json({ user: { id: user.id, username: user.username, role: user.role }, token });
+	return c.json({
+		user: {
+			id: user.id,
+			username: user.username,
+			role: user.role,
+			needsOnboarding: (user.onboarding_completed_version ?? 0) < ONBOARDING_VERSION
+		},
+		token
+	});
 });
 
 app.post('/api/auth/logout', async (c) => {
@@ -539,7 +554,31 @@ app.use('/api/*', async (c, next) => {
 
 app.get('/api/auth/session', async (c) => {
 	const user = c.get('user');
-	return c.json({ user: { id: user.sub, username: user.username, role: user.role } });
+	// The JWT carries only sub/username/role, so read the onboarding version from
+	// the row (one D1 read per app load) — otherwise a returning user restored via
+	// cookie/token would never see the mandatory course.
+	const row = await c.env.DB.prepare(
+		'SELECT onboarding_completed_version FROM staff_users WHERE id = ? LIMIT 1'
+	).bind(user.sub).first<{ onboarding_completed_version: number }>();
+	return c.json({
+		user: {
+			id: user.sub,
+			username: user.username,
+			role: user.role,
+			needsOnboarding: (row?.onboarding_completed_version ?? 0) < ONBOARDING_VERSION
+		}
+	});
+});
+
+// Mark the current user's onboarding course as completed at the current version.
+// Any authenticated user marks their OWN onboarding (no permission gate).
+app.post('/api/me/onboarding-complete', async (c) => {
+	const actor = c.get('user');
+	await c.env.DB.prepare(
+		'UPDATE staff_users SET onboarding_completed_version = ?, updated_at = ? WHERE id = ?'
+	).bind(ONBOARDING_VERSION, nowIso(), actor.sub).run();
+	await insertAuditLog(c.env, actor.sub, 'user.onboarding_complete', 'staff_user', actor.sub, { version: ONBOARDING_VERSION });
+	return c.json({ ok: true, onboardingVersion: ONBOARDING_VERSION });
 });
 
 // ─── Self-service profile (any authenticated user) ────────────────────────────
