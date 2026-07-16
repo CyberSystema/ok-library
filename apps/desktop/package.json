@@ -15,7 +15,7 @@
     "dist:win": "npm run build:web && electron-builder --win --config electron-builder.yml"
   },
   "devDependencies": {
-    "electron": "^33.2.0",
-    "electron-builder": "^25.1.8"
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3"
   }
 }

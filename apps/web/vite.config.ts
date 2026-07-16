@@ -10,9 +10,9 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   build: {
+    // Vite 8 drives the production transform/minify target from build.target
+    // (the separate esbuild.target option was removed), so this one setting now
+    // covers what the two used to.
     target: ['es2020', 'safari14', 'chrome90', 'firefox90', 'edge90']
-  },
-  esbuild: {
-    target: 'es2020'
   }
 });
