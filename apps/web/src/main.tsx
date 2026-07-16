@@ -634,7 +634,12 @@ async function apiRequest<T>(
       return (await response.text()) as T;
     }
 
-    const payload = (await response.json()) as T;
+    // A 204 No Content (and any other empty body) has nothing to parse — DELETE
+    // endpoints return this. Calling response.json() on an empty body throws
+    // "JSON.parse: unexpected end of data", so read the text first and only
+    // parse when there is something there.
+    const bodyText = await response.text();
+    const payload = (bodyText ? JSON.parse(bodyText) : undefined) as T;
     setNetStatus('online');
 
     // Persist successful GETs to cache (fire-and-forget) and invalidate
