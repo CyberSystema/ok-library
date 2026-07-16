@@ -1736,6 +1736,76 @@ mark.hl {
   transition: background 0.15s ease;
 }
 .lightbox-close:hover { background: rgba(255, 255, 255, 0.28); }
+
+/* ── Custom right-click context menu ──────────────────────────────────────── */
+.ctx-menu {
+  position: fixed;
+  z-index: 1200; /* above the detail modal (200) and cover lightbox (500) */
+  min-width: 210px;
+  max-width: 320px;
+  max-height: min(80vh, 560px);
+  overflow-y: auto;
+  overscroll-behavior: contain; /* scrolling the menu never chains to the page */
+  padding: 0.35rem;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  /* Black (not navy) so the elevation stays visible on the dark surface too. */
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.3);
+  animation: ctxIn 0.1s ease;
+  user-select: none;
+}
+@keyframes ctxIn {
+  from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.ctx-menu-title {
+  padding: 0.3rem 0.55rem 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.25rem;
+}
+.ctx-menu-header {
+  padding: 0.3rem 0.6rem 0.15rem;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-light);
+}
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  width: 100%;
+  padding: 0.4rem 0.6rem;
+  border: none;
+  background: none;
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+.ctx-item:hover:not(:disabled),
+.ctx-item:focus-visible {
+  background: var(--accent-light);
+  color: var(--accent);
+  outline: none;
+}
+.ctx-item:disabled { opacity: 0.45; cursor: default; }
+.ctx-item.danger { color: var(--danger); }
+.ctx-item.danger:hover:not(:disabled),
+.ctx-item.danger:focus-visible { background: var(--danger-bg); color: var(--danger); }
+.ctx-icon { width: 1.15rem; flex-shrink: 0; text-align: center; font-size: 0.9rem; }
+.ctx-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.ctx-sep { height: 1px; background: var(--border); margin: 0.25rem 0.3rem; }
 .button-like {
   display: inline-flex;
   align-items: center;

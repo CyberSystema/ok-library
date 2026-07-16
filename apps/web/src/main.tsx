@@ -1,4 +1,4 @@
-import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import {
   BookCardSkeleton,
@@ -764,6 +764,160 @@ function VariantGroupCard({ group, mergeLabel, keepLabel, onMerge }: {
   );
 }
 
+// ── Custom right-click context menu ─────────────────────────────────────────
+// A single app-owned menu that replaces the browser's native one on the app's
+// own surfaces. Menu items are built in App scope (so they can call the app's
+// handlers + read the permission gates) and handed to this pure renderer, which
+// only positions the menu, clamps it to the viewport, and handles dismissal +
+// keyboard navigation.
+type CtxItem =
+  | { sep: true }
+  | { header: string }
+  | { label: string; icon?: string; onClick: () => void; danger?: boolean; disabled?: boolean };
+
+interface CtxMenuState {
+  x: number;
+  y: number;
+  items: CtxItem[];
+  title?: string;
+}
+
+// Drop empty groups: leading/trailing/duplicate separators and headers that end
+// up with no actionable item beneath them, so a permission-filtered menu never
+// shows a stray divider or an empty section.
+function pruneCtxItems(items: CtxItem[]): CtxItem[] {
+  const out: CtxItem[] = [];
+  for (const it of items) {
+    if ('sep' in it) {
+      if (out.length === 0) continue;
+      const prev = out[out.length - 1];
+      if ('sep' in prev || 'header' in prev) continue;
+      out.push(it);
+    } else if ('header' in it) {
+      // Collapse a header that immediately follows another header/sep-less start.
+      if (out.length > 0 && 'header' in out[out.length - 1]) out.pop();
+      out.push(it);
+    } else {
+      out.push(it);
+    }
+  }
+  // Trim trailing separators / dangling headers.
+  while (out.length > 0) {
+    const last = out[out.length - 1];
+    if ('sep' in last || 'header' in last) out.pop();
+    else break;
+  }
+  // Drop any header not immediately followed by an actionable item — otherwise a
+  // header whose whole section was permission-filtered would mislabel whatever
+  // section comes next.
+  return out.filter((it, i) => {
+    if (!('header' in it)) return true;
+    const next = out[i + 1];
+    return next !== undefined && !('sep' in next) && !('header' in next);
+  });
+}
+
+function ContextMenuView({ state, onClose }: { state: CtxMenuState; onClose: () => void }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  // The element focused when the menu opened, so focus can return there on close.
+  const triggerRef = useRef<HTMLElement | null>(null);
+  const [pos, setPos] = useState<{ x: number; y: number; ready: boolean }>({ x: state.x, y: state.y, ready: false });
+
+  // Measure then clamp inside the viewport (shift so the menu never spills
+  // off-screen). Runs before paint. Also remember the trigger element (still
+  // focused at this point) so we can restore focus when the menu closes.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (!triggerRef.current) triggerRef.current = (document.activeElement as HTMLElement) ?? null;
+    const pad = 8;
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    let x = state.x;
+    let y = state.y;
+    if (x + w + pad > window.innerWidth) x = Math.max(pad, window.innerWidth - w - pad);
+    if (y + h + pad > window.innerHeight) y = Math.max(pad, window.innerHeight - h - pad);
+    setPos({ x, y, ready: true });
+  }, [state.x, state.y, state.items]);
+
+  // Focus the first item only AFTER the menu is visible — a visibility:hidden
+  // element cannot receive focus, so focusing inside the clamp effect (while
+  // still hidden) would silently no-op.
+  useEffect(() => {
+    if (pos.ready) ref.current?.querySelector<HTMLButtonElement>('button.ctx-item:not([disabled])')?.focus();
+  }, [pos.ready]);
+
+  // Return focus to the trigger when the menu unmounts (any close path), so
+  // keyboard users don't get dumped at the top of the document.
+  useEffect(() => () => {
+    const el = triggerRef.current;
+    if (el && document.body.contains(el)) el.focus?.();
+  }, []);
+
+  // Dismiss on any outside press, page scroll, resize, or window blur. Wheel and
+  // mousedown are guarded so scrolling/clicking INSIDE the menu doesn't close it
+  // (the menu can scroll when it is taller than the viewport). Escape is handled
+  // by the App-level key handler so it takes priority over the modals.
+  useEffect(() => {
+    const isOutside = (t: EventTarget | null) => !ref.current || !ref.current.contains(t as Node);
+    const onDown = (e: MouseEvent) => { if (isOutside(e.target)) onClose(); };
+    const onWheel = (e: WheelEvent) => { if (isOutside(e.target)) onClose(); };
+    window.addEventListener('mousedown', onDown, true);
+    window.addEventListener('wheel', onWheel, { passive: true });
+    window.addEventListener('resize', onClose);
+    window.addEventListener('blur', onClose);
+    return () => {
+      window.removeEventListener('mousedown', onDown, true);
+      window.removeEventListener('wheel', onWheel);
+      window.removeEventListener('resize', onClose);
+      window.removeEventListener('blur', onClose);
+    };
+  }, [onClose]);
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Tab') { e.preventDefault(); onClose(); return; }
+    const btns = Array.from(ref.current?.querySelectorAll<HTMLButtonElement>('button.ctx-item:not([disabled])') ?? []);
+    if (btns.length === 0) return;
+    const idx = btns.findIndex((b) => b === document.activeElement);
+    if (e.key === 'ArrowDown') { e.preventDefault(); btns[(idx + 1) % btns.length].focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); btns[(idx - 1 + btns.length) % btns.length].focus(); }
+    else if (e.key === 'Home') { e.preventDefault(); btns[0].focus(); }
+    else if (e.key === 'End') { e.preventDefault(); btns[btns.length - 1].focus(); }
+  };
+
+  return (
+    <div
+      ref={ref}
+      className="ctx-menu"
+      role="menu"
+      aria-label={state.title}
+      style={{ left: pos.x, top: pos.y, visibility: pos.ready ? 'visible' : 'hidden' }}
+      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
+      onKeyDown={onKeyDown}
+    >
+      {state.title ? <div className="ctx-menu-title" title={state.title}>{state.title}</div> : null}
+      {state.items.map((it, i) => {
+        if ('sep' in it) return <div key={i} className="ctx-sep" role="separator" />;
+        if ('header' in it) return <div key={i} className="ctx-menu-header">{it.header}</div>;
+        return (
+          <button
+            key={i}
+            type="button"
+            role="menuitem"
+            className={`ctx-item${it.danger ? ' danger' : ''}`}
+            disabled={it.disabled}
+            title={it.label}
+            onClick={() => { onClose(); it.onClick(); }}
+          >
+            <span className="ctx-icon" aria-hidden="true">{it.icon ?? ''}</span>
+            <span className="ctx-label">{it.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function App() {
   const toast = useToast();
   const confirm = useConfirm();
@@ -938,6 +1092,12 @@ function App() {
   // Full-screen cover zoom (lightbox). Holds the resolved cover URL while open,
   // null while closed. Opened by clicking the large cover in the detail view.
   const [coverZoom, setCoverZoom] = useState<string | null>(null);
+  // Custom right-click menu: null when closed, else its screen position + items.
+  const [contextMenu, setContextMenu] = useState<CtxMenuState | null>(null);
+  // A hidden file input reused by the "Replace/Add cover" menu item — the book
+  // to attach the chosen file to is stashed in a ref while the picker is open.
+  const coverInputRef = useRef<HTMLInputElement | null>(null);
+  const coverUploadBookRef = useRef<Book | null>(null);
   const [showAddBook, setShowAddBook] = useState(false);
   const [bulkStatus, setBulkStatus] = useState<string>('');
   const [bulkShelfCode, setBulkShelfCode] = useState('');
@@ -1126,6 +1286,12 @@ function App() {
         return;
       }
       if (event.key === 'Escape') {
+        // Layered dismissal, top-most first: context menu → cover lightbox →
+        // detail modal. Each returns so Escape only peels off one layer.
+        if (contextMenu) {
+          setContextMenu(null);
+          return;
+        }
         // The cover lightbox sits on top of the detail modal, so Escape must
         // close the lightbox FIRST and leave the detail modal open.
         if (coverZoom) {
@@ -1141,7 +1307,7 @@ function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [loggedIn, detailBook, coverZoom]);
+  }, [loggedIn, detailBook, coverZoom, contextMenu]);
 
   // Lock the body scroll while any full-screen modal is open. Without this a
   // long detail/profile modal lets the underlying list scroll on touch+wheel,
@@ -3719,27 +3885,190 @@ function App() {
     );
   }
 
-  function startEditFromDetail() {
-    if (!detailBook) return;
+  // Enter edit mode for a book. With no argument it edits the book already open
+  // in the detail modal (the modal's Edit button); passing a book (e.g. from the
+  // right-click menu on a card) opens that book straight into edit mode.
+  function startEditFromDetail(src: Book | null = detailBook) {
+    const b = src ?? detailBook;
+    if (!b) return;
+    if (!detailBook || detailBook.id !== b.id) {
+      setDetailBook(b);
+      setBookHistory([]);
+      void loadBookHistory(b.id);
+    }
     setDetailMode('edit');
     setEditForm({
-      id: detailBook.id,
-      title: detailBook.title,
-      author: detailBook.author,
-      isbn: detailBook.isbn ?? '',
-      shelfCode: detailBook.shelfCode ?? '',
-      publicationYear: detailBook.publicationYear?.toString() ?? '',
-      status: detailBook.status,
-      version: detailBook.version,
-      publisher: detailBook.publisher ?? '',
-      language: detailBook.language ?? '',
-      description: detailBook.description ?? ''
+      id: b.id,
+      title: b.title,
+      author: b.author,
+      isbn: b.isbn ?? '',
+      shelfCode: b.shelfCode ?? '',
+      publicationYear: b.publicationYear?.toString() ?? '',
+      status: b.status,
+      version: b.version,
+      publisher: b.publisher ?? '',
+      language: b.language ?? '',
+      description: b.description ?? ''
     });
-    setAttributeEditorValues(detailBook.customFields ?? {});
+    setAttributeEditorValues(b.customFields ?? {});
+  }
+
+  // ── Context-menu plumbing ─────────────────────────────────────────────────
+  const closeContextMenu = useCallback(() => setContextMenu(null), []);
+
+  // Open the custom menu at the cursor, suppressing the native one. Items are
+  // pruned first so a permission-filtered menu never shows an empty section; if
+  // nothing survives we let the native menu through (no preventDefault).
+  function openContextMenu(e: React.MouseEvent, items: CtxItem[], title?: string) {
+    const cleaned = pruneCtxItems(items);
+    if (cleaned.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setContextMenu({ x: e.clientX, y: e.clientY, items: cleaned, title });
+  }
+
+  function copyText(text: string, whatLabel: string) {
+    if (!text) return;
+    // Only claim success once the write actually resolves; in an insecure
+    // context navigator.clipboard is undefined, so don't show a false "copied".
+    const p = navigator.clipboard?.writeText(text);
+    if (p) p.then(() => pushAppToast('success', t('ctx.copied', { what: whatLabel }))).catch(() => setError(t('toast.copyFailed')));
+    else setError(t('toast.copyFailed'));
+  }
+
+  // Fire the hidden cover picker for a specific book (used by the menu item).
+  function triggerCoverUpload(book: Book) {
+    coverUploadBookRef.current = book;
+    coverInputRef.current?.click();
+  }
+
+  // A loan row only carries a bookId; the current page of `books` may not hold
+  // it, so fetch the full record before opening the detail modal.
+  async function openBookById(bookId: string) {
+    try {
+      const book = await apiRequest<Book>(`/api/books/${bookId}`);
+      setCurrentSection('books');
+      openBookDetail(book);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  function buildBookMenu(book: Book): CtxItem[] {
+    const items: CtxItem[] = [];
+    items.push({ label: t('ctx.view'), icon: '📖', onClick: () => openBookDetail(book) });
+    if (canWrite) items.push({ label: t('ctx.edit'), icon: '✏️', onClick: () => startEditFromDetail(book) });
+    if (canSeeCirculation && book.status === 'available') {
+      // Mirror the detail-modal Borrow button, including closing the modal so the
+      // circulation borrow form isn't hidden behind it.
+      items.push({ label: t('ctx.borrow'), icon: '📤', onClick: () => { setSelectedBook(book); setCurrentSection('circulation'); if (detailBook) closeDetail(); } });
+    }
+    if (canSeeCirculation && book.status === 'borrowed') {
+      items.push({ label: t('ctx.return'), icon: '📥', onClick: () => { void returnBook(book); if (detailBook) closeDetail(); } });
+    }
+
+    // Cover group.
+    const cover: CtxItem[] = [];
+    if (book.coverUrl) cover.push({ label: t('ctx.zoomCover'), icon: '🔍', onClick: () => setCoverZoom(joinApiUrl(book.coverUrl!)) });
+    if (canWrite) cover.push({ label: book.coverUrl ? t('ctx.replaceCover') : t('ctx.addCover'), icon: '🖼️', onClick: () => triggerCoverUpload(book) });
+    if (canWrite && book.coverUrl) cover.push({ label: t('ctx.removeCover'), icon: '🗑️', onClick: () => void deleteBookCover(book) });
+    if (cover.length) { items.push({ sep: true }); items.push(...cover); }
+
+    // Labels / codes group.
+    if (canPrintLabels) {
+      items.push({ sep: true });
+      items.push({ label: t('ctx.printLabel'), icon: '🏷️', onClick: () => void printLabels([book]) });
+      items.push({ label: t('ctx.genQr'), icon: '🔳', onClick: () => void generateCode(book, 'qr') });
+      items.push({ label: t('ctx.genBarcode'), icon: '📊', onClick: () => void generateCode(book, 'barcode') });
+    }
+
+    // Copy group — only offer fields that actually have a value (so a menu item
+    // never silently no-ops), and only show the group when something is copyable.
+    const copy: CtxItem[] = [];
+    if (book.title && !isPlaceholder(book.title, 'title')) copy.push({ label: t('ctx.copyTitle'), onClick: () => copyText(book.title, t('ctx.copyTitle')) });
+    if (book.author && !isPlaceholder(book.author, 'author')) copy.push({ label: t('ctx.copyAuthor'), onClick: () => copyText(book.author, t('ctx.copyAuthor')) });
+    if (book.isbn) copy.push({ label: t('ctx.copyIsbn'), onClick: () => copyText(book.isbn!, t('ctx.copyIsbn')) });
+    if (book.shelfCode) copy.push({ label: t('ctx.copyShelf'), onClick: () => copyText(book.shelfCode!, t('ctx.copyShelf')) });
+    if (book.legacyId) copy.push({ label: t('ctx.copyLegacy'), onClick: () => copyText(book.legacyId!, t('ctx.copyLegacy')) });
+    if (copy.length) {
+      items.push({ sep: true });
+      items.push({ header: t('ctx.copyHeader') });
+      items.push(...copy);
+    }
+
+    // Selection.
+    if (canWrite) {
+      const isSel = selectedBookIds.includes(book.id);
+      items.push({ sep: true });
+      items.push({
+        label: isSel ? t('ctx.deselect') : t('ctx.select'),
+        icon: isSel ? '☑️' : '⬜',
+        onClick: () => { if (!selectionMode) setSelectionMode(true); toggleBookSelection(book.id); }
+      });
+    }
+
+    // Delete (destructive, last).
+    if (canDelete) {
+      items.push({ sep: true });
+      items.push({ label: t('ctx.delete'), icon: '🗑️', danger: true, onClick: () => void deleteBook(book) });
+    }
+    return items;
+  }
+
+  function buildCategoryMenu(cat: CategoryItem): CtxItem[] {
+    const items: CtxItem[] = [];
+    const active = categoryFilter === cat.code;
+    items.push({ label: t('ctx.filterCategory'), icon: '📂', disabled: active, onClick: () => { setCategoryFilter(cat.code); setCurrentPage(1); } });
+    if (categoryFilter) items.push({ label: t('ctx.clearCategoryFilter'), icon: '✖️', onClick: () => { setCategoryFilter(''); setCurrentPage(1); } });
+    items.push({ sep: true });
+    items.push({ label: t('ctx.copyName'), onClick: () => copyText(cat.label ? `${cat.code} ${cat.label}` : cat.code, t('ctx.copyName')) });
+    return items;
+  }
+
+  function buildLoanMenu(loan: ActiveBorrow): CtxItem[] {
+    const items: CtxItem[] = [];
+    const title = displayTitle({ title: loan.title }, t('common.untitled'));
+    if (canSeeCirculation) items.push({ label: t('ctx.returnLoan'), icon: '📥', onClick: () => void quickReturnByBookId(loan.bookId, title) });
+    items.push({ label: t('ctx.openBook'), icon: '📖', onClick: () => void openBookById(loan.bookId) });
+    if (canSeeCirculation && activeBorrows.some((l) => l.isOverdue)) {
+      items.push({ label: t('ctx.returnAllOverdue'), icon: '⏰', onClick: () => void returnAllOverdue() });
+    }
+    items.push({ sep: true });
+    items.push({ label: t('ctx.copyBorrower'), onClick: () => copyText(loan.borrowerContact ? `${loan.borrowerName} · ${loan.borrowerContact}` : loan.borrowerName, t('ctx.copyBorrower')) });
+    return items;
+  }
+
+  // The fallback menu for empty space / general areas, plus copy+search when
+  // there is a text selection.
+  function buildDefaultMenu(selection: string): CtxItem[] {
+    const items: CtxItem[] = [];
+    const sel = selection.trim();
+    if (sel) {
+      const short = sel.length > 30 ? `${sel.slice(0, 30)}…` : sel;
+      items.push({ label: t('ctx.copySelection'), icon: '📋', onClick: () => copyText(sel, t('ctx.copySelectionWhat')) });
+      items.push({ label: t('ctx.searchSelection', { q: short }), icon: '🔎', onClick: () => { setQ(sel); setCurrentSection('books'); setCurrentPage(1); } });
+      items.push({ sep: true });
+    }
+    if (canWrite) items.push({ label: t('ctx.addBook'), icon: '➕', onClick: () => { setCurrentSection('books'); setShowAddBook(true); } });
+    items.push({ label: t('ctx.refresh'), icon: '🔄', onClick: () => void refreshEverything() });
+    if (canExportCsv) items.push({ label: t('ctx.exportCsv'), icon: '⬇️', onClick: () => void exportFilteredBooksCsv() });
+    items.push({ sep: true });
+    items.push({ label: t('ctx.toggleTheme'), icon: theme === 'dark' ? '☀️' : '🌙', onClick: () => setTheme((c) => (c === 'dark' ? 'light' : 'dark')) });
+    return items;
+  }
+
+  // Root-level right-click: default menu for empty space, but never hijack the
+  // native menu on editable fields (a librarian needs cut/copy/paste there).
+  function handleRootContextMenu(e: React.MouseEvent) {
+    if (!loggedIn) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('input, textarea, select, [contenteditable="true"]')) return;
+    const selection = window.getSelection()?.toString() ?? '';
+    openContextMenu(e, buildDefaultMenu(selection));
   }
 
   return (
-    <div className="app-shell" aria-busy={isWorking}>
+    <div className="app-shell" aria-busy={isWorking} onContextMenu={handleRootContextMenu}>
 
       {/* Autocomplete suggestions for the add/edit book forms, sourced from the
           catalog's existing values so a librarian rarely retypes a repeated
@@ -3853,7 +4182,15 @@ function App() {
       {/* ═══ BOOK DETAIL MODAL ═══ */}
       {detailBook && (
         <div className="modal-overlay" onClick={closeDetail} role="dialog" aria-modal="true">
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal"
+            onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => {
+              // Keep the native menu on the edit form's text fields.
+              if ((e.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"]')) return;
+              openContextMenu(e, buildBookMenu(detailBook), displayTitle(detailBook, t('common.untitled')));
+            }}
+          >
 
             {/* Header */}
             <div className="modal-header">
@@ -3886,7 +4223,7 @@ function App() {
               {detailMode === 'view' ? (
                 <>
                   {canWrite && (
-                    <button className="secondary small" onClick={startEditFromDetail}>{t('detail.editBtn')}</button>
+                    <button className="secondary small" onClick={() => startEditFromDetail()}>{t('detail.editBtn')}</button>
                   )}
                   {canWrite && Boolean((detailBook.customFields as Record<string, unknown> | undefined)?.needs_review) && (
                     <button className="primary small" onClick={() => void markReviewed(detailBook)}>{t('detail.markReviewed')}</button>
@@ -4173,6 +4510,23 @@ function App() {
           <img className="lightbox-img" src={coverZoom} alt={t('detail.coverZoomAria')} />
         </div>
       )}
+
+      {/* ═══ CUSTOM CONTEXT MENU ═══ */}
+      {contextMenu && <ContextMenuView state={contextMenu} onClose={closeContextMenu} />}
+      {/* Hidden picker reused by the "Replace/Add cover" menu item. */}
+      <input
+        ref={coverInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          e.target.value = '';
+          const b = coverUploadBookRef.current;
+          coverUploadBookRef.current = null;
+          if (f && b) void uploadBookCover(b, f);
+        }}
+      />
 
       {/* ═══ LOGIN ═══ */}
       {sessionLoading ? null : !loggedIn ? (
@@ -4577,6 +4931,7 @@ function App() {
                                 className={`category-rail-item${categoryFilter === c.code ? ' is-active' : ''}`}
                                 aria-pressed={categoryFilter === c.code}
                                 onClick={() => setCategoryFilter(c.code)}
+                                onContextMenu={(e) => openContextMenu(e, buildCategoryMenu(c), c.label ? `${c.code} ${c.label}` : c.code)}
                                 title={c.label ?? c.code}
                               >
                                 <span className="cat-label">
@@ -5094,6 +5449,7 @@ function App() {
                               }}
                               role="button"
                               tabIndex={0}
+                              onContextMenu={(e) => openContextMenu(e, buildBookMenu(book), displayTitle(book, t('common.untitled')))}
                               onKeyDown={(e) => {
                                 if (e.key !== 'Enter' && e.key !== ' ') return;
                                 e.preventDefault();
@@ -5250,7 +5606,7 @@ function App() {
                   ) : (
                     <div className="loan-list">
                       {activeBorrows.map((loan) => (
-                        <div key={loan.id} className={`loan-item${loan.isOverdue ? ' overdue' : ''}`}>
+                        <div key={loan.id} className={`loan-item${loan.isOverdue ? ' overdue' : ''}`} onContextMenu={(e) => openContextMenu(e, buildLoanMenu(loan), displayTitle({ title: loan.title }, t('common.untitled')))}>
                           <div className="loan-item-info">
                             <strong>{displayTitle({ title: loan.title }, t('common.untitled'))}</strong>
                             <p className="meta">
