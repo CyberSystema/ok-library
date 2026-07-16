@@ -1023,6 +1023,10 @@ function App() {
     description: ''
   });
   const [createAttrValues, setCreateAttrValues] = useState<Record<string, unknown>>({});
+  // Field keys (core: 'title'; custom: 'cf:<key>') flagged as missing-required on
+  // the last add-book submit attempt, so they can be visually highlighted.
+  const [createFieldErrors, setCreateFieldErrors] = useState<Set<string>>(new Set());
+  const titleInputRef = useRef<HTMLInputElement | null>(null);
   // Cover image chosen in the add-book form. It can only be uploaded once the
   // book row exists (the cover endpoint keys on the book id), so we hold the
   // File here and PUT it right after the book is created. The object-URL
@@ -1043,6 +1047,10 @@ function App() {
     language: '',
     description: ''
   });
+  // Missing-required field keys flagged on the last edit-save attempt (mirrors
+  // createFieldErrors), so an existing book can't be saved with its title blanked.
+  const [editFieldErrors, setEditFieldErrors] = useState<Set<string>>(new Set());
+  const editTitleInputRef = useRef<HTMLInputElement | null>(null);
 
   const [fieldForm, setFieldForm] = useState({
     key: '',
@@ -2580,6 +2588,31 @@ function App() {
     clearStatus();
     setDuplicateWarning([]);
 
+    // Required-field gate (client side). A book must have a title, and every
+    // admin-marked-required custom field must be filled. Block the submit,
+    // highlight the offending fields, and focus the first one — instead of
+    // creating a junk "(Untitled)" record or bouncing off the server.
+    const errorKeys = new Set<string>();
+    const missingLabels: string[] = [];
+    if (!createForm.title.trim()) {
+      errorKeys.add('title');
+      missingLabels.push(t('library.add.bookTitle'));
+    }
+    for (const field of customFields) {
+      if (!field.required) continue;
+      const raw = createAttrValues[field.key];
+      if (raw === undefined || raw === null || raw === '') {
+        errorKeys.add(`cf:${field.key}`);
+        missingLabels.push(field.label);
+      }
+    }
+    setCreateFieldErrors(errorKeys);
+    if (missingLabels.length > 0) {
+      setError(t('toast.requiredFields', { list: missingLabels.join(', ') }));
+      if (errorKeys.has('title')) titleInputRef.current?.focus();
+      return;
+    }
+
     try {
       const customFieldsValue = buildCustomFieldsPayload(createAttrValues);
       const publicationYear = parsePublicationYear(createForm.publicationYear);
@@ -2613,6 +2646,7 @@ function App() {
         language: '',
         description: ''
       });
+      setCreateFieldErrors(new Set());
       setCreateAttrValues({});
       clearCreateCover();
       setShowAddBook(false);
@@ -2815,6 +2849,29 @@ function App() {
     if (!editForm.id) return;
     clearStatus();
 
+    // Same required-field gate as the add form: never let an edit blank out the
+    // title or clear a required custom field.
+    const errorKeys = new Set<string>();
+    const missingLabels: string[] = [];
+    if (!editForm.title.trim()) {
+      errorKeys.add('title');
+      missingLabels.push(t('detail.title'));
+    }
+    for (const field of customFields) {
+      if (!field.required) continue;
+      const raw = attributeEditorValues[field.key];
+      if (raw === undefined || raw === null || raw === '') {
+        errorKeys.add(`cf:${field.key}`);
+        missingLabels.push(field.label);
+      }
+    }
+    setEditFieldErrors(errorKeys);
+    if (missingLabels.length > 0) {
+      setError(t('toast.requiredFields', { list: missingLabels.join(', ') }));
+      if (errorKeys.has('title')) editTitleInputRef.current?.focus();
+      return;
+    }
+
     try {
       const customFieldsValue = buildCustomFieldsPayload(attributeEditorValues);
       const publicationYear = parsePublicationYear(editForm.publicationYear);
@@ -2836,6 +2893,7 @@ function App() {
       }));
 
       setEditForm((prev) => ({ ...prev, version: result.version }));
+      setEditFieldErrors(new Set());
       setMessage(t('toast.bookUpdated'));
       setDetailBook((prev) =>
         prev && prev.id === editForm.id
@@ -3816,7 +3874,8 @@ function App() {
 
   function renderCustomFieldsForm(
     values: Record<string, unknown>,
-    setValue: (key: string, value: unknown) => void
+    setValue: (key: string, value: unknown) => void,
+    errorKeys?: Set<string>
   ): React.ReactNode {
     if (customFields.length === 0) {
       return (
@@ -3828,6 +3887,8 @@ function App() {
         {customFields.map((field) => {
           const v = values[field.key];
           const idAttr = `cf-${field.key}`;
+          const hasError = errorKeys?.has(`cf:${field.key}`) ?? false;
+          const mark = field.required ? <span className="required-mark"> *</span> : null;
           if (field.type === 'boolean') {
             const checked = v === true || v === 'true';
             return (
@@ -3838,16 +3899,19 @@ function App() {
                   checked={checked}
                   onChange={(e) => setValue(field.key, e.target.checked)}
                 />
-                <span>{field.label}{field.required && <span className="required-mark"> *</span>}</span>
+                <span>{field.label}{mark}</span>
               </label>
             );
           }
           if (field.type === 'enum') {
             return (
               <div key={field.key} className="form-field">
-                <label htmlFor={idAttr}>{field.label}{field.required && <span className="required-mark"> *</span>}</label>
+                <label htmlFor={idAttr}>{field.label}{mark}</label>
                 <select
                   id={idAttr}
+                  className={hasError ? 'input-error' : undefined}
+                  aria-required={field.required || undefined}
+                  aria-invalid={hasError || undefined}
                   value={(v as string) ?? ''}
                   onChange={(e) => setValue(field.key, e.target.value || null)}
                 >
@@ -3867,10 +3931,13 @@ function App() {
               : (v as string | number | null | undefined) ?? '';
           return (
             <div key={field.key} className="form-field">
-              <label htmlFor={idAttr}>{field.label}{field.required && <span className="required-mark"> *</span>}</label>
+              <label htmlFor={idAttr}>{field.label}{mark}</label>
               <input
                 id={idAttr}
                 type={inputType}
+                className={hasError ? 'input-error' : undefined}
+                aria-required={field.required || undefined}
+                aria-invalid={hasError || undefined}
                 value={displayValue === null || displayValue === undefined ? '' : String(displayValue)}
                 onChange={(e) => setValue(field.key, e.target.value)}
                 placeholder={field.key}
@@ -4415,8 +4482,24 @@ function App() {
                 <form onSubmit={saveBookEdit} className="simple-form">
                   <div className="form-row">
                     <div>
-                      <label>{t('detail.title')}</label>
-                      <input value={editForm.title} onChange={(e) => setEditForm({ ...editForm, title: e.target.value })} />
+                      <label>{t('detail.title')}<span className="required-mark"> *</span></label>
+                      <input
+                        ref={editTitleInputRef}
+                        className={editFieldErrors.has('title') ? 'input-error' : undefined}
+                        aria-required="true"
+                        aria-invalid={editFieldErrors.has('title') || undefined}
+                        value={editForm.title}
+                        onChange={(e) => {
+                          setEditForm({ ...editForm, title: e.target.value });
+                          if (editFieldErrors.has('title')) {
+                            setEditFieldErrors((prev) => {
+                              const next = new Set(prev);
+                              next.delete('title');
+                              return next;
+                            });
+                          }
+                        }}
+                      />
                     </div>
                     <div>
                       <label>{t('detail.author')}</label>
@@ -4474,8 +4557,20 @@ function App() {
 
                   <details className="custom-fields-section" open>
                     <summary>{t('library.add.attributes', { n: customFields.length })}</summary>
-                    {renderCustomFieldsForm(attributeEditorValues, (key, value) =>
-                      setAttributeEditorValues((prev) => ({ ...prev, [key]: value }))
+                    {renderCustomFieldsForm(
+                      attributeEditorValues,
+                      (key, value) => {
+                        setAttributeEditorValues((prev) => ({ ...prev, [key]: value }));
+                        const empty = value === undefined || value === null || value === '';
+                        if (!empty && editFieldErrors.has(`cf:${key}`)) {
+                          setEditFieldErrors((prev) => {
+                            const next = new Set(prev);
+                            next.delete(`cf:${key}`);
+                            return next;
+                          });
+                        }
+                      },
+                      editFieldErrors
                     )}
                   </details>
 
@@ -4954,8 +5049,26 @@ function App() {
                     <form onSubmit={createBook} className="simple-form">
                       <div className="form-row">
                         <div>
-                          <label>{t('library.add.bookTitle')}</label>
-                          <input value={createForm.title} onChange={(e) => setCreateForm({ ...createForm, title: e.target.value })} placeholder={t('library.add.titlePh')} />
+                          <label>{t('library.add.bookTitle')}<span className="required-mark"> *</span></label>
+                          <input
+                            ref={titleInputRef}
+                            className={createFieldErrors.has('title') ? 'input-error' : undefined}
+                            aria-required="true"
+                            aria-invalid={createFieldErrors.has('title') || undefined}
+                            value={createForm.title}
+                            onChange={(e) => {
+                              setCreateForm({ ...createForm, title: e.target.value });
+                              // Clear the title error as soon as the librarian starts typing.
+                              if (createFieldErrors.has('title')) {
+                                setCreateFieldErrors((prev) => {
+                                  const next = new Set(prev);
+                                  next.delete('title');
+                                  return next;
+                                });
+                              }
+                            }}
+                            placeholder={t('library.add.titlePh')}
+                          />
                         </div>
                         <div>
                           <label>{t('library.add.author')}</label>
@@ -5063,10 +5176,23 @@ function App() {
                         </div>
                       </div>
 
-                      <details className="custom-fields-section" open={customFields.length > 0 && customFields.length <= 6}>
+                      <details className="custom-fields-section" open={customFields.length > 0 && (customFields.length <= 6 || [...createFieldErrors].some((k) => k.startsWith('cf:')))}>
                         <summary>{t('library.add.attributes', { n: customFields.length })}</summary>
-                        {renderCustomFieldsForm(createAttrValues, (key, value) =>
-                          setCreateAttrValues((prev) => ({ ...prev, [key]: value }))
+                        {renderCustomFieldsForm(
+                          createAttrValues,
+                          (key, value) => {
+                            setCreateAttrValues((prev) => ({ ...prev, [key]: value }));
+                            // Clear a required-field error once the field is given a value.
+                            const empty = value === undefined || value === null || value === '';
+                            if (!empty && createFieldErrors.has(`cf:${key}`)) {
+                              setCreateFieldErrors((prev) => {
+                                const next = new Set(prev);
+                                next.delete(`cf:${key}`);
+                                return next;
+                              });
+                            }
+                          },
+                          createFieldErrors
                         )}
                       </details>
 

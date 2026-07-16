@@ -959,6 +959,13 @@ label {
 }
 .required-mark { color: var(--danger); margin-left: 2px; }
 
+/* A form field flagged as missing-required on submit. */
+.input-error,
+.input-error:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.14);
+}
+
 /* ================== FILTER CHIPS ================== */
 .filter-chips {
   display: flex;
