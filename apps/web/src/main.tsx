@@ -219,6 +219,53 @@ const IMPORT_CHUNK_SIZE = 500;
 const IMPORT_MIN_CHUNK_SIZE = 1;
 const PAGE_SIZE = 50;
 const DEBOUNCE_MS = 350;
+// The book-list filter params, built in ONE place so the grid query and the
+// "select all matching" query can never drift apart — if they did, the librarian
+// would select a different set than the one they are looking at. Pure (takes the
+// values, reads no state) so callers can't capture a stale closure.
+function buildBookFilterParams(f: {
+  q: string;
+  qExclude: string;
+  qMode: string;
+  partialWords: boolean;
+  fuzzyTypos: boolean;
+  searchFields: string[];
+  status: string;
+  filterLanguage: string;
+  filterYear: string;
+  categoryFilter: string;
+  needsReviewFilter: boolean;
+  shelfFilter: string;
+  smartListKey: string;
+  smartLists: ReadonlyArray<{ key: string; params: Record<string, string> }>;
+}): URLSearchParams {
+  const query = new URLSearchParams();
+  if (f.q) query.set('q', f.q);
+  if (f.qExclude) query.set('qExclude', f.qExclude);
+  query.set('qMode', f.qMode);
+  query.set('partialWords', String(f.partialWords));
+  query.set('fuzzyTypos', String(f.fuzzyTypos));
+  query.set('searchFields', f.searchFields.join(','));
+  if (f.status) query.set('status', f.status);
+  if (f.filterLanguage) query.set('language', f.filterLanguage);
+  // Only send a complete, in-range year — otherwise every keystroke ("1", "19",
+  // "190") would post a year the schema rejects (1000–3000) and pop a 400 toast
+  // mid-typing. Partial input simply doesn't filter yet.
+  if (f.filterYear) {
+    const yr = Number(f.filterYear);
+    if (Number.isInteger(yr) && yr >= 1000 && yr <= 3000) query.set('year', f.filterYear);
+  }
+  if (f.categoryFilter) query.set('custom_category_code', f.categoryFilter);
+  if (f.needsReviewFilter) query.set('custom_needs_review', '1');
+  if (f.shelfFilter) query.set('shelfCode', f.shelfFilter);
+  // Apply the active smart-list's filters last so it composes with the rest.
+  if (f.smartListKey) {
+    const list = f.smartLists.find((l) => l.key === f.smartListKey);
+    if (list) for (const [k, v] of Object.entries(list.params)) query.set(k, v);
+  }
+  return query;
+}
+
 const PREFS_STORAGE_KEY = 'ok-library-prefs-v1';
 // Bulk-selection ids, kept in sessionStorage (per tab, cleared when the tab
 // closes) so paging/searching/reloading never loses a selection in progress.
@@ -2186,34 +2233,11 @@ function App() {
         return;
       }
 
-      const query = new URLSearchParams();
-      if (q) query.set('q', q);
-      if (qExclude) query.set('qExclude', qExclude);
-      query.set('qMode', qMode);
-      query.set('partialWords', String(partialWords));
-      query.set('fuzzyTypos', String(fuzzyTypos));
-      query.set('searchFields', searchFields.join(','));
-      if (status) query.set('status', status);
-      if (filterLanguage) query.set('language', filterLanguage);
-      // Only send a complete, in-range year — otherwise every keystroke ("1",
-      // "19", "190") would post a year the schema rejects (1000–3000) and pop a
-      // 400 toast mid-typing. Partial input simply doesn't filter yet.
-      if (filterYear) {
-        const yr = Number(filterYear);
-        if (Number.isInteger(yr) && yr >= 1000 && yr <= 3000) query.set('year', filterYear);
-      }
-      if (categoryFilter) query.set('custom_category_code', categoryFilter);
-      if (needsReviewFilter) query.set('custom_needs_review', '1');
-      if (shelfFilter) query.set('shelfCode', shelfFilter);
-      // Apply the active smart-list's filters last so it composes with the rest.
-      if (smartListKey) {
-        const list = SMART_LISTS.find((l) => l.key === smartListKey);
-        if (list) {
-          for (const [k, v] of Object.entries(list.params)) {
-            query.set(k, v);
-          }
-        }
-      }
+      const query = buildBookFilterParams({
+        q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
+        status, filterLanguage, filterYear, categoryFilter,
+        needsReviewFilter, shelfFilter, smartListKey, smartLists: SMART_LISTS
+      });
       query.set('sortBy', sortBy);
       query.set('sortDir', sortDir);
       query.set('page', page.toString());
@@ -3229,6 +3253,49 @@ function App() {
     setSelectedBookIds([]);
   }
 
+  // ── Criteria-based selection ──────────────────────────────────────────────
+  // Add every book matching a server-side query to the selection. Union, never
+  // replace, and report how many were newly added so the librarian can see the
+  // effect even when most were already selected.
+  async function addMatchingToSelection(query: URLSearchParams, what: string) {
+    try {
+      const res = await runAction(() => apiRequest<{ ids: string[]; total: number }>(`/api/books/ids?${query.toString()}`));
+      const ids = res.ids ?? [];
+      let added = 0;
+      setSelectedBookIds((prev) => {
+        const next = new Set(prev);
+        const before = next.size;
+        for (const id of ids) next.add(id);
+        added = next.size - before;
+        return [...next];
+      });
+      // setState is async; recompute for the message from the same data.
+      const alreadyHad = ids.filter((id) => selectedBookIds.includes(id)).length;
+      setMessage(t('toast.selectedMatching', { n: ids.length - alreadyHad, what }));
+      if (ids.length > 0 && !selectionMode) setSelectionMode(true);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // "Select everything matching what I'm looking at" — reuses the exact filter
+  // params the grid is showing, so the selection is always what's on screen.
+  function selectAllMatchingFilters() {
+    const query = buildBookFilterParams({
+      q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
+      status, filterLanguage, filterYear, categoryFilter,
+      needsReviewFilter, shelfFilter, smartListKey, smartLists: SMART_LISTS
+    });
+    void addMatchingToSelection(query, t('library.bulk.criteria.currentView'));
+  }
+
+  // "Select every book by this author / on this shelf / from this publisher."
+  function selectByCriterion(kind: 'authorExact' | 'shelfExact' | 'publisherExact', value: string, what: string) {
+    const query = new URLSearchParams();
+    query.set(kind, value);
+    void addMatchingToSelection(query, what);
+  }
+
   // Resolve the selected ids to their live rows so a bulk action can span pages.
   // Always fetched fresh (never from the loaded page) so each book carries its
   // CURRENT version for the per-row concurrency check. Chunked to keep the query
@@ -4177,6 +4244,30 @@ function App() {
         icon: isSel ? '☑️' : '⬜',
         onClick: () => { if (!selectionMode) setSelectionMode(true); toggleBookSelection(book.id); }
       });
+      // Criteria-based selection: pick up every book sharing this book's author,
+      // shelf or publisher — in one click, across the whole catalogue.
+      const sameAuthor = book.author && !isPlaceholder(book.author, 'author') ? book.author : '';
+      if (sameAuthor) {
+        items.push({
+          label: t('ctx.selectSameAuthor'),
+          icon: '👤',
+          onClick: () => selectByCriterion('authorExact', sameAuthor, t('ctx.selectSameAuthorWhat'))
+        });
+      }
+      if (book.shelfCode) {
+        items.push({
+          label: t('ctx.selectSameShelf', { code: book.shelfCode }),
+          icon: '🗄️',
+          onClick: () => selectByCriterion('shelfExact', book.shelfCode!, t('ctx.selectSameShelfWhat'))
+        });
+      }
+      if (book.publisher) {
+        items.push({
+          label: t('ctx.selectSamePublisher'),
+          icon: '🏢',
+          onClick: () => selectByCriterion('publisherExact', book.publisher!, t('ctx.selectSamePublisherWhat'))
+        });
+      }
     }
 
     // Delete (destructive, last).
@@ -5576,7 +5667,7 @@ function App() {
                 {/* Shown whenever a selection exists — even after leaving selection
                     mode or paging away — so a selection is never invisible and the
                     user can always act on it or clear it. */}
-                {canWrite && selectedBookIds.length > 0 && (
+                {canWrite && (selectionMode || selectedBookIds.length > 0) && (
                   <div className="bulk-bar" role="region" aria-label={t('library.bulk.aria')}>
                     <div className="bulk-bar-info">
                       <strong>{selectedBookIds.length} </strong>
@@ -5587,9 +5678,14 @@ function App() {
                       {selectedOnPageCount > 0 && (
                         <button className="link-btn" onClick={deselectAllOnPage}>{t('library.bulk.deselectPage', { n: selectedOnPageCount })}</button>
                       )}
+                      {/* Criteria selection: everything matching the current
+                          search/filters, across every page. */}
+                      <button className="link-btn" onClick={selectAllMatchingFilters}>{t('library.bulk.selectMatching', { n: totalBooksCount })}</button>
                       <button className="link-btn" onClick={clearSelectedBooks}>{t('library.bulk.clear')}</button>
                     </div>
-                    <div className="bulk-bar-actions">
+                    {/* Actions only make sense once something is selected; the
+                        info row above still offers the criteria selectors. */}
+                    <div className="bulk-bar-actions" style={selectedBookIds.length === 0 ? { display: 'none' } : undefined}>
                       <select value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)} aria-label={t('library.bulk.setStatusAria')}>
                         <option value="">{t('library.bulk.setStatus')}</option>
                         <option value="available">{t('status.available')}</option>

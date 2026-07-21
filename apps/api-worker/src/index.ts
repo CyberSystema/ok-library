@@ -808,6 +808,42 @@ app.get('/api/books/by-ids', async (c) => {
 	return c.json({ items: (res.results ?? []).map(parseBook) });
 });
 
+// Criteria-based selection: return every id matching a filter set, unpaginated.
+// Two uses: "select all matching what I'm looking at" (the client forwards its
+// current search/filters verbatim) and "select every book by this author / on
+// this shelf / from this publisher" (the exact* params). Ids only — selecting a
+// few thousand books must not read a few thousand whole rows.
+// NOTE: registered before `/api/books/:id` so "ids" isn't captured as an id.
+app.get('/api/books/ids', async (c) => {
+	const query = BookFilterQuerySchema.parse(c.req.query());
+	const customFilters = Object.entries(c.req.query())
+		.filter(([key]) => key.startsWith('custom_'))
+		.map(([key, value]) => ({ key: key.replace('custom_', ''), value }));
+	const authorExact = c.req.query('authorExact');
+	const publisherExact = c.req.query('publisherExact');
+	const shelfExact = c.req.query('shelfExact');
+
+	const result = await queryBooksWithFilters(c.env, {
+		...query,
+		customFilters,
+		missingIsbn: query.missingIsbn,
+		missingShelf: query.missingShelf,
+		untitled: query.untitled,
+		unknownAuthor: query.unknownAuthor,
+		includeDeleted: false,
+		authorExact,
+		publisherExact,
+		shelfExact,
+		idsOnly: true,
+		// Comfortably above the whole catalogue so "select all matching" is never
+		// silently truncated for this library's size.
+		idsLimit: 20000
+	});
+	// The fuzzy-search path returns rows rather than ids; fall back to mapping.
+	const ids = result.ids ?? result.rows.map((r) => String((r as { id: unknown }).id));
+	return c.json({ ids, total: ids.length });
+});
+
 // NOTE: registered before `/api/books/:id` so "facets" isn't captured as an id.
 // Distinct catalog values that power predictive autocomplete on BOTH the
 // cataloguing forms and the search filters — for everyone, since search helps

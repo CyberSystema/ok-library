@@ -447,8 +447,17 @@ export async function queryBooksWithFilters(
     // which walks every page and discards `total`) set this to skip the
     // COUNT(*) scan — that's ~12,500 D1 rows read PER page otherwise.
     skipCount?: boolean;
+    // Exact "same as this book" criteria for criteria-based selection.
+    authorExact?: string;
+    publisherExact?: string;
+    shelfExact?: string;
+    // Return ONLY the matching ids (unpaginated, up to `idsLimit`) instead of
+    // full rows. Used by "select all matching": selecting 3,000 books must not
+    // read 3,000 whole rows when the client only needs their ids.
+    idsOnly?: boolean;
+    idsLimit?: number;
   }
-): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
+): Promise<{ total: number; rows: Array<Record<string, unknown>>; ids?: string[] }> {
   const qText = (opts.q ?? '').trim();
   const excludeText = (opts.qExclude ?? '').trim();
   const requestedFields = (opts.searchFields ?? '')
@@ -528,6 +537,29 @@ export async function queryBooksWithFilters(
   if (opts.shelfCode) {
     where.push('LOWER(b.shelf_code) LIKE LOWER(?)');
     values.push(`%${opts.shelfCode}%`);
+  }
+  // EXACT "same as this book" criteria, used by the criteria-based selection
+  // ("select every book by this author / on this shelf / from this publisher").
+  // Author and publisher match on the accent+case FOLD so the variant spellings
+  // of one name ("ΜΙΓΝΕ" / "Migne") are treated as the same person — which is
+  // exactly what a librarian means by "the same author". Shelf codes are stored
+  // upper-cased by normalizeBookData, so those compare literally.
+  // Match the fold column when it is populated (that catches variant spellings
+  // of one name), and fall back to raw equality otherwise. The fallback matters:
+  // the bulk-imported catalogue has NULL *_fold on many rows, and SQLite's
+  // LOWER() is ASCII-only, so a Greek name would never match through the fold
+  // expression alone.
+  if (opts.authorExact !== undefined) {
+    where.push("(COALESCE(b.author_fold, '') = ? OR TRIM(COALESCE(b.author, '')) = ?)");
+    values.push(foldDiacritics(opts.authorExact), opts.authorExact.trim());
+  }
+  if (opts.publisherExact !== undefined) {
+    where.push("(COALESCE(b.publisher_fold, '') = ? OR TRIM(COALESCE(b.publisher, '')) = ?)");
+    values.push(foldDiacritics(opts.publisherExact), opts.publisherExact.trim());
+  }
+  if (opts.shelfExact !== undefined) {
+    where.push("UPPER(TRIM(COALESCE(b.shelf_code, ''))) = ?");
+    values.push(opts.shelfExact.trim().toUpperCase());
   }
   for (const filter of opts.customFilters) {
     // json_extract validates the path; key is constrained to [a-zA-Z0-9_] in custom_field schema.
@@ -623,6 +655,20 @@ export async function queryBooksWithFilters(
     ? 'books b JOIN books_fts ON books_fts.rowid = b.ROWID'
     : 'books b';
   const whereSql = `WHERE ${where.join(' AND ')}`;
+
+  // Ids-only: one narrow, unpaginated query over the same WHERE. Capped so a
+  // pathological "select everything" can't stream the whole table.
+  if (opts.idsOnly) {
+    const cap = Math.max(1, Math.min(20000, opts.idsLimit ?? 10000));
+    const idsRes = await env.DB.prepare(
+      `SELECT b.id FROM ${fromClause} ${whereSql}
+       ORDER BY ${blankLastSort}b.${sortColumn} ${sortDir}, b.id DESC LIMIT ?`
+    )
+      .bind(...values, cap)
+      .all<{ id: string }>();
+    const ids = (idsRes.results ?? []).map((r) => r.id);
+    return { total: ids.length, rows: [], ids };
+  }
 
   const rowsStmt = env.DB.prepare(
     `SELECT b.* FROM ${fromClause} ${whereSql}
