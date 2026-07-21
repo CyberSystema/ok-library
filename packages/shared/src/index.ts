@@ -74,8 +74,24 @@ export const CreateBookSchema = BookCoreSchema.extend({
   status: BookStatusSchema.default('available')
 });
 
+// A PARTIAL update: any field the caller omits must be left untouched.
+//
+// `.partial()` alone is NOT enough. It makes every key optional but does not
+// remove the `.default()` wrappers declared above, so Zod still SUBSTITUTES a
+// default when a key is absent: parsing `{ shelfCode, version }` used to yield
+// `{ shelfCode, version, title: '', author: '', tags: [], customFields: {},
+// status: 'available' }`. The update handlers merge that over the stored row,
+// which silently wiped the title, author, tags and custom fields of every book
+// touched by a partial update (e.g. a bulk "set shelf code"). The defaulted
+// fields are therefore re-declared here WITHOUT defaults — absent now really
+// does mean "don't change this column".
 export const UpdateBookSchema = CreateBookSchema.partial().extend({
-  version: z.number().int().min(0)
+  version: z.number().int().min(0),
+  title: z.string().max(300).optional(),
+  author: z.string().max(200).optional(),
+  tags: z.array(z.string().max(50)).max(30).optional(),
+  status: BookStatusSchema.optional(),
+  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).optional()
 });
 
 export const BookSchema = CreateBookSchema.extend({

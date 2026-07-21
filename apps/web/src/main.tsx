@@ -220,6 +220,9 @@ const IMPORT_MIN_CHUNK_SIZE = 1;
 const PAGE_SIZE = 50;
 const DEBOUNCE_MS = 350;
 const PREFS_STORAGE_KEY = 'ok-library-prefs-v1';
+// Bulk-selection ids, kept in sessionStorage (per tab, cleared when the tab
+// closes) so paging/searching/reloading never loses a selection in progress.
+const SELECTION_STORAGE_KEY = 'ok-library-selection-v1';
 
 type SortBy = 'updatedAt' | 'title' | 'author' | 'publicationYear' | 'status';
 type SortDir = 'asc' | 'desc';
@@ -1101,7 +1104,18 @@ function App() {
     maintenanceBooks: 0
   });
   const [attributeEditorValues, setAttributeEditorValues] = useState<Record<string, unknown>>({});
-  const [selectedBookIds, setSelectedBookIds] = useState<string[]>([]);
+  // Book selection for bulk actions. Persisted per-tab so a reload (or an
+  // accidental navigation) doesn't silently throw away a long selection the
+  // librarian built up across several pages.
+  const [selectedBookIds, setSelectedBookIds] = useState<string[]>(() => {
+    try {
+      const raw = sessionStorage.getItem(SELECTION_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === 'string') : [];
+    } catch {
+      return [];
+    }
+  });
   // When false, per-row checkboxes are hidden. The user must click "Select"
   // in the section header to enter selection mode. This keeps the default
   // browsing surface uncluttered — nothing is selectable until requested.
@@ -1148,14 +1162,19 @@ function App() {
     if (!createCoverPreview) return;
     return () => URL.revokeObjectURL(createCoverPreview);
   }, [createCoverPreview]);
-  // Clear the book selection whenever the page actually changes. A selection
-  // can't span pages — bulk status/shelf/labels only have the loaded page's
-  // rows (they need each book's version), while bulk delete used the raw id
-  // list, so a cross-page selection silently applied inconsistently. Confining
-  // selection to the visible page makes every bulk action act on the same set.
+  // NOTE: the selection deliberately SURVIVES paging, searching, filtering and
+  // sorting. It is a set of book ids, and every bulk action resolves those ids
+  // to their live rows via GET /api/books/by-ids (which supplies each book's
+  // current `version`), so an action always applies to the whole selection —
+  // not just the page that happens to be loaded. Only the user clears it, via
+  // "Clear selection" (or sign-out); the app never drops it behind their back.
+  // Selection is mirrored into sessionStorage so an accidental reload keeps it.
   useEffect(() => {
-    setSelectedBookIds([]);
-  }, [currentPage]);
+    try {
+      if (selectedBookIds.length === 0) sessionStorage.removeItem(SELECTION_STORAGE_KEY);
+      else sessionStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(selectedBookIds));
+    } catch { /* private mode / quota — selection still works in memory */ }
+  }, [selectedBookIds]);
   // Browser-level offline events flip us back to "offline" immediately so
   // we don't have to wait for the next failing fetch to update the UI.
   useEffect(() => {
@@ -1353,6 +1372,10 @@ function App() {
     const diffMs = new Date(item.dueAt).getTime() - Date.now();
     return diffMs > 0 && diffMs <= 48 * 60 * 60 * 1000;
   }).length;
+
+  // How many of the currently-visible books are part of the (possibly much
+  // larger, cross-page) selection — drives the "select all / deselect" links.
+  const selectedOnPageCount = books.reduce((n, b) => (selectedBookIds.includes(b.id) ? n + 1 : n), 0);
 
   const role = currentUser?.role ?? null;
   const isAdmin = role === 'admin';
@@ -3183,12 +3206,43 @@ function App() {
     });
   }
 
+  // ADD every book on the current page to the selection (never replace it) — a
+  // selection is cumulative across pages and searches.
   function selectAllOnPage() {
-    setSelectedBookIds(books.map((book) => book.id));
+    setSelectedBookIds((prev) => {
+      const next = new Set(prev);
+      for (const book of books) next.add(book.id);
+      return [...next];
+    });
   }
 
+  // Remove just the current page's books, leaving the rest of the selection.
+  function deselectAllOnPage() {
+    setSelectedBookIds((prev) => {
+      const onPage = new Set(books.map((b) => b.id));
+      return prev.filter((id) => !onPage.has(id));
+    });
+  }
+
+  // The ONLY thing that empties the selection (besides sign-out).
   function clearSelectedBooks() {
     setSelectedBookIds([]);
+  }
+
+  // Resolve the selected ids to their live rows so a bulk action can span pages.
+  // Always fetched fresh (never from the loaded page) so each book carries its
+  // CURRENT version for the per-row concurrency check. Chunked to keep the query
+  // string short. Ids that no longer exist (deleted elsewhere) simply drop out,
+  // and the caller reports them.
+  async function resolveSelectedBooks(ids: string[]): Promise<Book[]> {
+    const found = new Map<string, Book>();
+    for (let i = 0; i < ids.length; i += 40) {
+      const chunk = ids.slice(i, i + 40);
+      const res = await apiRequest<{ items: Book[] }>(`/api/books/by-ids?ids=${chunk.map(encodeURIComponent).join(',')}`);
+      for (const b of res.items ?? []) found.set(b.id, b);
+    }
+    // Preserve the order the librarian selected in.
+    return ids.map((id) => found.get(id)).filter((b): b is Book => Boolean(b));
   }
 
   // Batch a set of book mutations into ONE /api/sync/push request instead of
@@ -3200,23 +3254,39 @@ function App() {
   // stable across apiRequest's internal retries). Returns per-row success/fail.
   async function pushBulkMutations(
     mutations: Array<{ operation: 'update_book' | 'delete_book'; payload: Record<string, unknown> }>
-  ): Promise<{ success: number; failed: number }> {
+  ): Promise<{ success: number; failed: number; okIds: string[] }> {
     const clientTimestamp = new Date().toISOString();
-    const res = await runAction(() =>
-      apiRequest<{ results: Array<{ status: string }> }>(`/api/sync/push`, {
-        method: 'POST',
-        body: JSON.stringify({
-          mutations: mutations.map((m) => ({
-            operation: m.operation,
-            payload: m.payload,
-            clientMutationId: newMutationId(),
-            clientTimestamp
-          }))
+    let success = 0;
+    let failed = 0;
+    const okIds: string[] = [];
+    // The sync endpoint accepts at most 200 mutations per request, so a large
+    // cross-page selection is split into consecutive batches.
+    for (let i = 0; i < mutations.length; i += 200) {
+      const batch = mutations.slice(i, i + 200);
+      const res = await runAction(() =>
+        apiRequest<{ results: Array<{ status: string; result?: { id?: string } }> }>(`/api/sync/push`, {
+          method: 'POST',
+          body: JSON.stringify({
+            mutations: batch.map((m) => ({
+              operation: m.operation,
+              payload: m.payload,
+              clientMutationId: newMutationId(),
+              clientTimestamp
+            }))
+          })
         })
-      })
-    );
-    const failed = res.results.filter((r) => r.status !== 'success').length;
-    return { success: res.results.length - failed, failed };
+      );
+      res.results.forEach((r, idx) => {
+        if (r.status === 'success') {
+          success += 1;
+          const id = (r.result?.id ?? (batch[idx].payload as { id?: string }).id);
+          if (id) okIds.push(id);
+        } else {
+          failed += 1;
+        }
+      });
+    }
+    return { success, failed, okIds };
   }
 
   async function applyBulkBookChanges() {
@@ -3239,7 +3309,10 @@ function App() {
         throw new Error(t('toast.bulkRequireValue'));
       }
 
-      const selectedBooks = books.filter((book) => selectedBookIds.includes(book.id));
+      // Resolve the WHOLE selection (not just the loaded page) to live rows so
+      // every selected book is edited and carries its current version.
+      const selectedBooks = await resolveSelectedBooks(selectedBookIds);
+      const vanished = selectedBookIds.length - selectedBooks.length;
       const { success, failed } = await pushBulkMutations(
         selectedBooks.map((book) => ({
           operation: 'update_book',
@@ -3249,15 +3322,15 @@ function App() {
         }))
       );
 
-      if (failed > 0) {
-        setMessage(t('toast.bulkPartial', { success, failed }));
+      if (failed + vanished > 0) {
+        setMessage(t('toast.bulkPartial', { success, failed: failed + vanished }));
       } else {
         setMessage(t('toast.bulkAll', { n: success }));
       }
 
       setBulkStatus('');
       setBulkShelfCode('');
-      setSelectedBookIds([]);
+      // The selection deliberately survives the action — only the user clears it.
       await Promise.all([loadBooks(), loadRoomSummary()]);
     } catch (e) {
       setError((e as Error).message);
@@ -4920,13 +4993,11 @@ function App() {
                       <button
                         className={`small ${selectionMode ? 'primary' : 'secondary'}`}
                         onClick={() => {
-                          setSelectionMode((v) => {
-                            // Leaving selection mode also clears any pending
-                            // selection, so nothing lingers when the user
-                            // returns to normal browsing.
-                            if (v) setSelectedBookIds([]);
-                            return !v;
-                          });
+                          // Toggling selection mode only shows/hides the row
+                          // checkboxes — it never discards the selection. Only
+                          // "Clear selection" does that (the bulk bar stays
+                          // visible while a selection exists).
+                          setSelectionMode((v) => !v);
                         }}
                         aria-pressed={selectionMode}
                         title={selectionMode ? t('library.select.exit') : t('library.select.enter')}
@@ -5502,12 +5573,20 @@ function App() {
                 </div>
 
                 {/* Bulk action bar — only visible when at least one book is selected. */}
-                {canWrite && selectionMode && selectedBookIds.length > 0 && (
+                {/* Shown whenever a selection exists — even after leaving selection
+                    mode or paging away — so a selection is never invisible and the
+                    user can always act on it or clear it. */}
+                {canWrite && selectedBookIds.length > 0 && (
                   <div className="bulk-bar" role="region" aria-label={t('library.bulk.aria')}>
                     <div className="bulk-bar-info">
                       <strong>{selectedBookIds.length} </strong>
                       <span className="muted small">{t('library.bulk.selectedSuffix')}</span>
-                      <button className="link-btn" onClick={selectAllOnPage}>{t('library.bulk.selectAll', { n: books.length })}</button>
+                      {selectedOnPageCount < books.length && (
+                        <button className="link-btn" onClick={selectAllOnPage}>{t('library.bulk.selectAll', { n: books.length })}</button>
+                      )}
+                      {selectedOnPageCount > 0 && (
+                        <button className="link-btn" onClick={deselectAllOnPage}>{t('library.bulk.deselectPage', { n: selectedOnPageCount })}</button>
+                      )}
                       <button className="link-btn" onClick={clearSelectedBooks}>{t('library.bulk.clear')}</button>
                     </div>
                     <div className="bulk-bar-actions">
@@ -5535,8 +5614,16 @@ function App() {
                         <button
                           className="secondary small"
                           onClick={() => {
-                            const targets = books.filter((b) => selectedBookIds.includes(b.id));
-                            void printLabels(targets);
+                            // Resolve the whole selection so labels print for books
+                            // on other pages too, not just the visible ones.
+                            void (async () => {
+                              try {
+                                const targets = await resolveSelectedBooks(selectedBookIds);
+                                await printLabels(targets);
+                              } catch (e) {
+                                setError((e as Error).message);
+                              }
+                            })();
                           }}
                         >{t('library.bulk.labels')}</button>
                       )}
@@ -5553,14 +5640,18 @@ function App() {
                           clearStatus();
                           try {
                             const ids = [...selectedBookIds];
-                            // One batched sync push (1 KV write) instead of N deletes.
-                            const { success, failed } = await pushBulkMutations(
+                            // Batched sync pushes (1 KV write per batch) instead of N deletes.
+                            const { success, failed, okIds } = await pushBulkMutations(
                               ids.map((id) => ({ operation: 'delete_book', payload: { id } }))
                             );
                             setMessage(failed === 0
                               ? t('toast.deletedAll', { n: success, s: success === 1 ? '' : 's' })
                               : t('toast.deletedMixed', { success, failed }));
-                            setSelectedBookIds([]);
+                            // Drop only the books that were actually deleted — they no
+                            // longer exist. Anything that failed stays selected so the
+                            // librarian can see and retry it.
+                            const deleted = new Set(okIds);
+                            setSelectedBookIds((prev) => prev.filter((id) => !deleted.has(id)));
                             await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadStats()]);
                           } catch (e) {
                             setError((e as Error).message);

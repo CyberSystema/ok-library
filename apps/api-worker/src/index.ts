@@ -784,6 +784,30 @@ app.get('/api/books', async (c) => {
 // (title, author, publisher, language, shelf code). Ordered by frequency so
 // the values a librarian actually reuses surface first, then capped to keep the
 // payload small. Cached per books-cache-version so it refreshes after any write.
+// Resolve a set of book ids to their full current records. This is what lets a
+// bulk selection SPAN PAGES: the client keeps only ids, and before a bulk edit
+// or label print it fetches the live rows here so every book carries its current
+// `version` for the per-row optimistic-concurrency check. Deliberately a GET —
+// a read-only POST would burn a KV rate-limiter write, a D1 mutation-log row and
+// a client cache-bust on every selection resolve. Ids come in a comma-separated
+// query string, so the client chunks them to stay well under URL length limits.
+// NOTE: registered before `/api/books/:id` so "by-ids" isn't captured as an id.
+app.get('/api/books/by-ids', async (c) => {
+	const ids = (c.req.query('ids') ?? '')
+		.split(',')
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.slice(0, 100);
+	if (ids.length === 0) return c.json({ items: [] });
+	const placeholders = ids.map(() => '?').join(',');
+	const res = await c.env.DB.prepare(
+		`SELECT * FROM books WHERE id IN (${placeholders}) AND deleted_at IS NULL`
+	)
+		.bind(...ids)
+		.all<Record<string, unknown>>();
+	return c.json({ items: (res.results ?? []).map(parseBook) });
+});
+
 // NOTE: registered before `/api/books/:id` so "facets" isn't captured as an id.
 // Distinct catalog values that power predictive autocomplete on BOTH the
 // cataloguing forms and the search filters — for everyone, since search helps
