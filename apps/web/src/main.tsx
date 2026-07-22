@@ -2091,6 +2091,12 @@ function App() {
     setMyPermissions(null);
     setPermissionMatrix(null);
     setShowOnboarding(false);
+    // Drop the bulk selection too. It is persisted in sessionStorage, so without
+    // this the NEXT librarian to sign in on the same tab would inherit the
+    // previous one's selection — and a bulk action would silently hit books
+    // they never chose and cannot see.
+    setSelectedBookIds([]);
+    setSelectionMode(false);
     setMessage(t('login.signedOut'));
   }
 
@@ -2101,10 +2107,13 @@ function App() {
   async function completeOnboarding() {
     try {
       await apiRequest<{ ok: boolean }>('/api/me/onboarding-complete', { method: 'POST' });
-      setCurrentUser((prev) => (prev ? { ...prev, needsOnboarding: false } : prev));
     } catch (e) {
+      // Never trap a librarian behind the mandatory course. If the server call
+      // fails (offline, 500, quota) we still let them into the app — the flag
+      // stays set server-side, so the course simply reappears next sign-in.
       setError((e as Error).message);
     } finally {
+      setCurrentUser((prev) => (prev ? { ...prev, needsOnboarding: false } : prev));
       setShowOnboarding(false);
     }
   }
@@ -3326,32 +3335,44 @@ function App() {
     let success = 0;
     let failed = 0;
     const okIds: string[] = [];
-    // The sync endpoint accepts at most 200 mutations per request, so a large
-    // cross-page selection is split into consecutive batches.
-    for (let i = 0; i < mutations.length; i += 200) {
-      const batch = mutations.slice(i, i + 200);
-      const res = await runAction(() =>
-        apiRequest<{ results: Array<{ status: string; result?: { id?: string } }> }>(`/api/sync/push`, {
-          method: 'POST',
-          body: JSON.stringify({
-            mutations: batch.map((m) => ({
-              operation: m.operation,
-              payload: m.payload,
-              clientMutationId: newMutationId(),
-              clientTimestamp
-            }))
+    // Batch size is bounded by the Workers FREE plan's 1,000-subrequest limit
+    // per invocation, not by the endpoint's 200-mutation schema cap: each
+    // mutation costs several D1 calls, so a 200-mutation request dies partway
+    // through with a 500 *after* writing some books. 40 keeps a request well
+    // inside the budget.
+    const BATCH = 40;
+    for (let i = 0; i < mutations.length; i += BATCH) {
+      const batch = mutations.slice(i, i + BATCH);
+      try {
+        const res = await runAction(() =>
+          apiRequest<{ results: Array<{ status: string; result?: { id?: string } }> }>(`/api/sync/push`, {
+            method: 'POST',
+            body: JSON.stringify({
+              mutations: batch.map((m) => ({
+                operation: m.operation,
+                payload: m.payload,
+                clientMutationId: newMutationId(),
+                clientTimestamp
+              }))
+            })
           })
-        })
-      );
-      res.results.forEach((r, idx) => {
-        if (r.status === 'success') {
-          success += 1;
-          const id = (r.result?.id ?? (batch[idx].payload as { id?: string }).id);
-          if (id) okIds.push(id);
-        } else {
-          failed += 1;
-        }
-      });
+        );
+        res.results.forEach((r, idx) => {
+          if (r.status === 'success') {
+            success += 1;
+            const id = (r.result?.id ?? (batch[idx].payload as { id?: string }).id);
+            if (id) okIds.push(id);
+          } else {
+            failed += 1;
+          }
+        });
+      } catch {
+        // A transport failure on ONE batch must not discard the batches that
+        // already succeeded — otherwise the caller reports total failure, never
+        // prunes the selection, and the librarian re-runs an action that has
+        // partly landed. Count this batch as failed and carry on.
+        failed += batch.length;
+      }
     }
     return { success, failed, okIds };
   }
@@ -5723,6 +5744,11 @@ function App() {
                           }}
                         >{t('library.bulk.labels')}</button>
                       )}
+                      {/* Deletion needs books.delete, like every other delete
+                          affordance (context menu, detail modal). Without this
+                          gate the UI offered bulk delete to librarians whose
+                          admin had turned deletion off. */}
+                      {canDelete && (
                       <button
                         className="danger small"
                         onClick={async () => {
@@ -5754,6 +5780,7 @@ function App() {
                           }
                         }}
                       >{t('common.delete')}</button>
+                      )}
                     </div>
                   </div>
                 )}

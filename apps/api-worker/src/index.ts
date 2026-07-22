@@ -1106,6 +1106,153 @@ app.post('/api/admin/consolidate-value', requirePermission('books.write', { libr
 	return c.json({ updated });
 });
 
+// ── Static /api/books/* routes ───────────────────────────────────────────
+// These MUST stay above `/api/books/:id`: Hono matches in registration order,
+// so if `:id` is registered first it swallows /trash, /duplicates and
+// /semantic and every one of those requests 404s "Book not found".
+app.get('/api/books/trash', requirePermission('books.delete'), async (c) => {
+	const page = Math.max(1, Number(c.req.query('page') ?? 1));
+	const pageSize = Math.min(100, Math.max(1, Number(c.req.query('pageSize') ?? 25)));
+	const offset = (page - 1) * pageSize;
+
+	const [rowsRes, countRes] = await Promise.all([
+		c.env.DB.prepare(
+			`SELECT * FROM books WHERE deleted_at IS NOT NULL
+			 ORDER BY deleted_at DESC LIMIT ? OFFSET ?`
+		).bind(pageSize, offset).all(),
+		c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL').first<{ n: number }>()
+	]);
+
+	return c.json({
+		page,
+		pageSize,
+		total: Number(countRes?.n ?? 0),
+		items: ((rowsRes.results ?? []) as Array<Record<string, unknown>>).map(parseBook)
+	});
+});
+
+app.get('/api/books/duplicates', requirePermission('books.write', { librarian: true }), async (c) => {
+	// Step 1: aggregate to find duplicate keys directly in SQL — never loads the full table.
+	const limit = Math.max(1, Math.min(200, Number(c.req.query('limit') ?? 50)));
+	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
+
+	// Canonical grouping keys: fold the legacy '(Unknown)'/'(Untitled)' sentinels
+	// to '' so a re-catalogued blank-author book and its legacy '(Unknown)' twin
+	// land in the SAME duplicate group. Must be identical in the GROUP BY, the
+	// match predicates, and the details projection or the buckets won't line up.
+	const TITLE_KEY = "CASE WHEN LOWER(TRIM(title)) = '(untitled)' THEN '' ELSE LOWER(TRIM(title)) END";
+	const AUTHOR_KEY = "CASE WHEN LOWER(TRIM(author)) = '(unknown)' THEN '' ELSE LOWER(TRIM(author)) END";
+
+	// Get the global count of duplicate groups in parallel with the paged
+	// slice. The previous `total` was just the count of returned groups,
+	// which made UI pagination misleading once more than `limit` groups
+	// existed.
+	const [groupsRes, totalRes] = await Promise.all([
+		c.env.DB.prepare(
+			`SELECT
+				${TITLE_KEY} AS title_key,
+				${AUTHOR_KEY} AS author_key,
+				COUNT(*) AS dup_count
+			 FROM books
+			 WHERE deleted_at IS NULL
+			 GROUP BY title_key, author_key
+			 HAVING COUNT(*) > 1
+			 ORDER BY dup_count DESC, title_key ASC
+			 LIMIT ? OFFSET ?`
+		).bind(limit, offset).all<{ title_key: string; author_key: string; dup_count: number }>(),
+		c.env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM (
+				SELECT 1 FROM books
+				 WHERE deleted_at IS NULL
+				 GROUP BY ${TITLE_KEY}, ${AUTHOR_KEY}
+				HAVING COUNT(*) > 1
+			)`
+		).first<{ n: number }>()
+	]);
+
+	const totalGroups = Number(totalRes?.n ?? 0);
+	const groups = groupsRes.results ?? [];
+	if (groups.length === 0) {
+		return c.json({ total: totalGroups, groups: [], page: { limit, offset } });
+	}
+
+	// Step 2: bulk-fetch only the rows in those duplicate buckets via OR predicates.
+	const orClauses = groups
+		.map(() => `(${TITLE_KEY} = ? AND ${AUTHOR_KEY} = ?)`)
+		.join(' OR ');
+	const params: unknown[] = [];
+	for (const g of groups) {
+		params.push(g.title_key, g.author_key);
+	}
+
+	const detailsRes = await c.env.DB.prepare(
+		`SELECT id, title, author, isbn,
+				${TITLE_KEY} AS title_key, ${AUTHOR_KEY} AS author_key
+		 FROM books
+		 WHERE deleted_at IS NULL AND (${orClauses})
+		 ORDER BY title_key ASC, author_key ASC, id ASC`
+	).bind(...params).all<{
+		id: string;
+		title: string;
+		author: string;
+		isbn: string | null;
+		title_key: string;
+		author_key: string;
+	}>();
+
+	const groupMap = new Map<string, Array<{ id: string; title: string; author: string; isbn: string | null }>>();
+	for (const row of detailsRes.results ?? []) {
+		const key = `${row.title_key}|||${row.author_key}`;
+		const list = groupMap.get(key) ?? [];
+		list.push({ id: row.id, title: row.title, author: row.author, isbn: row.isbn });
+		groupMap.set(key, list);
+	}
+
+	const orderedGroups = groups
+		.map((g) => groupMap.get(`${g.title_key}|||${g.author_key}`) ?? [])
+		.filter((list) => list.length > 1);
+
+	return c.json({ total: totalGroups, groups: orderedGroups, page: { limit, offset } });
+});
+
+app.get('/api/books/semantic', async (c) => {
+	if (!semanticSearchEnabled(c.env)) {
+		throw new HTTPException(503, { message: 'Semantic search is not enabled on this deployment.' });
+	}
+	const q = (c.req.query('q') ?? '').trim();
+	if (!q) {
+		return c.json({ items: [], total: 0, model: EMBEDDING_MODEL });
+	}
+	const topK = Math.max(1, Math.min(100, Number(c.req.query('topK') ?? 24)));
+
+	const matches = await semanticSearchBookIds(c.env, q, topK);
+	if (matches.length === 0) {
+		return c.json({ items: [], total: 0, model: EMBEDDING_MODEL });
+	}
+
+	// Hydrate by id while preserving Vectorize's score order. The IN clause
+	// is bounded by topK ≤ 100, well within D1 parameter limits.
+	const placeholders = matches.map(() => '?').join(',');
+	const rowsRes = await c.env.DB.prepare(
+		`SELECT * FROM books WHERE id IN (${placeholders}) AND deleted_at IS NULL`
+	).bind(...matches.map((m) => m.id)).all();
+	const byId = new Map<string, Record<string, unknown>>();
+	for (const row of rowsRes.results ?? []) {
+		const r = row as Record<string, unknown>;
+		const id = r.id as string;
+		byId.set(id, parseBook(r));
+	}
+
+	const items = matches
+		.map((m) => {
+			const book = byId.get(m.id);
+			return book ? { ...book, _score: m.score } : null;
+		})
+		.filter(Boolean);
+
+	return c.json({ items, total: items.length, model: EMBEDDING_MODEL });
+});
+
 app.get('/api/books/:id', async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
@@ -1478,26 +1625,6 @@ app.post('/api/books/:id/restore', requirePermission('books.delete'), async (c) 
 
 // List soft-deleted books — the "trash" view. Admin-only. Paged so a runaway
 // bulk-delete doesn't return a 12K-row payload.
-app.get('/api/books/trash', requirePermission('books.delete'), async (c) => {
-	const page = Math.max(1, Number(c.req.query('page') ?? 1));
-	const pageSize = Math.min(100, Math.max(1, Number(c.req.query('pageSize') ?? 25)));
-	const offset = (page - 1) * pageSize;
-
-	const [rowsRes, countRes] = await Promise.all([
-		c.env.DB.prepare(
-			`SELECT * FROM books WHERE deleted_at IS NOT NULL
-			 ORDER BY deleted_at DESC LIMIT ? OFFSET ?`
-		).bind(pageSize, offset).all(),
-		c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NOT NULL').first<{ n: number }>()
-	]);
-
-	return c.json({
-		page,
-		pageSize,
-		total: Number(countRes?.n ?? 0),
-		items: ((rowsRes.results ?? []) as Array<Record<string, unknown>>).map(parseBook)
-	});
-});
 
 // Hard-delete a book from the trash. Admin-only. Removes the book row plus
 // orphan rows that referenced it; covers in R2 are wiped too.
@@ -2635,6 +2762,15 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				await replaceBookAttributeValues(c.env, id, customFields);
 				resultData = { id };
 			} else if (mutation.operation === 'delete_book') {
+				// Deletion needs its OWN permission. The route is gated only on the
+				// coarse books.write, so without this a librarian whose admin turned
+				// "Delete books" OFF could still soft-delete the whole catalogue
+				// through the bulk Delete button (same reasoning as the circulation
+				// re-check below). No `librarian: true` default — books.delete is
+				// deny-by-default for librarian and viewer, matching DELETE /api/books/:id.
+				if (!(await userHasPermission(c, 'books.delete'))) {
+					throw new HTTPException(403, { message: 'Permission denied: books.delete' });
+				}
 				const row = z.object({ id: z.string().min(1) }).parse(mutation.payload);
 				const now = nowIso();
 				// Don't strand an open loan (mirror the direct DELETE guard).
@@ -2895,89 +3031,6 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 	return c.json({ results });
 });
 
-app.get('/api/books/duplicates', requirePermission('books.write', { librarian: true }), async (c) => {
-	// Step 1: aggregate to find duplicate keys directly in SQL — never loads the full table.
-	const limit = Math.max(1, Math.min(200, Number(c.req.query('limit') ?? 50)));
-	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
-
-	// Canonical grouping keys: fold the legacy '(Unknown)'/'(Untitled)' sentinels
-	// to '' so a re-catalogued blank-author book and its legacy '(Unknown)' twin
-	// land in the SAME duplicate group. Must be identical in the GROUP BY, the
-	// match predicates, and the details projection or the buckets won't line up.
-	const TITLE_KEY = "CASE WHEN LOWER(TRIM(title)) = '(untitled)' THEN '' ELSE LOWER(TRIM(title)) END";
-	const AUTHOR_KEY = "CASE WHEN LOWER(TRIM(author)) = '(unknown)' THEN '' ELSE LOWER(TRIM(author)) END";
-
-	// Get the global count of duplicate groups in parallel with the paged
-	// slice. The previous `total` was just the count of returned groups,
-	// which made UI pagination misleading once more than `limit` groups
-	// existed.
-	const [groupsRes, totalRes] = await Promise.all([
-		c.env.DB.prepare(
-			`SELECT
-				${TITLE_KEY} AS title_key,
-				${AUTHOR_KEY} AS author_key,
-				COUNT(*) AS dup_count
-			 FROM books
-			 WHERE deleted_at IS NULL
-			 GROUP BY title_key, author_key
-			 HAVING COUNT(*) > 1
-			 ORDER BY dup_count DESC, title_key ASC
-			 LIMIT ? OFFSET ?`
-		).bind(limit, offset).all<{ title_key: string; author_key: string; dup_count: number }>(),
-		c.env.DB.prepare(
-			`SELECT COUNT(*) AS n FROM (
-				SELECT 1 FROM books
-				 WHERE deleted_at IS NULL
-				 GROUP BY ${TITLE_KEY}, ${AUTHOR_KEY}
-				HAVING COUNT(*) > 1
-			)`
-		).first<{ n: number }>()
-	]);
-
-	const totalGroups = Number(totalRes?.n ?? 0);
-	const groups = groupsRes.results ?? [];
-	if (groups.length === 0) {
-		return c.json({ total: totalGroups, groups: [], page: { limit, offset } });
-	}
-
-	// Step 2: bulk-fetch only the rows in those duplicate buckets via OR predicates.
-	const orClauses = groups
-		.map(() => `(${TITLE_KEY} = ? AND ${AUTHOR_KEY} = ?)`)
-		.join(' OR ');
-	const params: unknown[] = [];
-	for (const g of groups) {
-		params.push(g.title_key, g.author_key);
-	}
-
-	const detailsRes = await c.env.DB.prepare(
-		`SELECT id, title, author, isbn,
-				${TITLE_KEY} AS title_key, ${AUTHOR_KEY} AS author_key
-		 FROM books
-		 WHERE deleted_at IS NULL AND (${orClauses})
-		 ORDER BY title_key ASC, author_key ASC, id ASC`
-	).bind(...params).all<{
-		id: string;
-		title: string;
-		author: string;
-		isbn: string | null;
-		title_key: string;
-		author_key: string;
-	}>();
-
-	const groupMap = new Map<string, Array<{ id: string; title: string; author: string; isbn: string | null }>>();
-	for (const row of detailsRes.results ?? []) {
-		const key = `${row.title_key}|||${row.author_key}`;
-		const list = groupMap.get(key) ?? [];
-		list.push({ id: row.id, title: row.title, author: row.author, isbn: row.isbn });
-		groupMap.set(key, list);
-	}
-
-	const orderedGroups = groups
-		.map((g) => groupMap.get(`${g.title_key}|||${g.author_key}`) ?? [])
-		.filter((list) => list.length > 1);
-
-	return c.json({ total: totalGroups, groups: orderedGroups, page: { limit, offset } });
-});
 
 // ─── Semantic search ─────────────────────────────────────────────────────
 // Free-text → embedding → Vectorize ANN lookup → hydrate book rows.
@@ -2985,43 +3038,6 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 // gracefully fall back to FTS without speculating about whether the feature
 // is wired up.
 
-app.get('/api/books/semantic', async (c) => {
-	if (!semanticSearchEnabled(c.env)) {
-		throw new HTTPException(503, { message: 'Semantic search is not enabled on this deployment.' });
-	}
-	const q = (c.req.query('q') ?? '').trim();
-	if (!q) {
-		return c.json({ items: [], total: 0, model: EMBEDDING_MODEL });
-	}
-	const topK = Math.max(1, Math.min(100, Number(c.req.query('topK') ?? 24)));
-
-	const matches = await semanticSearchBookIds(c.env, q, topK);
-	if (matches.length === 0) {
-		return c.json({ items: [], total: 0, model: EMBEDDING_MODEL });
-	}
-
-	// Hydrate by id while preserving Vectorize's score order. The IN clause
-	// is bounded by topK ≤ 100, well within D1 parameter limits.
-	const placeholders = matches.map(() => '?').join(',');
-	const rowsRes = await c.env.DB.prepare(
-		`SELECT * FROM books WHERE id IN (${placeholders}) AND deleted_at IS NULL`
-	).bind(...matches.map((m) => m.id)).all();
-	const byId = new Map<string, Record<string, unknown>>();
-	for (const row of rowsRes.results ?? []) {
-		const r = row as Record<string, unknown>;
-		const id = r.id as string;
-		byId.set(id, parseBook(r));
-	}
-
-	const items = matches
-		.map((m) => {
-			const book = byId.get(m.id);
-			return book ? { ...book, _score: m.score } : null;
-		})
-		.filter(Boolean);
-
-	return c.json({ items, total: items.length, model: EMBEDDING_MODEL });
-});
 
 // Backfill / re-embed pass. Admin-only. Pages through books that either
 // have no embedding yet OR were embedded with a different model than the

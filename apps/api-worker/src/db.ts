@@ -647,7 +647,9 @@ export async function queryBooksWithFilters(
       sortDir,
       limit,
       offset,
-      useFtsJoin
+      useFtsJoin,
+      idsOnly: opts.idsOnly,
+      idsLimit: opts.idsLimit
     });
   }
 
@@ -706,8 +708,14 @@ async function runFuzzyFiltered(
     limit: number;
     offset: number;
     useFtsJoin: boolean;
+    // Mirrors the non-fuzzy path: return every matching id instead of one page.
+    // Without this, "select all matching" fell back to a single 25-row page
+    // whenever a search term was active (fuzzy is on by default), so a bulk
+    // action silently applied to a slice of what the user was shown.
+    idsOnly?: boolean;
+    idsLimit?: number;
   }
-): Promise<{ total: number; rows: Array<Record<string, unknown>> }> {
+): Promise<{ total: number; rows: Array<Record<string, unknown>>; ids?: string[] }> {
   // Build a permissive SQL LIKE pre-filter so substring matches *always*
   // surface even when the catalog has more rows than the candidate cap. For
   // each query token we OR a `%token%` (catches exact-substring hits) and a
@@ -795,6 +803,14 @@ async function runFuzzyFiltered(
   const rows = ((res.results ?? []) as Array<Record<string, unknown>>).map(parseBook);
 
   const filtered = rows.filter((row) => fuzzyRowMatches(row, tokens, ctx.activeFields, ctx.qMode));
+
+  // Ids-only callers ("select all matching") need the WHOLE matched set, not a
+  // page — otherwise a bulk action runs on 25 books while the UI promised N.
+  if (ctx.idsOnly) {
+    const cap = Math.max(1, Math.min(20000, ctx.idsLimit ?? 10000));
+    const ids = filtered.slice(0, cap).map((r) => String((r as { id: unknown }).id));
+    return { total: ids.length, rows: [], ids };
+  }
 
   const paged = filtered.slice(ctx.offset, ctx.offset + ctx.limit);
   return { total: filtered.length, rows: paged };
