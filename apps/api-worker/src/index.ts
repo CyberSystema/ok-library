@@ -1281,7 +1281,16 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 	// Coerce to available; lending is done via the borrow action.
 	if (payload.status === 'borrowed') payload.status = 'available';
 	const now = nowIso();
-	const id = crypto.randomUUID();
+	// Derive the row id from the client's mutation id when there is one, and
+	// INSERT OR IGNORE below. The idempotency middleware already replays a
+	// recorded response, but it only records 2xx — so if the INSERT committed
+	// and a LATER step (cache bump, audit log) turned the request into a 500,
+	// the client's retry re-ran the whole handler and added a second copy of
+	// the book. A deterministic id makes the retry land on the same row.
+	const clientMutationId = c.req.header('x-client-mutation-id');
+	const id = clientMutationId
+		? await deterministicUuid(`create_book:${clientMutationId}`)
+		: crypto.randomUUID();
 	const customFields = await validateCustomFields(c.env, payload.customFields);
 
 	const tagsJson = JSON.stringify(payload.tags);
@@ -1297,7 +1306,7 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 	});
 
 	await c.env.DB.prepare(
-		`INSERT INTO books (
+		`INSERT OR IGNORE INTO books (
 			id, title, author, isbn, publication_year, publisher, language, description,
 			room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 			legacy_id, created_at, updated_at, deleted_at,
@@ -1333,7 +1342,14 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 		.run();
 
 	await replaceBookAttributeValues(c.env, id, customFields);
-	await bumpBooksCacheVersion(c.env);
+	// The book is already committed. A failure to invalidate the cache is a
+	// staleness problem, not a reason to report failure — reporting failure
+	// makes the client retry a write that already succeeded.
+	try {
+		await bumpBooksCacheVersion(c.env);
+	} catch (error) {
+		console.warn('Cache version bump failed after book create, continuing', error);
+	}
 
 	// Fire-and-forget: keep the response snappy while the embedding round-
 	// trip (Workers AI → Vectorize) runs in the background. No-ops cleanly
@@ -1349,25 +1365,60 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 		customFields
 	}));
 
-	await insertAuditLog(c.env, c.get('user').sub, 'book.create', 'book', id, {
-		title: payload.title,
-		author: payload.author
-	});
+	try {
+		await insertAuditLog(c.env, c.get('user').sub, 'book.create', 'book', id, {
+			title: payload.title,
+			author: payload.author
+		});
+	} catch (error) {
+		console.warn('Audit log failed for book.create, continuing', error);
+	}
 
 	// Duplicate check: warn if another non-deleted book has the same title+author.
-	// Canonicalize the legacy '(Unknown)'/'(Untitled)' sentinels to '' on both
-	// sides so a re-catalogued legacy book (author '(Unknown)') is still detected
-	// as a duplicate of the same title added blank (author '') and vice versa.
-	const dupCheck = await c.env.DB.prepare(
-		`SELECT id, title, author FROM books
-		 WHERE deleted_at IS NULL AND id != ?
-		   AND CASE WHEN LOWER(TRIM(title)) = '(untitled)' THEN '' ELSE LOWER(TRIM(title)) END = LOWER(TRIM(?))
-		   AND CASE WHEN LOWER(TRIM(author)) = '(unknown)' THEN '' ELSE LOWER(TRIM(author)) END = LOWER(TRIM(?))`
-	)
-		.bind(id, payload.title, payload.author)
-		.all<{ id: string; title: string; author: string }>();
+	// Matched on the *_fold columns (indexed, and already accent/case folded in
+	// JS so Greek folds too — SQLite's LOWER() is ASCII-only). The previous
+	// LOWER(TRIM(title)) form could not use an index and therefore scanned all
+	// ~12.5K rows on every single book added.
+	//
+	// The legacy '(Unknown)'/'(Untitled)' sentinels canonicalize to '' on both
+	// sides so a re-catalogued legacy book still matches the same title added
+	// with a blank author, and vice versa.
+	const dupFolds = computeBookFolds({ title: payload.title, author: payload.author });
+	// A blank value folds to NULL, while legacy rows spell the same thing
+	// '(untitled)'/'(unknown)'. Match either spelling by giving each column two
+	// candidate values. `IS` rather than `=` so the NULL candidate matches, and
+	// unlike COALESCE(col, '') it leaves the column bare so the fold index is
+	// still usable.
+	const dupTitles: Array<string | null> =
+		dupFolds.title_fold === null ? [null, '(untitled)']
+		: dupFolds.title_fold === '(untitled)' ? ['(untitled)', null]
+		: [dupFolds.title_fold, dupFolds.title_fold];
+	const dupAuthors: Array<string | null> =
+		dupFolds.author_fold === null ? [null, '(unknown)']
+		: dupFolds.author_fold === '(unknown)' ? ['(unknown)', null]
+		: [dupFolds.author_fold, dupFolds.author_fold];
+	// One indexed probe per candidate pair (at most four, normally one). An
+	// `OR` across the alternatives would have forced SQLite back to scanning
+	// every active row, which is the whole cost this is avoiding.
+	const dupSeen = new Map<string, { id: string; title: string; author: string }>();
+	const dupPairs = new Set<string>();
+	for (const tf of new Set(dupTitles)) {
+		for (const af of new Set(dupAuthors)) {
+			const key = `${tf ?? '\u0000'}|${af ?? '\u0000'}`;
+			if (dupPairs.has(key)) continue;
+			dupPairs.add(key);
+			const hit = await c.env.DB.prepare(
+				`SELECT id, title, author FROM books
+				 WHERE deleted_at IS NULL AND id != ? AND title_fold IS ? AND author_fold IS ?
+				 LIMIT 20`
+			)
+				.bind(id, tf, af)
+				.all<{ id: string; title: string; author: string }>();
+			for (const r of hit.results ?? []) dupSeen.set(r.id, r);
+		}
+	}
 
-	const duplicateOf = dupCheck.results ?? [];
+	const duplicateOf = Array.from(dupSeen.values()).slice(0, 20);
 
 	return c.json({ id, ...(duplicateOf.length > 0 ? { duplicateOf } : {}) }, 201);
 });
@@ -1461,7 +1512,7 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 			legacy_id = ?, version = ?, updated_at = ?,
 			title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
-		 WHERE id = ? AND deleted_at IS NULL`
+		 WHERE id = ? AND deleted_at IS NULL AND version = ?`
 	)
 		.bind(
 			merged.title,
@@ -1487,7 +1538,13 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			mergedFolds.description_fold,
 			mergedFolds.tags_fold,
 			mergedFolds.custom_fields_fold,
-			id
+			id,
+			// Concurrency guard lives in the WHERE clause, not just the earlier
+			// read: comparing the version and THEN updating is check-then-act, so
+			// two simultaneous saves both passed the check and the second silently
+			// overwrote the first. Matching on the version we read makes the write
+			// itself conditional — a loser changes 0 rows and is reported below.
+			currentVersion
 		);
 
 	if (closeOpenLoanOnWrite) {
@@ -1502,7 +1559,11 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			updateBookStmt
 		]);
 	} else {
-		await updateBookStmt.run();
+		const res = await updateBookStmt.run();
+		if ((res.meta?.changes ?? 0) === 0) {
+			// Someone else committed between our read and this write.
+			throw new HTTPException(409, { message: 'Version conflict. Refresh and retry.' });
+		}
 	}
 
 	await replaceBookAttributeValues(c.env, id, merged.customFields as Record<string, unknown>);
@@ -1722,49 +1783,51 @@ app.post('/api/books/:id/borrow', requirePermission('circulation', { librarian: 
 	const now = nowIso();
 	const txId = crypto.randomUUID();
 
-	// Atomic state transition: only flip the row if it is still 'available'.
-	// A second concurrent borrow request will see meta.changes === 0 and 409.
-	// This replaces the previous read-then-write pattern that raced under load.
-	const flip = await c.env.DB.prepare(
-		`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ?
-		 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
-	).bind(now, bookId).run();
+	// A loan is two facts that must be true together: the ledger row exists and
+	// the book reads as 'borrowed'. Writing them as two independent statements
+	// meant a crash (or an evicted isolate) between them left the book flagged
+	// borrowed with nobody on the hook for it, and the compensating revert that
+	// tried to paper over that could itself fail. One batch = one D1
+	// transaction, so both land or neither does.
+	//
+	// Both statements carry the SAME `status = 'available'` guard, so a
+	// concurrent borrow that wins the race makes both no-ops rather than
+	// inserting an orphan ledger row. The INSERT runs first for exactly that
+	// reason — after the UPDATE the book is no longer 'available' and its own
+	// guard would never match.
+	const borrowResults = await runAtomic(c.env, [
+		c.env.DB.prepare(
+			`INSERT INTO borrow_transactions (
+				id, book_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
+			)
+			 SELECT ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
+			 WHERE EXISTS (SELECT 1 FROM books WHERE id = ? AND deleted_at IS NULL AND status = 'available')`
+		).bind(
+			txId,
+			bookId,
+			borrowerId,
+			borrowerName,
+			borrowerContact,
+			now,
+			payload.dueAt,
+			payload.notes ?? null,
+			c.get('user').sub,
+			now,
+			bookId
+		),
+		c.env.DB.prepare(
+			`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ?
+			 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
+		).bind(now, bookId)
+	]);
 
-	if ((flip.meta?.changes ?? 0) === 0) {
+	if ((borrowResults[1]?.meta?.changes ?? 0) === 0) {
 		const exists = await c.env.DB.prepare('SELECT status FROM books WHERE id = ? AND deleted_at IS NULL')
 			.bind(bookId).first<{ status: string }>();
 		if (!exists) {
 			throw new HTTPException(404, { message: 'Book not found' });
 		}
 		throw new HTTPException(409, { message: 'Book is not available' });
-	}
-
-	try {
-		await c.env.DB.prepare(
-			`INSERT INTO borrow_transactions (
-				id, book_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
-		)
-			.bind(
-				txId,
-				bookId,
-				borrowerId,
-				borrowerName,
-				borrowerContact,
-				now,
-				payload.dueAt,
-				payload.notes ?? null,
-				c.get('user').sub,
-				now
-			)
-			.run();
-	} catch (err) {
-		// Compensating revert if the transaction insert fails (e.g. partial
-		// unique-active-loan index trips because another writer raced in).
-		await c.env.DB.prepare(
-			`UPDATE books SET status = 'available', updated_at = ? WHERE id = ? AND status = 'borrowed'`
-		).bind(nowIso(), bookId).run();
-		throw err;
 	}
 
 	await bumpBooksCacheVersion(c.env);
@@ -1781,24 +1844,48 @@ app.post('/api/books/:id/return', requirePermission('circulation', { librarian: 
 	const payload = ReturnBookSchema.parse(await c.req.json());
 
 	const tx = await c.env.DB.prepare(
-		`SELECT id FROM borrow_transactions WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at DESC LIMIT 1`
+		`SELECT id, borrower_name FROM borrow_transactions WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at DESC LIMIT 1`
 	)
 		.bind(bookId)
-		.first<{ id: string }>();
+		.first<{ id: string; borrower_name: string | null }>();
 
 	if (!tx) {
 		throw new HTTPException(409, { message: 'No active borrow transaction found' });
 	}
 
+	// The client tells us which loan it thinks it is closing. If the open loan
+	// is a different one, the operator's screen is stale — the book was already
+	// returned and lent to somebody else — and closing it would file the new
+	// borrower's loan as returned while they still hold the book.
+	if (payload.transactionId && payload.transactionId !== tx.id) {
+		throw new HTTPException(409, {
+			message: `This book has since been lent to ${tx.borrower_name || 'someone else'}. Refresh and check before returning.`
+		});
+	}
+
 	const now = nowIso();
 	// Atomic: borrow row is closed AND the book becomes available, or neither.
-	await runAtomic(c.env, [
+	// The `returned_at IS NULL` guard makes the close idempotent under a
+	// double-click or a retried request.
+	const returnResults = await runAtomic(c.env, [
 		c.env.DB.prepare(
-			`UPDATE borrow_transactions SET returned_at = ?, notes = COALESCE(?, notes), updated_at = ? WHERE id = ?`
+			`UPDATE borrow_transactions SET returned_at = ?, return_notes = COALESCE(?, return_notes), updated_at = ?
+			 WHERE id = ? AND returned_at IS NULL`
 		).bind(now, payload.notes ?? null, now, tx.id),
-		c.env.DB.prepare(`UPDATE books SET status = 'available', version = version + 1, updated_at = ? WHERE id = ?`)
-			.bind(now, bookId)
+		// Only free the book if the statement above is the one that closed the
+		// loan — matching on OUR timestamp, not merely "returned_at is set".
+		// Had the loan already been closed and the book lent to someone else,
+		// this would otherwise mark an active loan's book as available.
+		c.env.DB.prepare(
+			`UPDATE books SET status = 'available', version = version + 1, updated_at = ?
+			 WHERE id = ? AND deleted_at IS NULL
+			   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ? AND returned_at = ?)`
+		).bind(now, bookId, tx.id, now)
 	]);
+
+	if ((returnResults[0]?.meta?.changes ?? 0) === 0) {
+		throw new HTTPException(409, { message: 'This loan was already closed. Refresh to see the current state.' });
+	}
 
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.return', 'book', bookId ?? null, {
@@ -1835,6 +1922,7 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 			due_at,
 			returned_at,
 			notes,
+			return_notes,
 			CASE WHEN returned_at IS NULL AND due_at < ? THEN 1 ELSE 0 END AS was_overdue,
 			created_by,
 			updated_at
@@ -1863,6 +1951,7 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 			dueAt: (row as Record<string, unknown>).due_at,
 			returnedAt: (row as Record<string, unknown>).returned_at,
 			notes: (row as Record<string, unknown>).notes,
+			returnNotes: (row as Record<string, unknown>).return_notes,
 			wasOverdue: (row as Record<string, unknown>).was_overdue === 1,
 			createdBy: (row as Record<string, unknown>).created_by,
 			updatedAt: (row as Record<string, unknown>).updated_at
@@ -2081,16 +2170,33 @@ app.get('/api/setup/default-book-structure', async (c) => {
 app.post('/api/setup/default-book-structure', requirePermission('setup'), async (c) => {
 	const now = nowIso();
 	const customColumns = DEFAULT_BOOK_STRUCTURE.filter((column) => column.customKey && column.customType);
+	// Read SOFT-DELETED definitions too. Filtering them out made this endpoint
+	// destructive on a second run: a field the librarian had deliberately
+	// deleted looked absent, so the upsert below resurrected it — and, because
+	// it also rewrote `required` and `enum_options`, it wiped the configuration
+	// of whatever it touched. Setup is meant to be safe to re-run.
 	const existingCustomFieldsResult = await c.env.DB.prepare(
-		`SELECT field_key, label FROM custom_field_definitions WHERE deleted_at IS NULL`
-	).all<ExistingCustomFieldRef>();
-	const existingCustomFields = [...(existingCustomFieldsResult.results ?? [])];
+		`SELECT field_key, label, deleted_at FROM custom_field_definitions`
+	).all<ExistingCustomFieldRef & { deleted_at: string | null }>();
+	const allExistingCustomFields = [...(existingCustomFieldsResult.results ?? [])];
+	const existingKeys = new Set(allExistingCustomFields.map((f) => f.field_key));
+	const liveCustomFields: ExistingCustomFieldRef[] = allExistingCustomFields.filter((f) => !f.deleted_at);
 
 	let configuredCustomColumns = 0;
 	const skippedAsSimilar: string[] = [];
+	const skippedAsDeleted: string[] = [];
 
 	for (const column of customColumns) {
-		const similar = findSimilarCustomField(existingCustomFields, column);
+		// An exact key hit wins regardless of state — never re-create or revive it.
+		if (column.customKey && existingKeys.has(column.customKey)) {
+			const row = allExistingCustomFields.find((f) => f.field_key === column.customKey);
+			if (row?.deleted_at) skippedAsDeleted.push(column.label);
+			else skippedAsSimilar.push(column.label);
+			continue;
+		}
+		// Otherwise fall back to the fuzzy label match against LIVE fields, so a
+		// differently-keyed equivalent ("Sub Title" vs "subtitle") isn't doubled.
+		const similar = findSimilarCustomField(liveCustomFields, column);
 		if (similar) {
 			skippedAsSimilar.push(column.label);
 			continue;
@@ -2100,13 +2206,7 @@ app.post('/api/setup/default-book-structure', requirePermission('setup'), async 
 			`INSERT INTO custom_field_definitions
 				(id, field_key, label, field_type, required, enum_options, created_at, updated_at, deleted_at)
 			 VALUES (?, ?, ?, ?, 0, '[]', ?, ?, NULL)
-			 ON CONFLICT(field_key) DO UPDATE SET
-				label = excluded.label,
-				field_type = excluded.field_type,
-				required = 0,
-				enum_options = '[]',
-				updated_at = excluded.updated_at,
-				deleted_at = NULL`
+			 ON CONFLICT(field_key) DO NOTHING`
 		)
 			.bind(
 				crypto.randomUUID(),
@@ -2118,16 +2218,18 @@ app.post('/api/setup/default-book-structure', requirePermission('setup'), async 
 			)
 			.run();
 
-		existingCustomFields.push({ field_key: column.customKey ?? '', label: column.label });
+		if (column.customKey) existingKeys.add(column.customKey);
+		liveCustomFields.push({ field_key: column.customKey ?? '', label: column.label });
 		configuredCustomColumns += 1;
 	}
 
 	await insertAuditLog(c.env, c.get('user').sub, 'setup.defaultBookStructure', 'custom_field', null, {
 		count: configuredCustomColumns,
-		skippedAsSimilar
+		skippedAsSimilar,
+		skippedAsDeleted
 	});
 
-	return c.json({ ok: true, configuredCustomColumns, skippedAsSimilar });
+	return c.json({ ok: true, configuredCustomColumns, skippedAsSimilar, skippedAsDeleted });
 });
 
 app.get('/api/rooms/summary', async (c) => {
@@ -2331,27 +2433,65 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 		throw new HTTPException(404, { message: 'Custom field not found' });
 	}
 
-	let renamedBooks = 0;
-
-	// The definition rename + per-book key rewrites are run together where
-	// possible, but D1's batch() caps at 50 statements per call — so libraries
-	// with more than ~49 books carrying this key would have thrown if we
-	// shoved everything into one batch. We chunk in groups of 50 and put the
-	// definition update in the very first batch so the def is committed
-	// alongside the first slice of book rewrites. Later book batches lose
-	// strict cross-batch atomicity, but each book UPDATE is idempotent on
-	// (custom_fields, custom_fields_fold) — retrying the rename completes
-	// any books that were missed mid-flight, since `validateCustomFields`
-	// tolerates unknown keys on the update path.
+	// A definition edit can invalidate values already stored on books:
+	//   * renaming the key leaves every book holding the OLD key,
+	//   * changing the type leaves values of the old type,
+	//   * removing enum options leaves books holding a now-illegal choice.
+	// Any of these makes a book fail validation on its next save — the book
+	// becomes un-editable while the UI still shows a plausible value. So the
+	// books are migrated here, in ONE pass over the table rather than the two
+	// full scans this used to do.
 	const D1_BATCH_LIMIT = 50;
-	const defUpdate = c.env.DB.prepare(
-		`UPDATE custom_field_definitions
-			 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
-		 WHERE id = ? AND deleted_at IS NULL`
-	).bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id);
+	const oldKey = existing.field_key;
+	const newKey = payload.key;
+	const typeChanged = existing.field_type !== payload.type;
+	const oldEnumOptions = existing.field_type === 'enum'
+		? safeJsonParse<string[]>(existing.enum_options ?? '[]', [])
+		: [];
+	const removedEnumOptions = payload.type === 'enum'
+		? oldEnumOptions.filter((o) => !payload.enumOptions.includes(o))
+		: [];
+	const needsBookSweep = oldKey !== newKey || typeChanged || removedEnumOptions.length > 0;
 
+	// Convert a stored value to the field's new type. Returns `undefined` when
+	// the value cannot be represented at all — better to drop one cell than to
+	// leave the whole book unsaveable.
+	const coerceToType = (value: unknown): unknown => {
+		if (value === null || value === undefined) return value;
+		switch (payload.type) {
+			case 'text':
+				return typeof value === 'string' ? value : String(value);
+			case 'number': {
+				if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+				const n = Number(String(value).trim().replace(',', '.'));
+				return Number.isFinite(n) ? n : undefined;
+			}
+			case 'boolean': {
+				if (typeof value === 'boolean') return value;
+				const t = String(value).trim().toLowerCase();
+				if (['true', '1', 'yes', 'y', 'on', 'ναι'].includes(t)) return true;
+				if (['false', '0', 'no', 'n', 'off', 'οχι', 'όχι'].includes(t)) return false;
+				return undefined;
+			}
+			case 'date': {
+				const t = String(value).trim();
+				return t && !Number.isNaN(Date.parse(t)) ? t : undefined;
+			}
+			case 'enum': {
+				const t = String(value);
+				return payload.enumOptions.includes(t) ? t : undefined;
+			}
+			default:
+				return value;
+		}
+	};
+
+	let renamedBooks = 0;
+	let clearedEnumBooks = 0;
+	let retypedBooks = 0;
 	const bookUpdates: D1PreparedStatement[] = [];
-	if (existing.field_key !== payload.key) {
+
+	if (needsBookSweep) {
 		const books = await c.env.DB.prepare('SELECT id, custom_fields FROM books WHERE deleted_at IS NULL').all<{
 			id: string;
 			custom_fields: string;
@@ -2359,15 +2499,46 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 
 		for (const row of books.results ?? []) {
 			const values = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
-			if (!Object.prototype.hasOwnProperty.call(values, existing.field_key)) {
-				continue;
+			let changed = false;
+			let renamedThisRow = false;
+
+			if (oldKey !== newKey && Object.prototype.hasOwnProperty.call(values, oldKey)) {
+				const oldValue = values[oldKey];
+				if (!Object.prototype.hasOwnProperty.call(values, newKey)) {
+					values[newKey] = oldValue;
+				}
+				delete values[oldKey];
+				changed = true;
+				renamedThisRow = true;
 			}
 
-			const oldValue = values[existing.field_key];
-			if (!Object.prototype.hasOwnProperty.call(values, payload.key)) {
-				values[payload.key] = oldValue;
+			if (Object.prototype.hasOwnProperty.call(values, newKey)) {
+				const current = values[newKey];
+				const coerced = coerceToType(current);
+				if (coerced === undefined) {
+					delete values[newKey];
+					changed = true;
+					// Losing an out-of-range enum choice and losing an un-convertible
+					// value are reported separately so the operator can tell which
+					// part of their edit cost them data.
+					if (
+						payload.type === 'enum' &&
+						typeof current === 'string' &&
+						removedEnumOptions.includes(current)
+					) {
+						clearedEnumBooks += 1;
+					} else {
+						retypedBooks += 1;
+					}
+				} else if (coerced !== current) {
+					values[newKey] = coerced as string | number | boolean | null;
+					changed = true;
+					retypedBooks += 1;
+				}
 			}
-			delete values[existing.field_key];
+
+			if (!changed) continue;
+			if (renamedThisRow) renamedBooks += 1;
 
 			const valuesJson = JSON.stringify(values);
 			const valuesFold = computeBookFolds({ customFieldsJson: valuesJson }).custom_fields_fold;
@@ -2375,69 +2546,45 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 				c.env.DB.prepare('UPDATE books SET custom_fields = ?, custom_fields_fold = ?, updated_at = ?, version = version + 1 WHERE id = ?')
 					.bind(valuesJson, valuesFold, nowIso(), row.id)
 			);
-			renamedBooks += 1;
+		}
+
+		for (let i = 0; i < bookUpdates.length; i += D1_BATCH_LIMIT) {
+			await runAtomic(c.env, bookUpdates.slice(i, i + D1_BATCH_LIMIT));
 		}
 	}
 
-	// First batch: def update + as many book updates as will fit alongside it.
-	const firstChunk = bookUpdates.slice(0, D1_BATCH_LIMIT - 1);
-	await runAtomic(c.env, [defUpdate, ...firstChunk]);
-	for (let i = firstChunk.length; i < bookUpdates.length; i += D1_BATCH_LIMIT) {
-		await runAtomic(c.env, bookUpdates.slice(i, i + D1_BATCH_LIMIT));
-	}
+	// The definition is updated LAST, deliberately.
+	//
+	// It used to go first (batched with the opening slice of book rewrites).
+	// If a later batch then failed, the definition already carried the NEW key,
+	// so re-running the rename saw old === new, skipped the sweep entirely, and
+	// the un-migrated books kept the old key forever with no way to finish the
+	// job. Writing the definition only after every book is migrated makes the
+	// operation resumable: a failed run leaves the old definition in place and
+	// simply retrying completes it (already-migrated books are no-ops).
+	await c.env.DB.prepare(
+		`UPDATE custom_field_definitions
+			 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
+		 WHERE id = ? AND deleted_at IS NULL`
+	)
+		.bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id)
+		.run();
 
-	// A rename rewrites many books' custom_fields; without bumping the cache
-	// version the 60s KV books-list cache keeps serving the old key/value shape.
-	if (renamedBooks > 0) {
+	// Rewriting many books' custom_fields without bumping the cache version
+	// leaves the books-list cache serving the old key/value shape.
+	if (bookUpdates.length > 0) {
 		await bumpBooksCacheVersion(c.env);
-	}
-
-	// Enum-option removal migration: if this edit dropped one or more enum
-	// options, any book still holding a removed value would fail validation on
-	// its next edit ("must be one of …") and become un-editable, while the UI
-	// shows a valid-looking selection. Clear the orphaned value from those books
-	// so they stay editable. Runs AFTER the rename rewrites, so books already
-	// carry the final key.
-	let clearedEnumBooks = 0;
-	if (payload.type === 'enum') {
-		const oldOpts = existing.field_type === 'enum'
-			? safeJsonParse<string[]>(existing.enum_options ?? '[]', [])
-			: [];
-		const removed = oldOpts.filter((o) => !payload.enumOptions.includes(o));
-		if (removed.length > 0) {
-			const key = payload.key; // post-rename key the books now hold
-			const books = await c.env.DB.prepare('SELECT id, custom_fields FROM books WHERE deleted_at IS NULL').all<{
-				id: string; custom_fields: string;
-			}>();
-			const clearUpdates: D1PreparedStatement[] = [];
-			for (const row of books.results ?? []) {
-				const cf = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
-				if (typeof cf[key] === 'string' && removed.includes(cf[key] as string)) {
-					delete cf[key];
-					const json = JSON.stringify(cf);
-					const fold = computeBookFolds({ customFieldsJson: json }).custom_fields_fold;
-					clearUpdates.push(
-						c.env.DB.prepare('UPDATE books SET custom_fields = ?, custom_fields_fold = ?, updated_at = ?, version = version + 1 WHERE id = ?')
-							.bind(json, fold, nowIso(), row.id)
-					);
-					clearedEnumBooks += 1;
-				}
-			}
-			for (let i = 0; i < clearUpdates.length; i += D1_BATCH_LIMIT) {
-				await runAtomic(c.env, clearUpdates.slice(i, i + D1_BATCH_LIMIT));
-			}
-			if (clearedEnumBooks > 0) await bumpBooksCacheVersion(c.env);
-		}
 	}
 
 	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id, {
 		oldKey: existing.field_key,
 		key: payload.key,
 		renamedBooks,
-		clearedEnumBooks
+		clearedEnumBooks,
+		retypedBooks
 	});
 
-	return c.json({ id });
+	return c.json({ id, renamedBooks, clearedEnumBooks, retypedBooks });
 });
 
 app.delete('/api/custom-fields/:id', requirePermission('customFields.manage', { librarian: true }), async (c) => {
@@ -2508,13 +2655,34 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 	}
 
 	let importedRows = 0;
+	let updatedRows = 0;
 	for (const item of readyRows) {
 		const { index, customFields } = item;
 		const row = normalizeBookData(item.row);
 		// A newly-imported book can't already be on loan — never create it 'borrowed'.
 		if (row.status === 'borrowed') row.status = 'available';
 		try {
-			const bookId = crypto.randomUUID();
+			// Re-running an import is a normal thing to do: the librarian fixes a
+			// few cells and uploads the corrected sheet. When the sheet carries a
+			// stable id, match on it and UPDATE — otherwise every re-run silently
+			// doubled the catalogue and there was no way to undo it in bulk.
+			const legacyId = (item.row as { legacyId?: string | null }).legacyId?.trim() || null;
+			let existing: { id: string; deleted_at: string | null } | null = null;
+			if (legacyId) {
+				existing = await c.env.DB.prepare(
+					'SELECT id, deleted_at FROM books WHERE legacy_id = ? LIMIT 1'
+				)
+					.bind(legacyId)
+					.first<{ id: string; deleted_at: string | null } | null>();
+			}
+			// A book the librarian deliberately trashed must not come back to life
+			// because it is still sitting in the source sheet.
+			if (existing?.deleted_at) {
+				skippedRows.push({ index, reason: 'matching book is in the trash — restore it first' });
+				continue;
+			}
+
+			const bookId = existing?.id ?? crypto.randomUUID();
 			const importTagsJson = JSON.stringify(row.tags);
 			const importCustomFieldsJson = JSON.stringify(customFields);
 			const importFolds = computeBookFolds({
@@ -2526,63 +2694,107 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 				tagsJson: importTagsJson,
 				customFieldsJson: importCustomFieldsJson
 			});
-			await c.env.DB.prepare(
-				`INSERT INTO books (
-					id, title, author, isbn, publication_year, publisher, language, description,
-					room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
-					created_at, updated_at, deleted_at,
-					title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
-			)
-				.bind(
-					bookId,
-					row.title,
-					row.author,
-					row.isbn ?? null,
-					row.publicationYear ?? null,
-					row.publisher ?? null,
-					row.language ?? null,
-					row.description ?? null,
-					row.roomCode ?? null,
-					row.shelfCode ?? null,
-					row.acquisitionDate ?? null,
-					importTagsJson,
-					importCustomFieldsJson,
-					row.status,
-					now,
-					now,
-					importFolds.title_fold,
-					importFolds.author_fold,
-					importFolds.isbn_fold,
-					importFolds.publisher_fold,
-					importFolds.description_fold,
-					importFolds.tags_fold,
-					importFolds.custom_fields_fold
+			if (existing) {
+				// Status is deliberately NOT updated: the book's circulation state is
+				// owned by the borrow/return flow, and a sheet saying 'available'
+				// must not wipe out an open loan.
+				await c.env.DB.prepare(
+					`UPDATE books SET
+						title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?,
+						description = ?, room_code = ?, shelf_code = ?, acquisition_date = ?,
+						tags = ?, custom_fields = ?, updated_at = ?, version = version + 1,
+						title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?,
+						description_fold = ?, tags_fold = ?, custom_fields_fold = ?
+					 WHERE id = ? AND deleted_at IS NULL`
 				)
-				.run();
+					.bind(
+						row.title,
+						row.author,
+						row.isbn ?? null,
+						row.publicationYear ?? null,
+						row.publisher ?? null,
+						row.language ?? null,
+						row.description ?? null,
+						row.roomCode ?? null,
+						row.shelfCode ?? null,
+						row.acquisitionDate ?? null,
+						importTagsJson,
+						importCustomFieldsJson,
+						now,
+						importFolds.title_fold,
+						importFolds.author_fold,
+						importFolds.isbn_fold,
+						importFolds.publisher_fold,
+						importFolds.description_fold,
+						importFolds.tags_fold,
+						importFolds.custom_fields_fold,
+						bookId
+					)
+					.run();
+			} else {
+				await c.env.DB.prepare(
+					`INSERT INTO books (
+						id, title, author, isbn, publication_year, publisher, language, description,
+						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
+						legacy_id, created_at, updated_at, deleted_at,
+						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+				)
+					.bind(
+						bookId,
+						row.title,
+						row.author,
+						row.isbn ?? null,
+						row.publicationYear ?? null,
+						row.publisher ?? null,
+						row.language ?? null,
+						row.description ?? null,
+						row.roomCode ?? null,
+						row.shelfCode ?? null,
+						row.acquisitionDate ?? null,
+						importTagsJson,
+						importCustomFieldsJson,
+						row.status,
+						// Persist the source key so the NEXT re-import can find this row.
+						// It was dropped before, which is why re-imports duplicated.
+						legacyId,
+						now,
+						now,
+						importFolds.title_fold,
+						importFolds.author_fold,
+						importFolds.isbn_fold,
+						importFolds.publisher_fold,
+						importFolds.description_fold,
+						importFolds.tags_fold,
+						importFolds.custom_fields_fold
+					)
+					.run();
+			}
 
 			await replaceBookAttributeValues(c.env, bookId, customFields);
-			importedRows += 1;
+			if (existing) updatedRows += 1;
+			else importedRows += 1;
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : 'insert failed';
 			skippedRows.push({ index, reason });
 		}
 	}
 
-	if (importedRows > 0) {
+	if (importedRows > 0 || updatedRows > 0) {
 		await bumpBooksCacheVersion(c.env);
 	}
 
 	try {
 		await insertAuditLog(c.env, c.get('user').sub, 'book.import', 'book', null, {
 			rows: importedRows,
+			updatedRows,
 			skippedRows
 		});
 	} catch (error) {
 		console.warn('Audit log failed for book.import, continuing', error);
 	}
 
-	return c.json({ importedRows, skippedRows }, 201);
+	return c.json({ importedRows, updatedRows, skippedRows }, 201);
 });
 
 app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: true }), async (c) => {
@@ -2597,50 +2809,108 @@ app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: tr
 		.filter(([key]) => key.startsWith('custom_'))
 		.map(([key, value]) => ({ key: key.replace('custom_', ''), value }));
 
-	// Walk the full result set page by page so we can stream an export of
-	// arbitrary size without holding the whole table in memory or tripping
-	// any single-query result cap. Using a generous pageSize keeps the
-	// round-trip count low; the loop terminates as soon as we hit a short page.
-	const PAGE_SIZE = 100;
+	// Resolve the matching ids in ONE query, then read the rows by id.
+	//
+	// This used to walk `page=1,2,3…` with pageSize 100. OFFSET paging makes
+	// SQLite re-scan and discard every row before the offset, so exporting a
+	// 12.5K catalogue cost ~800K row reads — a single export could eat a
+	// sixth of the daily D1 read budget, and it grew with the SQUARE of the
+	// catalogue. Fetching by id is linear: one id scan plus one read per row.
+	// 20,000 is the ids-only query's own hard cap (see queryBooksWithFilters).
+	const EXPORT_ROW_LIMIT = 20_000;
+	const idResult = await queryBooksWithFilters(c.env, {
+		...query,
+		customFilters,
+		includeDeleted: false,
+		idsOnly: true,
+		idsLimit: EXPORT_ROW_LIMIT,
+		skipCount: true
+	});
+	// Ids-only returns `ids`; the fuzzy-search path can't and returns whole rows
+	// instead, so accept either shape.
+	const exportIds = (
+		idResult.ids ?? (idResult.rows as Array<Record<string, unknown>>).map((r) => String(r.id ?? ''))
+	).filter(Boolean);
+
 	const aggregatedRows: Array<Record<string, unknown>> = [];
-	for (let page = 1; ; page += 1) {
-		const slice = await queryBooksWithFilters(c.env, {
-			...query,
-			customFilters,
-			page,
-			pageSize: PAGE_SIZE,
-			includeDeleted: false,
-			// The export walks every page and discards the total, so skip the
-			// per-page COUNT(*) scan (~12,500 D1 rows read each otherwise).
-			skipCount: true
-		});
-		for (const row of slice.rows) aggregatedRows.push(row);
-		if (slice.rows.length < PAGE_SIZE) break;
-		// Safety stop so a malformed loop can't run forever. 200K rows is
-		// well above the realistic library size; if anyone exports past
-		// that, the result is still useful — just truncated with a header.
-		if (aggregatedRows.length >= 200_000) break;
+	// D1 allows at most 100 bound parameters per statement, so each SELECT takes
+	// 90 ids; several statements are then sent in one batch() so a full-catalogue
+	// export is a handful of round-trips rather than a hundred and forty.
+	const IDS_PER_STATEMENT = 90;
+	const STATEMENTS_PER_BATCH = 20;
+	const idStatements: D1PreparedStatement[] = [];
+	for (let i = 0; i < exportIds.length; i += IDS_PER_STATEMENT) {
+		const batch = exportIds.slice(i, i + IDS_PER_STATEMENT);
+		const placeholders = batch.map(() => '?').join(',');
+		idStatements.push(
+			c.env.DB.prepare(`SELECT * FROM books WHERE id IN (${placeholders}) AND deleted_at IS NULL`).bind(...batch)
+		);
 	}
+	for (let i = 0; i < idStatements.length; i += STATEMENTS_PER_BATCH) {
+		const results = await c.env.DB.batch<Record<string, unknown>>(
+			idStatements.slice(i, i + STATEMENTS_PER_BATCH)
+		);
+		for (const res of results) {
+			for (const row of res.results ?? []) {
+				aggregatedRows.push(parseBook(row) as unknown as Record<string, unknown>);
+			}
+		}
+	}
+	// `IN (...)` does not preserve the requested order, so restore the sort the
+	// caller asked for — an export whose rows are in arbitrary order is much
+	// harder to diff against the previous one.
+	const idOrder = new Map(exportIds.map((exportId, position) => [exportId, position]));
+	aggregatedRows.sort(
+		(a, b) => (idOrder.get(String(a.id)) ?? 0) - (idOrder.get(String(b.id)) ?? 0)
+	);
+
+	// The CSV doubles as this library's off-site backup, so it must carry every
+	// field — not just the twenty columns of the original catalogue sheet.
+	// Previously tags, status, room code, publication year, acquisition date,
+	// the legacy id, and ANY custom field the librarian added later were all
+	// absent, so a restore from this file would have quietly lost them.
+	const extraCoreColumns: DefaultBookStructureColumn[] = [
+		{ label: 'Publication Year', coreKey: 'publicationYear' },
+		{ label: 'Room Code', coreKey: 'roomCode' },
+		{ label: 'Acquisition Date', coreKey: 'acquisitionDate' },
+		{ label: 'Status', coreKey: 'status' },
+		{ label: 'Legacy ID', coreKey: 'legacyId' },
+		{ label: 'Created At', coreKey: 'createdAt' },
+		{ label: 'Updated At', coreKey: 'updatedAt' }
+	];
+	const knownCustomKeys = new Set(
+		DEFAULT_BOOK_STRUCTURE.filter((column) => column.customKey).map((column) => column.customKey as string)
+	);
+	const extraCustomColumns: DefaultBookStructureColumn[] = (await loadCustomFieldDefs(c.env))
+		.filter((def) => !knownCustomKeys.has(def.field_key))
+		.map((def) => ({ label: def.field_key, customKey: def.field_key }));
+
+	const exportColumns: DefaultBookStructureColumn[] = [
+		...DEFAULT_BOOK_STRUCTURE,
+		...extraCoreColumns,
+		...extraCustomColumns
+	];
+	// 'Tags' is handled separately: it is an array on the row and needs joining.
+	const TAGS_LABEL = 'Tags';
 
 	const exportRows = aggregatedRows.map((row) => {
 		const customFields = (row.customFields as Record<string, unknown> | undefined) ?? {};
 		const shaped: Record<string, unknown> = {};
 
-		for (const column of DEFAULT_BOOK_STRUCTURE) {
+		for (const column of exportColumns) {
 			if (column.coreKey) {
 				shaped[column.label] = row[column.coreKey];
 			} else if (column.customKey) {
 				shaped[column.label] = customFields[column.customKey] ?? null;
 			}
 		}
+		const tags = row.tags;
+		shaped[TAGS_LABEL] = Array.isArray(tags) ? tags.join('; ') : (tags ?? null);
 
 		return shaped;
 	});
 
-	const csv = toCsv(
-		exportRows,
-		DEFAULT_BOOK_STRUCTURE.map((column) => column.label)
-	);
+	const csv = toCsv(exportRows, [...exportColumns.map((column) => column.label), TAGS_LABEL]);
 
 	c.header('Content-Type', 'text/csv; charset=utf-8');
 	c.header('Content-Disposition', 'attachment; filename="books.csv"');
@@ -2812,14 +3082,32 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					throw new HTTPException(409, { message: 'Change loan status via the borrow/return actions.' });
 				}
 
+				// Match the direct PUT exactly. Strict validation here meant a queued
+				// edit failed forever if an attribute had since been made required
+				// or deleted — the mutation could never drain, and a bulk edit that
+				// touched only the shelf code was rejected over an unrelated field.
+				const syncCustomFields = await validateCustomFields(
+					c.env,
+					(incoming.customFields ??
+						JSON.parse(((current as Record<string, unknown>).custom_fields as string) ?? '{}')) as Record<string, unknown>,
+					{ requireAllRequired: incoming.customFields !== undefined, rejectUnknownKeys: false }
+				);
+				// Keep values whose DEFINITION was soft-deleted: validate… drops
+				// them, which would quietly erase the book's stored value.
+				{
+					const existingCustom = JSON.parse(
+						((current as Record<string, unknown>).custom_fields as string) ?? '{}'
+					) as Record<string, unknown>;
+					const liveKeys = new Set((await loadCustomFieldDefs(c.env)).map((d) => d.field_key));
+					for (const [k, v] of Object.entries(existingCustom)) {
+						if (!liveKeys.has(k) && !(k in syncCustomFields)) syncCustomFields[k] = v;
+					}
+				}
+
 				const merged = {
 					...parseBook(current as Record<string, unknown>),
 					...incoming,
-					customFields: await validateCustomFields(
-						c.env,
-						(incoming.customFields ??
-							JSON.parse(((current as Record<string, unknown>).custom_fields as string) ?? '{}')) as Record<string, unknown>
-					),
+					customFields: syncCustomFields,
 					version: currentVersion + 1,
 					updatedAt: nowIso()
 				};
@@ -2841,13 +3129,13 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					customFieldsJson: mergedCustomFieldsJson
 				});
 
-				await c.env.DB.prepare(
+				const syncUpd = await c.env.DB.prepare(
 					`UPDATE books SET
 						 title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?, description = ?,
 						 room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 						 version = ?, updated_at = ?,
 						 title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
-					 WHERE id = ? AND deleted_at IS NULL`
+					 WHERE id = ? AND deleted_at IS NULL AND version = ?`
 				)
 					.bind(
 						merged.title,
@@ -2872,9 +3160,15 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						mergedFolds.description_fold,
 						mergedFolds.tags_fold,
 						mergedFolds.custom_fields_fold,
-						row.id
+						row.id,
+						// Same check-then-act guard as the direct PUT: the write only
+						// lands if the row is still at the version we read.
+						currentVersion
 					)
 					.run();
+				if ((syncUpd.meta?.changes ?? 0) === 0) {
+					throw new HTTPException(409, { message: 'Version conflict' });
+				}
 
 				await replaceBookAttributeValues(c.env, row.id, merged.customFields as Record<string, unknown>);
 				resultData = { id: row.id, version: merged.version };
@@ -2934,25 +3228,43 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				}
 				const row = z.object({ id: z.string().min(1), data: ReturnBookSchema }).parse(mutation.payload);
 				const tx = await c.env.DB.prepare(
-					`SELECT id FROM borrow_transactions WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at DESC LIMIT 1`
+					`SELECT id, borrower_name FROM borrow_transactions WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at DESC LIMIT 1`
 				)
 					.bind(row.id)
-					.first<{ id: string }>();
+					.first<{ id: string; borrower_name: string | null }>();
 
 				if (!tx) {
 					throw new HTTPException(409, { message: 'No active borrow transaction found' });
 				}
 
+				// A queued offline return names the loan it saw. Replaying it against
+				// a different open loan would close the wrong borrower's record —
+				// exactly the risk offline queues create, since the mutation may be
+				// hours old by the time it reaches us.
+				if (row.data.transactionId && row.data.transactionId !== tx.id) {
+					throw new HTTPException(409, {
+						message: `This book has since been lent to ${tx.borrower_name || 'someone else'}. Refresh and check before returning.`
+					});
+				}
+
 				const now = nowIso();
 				// Atomic: close the loan AND flip the book to available together, so a
 				// mid-request failure can't leave the book stuck 'borrowed' with no
-				// open loan (mirrors the direct /return endpoint).
-				await runAtomic(c.env, [
-					c.env.DB.prepare(`UPDATE borrow_transactions SET returned_at = ?, notes = COALESCE(?, notes), updated_at = ? WHERE id = ?`)
-						.bind(now, row.data.notes ?? null, now, tx.id),
-					c.env.DB.prepare(`UPDATE books SET status = 'available', version = version + 1, updated_at = ? WHERE id = ?`)
-						.bind(now, row.id)
+				// open loan (mirrors the direct /return endpoint, guards included).
+				const syncReturn = await runAtomic(c.env, [
+					c.env.DB.prepare(
+						`UPDATE borrow_transactions SET returned_at = ?, return_notes = COALESCE(?, return_notes), updated_at = ?
+						 WHERE id = ? AND returned_at IS NULL`
+					).bind(now, row.data.notes ?? null, now, tx.id),
+					c.env.DB.prepare(
+						`UPDATE books SET status = 'available', version = version + 1, updated_at = ?
+						 WHERE id = ? AND deleted_at IS NULL
+						   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ? AND returned_at = ?)`
+					).bind(now, row.id, tx.id, now)
 				]);
+				if ((syncReturn[0]?.meta?.changes ?? 0) === 0) {
+					throw new HTTPException(409, { message: 'This loan was already closed.' });
+				}
 
 				resultData = { transactionId: tx.id };
 			}
@@ -3941,6 +4253,9 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 	const defs = await loadCustomFieldDefs(c.env);
 
 	type Prepared = {
+		// The row's position in the uploaded sheet, so a failure late in the
+		// write loop can name the offending row instead of reporting index -1.
+		sourceIndex: number;
 		legacyId: string | null;
 		title: string;
 		author: string;
@@ -3951,6 +4266,34 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 		description: string | null;
 		shelfCode: string | null;
 		customFields: Record<string, unknown>;
+	};
+
+	// The columns we need from a book that already exists under this legacy id:
+	// its trash state, its custom fields, and every core column — because a
+	// re-import must MERGE with what is on file rather than overwrite it.
+	type ExistingImportRow = {
+		id: string;
+		deleted_at: string | null;
+		custom_fields: string | null;
+		title: string | null;
+		author: string | null;
+		isbn: string | null;
+		publication_year: number | null;
+		publisher: string | null;
+		language: string | null;
+		description: string | null;
+		shelf_code: string | null;
+	};
+
+	// A source sheet is rarely the whole truth: catalogue exports routinely omit
+	// columns, and a partial sheet used to blank publisher/ISBN/description/shelf
+	// on every book it touched — deleting work a librarian had typed in by hand.
+	// A blank cell now means "nothing to say about this field", not "erase it".
+	// (To actually clear a field, edit the book — import is additive.)
+	const keepIfBlank = <T,>(incoming: T | null, existing: T | null): T | null => {
+		if (incoming === null || incoming === undefined) return existing;
+		if (typeof incoming === 'string' && incoming.trim() === '') return existing;
+		return incoming;
 	};
 
 	const prepared: Prepared[] = [];
@@ -3977,6 +4320,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 			});
 
 			prepared.push({
+				sourceIndex: index,
 				legacyId: row.legacyId ? row.legacyId.trim() : null,
 				// Blank title/author are stored as the empty string (the canonical
 				// "no value" form — see normalizeBookData). The NOT NULL columns are
@@ -4035,14 +4379,16 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 			// Fetch deleted_at + existing custom_fields so we can (a) refuse to
 			// resurrect a soft-deleted book and (b) merge rather than clobber the
 			// librarian's manually-entered custom fields on re-import.
-			let existingRow: { id: string; deleted_at: string | null; custom_fields: string | null } | null = null;
+			let existingRow: ExistingImportRow | null = null;
 
 			if (p.legacyId) {
 				existingRow = await c.env.DB.prepare(
-					'SELECT id, deleted_at, custom_fields FROM books WHERE legacy_id = ? LIMIT 1'
+					`SELECT id, deleted_at, custom_fields, title, author, isbn, publication_year,
+					        publisher, language, description, shelf_code
+					 FROM books WHERE legacy_id = ? LIMIT 1`
 				)
 					.bind(p.legacyId)
-					.first<{ id: string; deleted_at: string | null; custom_fields: string | null } | null>();
+					.first<ExistingImportRow | null>();
 			}
 
 			// The book to write into custom_fields / attribute values. For an
@@ -4067,9 +4413,21 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 				delete (sourceCf as Record<string, unknown>).needs_review;
 				effectiveCf = { ...existingCf, ...sourceCf };
 				const mergedCustomJson = JSON.stringify(effectiveCf);
+				// Merge in JS rather than with SQL COALESCE so the *_fold search
+				// columns are derived from the values we are actually storing. Folds
+				// computed from the raw source row would leave a book findable only
+				// under text it no longer has.
+				const mergedTitle = keepIfBlank(p.title, existingRow.title) ?? '';
+				const mergedAuthor = keepIfBlank(p.author, existingRow.author) ?? '';
+				const mergedIsbn = keepIfBlank(p.isbn, existingRow.isbn);
+				const mergedYear = keepIfBlank(p.publicationYear, existingRow.publication_year);
+				const mergedPublisher = keepIfBlank(p.publisher, existingRow.publisher);
+				const mergedLanguage = keepIfBlank(p.language, existingRow.language);
+				const mergedDescription = keepIfBlank(p.description, existingRow.description);
+				const mergedShelf = keepIfBlank(p.shelfCode, existingRow.shelf_code);
 				const folds = computeBookFolds({
-					title: p.title, author: p.author, isbn: p.isbn, publisher: p.publisher,
-					description: p.description, tagsJson: tags, customFieldsJson: mergedCustomJson
+					title: mergedTitle, author: mergedAuthor, isbn: mergedIsbn, publisher: mergedPublisher,
+					description: mergedDescription, tagsJson: tags, customFieldsJson: mergedCustomJson
 				});
 				await c.env.DB.prepare(
 					`UPDATE books SET
@@ -4081,14 +4439,14 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 					 WHERE id = ? AND deleted_at IS NULL`
 				)
 					.bind(
-						p.title,
-						p.author,
-						p.isbn,
-						p.publicationYear,
-						p.publisher,
-						p.language,
-						p.description,
-						p.shelfCode,
+						mergedTitle,
+						mergedAuthor,
+						mergedIsbn,
+						mergedYear,
+						mergedPublisher,
+						mergedLanguage,
+						mergedDescription,
+						mergedShelf,
 						mergedCustomJson,
 						now,
 						folds.title_fold,
@@ -4152,7 +4510,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 			else inserted += 1;
 		} catch (error) {
 			const reason = error instanceof Error ? error.message : 'insert/update failed';
-			skippedRows.push({ index: -1, reason });
+			skippedRows.push({ index: p.sourceIndex, reason });
 		}
 	}
 
@@ -4383,11 +4741,16 @@ app.post('/api/borrowers/:id/erase', requirePermission('setup'), async (c) => {
 	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
 	}
-	// Also strip any free-text `notes` on the borrower's loan history that
-	// might contain identifying phrases the operator typed at borrow time.
+	// Every loan row keeps a denormalized SNAPSHOT of the borrower's name and
+	// contact (so history survives a borrower being deleted). Erasing only the
+	// `borrowers` row therefore erased nothing that mattered — the name and
+	// phone number stayed readable in loan history, exports, and the overdue
+	// list. Anonymize the snapshots and the free-text notes on both sides.
 	await c.env.DB.prepare(
-		'UPDATE borrow_transactions SET notes = NULL WHERE borrower_id = ?'
-	).bind(id).run();
+		`UPDATE borrow_transactions
+		 SET borrower_name = ?, borrower_contact = NULL, notes = NULL, return_notes = NULL, updated_at = ?
+		 WHERE borrower_id = ?`
+	).bind(sentinel, nowIso(), id).run();
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.erase', 'borrower', id, {});
 	return c.json({ id, anonymizedName: sentinel });
 });

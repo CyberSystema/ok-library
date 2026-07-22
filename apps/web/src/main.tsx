@@ -528,7 +528,16 @@ function isPayloadTooLargeError(error: unknown): boolean {
     return true;
   }
 
-  return /too big|payload|entity too large|request too large/i.test(error.message);
+  // A 400 is the server REJECTING the rows (bad custom field, missing title) —
+  // never a size complaint. Matching the bare word "payload" used to catch the
+  // server's own "Invalid import payload." message, so a validation error was
+  // mistaken for an oversized request: the importer kept halving the chunk and,
+  // once it hit the minimum, silently dropped rows one at a time.
+  if (error.status === 400) {
+    return false;
+  }
+
+  return /too big|too large|entity too large|request too large/i.test(error.message);
 }
 
 // Cache-bust families: keys whose paths start with any of these are
@@ -545,7 +554,12 @@ const CACHE_BUST_FAMILIES = [
   'GET /api/borrowers',
   'GET /api/needs-review-count',
   'GET /api/audit-logs',
-  'GET /api/users'
+  'GET /api/users',
+  // The session response carries `needsOnboarding` and the current role. Left
+  // out, a cached copy kept re-launching the finished onboarding course, and a
+  // role change stayed invisible until the cache expired.
+  'GET /api/auth/session',
+  'GET /api/me'
 ];
 
 // Simple network-status signal so the UI can surface a banner when we're
@@ -1664,7 +1678,17 @@ function App() {
       'more copies',
       'tags',
       'status',
-      'customfields'
+      'customfields',
+      // Stable source key — see LEGACY_ID_ALIASES.
+      'legacyid',
+      'legacy id',
+      'legacy_id',
+      'accession',
+      'accession number',
+      'accessionnumber',
+      'catalog id',
+      'catalogue id',
+      'record id'
     ]);
 
     const seen = new Set<string>();
@@ -1692,6 +1716,22 @@ function App() {
 
     return unknown;
   }
+
+  // Column headings that mean "this row's permanent id in the source system".
+  // Ordered most-specific first so a sheet with both `accession number` and a
+  // generic `id` uses the accession number.
+  const LEGACY_ID_ALIASES = [
+    'legacyid',
+    'legacy id',
+    'legacy_id',
+    'accession number',
+    'accessionnumber',
+    'accession',
+    'catalogue id',
+    'catalog id',
+    'record id',
+    'id'
+  ];
 
   function firstSpreadsheetValue(row: Record<string, unknown>, aliases: string[]): unknown {
     for (const alias of aliases) {
@@ -1832,6 +1872,10 @@ function App() {
     return {
       title,
       author: author ?? '',
+      // The sheet's own identifier for the record. Sending it lets a corrected
+      // re-upload UPDATE the books it already created instead of adding a
+      // second copy of each one.
+      legacyId: toNullableText(firstSpreadsheetValue(row, LEGACY_ID_ALIASES)),
       isbn: toNullableText(firstSpreadsheetValue(row, ['isbn'])),
       publicationYear,
       publisher: toNullableText(firstSpreadsheetValue(row, ['publisher'])),
@@ -3128,13 +3172,16 @@ function App() {
     }
   }
 
-  async function quickReturnByBookId(bookId: string, title: string) {
+  // `transactionId` is the loan this screen was showing. The server refuses the
+  // return if a different loan is open now, so a list left open while someone
+  // else returned and re-lent the book can't close the new borrower's loan.
+  async function quickReturnByBookId(bookId: string, title: string, transactionId?: string) {
     clearStatus();
 
     try {
       await runAction(() => apiRequest(`/api/books/${bookId}/return`, {
         method: 'POST',
-        body: JSON.stringify({ notes: 'Returned from active loans list' })
+        body: JSON.stringify({ notes: 'Returned from active loans list', transactionId: transactionId ?? null })
       }));
       setMessage(t('toast.bookReturned', { title }));
       await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
@@ -3158,7 +3205,7 @@ function App() {
           overdueItems.map((item) =>
             apiRequest(`/api/books/${item.bookId}/return`, {
               method: 'POST',
-              body: JSON.stringify({ notes: 'Bulk returned from overdue list' })
+              body: JSON.stringify({ notes: 'Bulk returned from overdue list', transactionId: item.id })
             })
           )
         )
@@ -4028,7 +4075,13 @@ function App() {
               continue;
             }
 
-            throw error;
+            // Anything else is fatal for this run, but rows already written are
+            // IN the database. Saying only "request failed" invites the
+            // librarian to re-upload the whole sheet on top of a partial one.
+            const detail = error instanceof Error ? error.message : String(error);
+            throw new Error(
+              t('toast.importPartialFailure', { imported: totalImported, row: cursor + 2, detail })
+            );
           }
         }
 
@@ -4312,7 +4365,7 @@ function App() {
   function buildLoanMenu(loan: ActiveBorrow): CtxItem[] {
     const items: CtxItem[] = [];
     const title = displayTitle({ title: loan.title }, t('common.untitled'));
-    if (canSeeCirculation) items.push({ label: t('ctx.returnLoan'), icon: '📥', onClick: () => void quickReturnByBookId(loan.bookId, title) });
+    if (canSeeCirculation) items.push({ label: t('ctx.returnLoan'), icon: '📥', onClick: () => void quickReturnByBookId(loan.bookId, title, loan.id) });
     items.push({ label: t('ctx.openBook'), icon: '📖', onClick: () => void openBookById(loan.bookId) });
     if (canSeeCirculation && activeBorrows.some((l) => l.isOverdue)) {
       items.push({ label: t('ctx.returnAllOverdue'), icon: '⏰', onClick: () => void returnAllOverdue() });
@@ -5999,7 +6052,7 @@ function App() {
                               {loan.isOverdue && <span className="overdue-tag"> · {t('loans.overdueTag')}</span>}
                             </p>
                           </div>
-                          <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, displayTitle({ title: loan.title }, t('common.untitled')))}>
+                          <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, displayTitle({ title: loan.title }, t('common.untitled')), loan.id)}>
                             {t('loans.return')}
                           </button>
                         </div>

@@ -134,7 +134,12 @@ export const UpsertBorrowerSchema = BorrowerSchema.pick({
 });
 
 export const ReturnBookSchema = z.object({
-  notes: z.string().max(2000).optional().nullable()
+  notes: z.string().max(2000).optional().nullable(),
+  // Which loan the operator believes they are closing. Optional for backward
+  // compatibility, but when present the server refuses to close a different
+  // one — a screen left open while someone else returned and re-lent the book
+  // would otherwise silently close the NEW borrower's loan.
+  transactionId: z.string().min(1).max(64).optional().nullable()
 });
 
 export const RoomSchema = z.object({
@@ -259,6 +264,9 @@ export const SyncPushSchema = z.object({
 
 export const ImportBooksSchema = z.object({
   dryRun: z.boolean().default(true),
+  // Rows carry the optional `legacyId` from BookCoreSchema — a stable key from
+  // the source spreadsheet. Without one, importing the same file twice creates
+  // a second copy of every book; with one, the second run updates the first.
   rows: z.array(CreateBookSchema).max(2000)
 });
 

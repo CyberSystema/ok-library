@@ -12,7 +12,7 @@ Usage:
 
 Exit code 0 = everything held. Non-zero = at least one assertion failed.
 """
-import json, os, sys, urllib.request, urllib.parse, uuid, zlib, struct
+import csv, io, json, os, sys, urllib.request, urllib.parse, uuid, zlib, struct
 
 BASE = os.environ.get("API", "http://127.0.0.1:8787").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -37,6 +37,18 @@ def call(method, path, body=None, raw=None, ctype=None, token=None):
         t = e.read().decode()
         try: return e.code, (json.loads(t) if t.strip() else None)
         except Exception: return e.code, {"raw": t[:300]}
+
+
+def call_text(method, path, token=None):
+    """Like call(), but returns the raw response body — for CSV and other
+    non-JSON endpoints."""
+    req = urllib.request.Request(BASE + path, method=method,
+                                 headers={"Authorization": f"Bearer {token or TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.status, r.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
 
 
 def check(name, cond, detail=""):
@@ -214,12 +226,160 @@ if st == 201:
 else:
     print(f"  (could not create test librarian: {st}; skipped)")
 
+print("=== 14. REGRESSION: concurrent saves cannot silently clobber ===")
+cb, _ = mkbook(shelfCode="ZZ-A")
+v = get(cb)["version"]
+# Two writers that both read version v. The first wins; the second must be
+# refused rather than overwriting it.
+st1, _ = call("PUT", f"/api/books/{cb}", {"version": v, "shelfCode": "ZZ-FIRST"})
+st2, _ = call("PUT", f"/api/books/{cb}", {"version": v, "shelfCode": "ZZ-SECOND"})
+check("first concurrent save applied", st1 == 200, st1)
+check("second concurrent save refused 409", st2 == 409, st2)
+check("first writer's value survived", get(cb)["shelfCode"] == "ZZ-FIRST", get(cb)["shelfCode"])
+# Same guarantee on the offline-sync path.
+st, r = call("PUT", f"/api/books/{cb}", {"version": get(cb)["version"], "shelfCode": "ZZ-C"})
+stale_v = v
+st, r = call("POST", "/api/sync/push", {"mutations": [{"operation": "update_book",
+    "payload": {"id": cb, "data": {"version": stale_v, "shelfCode": "ZZ-SYNCSTALE"}},
+    "clientMutationId": uuid.uuid4().hex, "clientTimestamp": "2026-07-22T00:00:00.000Z"}]})
+res = (r or {}).get("results", [{}])[0]
+check("sync push rejects a stale-version update", res.get("status") == "error", res)
+check("sync stale write did NOT apply", get(cb)["shelfCode"] == "ZZ-C", get(cb)["shelfCode"])
+
+print("=== 15. REGRESSION: return targets the loan the operator saw ===")
+rb2, _ = mkbook()
+st, r = call("POST", f"/api/books/{rb2}/borrow",
+             {"borrowerName": "ZZ Borrower A", "dueAt": "2027-01-01T00:00:00.000Z", "notes": "borrow-note"})
+tx1 = (r or {}).get("transactionId")
+check("borrow returned a transaction id", bool(tx1), r)
+st, r = call("POST", f"/api/books/{rb2}/return", {"notes": None, "transactionId": "not-the-open-loan"})
+check("return with a mismatched loan id is refused", st == 409, f"{st} {r}")
+check("book still on loan after the refusal", get(rb2)["status"] == "borrowed")
+st, r = call("POST", f"/api/books/{rb2}/return", {"notes": "return-note", "transactionId": tx1})
+check("return with the correct loan id succeeds", st == 200, f"{st} {r}")
+st, hist = call("GET", f"/api/books/{rb2}/history")
+row = (hist or {}).get("items", [{}])[0]
+check("borrow note survived the return", row.get("notes") == "borrow-note", row.get("notes"))
+check("return note stored separately", row.get("returnNotes") == "return-note", row.get("returnNotes"))
+# Closing an already-closed loan must not re-free a book that was lent again.
+st, r = call("POST", f"/api/books/{rb2}/return", {"notes": None, "transactionId": tx1})
+check("closing an already-closed loan is refused", st == 409, f"{st} {r}")
+
+print("=== 16. REGRESSION: borrow leaves no half-written state ===")
+bb2, _ = mkbook()
+st, r = call("POST", f"/api/books/{bb2}/borrow", {"borrowerName": "ZZ Borrower B", "dueAt": "2027-01-01T00:00:00.000Z"})
+st, act = call("GET", "/api/borrow/active")
+open_loans = [x for x in (act or {}).get("items", []) if x.get("bookId") == bb2]
+check("borrowed book owns exactly one open loan", len(open_loans) == 1, len(open_loans))
+check("borrowed book reads as borrowed", get(bb2)["status"] == "borrowed")
+call("POST", f"/api/books/{bb2}/return", {"notes": None})
+
+print("=== 17. REGRESSION: re-import updates instead of duplicating ===")
+legacy = "ZZLEG" + uuid.uuid4().hex[:8]
+row = {"title": "ZZITEST reimport", "author": "ZZ Author", "legacyId": legacy, "shelfCode": "ZZ-R1"}
+st, r1 = call("POST", "/api/import/books", {"dryRun": False, "rows": [row]})
+check("first import inserted", (r1 or {}).get("importedRows") == 1, r1)
+row2 = dict(row); row2["shelfCode"] = "ZZ-R2"
+st, r2 = call("POST", "/api/import/books", {"dryRun": False, "rows": [row2]})
+check("second import updated, did not insert", (r2 or {}).get("updatedRows") == 1 and (r2 or {}).get("importedRows") == 0, r2)
+st, found = call("GET", "/api/books?q=" + urllib.parse.quote("ZZITEST reimport") + "&searchFields=title")
+hits = [b for b in (found or {}).get("items", []) if b.get("legacyId") == legacy]
+for b in hits: CREATED.append(b["id"])
+check("exactly one book exists for the legacy id", len(hits) == 1, len(hits))
+check("re-import applied the corrected value", hits and hits[0]["shelfCode"] == "ZZ-R2", hits and hits[0].get("shelfCode"))
+
+print("=== 18. REGRESSION: erasing a borrower clears their loan history PII ===")
+eb, _ = mkbook()
+pii_name = "ZZ Erase " + uuid.uuid4().hex[:6]
+st, r = call("POST", f"/api/books/{eb}/borrow",
+             {"borrowerName": pii_name, "borrowerContact": "+30 000 000", "dueAt": "2027-01-01T00:00:00.000Z"})
+borrower_id = (r or {}).get("borrowerId")
+call("POST", f"/api/books/{eb}/return", {"notes": None})
+if borrower_id:
+    st, _ = call("POST", f"/api/borrowers/{borrower_id}/erase")
+    check("erase accepted", st == 200, st)
+    st, hist = call("GET", f"/api/books/{eb}/history")
+    names = [x.get("borrowerName") for x in (hist or {}).get("items", [])]
+    contacts = [x.get("borrowerContact") for x in (hist or {}).get("items", [])]
+    check("loan history no longer names the borrower", pii_name not in names, names)
+    check("loan history no longer holds their contact", not any(contacts), contacts)
+else:
+    print("  (no borrower id returned; skipped)")
+
+print("=== 19. REGRESSION: a deactivated account loses access at once ===")
+uname2 = "zzintegrity" + uuid.uuid4().hex[:6]
+st, created_user = call("POST", "/api/users", {"username": uname2, "password": "ZzIntegrity!2026", "role": "librarian"})
+if st == 201:
+    USERS.append(uname2)
+    tok2 = login(uname2, "ZzIntegrity!2026")
+    st, _ = call("GET", "/api/books?pageSize=1", token=tok2)
+    check("new librarian can read while active", st == 200, st)
+    uid = ((created_user or {}).get("user") or {}).get("id")
+    check("created user id returned", bool(uid), created_user)
+    st, r = call("PUT", f"/api/users/{uid}", {"active": False})
+    check("deactivation accepted", st == 200, f"{st} {r}")
+    st, r = call("GET", "/api/books?pageSize=1", token=tok2)
+    check("their existing token stops working once deactivated", st == 401, f"{st} {r}")
+else:
+    print(f"  (could not create test librarian: {st}; skipped)")
+
+print("=== 20. REGRESSION: CSV export carries every field ===")
+csv_book, csv_sent = mkbook(shelfCode="ZZ-CSV", tags=["zztag1", "zztag2"], publicationYear=1977)
+st, csv_text = call_text("GET", "/api/export/books.csv?q=" + urllib.parse.quote(csv_sent["title"]) + "&searchFields=title")
+check("export responded 200", st == 200, st)
+check("export starts with a UTF-8 BOM (Excel reads Greek correctly)", csv_text.startswith("\ufeff"), repr(csv_text[:4]))
+rows = list(csv.reader(io.StringIO(csv_text.lstrip("\ufeff"))))
+head = rows[0]
+for col in ("Status", "Legacy ID", "Room Code", "Publication Year", "Acquisition Date", "Tags"):
+    check(f"export includes the {col!r} column", col in head, head[:6])
+mine = [r for r in rows[1:] if r and r[head.index("Title")] == csv_sent["title"]]
+check("the book appears in its own export", len(mine) == 1, len(mine))
+if mine:
+    rec = dict(zip(head, mine[0]))
+    check("export carries status", rec.get("Status") == "available", rec.get("Status"))
+    check("export carries publication year", rec.get("Publication Year") == "1977", rec.get("Publication Year"))
+    check("export carries tags", rec.get("Tags") == "zztag1; zztag2", rec.get("Tags"))
+
+print("=== 21. REGRESSION: changing a field's type keeps books editable ===")
+fkey = "zzt" + uuid.uuid4().hex[:6]
+st, fdef = call("POST", "/api/custom-fields",
+                {"key": fkey, "label": "ZZ Type Test", "type": "text", "required": False, "enumOptions": []})
+if st == 201:
+    fid = (fdef or {}).get("id")
+    tb, _ = mkbook(customFields={fkey: "1234"})
+    tb2, _ = mkbook(customFields={fkey: "not a number"})
+    st, r = call("PUT", f"/api/custom-fields/{fid}",
+                 {"key": fkey, "label": "ZZ Type Test", "type": "number", "required": False, "enumOptions": []})
+    check("type change accepted", st == 200, f"{st} {r}")
+    check("a convertible value was converted, not dropped", get(tb)["customFields"].get(fkey) == 1234,
+          get(tb)["customFields"])
+    check("an unconvertible value was dropped", fkey not in get(tb2)["customFields"], get(tb2)["customFields"])
+    # The real point: both books must still SAVE.
+    st, _ = call("PUT", f"/api/books/{tb}", {"version": get(tb)["version"], "shelfCode": "ZZ-T1"})
+    check("book with the converted value is still editable", st == 200, st)
+    st, _ = call("PUT", f"/api/books/{tb2}", {"version": get(tb2)["version"], "shelfCode": "ZZ-T2"})
+    check("book whose value was dropped is still editable", st == 200, st)
+    # A rename must move the value, and re-running it must be harmless.
+    fkey2 = fkey + "r"
+    st, _ = call("PUT", f"/api/custom-fields/{fid}",
+                 {"key": fkey2, "label": "ZZ Type Test", "type": "number", "required": False, "enumOptions": []})
+    check("rename accepted", st == 200, st)
+    check("rename moved the value to the new key", get(tb)["customFields"].get(fkey2) == 1234, get(tb)["customFields"])
+    call("DELETE", f"/api/custom-fields/{fid}")
+else:
+    print(f"  (could not create test custom field: {st}; skipped)")
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")
 print(f"  removed {len(CREATED)} test books")
+for uname_ in USERS:
+    st_, list_ = call("GET", "/api/users")
+    row_ = next((u for u in (list_ or {}).get("users", []) if u.get("username") == uname_), None)
+    if row_ and row_.get("active"):
+        call("PUT", f"/api/users/{row_['id']}", {"active": False})
 if USERS:
-    print(f"  NOTE: test user(s) {', '.join(USERS)} remain (deactivate them in Settings)")
+    print(f"  deactivated {len(USERS)} test user(s)")
 
 print("\n" + "=" * 62)
 print(f"PASSED: {len(PASSES)}   FAILED: {len(FAILURES)}")

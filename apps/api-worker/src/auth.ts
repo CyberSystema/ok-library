@@ -264,7 +264,26 @@ export async function authMiddleware(c: Context<{ Bindings: Env; Variables: { us
   }
 
   const claims = await verifyAccessToken(c.env, token);
-  c.set('user', claims);
+
+  // Re-validate the account on every request. The JWT is self-contained and
+  // lives for ~12h, so without this an account that was deactivated, deleted,
+  // or demoted keeps its original access (including writes) until the token
+  // simply expires — an admin revoking someone has no effect. One indexed
+  // primary-key read is a cheap price for making revocation immediate.
+  //
+  // The ROLE is taken from the row, not the token, so a demotion applies at
+  // once and a stale "admin" claim cannot outlive the change.
+  const account = await c.env.DB.prepare(
+    'SELECT role, active FROM staff_users WHERE id = ? LIMIT 1'
+  )
+    .bind(claims.sub)
+    .first<{ role: 'admin' | 'librarian' | 'viewer'; active: number }>();
+
+  if (!account || account.active !== 1) {
+    throw new HTTPException(401, { message: 'Account is no longer active. Please sign in again.' });
+  }
+
+  c.set('user', { ...claims, role: account.role });
   await next();
 }
 
