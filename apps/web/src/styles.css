@@ -2038,3 +2038,75 @@ mark.hl {
     left: 1rem;
   }
 }
+
+/* ── Pinned ("everyday") custom attributes ─────────────────────────────────
+   The eight or so attributes the librarian fills on nearly every book were
+   buried alphabetically among two dozen rarely-used ones. Pinned fields lead
+   every attribute list and are boxed with an accent edge so the group reads as
+   distinct at a glance rather than needing to be searched for. */
+.cf-group-heading {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0.9rem 0 0.4rem;
+}
+.cf-group-heading:first-child { margin-top: 0; }
+
+.cf-pinned-group {
+  background: var(--accent-light);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem 0.85rem 0.85rem;
+  margin-bottom: 0.5rem;
+}
+.cf-pinned-group .cf-group-heading { color: var(--accent-dark); margin-top: 0; }
+
+/* In the Settings list the rows share one bordered container, so the group is
+   marked with the same accent edge rather than a nested box. */
+.cf-row-pinned {
+  background: var(--accent-light);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.cf-pin-on { color: var(--accent-dark); border-color: var(--accent); }
+
+[data-theme="dark"] .cf-pinned-group,
+[data-theme="dark"] .cf-row-pinned { background: rgba(37,99,235,0.14); }
+[data-theme="dark"] .cf-pinned-group .cf-group-heading,
+[data-theme="dark"] .cf-pin-on { color: #93b4fd; }
+
+/* ── Bulk edit panel ──────────────────────────────────────────────────────
+   Every control carries a "Clear" toggle, because in a bulk context an empty
+   box has to mean "leave alone" — the only way left to say "blank this" is an
+   explicit opt-in. */
+.bulk-section-heading {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  color: var(--text);
+  margin: 1.1rem 0 0.5rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+}
+.bulk-section-heading:first-of-type { margin-top: 0; }
+
+.bulk-field { display: flex; flex-direction: column; }
+.bulk-field input:disabled,
+.bulk-field select:disabled {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+  color: var(--text-light);
+}
+.bulk-clear {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.bulk-clear input { width: auto; margin: 0; }
+
+[data-theme="dark"] .bulk-field input:disabled,
+[data-theme="dark"] .bulk-field select:disabled { background: rgba(220,38,38,0.16); }

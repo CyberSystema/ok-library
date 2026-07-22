@@ -369,6 +369,151 @@ if st == 201:
 else:
     print(f"  (could not create test custom field: {st}; skipped)")
 
+print("=== 22. REGRESSION: bulk-setting one attribute must not wipe the others ===")
+# The whole point of customFieldsPatch. The old shape (customFields) REPLACES the
+# map, so a bulk "set series" would have erased every other attribute on every
+# selected book — silently, because most definitions are optional.
+bulk_ids = []
+for _ in range(2):
+    bid_, _sent = mkbook(customFields={"series": "Original", "category_label": "KEEP", "pages": 42},
+                         tags=["keepme"])
+    bulk_ids.append(bid_)
+muts = []
+for bid_ in bulk_ids:
+    muts.append({"operation": "update_book", "clientMutationId": uuid.uuid4().hex,
+                 "clientTimestamp": "2026-07-22T00:00:00.000Z",
+                 "payload": {"id": bid_, "data": {"version": get(bid_)["version"],
+                     "customFieldsPatch": {"series": "New", "signature_notes": "bulk"},
+                     "tagsAdd": ["bulkA"], "shelfCode": "ZZ-BULK"}}})
+st, r = call("POST", "/api/sync/push", {"mutations": muts})
+check("bulk patch push succeeded", all(x["status"] == "success" for x in (r or {}).get("results", [])), r)
+g = get(bulk_ids[0])
+check("patched attribute set", g["customFields"].get("series") == "New", g["customFields"])
+check("new attribute added", g["customFields"].get("signature_notes") == "bulk", g["customFields"])
+check("untouched attribute survived", g["customFields"].get("category_label") == "KEEP", g["customFields"])
+check("untouched numeric attribute survived", g["customFields"].get("pages") == 42, g["customFields"])
+check("core field applied alongside", g["shelfCode"] == "ZZ-BULK", g["shelfCode"])
+check("existing tag survived tagsAdd", "keepme" in g.get("tags", []), g.get("tags"))
+check("tag was added", "bulkA" in g.get("tags", []), g.get("tags"))
+check("title untouched by bulk edit", g["title"].startswith("ZZITEST"), g["title"])
+
+# null in the patch clears exactly one key; tagsRemove removes exactly one tag.
+st, r = call("POST", "/api/sync/push", {"mutations": [{"operation": "update_book",
+    "clientMutationId": uuid.uuid4().hex, "clientTimestamp": "2026-07-22T00:00:00.000Z",
+    "payload": {"id": bulk_ids[1], "data": {"version": get(bulk_ids[1])["version"],
+        "customFieldsPatch": {"series": None}, "tagsRemove": ["bulkA"]}}}]})
+g2 = get(bulk_ids[1])
+check("null in the patch cleared that attribute", "series" not in g2["customFields"], g2["customFields"])
+check("clearing one attribute left the rest", g2["customFields"].get("category_label") == "KEEP", g2["customFields"])
+check("tagsRemove removed only the named tag",
+      "bulkA" not in g2.get("tags", []) and "keepme" in g2.get("tags", []), g2.get("tags"))
+
+# Patched values go through the same type/enum validation as typed ones —
+# otherwise a bulk edit could plant a value that makes books unsaveable.
+st, r = call("POST", "/api/sync/push", {"mutations": [{"operation": "update_book",
+    "clientMutationId": uuid.uuid4().hex, "clientTimestamp": "2026-07-22T00:00:00.000Z",
+    "payload": {"id": bulk_ids[0], "data": {"version": get(bulk_ids[0])["version"],
+        "customFieldsPatch": {"pages": "not a number"}}}}]})
+check("a bad value for a number attribute is refused",
+      (r or {}).get("results", [{}])[0].get("status") == "error", r)
+check("the refused bulk write changed nothing", get(bulk_ids[0])["customFields"].get("pages") == 42,
+      get(bulk_ids[0])["customFields"])
+
+# The direct PUT must behave identically, or the two paths drift.
+st, r = call("PUT", f"/api/books/{bulk_ids[0]}",
+             {"version": get(bulk_ids[0])["version"], "customFieldsPatch": {"editor": "ZZ Editor"}})
+check("direct PUT accepts a patch", st == 200, f"{st} {r}")
+g3 = get(bulk_ids[0])
+check("PUT patch set the attribute", g3["customFields"].get("editor") == "ZZ Editor", g3["customFields"])
+check("PUT patch preserved the others", g3["customFields"].get("category_label") == "KEEP", g3["customFields"])
+
+print("=== 23. REGRESSION: pinned custom attributes lead the list ===")
+st, cf = call("GET", "/api/custom-fields")
+cf_items = (cf or {}).get("items", [])
+cf_pinned = [i for i in cf_items if i.get("pinned")]
+check("the API exposes the pinned flag", len(cf_pinned) > 0, len(cf_items))
+if cf_pinned:
+    check("every pinned attribute precedes every unpinned one",
+          all(i.get("pinned") for i in cf_items[:len(cf_pinned)]),
+          [i["key"] for i in cf_items[:len(cf_pinned) + 1]])
+    check("pinned attributes are ordered by sortOrder",
+          [i.get("sortOrder", 0) for i in cf_pinned] == sorted(i.get("sortOrder", 0) for i in cf_pinned),
+          [(i["key"], i.get("sortOrder")) for i in cf_pinned])
+    # Pinning is a display concern; it must survive an unrelated definition edit.
+    victim_cf = cf_pinned[0]
+    st, _ = call("PUT", f"/api/custom-fields/{victim_cf['id']}", {
+        "key": victim_cf["key"], "label": victim_cf["label"], "type": victim_cf["type"],
+        "required": victim_cf["required"], "pinned": victim_cf["pinned"],
+        "sortOrder": victim_cf.get("sortOrder", 0), "enumOptions": victim_cf["enumOptions"]})
+    st, cf2 = call("GET", "/api/custom-fields")
+    still = next((i for i in (cf2 or {}).get("items", []) if i["id"] == victim_cf["id"]), None)
+    check("a definition edit preserves its pinned state", bool(still and still.get("pinned")), still)
+
+    # A client that predates pinning — or a browser tab left open across the
+    # deploy — omits pinned/sortOrder entirely. That must not silently unpin the
+    # attribute as a side effect of renaming its label.
+    st, _ = call("PUT", f"/api/custom-fields/{victim_cf['id']}", {
+        "key": victim_cf["key"], "label": victim_cf["label"], "type": victim_cf["type"],
+        "required": victim_cf["required"], "enumOptions": victim_cf["enumOptions"]})
+    st, cf3 = call("GET", "/api/custom-fields")
+    legacy = next((i for i in (cf3 or {}).get("items", []) if i["id"] == victim_cf["id"]), None)
+    check("a client omitting pinned/sortOrder does not unpin the attribute",
+          bool(legacy and legacy.get("pinned")), legacy)
+    check("...and keeps its position", legacy and legacy.get("sortOrder") == victim_cf.get("sortOrder"),
+          (legacy or {}).get("sortOrder"))
+
+print("=== 24. REGRESSION: patch-write edge cases found in adversarial review ===")
+# Tags compare case-insensitively — that is how they are SEARCHED. Matching
+# exactly meant "remove History" did nothing to a book tagged "history".
+tb1, _ = mkbook(tags=["history", "Greek"])
+st, r = call("POST", "/api/sync/push", {"mutations": [{"operation": "update_book",
+    "clientMutationId": uuid.uuid4().hex, "clientTimestamp": "2026-07-22T00:00:00.000Z",
+    "payload": {"id": tb1, "data": {"version": get(tb1)["version"], "tagsRemove": ["HISTORY"]}}}]})
+g = get(tb1)
+check("tagsRemove matches regardless of case", "history" not in g.get("tags", []), g.get("tags"))
+check("tagsRemove left the other tags alone", "Greek" in g.get("tags", []), g.get("tags"))
+st, r = call("POST", "/api/sync/push", {"mutations": [{"operation": "update_book",
+    "clientMutationId": uuid.uuid4().hex, "clientTimestamp": "2026-07-22T00:00:00.000Z",
+    "payload": {"id": tb1, "data": {"version": get(tb1)["version"], "tagsAdd": ["GREEK", "new"]}}}]})
+g = get(tb1)
+check("tagsAdd does not duplicate an existing tag in another case",
+      len([x for x in g.get("tags", []) if x.lower() == "greek"]) == 1, g.get("tags"))
+check("tagsAdd still adds genuinely new tags", "new" in g.get("tags", []), g.get("tags"))
+
+# Whitespace is trimmed, and a whitespace-only value is a clear, not content.
+tb2, _ = mkbook(customFields={"series": "Keep"})
+st, r = call("PUT", f"/api/books/{tb2}",
+             {"version": get(tb2)["version"], "customFieldsPatch": {"signature_notes": "  padded  "}})
+check("patched text is trimmed", get(tb2)["customFields"].get("signature_notes") == "padded",
+      get(tb2)["customFields"].get("signature_notes"))
+st, r = call("PUT", f"/api/books/{tb2}",
+             {"version": get(tb2)["version"], "customFieldsPatch": {"signature_notes": "   "}})
+check("a whitespace-only patch clears rather than storing blanks",
+      "signature_notes" not in get(tb2)["customFields"], get(tb2)["customFields"])
+check("the clear left other attributes alone", get(tb2)["customFields"].get("series") == "Keep",
+      get(tb2)["customFields"])
+
+# Clearing a REQUIRED attribute would leave books unsaveable in the book form,
+# which sends the whole map and does enforce required.
+rkey = "zzreq" + uuid.uuid4().hex[:6]
+st, rdef = call("POST", "/api/custom-fields",
+                {"key": rkey, "label": "ZZ Required", "type": "text", "required": True, "enumOptions": []})
+if st == 201:
+    rid = (rdef or {}).get("id")
+    tb3, _ = mkbook(customFields={rkey: "present"})
+    st, r = call("PUT", f"/api/books/{tb3}",
+                 {"version": get(tb3)["version"], "customFieldsPatch": {rkey: None}})
+    check("clearing a required attribute is refused", st == 400, f"{st} {r}")
+    check("the required value survived the refusal", get(tb3)["customFields"].get(rkey) == "present",
+          get(tb3)["customFields"])
+    # Non-required attributes are still clearable.
+    st, r = call("PUT", f"/api/books/{tb3}",
+                 {"version": get(tb3)["version"], "customFieldsPatch": {"series": None}})
+    check("clearing a non-required attribute is still allowed", st == 200, f"{st} {r}")
+    call("DELETE", f"/api/custom-fields/{rid}")
+else:
+    print(f"  (could not create required test field: {st}; skipped)")
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

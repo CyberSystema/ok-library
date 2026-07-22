@@ -9,6 +9,9 @@ type CustomFieldDef = {
   field_type: 'text' | 'number' | 'boolean' | 'date' | 'enum';
   required: number;
   enum_options: string;
+  label?: string;
+  pinned?: number;
+  sort_order?: number;
 };
 
 type CustomFieldValidationOptions = {
@@ -1020,9 +1023,15 @@ export async function validateCustomFields(
 }
 
 export async function loadCustomFieldDefs(env: Env): Promise<CustomFieldDef[]> {
+  // Same ORDER BY as GET /api/custom-fields. This list is not only used for
+  // validation: it also decides the trailing column order of the CSV export and
+  // the order of the autocomplete facet keys. Leaving it unordered meant the
+  // backup file and the screens the librarian works in listed the same
+  // attributes differently.
   const defsResult = await env.DB.prepare(
-    `SELECT id, field_key, field_type, required, enum_options
-     FROM custom_field_definitions WHERE deleted_at IS NULL`
+    `SELECT id, field_key, field_type, required, enum_options, label, pinned, sort_order
+     FROM custom_field_definitions WHERE deleted_at IS NULL
+     ORDER BY pinned DESC, sort_order ASC, label ASC, field_key ASC`
   ).all<CustomFieldDef>();
   return defsResult.results ?? [];
 }

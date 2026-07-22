@@ -149,6 +149,92 @@ function findSimilarCustomField(
  * when `executionCtx.waitUntil` is unavailable (e.g. some test harnesses) —
  * better to do the work synchronously than to silently drop it.
  */
+/**
+ * Refuse a patch that CLEARS a required attribute.
+ *
+ * Patch-shaped writes are deliberately lenient about required attributes — a
+ * bulk edit must not fail because some unrelated book is missing one. But
+ * actively deleting a required value is different: the book form sends the
+ * whole map and DOES enforce required, so the book would 400 the next time
+ * anyone opened and saved it. Cheaper to refuse the clear than to strand books.
+ */
+async function assertPatchKeepsRequiredFields(
+	env: Env,
+	patch: { customFieldsPatch?: Record<string, unknown> } | undefined
+): Promise<void> {
+	const cleared = Object.entries(patch?.customFieldsPatch ?? {})
+		.filter(([, value]) => value === null || (typeof value === 'string' && value.trim() === ''))
+		.map(([key]) => key);
+	if (cleared.length === 0) return;
+
+	const defs = await loadCustomFieldDefs(env);
+	const required = defs.filter((def) => def.required === 1).map((def) => def.field_key);
+	const blocked = cleared.filter((key) => required.includes(key));
+	if (blocked.length > 0) {
+		throw new HTTPException(400, {
+			message: `Cannot clear required attribute(s): ${blocked.join(', ')}`
+		});
+	}
+}
+
+/**
+ * Apply the PATCH-shaped fields of an update (`customFieldsPatch`, `tagsAdd`,
+ * `tagsRemove`) on top of the values a book already has.
+ *
+ * These exist so a bulk edit can change ONE attribute across many books without
+ * transmitting — and therefore without being able to destroy — the attributes it
+ * isn't touching. `customFields` / `tags` remain whole-value replacements for
+ * the single-book form, which does render every field.
+ *
+ * A `null` in the patch clears that one key. Tag add/remove is de-duplicated and
+ * order-preserving, and remove wins over add for the same tag so a request that
+ * says both is at least deterministic.
+ */
+function applyBookPatchFields(
+	base: { customFields: Record<string, unknown>; tags: string[] },
+	patch: { customFieldsPatch?: Record<string, unknown>; tagsAdd?: string[]; tagsRemove?: string[] }
+): { customFields: Record<string, unknown>; tags: string[] } {
+	let customFields = base.customFields;
+	if (patch.customFieldsPatch) {
+		customFields = { ...base.customFields };
+		for (const [key, value] of Object.entries(patch.customFieldsPatch)) {
+			if (value === null) delete customFields[key];
+			// Trim text the same way the core columns are normalized, and treat a
+			// whitespace-only value as a clear rather than storing " " as if it
+			// were content.
+			else if (typeof value === 'string') {
+				const trimmed = value.trim();
+				if (trimmed === '') delete customFields[key];
+				else customFields[key] = trimmed;
+			} else customFields[key] = value;
+		}
+	}
+
+	let tags = base.tags;
+	if (patch.tagsAdd?.length || patch.tagsRemove?.length) {
+		// Tags match case-insensitively, because that is how they are SEARCHED
+		// (tags_fold). Comparing exactly meant "remove History" silently did
+		// nothing to a book tagged "history", and "add History" produced a second
+		// near-identical tag alongside it. The tag's original casing is preserved
+		// on the book; only the comparison is folded.
+		const fold = (tag: string) => tag.trim().toLowerCase();
+		const removing = new Set((patch.tagsRemove ?? []).map(fold).filter(Boolean));
+		const next = base.tags.filter((tag) => !removing.has(fold(tag)));
+		const present = new Set(next.map(fold));
+		for (const tag of patch.tagsAdd ?? []) {
+			const clean = tag.trim();
+			const key = fold(clean);
+			if (clean && !removing.has(key) && !present.has(key)) {
+				next.push(clean);
+				present.add(key);
+			}
+		}
+		tags = next;
+	}
+
+	return { customFields, tags };
+}
+
 function runAfterResponse(c: AppContext, work: () => Promise<unknown>): void {
 	const ctx = c.executionCtx as ExecutionContext | undefined;
 	if (ctx && typeof ctx.waitUntil === 'function') {
@@ -1469,10 +1555,25 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	const now = nowIso();
 	// Lenient mode: tolerate keys whose custom field definition was deleted,
 	// so a legacy value on the book doesn't block an unrelated edit.
+	await assertPatchKeepsRequiredFields(c.env, payload);
+	// Patch first, validate second. Validating only the whole-value form would
+	// let a bulk edit slip an unchecked value past the type/enum rules — a
+	// string into a number field, say — and books carrying an invalid value
+	// become unsaveable the next time anyone opens them.
 	const customFields = await validateCustomFields(
 		c.env,
-		(payload.customFields ?? JSON.parse((existingMap.custom_fields as string) ?? '{}')) as Record<string, unknown>,
-		{ requireAllRequired: payload.customFields !== undefined, rejectUnknownKeys: false }
+		applyBookPatchFields(
+			{
+				customFields: (payload.customFields ??
+					JSON.parse((existingMap.custom_fields as string) ?? '{}')) as Record<string, unknown>,
+				tags: []
+			},
+			payload
+		).customFields,
+		{
+			requireAllRequired: payload.customFields !== undefined,
+			rejectUnknownKeys: false
+		}
 	);
 	// Preserve values whose custom-field DEFINITION was soft-deleted. validate…
 	// strips keys with no live definition, so without this an unrelated edit
@@ -1481,15 +1582,33 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	{
 		const existingCustom = JSON.parse((existingMap.custom_fields as string) ?? '{}') as Record<string, unknown>;
 		const liveKeys = new Set((await loadCustomFieldDefs(c.env)).map((d) => d.field_key));
+		// …except keys the patch explicitly cleared. Re-merging those would undo
+		// the deletion the caller just asked for, so clearing an attribute whose
+		// definition had been soft-deleted would silently never take effect.
+		const explicitlyCleared = new Set(
+			Object.entries(payload.customFieldsPatch ?? {})
+				.filter(([, value]) => value === null || (typeof value === 'string' && value.trim() === ''))
+				.map(([key]) => key)
+		);
 		for (const [k, v] of Object.entries(existingCustom)) {
-			if (!liveKeys.has(k) && !(k in customFields)) customFields[k] = v;
+			if (!liveKeys.has(k) && !(k in customFields) && !explicitlyCleared.has(k)) customFields[k] = v;
 		}
 	}
+	// customFieldsPatch was already folded in above (before validation); only the
+	// tag add/remove still needs applying here.
+	const patched = applyBookPatchFields(
+		{
+			customFields,
+			tags: (payload.tags ?? JSON.parse((existingMap.tags as string) ?? '[]')) as string[]
+		},
+		{ tagsAdd: payload.tagsAdd, tagsRemove: payload.tagsRemove }
+	);
+
 	const merged = {
 		...parseBook(existingMap),
 		...payload,
-		tags: payload.tags ?? JSON.parse((existingMap.tags as string) ?? '[]'),
-		customFields,
+		tags: patched.tags,
+		customFields: patched.customFields,
 		version: currentVersion + 1,
 		updatedAt: now
 	};
@@ -2354,9 +2473,16 @@ app.delete('/api/rooms/:id', requirePermission('rooms.delete'), async (c) => {
 
 app.get('/api/custom-fields', async (c) => {
 	try {
+		// Pinned fields first, then each group by its explicit order, then label.
+		// Alphabetical-by-key alone buried the handful of attributes the librarian
+		// fills on nearly every book among two dozen they rarely open. Every
+		// consumer renders in the order this endpoint returns, so ordering here
+		// keeps the book form, the settings list and the bulk editor consistent.
 		const rows = await c.env.DB.prepare(
-			`SELECT id, field_key, label, field_type, required, enum_options, created_at, updated_at
-			 FROM custom_field_definitions WHERE deleted_at IS NULL ORDER BY field_key ASC`
+			`SELECT id, field_key, label, field_type, required, enum_options, created_at, updated_at,
+			        pinned, sort_order
+			 FROM custom_field_definitions WHERE deleted_at IS NULL
+			 ORDER BY pinned DESC, sort_order ASC, label ASC, field_key ASC`
 		).all();
 
 		const items = (rows.results ?? []).map((row) => {
@@ -2368,6 +2494,8 @@ app.get('/api/custom-fields', async (c) => {
 					label: r.label ?? '',
 					type: r.field_type ?? 'text',
 					required: r.required === 1,
+					pinned: r.pinned === 1,
+					sortOrder: Number(r.sort_order ?? 0),
 					enumOptions: JSON.parse((r.enum_options as string) ?? '[]'),
 					createdAt: r.created_at ?? '',
 					updatedAt: r.updated_at ?? ''
@@ -2380,6 +2508,8 @@ app.get('/api/custom-fields', async (c) => {
 					label: (row as Record<string, unknown>).label ?? '',
 					type: (row as Record<string, unknown>).field_type ?? 'text',
 					required: false,
+					pinned: (row as Record<string, unknown>).pinned === 1,
+					sortOrder: Number((row as Record<string, unknown>).sort_order ?? 0),
 					enumOptions: [],
 					createdAt: (row as Record<string, unknown>).created_at ?? '',
 					updatedAt: (row as Record<string, unknown>).updated_at ?? ''
@@ -2401,10 +2531,15 @@ app.post('/api/custom-fields', requirePermission('customFields.manage', { librar
 
 	await c.env.DB.prepare(
 		`INSERT INTO custom_field_definitions
-			(id, field_key, label, field_type, required, enum_options, created_at, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+			(id, field_key, label, field_type, required, enum_options, created_at, updated_at, deleted_at,
+			 pinned, sort_order)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`
 	)
-		.bind(id, payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, now)
+		.bind(
+			id, payload.key, payload.label, payload.type, payload.required ? 1 : 0,
+			JSON.stringify(payload.enumOptions), now, now,
+			payload.pinned ? 1 : 0, payload.sortOrder ?? 0
+		)
 		.run();
 
 	await insertAuditLog(c.env, c.get('user').sub, 'customField.create', 'custom_field', id, {
@@ -2424,10 +2559,13 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 	const now = nowIso();
 
 	const existing = await c.env.DB.prepare(
-		'SELECT id, field_key, field_type, enum_options FROM custom_field_definitions WHERE id = ? AND deleted_at IS NULL LIMIT 1'
+		'SELECT id, field_key, field_type, enum_options, pinned, sort_order FROM custom_field_definitions WHERE id = ? AND deleted_at IS NULL LIMIT 1'
 	)
 		.bind(id)
-		.first<{ id: string; field_key: string; field_type: string; enum_options: string | null }>();
+		.first<{
+			id: string; field_key: string; field_type: string; enum_options: string | null;
+			pinned: number; sort_order: number;
+		}>();
 
 	if (!existing) {
 		throw new HTTPException(404, { message: 'Custom field not found' });
@@ -2564,10 +2702,20 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 	// simply retrying completes it (already-migrated books are no-ops).
 	await c.env.DB.prepare(
 		`UPDATE custom_field_definitions
-			 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?
+			 SET field_key = ?, label = ?, field_type = ?, required = ?, enum_options = ?, updated_at = ?,
+			     pinned = ?, sort_order = ?
 		 WHERE id = ? AND deleted_at IS NULL`
 	)
-		.bind(payload.key, payload.label, payload.type, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions), now, id)
+		.bind(
+			payload.key, payload.label, payload.type, payload.required ? 1 : 0,
+			JSON.stringify(payload.enumOptions), now,
+			// Omitted => keep the placement the librarian already chose. A client
+			// that predates pinning (or a tab left open across the deploy) would
+			// otherwise unpin an attribute as a side effect of renaming its label.
+			(payload.pinned ?? existing.pinned === 1) ? 1 : 0,
+			payload.sortOrder ?? existing.sort_order,
+			id
+		)
 		.run();
 
 	// Rewriting many books' custom_fields without bumping the cache version
@@ -3086,10 +3234,18 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				// edit failed forever if an attribute had since been made required
 				// or deleted — the mutation could never drain, and a bulk edit that
 				// touched only the shelf code was rejected over an unrelated field.
+				await assertPatchKeepsRequiredFields(c.env, incoming);
 				const syncCustomFields = await validateCustomFields(
 					c.env,
-					(incoming.customFields ??
-						JSON.parse(((current as Record<string, unknown>).custom_fields as string) ?? '{}')) as Record<string, unknown>,
+					// Patch before validating — see the direct PUT for why.
+					applyBookPatchFields(
+						{
+							customFields: (incoming.customFields ??
+								JSON.parse(((current as Record<string, unknown>).custom_fields as string) ?? '{}')) as Record<string, unknown>,
+							tags: []
+						},
+						incoming
+					).customFields,
 					{ requireAllRequired: incoming.customFields !== undefined, rejectUnknownKeys: false }
 				);
 				// Keep values whose DEFINITION was soft-deleted: validate… drops
@@ -3099,15 +3255,31 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						((current as Record<string, unknown>).custom_fields as string) ?? '{}'
 					) as Record<string, unknown>;
 					const liveKeys = new Set((await loadCustomFieldDefs(c.env)).map((d) => d.field_key));
+					// …but never resurrect a key the patch just cleared (see the PUT).
+					const syncCleared = new Set(
+						Object.entries(incoming.customFieldsPatch ?? {})
+							.filter(([, value]) => value === null || (typeof value === 'string' && value.trim() === ''))
+							.map(([key]) => key)
+					);
 					for (const [k, v] of Object.entries(existingCustom)) {
-						if (!liveKeys.has(k) && !(k in syncCustomFields)) syncCustomFields[k] = v;
+						if (!liveKeys.has(k) && !(k in syncCustomFields) && !syncCleared.has(k)) syncCustomFields[k] = v;
 					}
 				}
 
+				const syncBase = parseBook(current as Record<string, unknown>);
+				const syncPatched = applyBookPatchFields(
+					{
+						customFields: syncCustomFields,
+						tags: (incoming.tags ?? syncBase.tags ?? []) as string[]
+					},
+					{ tagsAdd: incoming.tagsAdd, tagsRemove: incoming.tagsRemove }
+				);
+
 				const merged = {
-					...parseBook(current as Record<string, unknown>),
+					...syncBase,
 					...incoming,
-					customFields: syncCustomFields,
+					tags: syncPatched.tags,
+					customFields: syncPatched.customFields,
 					version: currentVersion + 1,
 					updatedAt: nowIso()
 				};

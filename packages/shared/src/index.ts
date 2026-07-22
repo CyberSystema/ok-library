@@ -91,7 +91,24 @@ export const UpdateBookSchema = CreateBookSchema.partial().extend({
   author: z.string().max(200).optional(),
   tags: z.array(z.string().max(50)).max(30).optional(),
   status: BookStatusSchema.optional(),
-  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).optional()
+  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
+
+  // PATCH forms, for setting one attribute across many books.
+  //
+  // `customFields` above REPLACES the whole map, which is right for a form that
+  // renders every attribute but catastrophic for a bulk edit: sending
+  // `{ series: 'X' }` for 300 books would erase every other attribute on all of
+  // them. `customFieldsPatch` merges instead — listed keys are set, `null`
+  // clears that one key, everything else is left alone. Making the safe shape
+  // expressible on the wire means a bulk edit never has to send (and so can
+  // never mangle) values it isn't changing.
+  customFieldsPatch: z
+    .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
+    .optional(),
+  // Same reasoning for tags: add/remove rather than replace, so bulk-tagging
+  // 300 books doesn't strip the tags each of them already carries.
+  tagsAdd: z.array(z.string().max(50)).max(30).optional(),
+  tagsRemove: z.array(z.string().max(50)).max(30).optional()
 });
 
 export const BookSchema = CreateBookSchema.extend({
@@ -167,6 +184,10 @@ export const CustomFieldSchema = z.object({
   label: z.string().min(1).max(200),
   type: CustomFieldTypeSchema,
   required: z.boolean(),
+  // Pinned attributes lead every attribute list, in `sortOrder`, so the fields
+  // the librarian fills on nearly every book aren't buried among the rare ones.
+  pinned: z.boolean().default(false),
+  sortOrder: z.number().int().min(0).max(9999).default(0),
   enumOptions: z.array(z.string().max(100)).default([]),
   createdAt: ISODateTimeSchema,
   updatedAt: ISODateTimeSchema
@@ -178,6 +199,17 @@ export const UpsertCustomFieldSchema = CustomFieldSchema.pick({
   type: true,
   required: true,
   enumOptions: true
+}).extend({
+  // Declared OPTIONAL here rather than picked from CustomFieldSchema, whose
+  // `.default(false)` would make an omitted value indistinguishable from an
+  // explicit `false`. A client that predates pinning — or simply a browser tab
+  // left open across the deploy — omits these; defaulting them would silently
+  // UNPIN an attribute as a side effect of renaming its label. Absent means
+  // "leave the current placement alone" (the update handler falls back to the
+  // stored row); on create there is nothing to fall back to, so it means
+  // unpinned/0.
+  pinned: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).max(9999).optional()
 }).superRefine((value, ctx) => {
   if (ReservedBookAttributeKeys.has(value.key)) {
     ctx.addIssue({

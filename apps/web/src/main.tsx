@@ -1,4 +1,4 @@
-import React, { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { Fragment, FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import {
   BookCardSkeleton,
@@ -80,6 +80,10 @@ type CustomField = {
   label: string;
   type: 'text' | 'number' | 'boolean' | 'date' | 'enum';
   required: boolean;
+  // Pinned attributes lead every attribute list, ordered by sortOrder. Optional
+  // so a client running against an API that predates the columns still parses.
+  pinned?: boolean;
+  sortOrder?: number;
   enumOptions: string[];
 };
 
@@ -1132,6 +1136,10 @@ function App() {
     label: '',
     type: 'text' as 'text' | 'number' | 'boolean' | 'date' | 'enum',
     required: false,
+    // Pinned attributes lead every attribute list. `sortOrder` positions the
+    // field within its group; ties fall back to the label.
+    pinned: false,
+    sortOrder: 0,
     enumOptionsCsv: ''
   });
   const [editingCustomFieldId, setEditingCustomFieldId] = useState<string | null>(null);
@@ -1194,7 +1202,15 @@ function App() {
   const coverUploadBookRef = useRef<Book | null>(null);
   const [showAddBook, setShowAddBook] = useState(false);
   const [bulkStatus, setBulkStatus] = useState<string>('');
-  const [bulkShelfCode, setBulkShelfCode] = useState('');
+  // Full bulk editor. Values are keyed 'core:<bookKey>' or 'cf:<attributeKey>';
+  // a key is only written if it appears in `bulkEditValues` (set it) or in
+  // `bulkEditClears` (blank it). Anything absent from BOTH is left untouched —
+  // an empty text box must never mean "erase this on 300 books".
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const [bulkEditValues, setBulkEditValues] = useState<Record<string, string>>({});
+  const [bulkEditClears, setBulkEditClears] = useState<Set<string>>(new Set());
+  const [bulkTagsAdd, setBulkTagsAdd] = useState('');
+  const [bulkTagsRemove, setBulkTagsRemove] = useState('');
   const [duplicateGroups, setDuplicateGroups] = useState<DuplicateGroup[]>([]);
   // Value-consistency tool: fold-equivalent spelling variants of a field.
   type VariantField = 'author' | 'publisher' | 'language' | 'shelfCode' | 'title';
@@ -1785,7 +1801,13 @@ function App() {
       return exact.key;
     }
 
-    const similar = customFields.find(
+    // The fuzzy fallback takes the FIRST match, so it must not depend on the
+    // order `customFields` happens to be in — that order is a DISPLAY concern
+    // (pinned attributes lead the list) and changing it must never silently
+    // re-point a spreadsheet column at a different attribute. Scan a copy
+    // sorted by key so the mapping is stable whatever the display order is.
+    const byKey = [...customFields].sort((a, b) => a.key.localeCompare(b.key));
+    const similar = byKey.find(
       (field) => columnsAreSimilar(field.key, preferredKey) || columnsAreSimilar(field.label, labelHint)
     );
     return similar?.key ?? preferredKey;
@@ -3424,6 +3446,170 @@ function App() {
     return { success, failed, okIds };
   }
 
+  // The core book columns a bulk edit may set. Deliberately excludes title,
+  // author, ISBN and description: those identify a specific book, and setting
+  // them across a selection is never what the librarian meant. Status is handled
+  // separately (it has a fixed option list and a circulation guard).
+  const BULK_CORE_FIELDS: Array<{
+    key: 'shelfCode' | 'roomCode' | 'publisher' | 'language' | 'publicationYear';
+    labelKey: string;
+    type: 'text' | 'number';
+    listId?: string;
+  }> = [
+    { key: 'shelfCode', labelKey: 'library.bulk.field.shelfCode', type: 'text', listId: 'suggest-shelf' },
+    // No listId: there is no room-code facet, so there is no datalist to point at.
+    { key: 'roomCode', labelKey: 'library.bulk.field.roomCode', type: 'text' },
+    { key: 'publisher', labelKey: 'library.bulk.field.publisher', type: 'text', listId: 'suggest-publisher' },
+    { key: 'language', labelKey: 'library.bulk.field.language', type: 'text', listId: 'suggest-language' },
+    { key: 'publicationYear', labelKey: 'library.bulk.field.publicationYear', type: 'number' }
+  ];
+
+  function resetBulkEditor() {
+    setBulkEditValues({});
+    setBulkEditClears(new Set());
+    setBulkTagsAdd('');
+    setBulkTagsRemove('');
+    setBulkStatus('');
+  }
+
+  // Dismissing the panel DISCARDS what was typed in it. Merely hiding it left
+  // the values armed while the bar showed only status + shelf, so the next
+  // click of the bar's Apply silently wrote fields the librarian had backed out
+  // of — to every selected book. "Cancel" has to mean cancel.
+  function closeBulkEditor() {
+    setBulkEditOpen(false);
+    resetBulkEditor();
+  }
+
+  function setBulkEditValue(fieldId: string, value: string) {
+    setBulkEditValues((prev) => {
+      const next = { ...prev };
+      if (value === '') delete next[fieldId];
+      else next[fieldId] = value;
+      return next;
+    });
+    // Typing a value and asking to clear the same field are contradictory;
+    // the last action wins.
+    if (value !== '') {
+      setBulkEditClears((prev) => {
+        if (!prev.has(fieldId)) return prev;
+        const next = new Set(prev);
+        next.delete(fieldId);
+        return next;
+      });
+    }
+  }
+
+  function toggleBulkEditClear(fieldId: string) {
+    const willClear = !bulkEditClears.has(fieldId);
+    setBulkEditClears((prev) => {
+      const next = new Set(prev);
+      if (willClear) next.add(fieldId);
+      else next.delete(fieldId);
+      return next;
+    });
+    // Separate call, not nested inside the updater above: React may invoke an
+    // updater more than once, and queueing a second setState from inside one is
+    // not guaranteed to run.
+    if (willClear) {
+      setBulkEditValues((vals) => {
+        if (!(fieldId in vals)) return vals;
+        const next = { ...vals };
+        delete next[fieldId];
+        return next;
+      });
+    }
+  }
+
+  // How many distinct fields the current bulk edit would write. Drives the
+  // confirmation copy and disables Apply when nothing is pending.
+  const bulkEditPendingCount =
+    Object.keys(bulkEditValues).length +
+    bulkEditClears.size +
+    (bulkStatus ? 1 : 0) +
+    (bulkTagsAdd.trim() ? 1 : 0) +
+    (bulkTagsRemove.trim() ? 1 : 0);
+
+  // One custom attribute inside the bulk editor. Mirrors the book form's input
+  // types so a value set in bulk is the same shape as one typed on a book — but
+  // every control additionally supports "leave unchanged", which the single-book
+  // form has no need for.
+  function renderBulkCustomField(field: CustomField): React.ReactNode {
+    const fieldId = `cf:${field.key}`;
+    const cleared = bulkEditClears.has(fieldId);
+    const raw = bulkEditValues[fieldId] ?? '';
+    const inputId = `bulk-${fieldId}`;
+
+    // A required attribute cannot be cleared — the server refuses it, because
+    // the book form enforces required and those books would stop saving. Don't
+    // offer a control that can only fail; mark the field instead.
+    const clearToggle = field.required ? null : (
+      <label className="checkbox-label bulk-clear">
+        <input type="checkbox" checked={cleared} onChange={() => toggleBulkEditClear(fieldId)} />
+        <span className="muted small">{t('library.bulk.clear2')}</span>
+      </label>
+    );
+    const requiredMark = field.required ? <span className="required-mark"> *</span> : null;
+
+    // Booleans need a third state the book form doesn't: "don't touch this".
+    // A plain checkbox can only say true/false, and defaulting to false would
+    // silently set the attribute on every selected book.
+    if (field.type === 'boolean') {
+      return (
+        <div key={fieldId} className="form-field bulk-field">
+          <label htmlFor={inputId}>{field.label}{requiredMark}</label>
+          <select
+            id={inputId}
+            value={raw}
+            disabled={cleared}
+            onChange={(e) => setBulkEditValue(fieldId, e.target.value)}
+          >
+            <option value="">{t('library.bulk.unchanged')}</option>
+            <option value="true">{t('common.yes')}</option>
+            <option value="false">{t('common.no')}</option>
+          </select>
+          {clearToggle}
+        </div>
+      );
+    }
+
+    if (field.type === 'enum') {
+      return (
+        <div key={fieldId} className="form-field bulk-field">
+          <label htmlFor={inputId}>{field.label}{requiredMark}</label>
+          <select
+            id={inputId}
+            value={raw}
+            disabled={cleared}
+            onChange={(e) => setBulkEditValue(fieldId, e.target.value)}
+          >
+            <option value="">{t('library.bulk.unchanged')}</option>
+            {field.enumOptions.map((opt) => (
+              <option key={opt} value={opt}>{opt}</option>
+            ))}
+          </select>
+          {clearToggle}
+        </div>
+      );
+    }
+
+    return (
+      <div key={fieldId} className="form-field bulk-field">
+        <label htmlFor={inputId}>{field.label}{requiredMark}</label>
+        <input
+          id={inputId}
+          type={field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text'}
+          value={raw}
+          disabled={cleared}
+          onChange={(e) => setBulkEditValue(fieldId, e.target.value)}
+          placeholder={cleared ? t('library.bulk.willClear') : t('library.bulk.unchanged')}
+          list={field.type === 'text' ? `suggest-cf-${field.key}` : undefined}
+        />
+        {clearToggle}
+      </div>
+    );
+  }
+
   async function applyBulkBookChanges() {
     clearStatus();
 
@@ -3436,9 +3622,65 @@ function App() {
       if (bulkStatus) {
         updates.status = bulkStatus;
       }
-      if (bulkShelfCode.trim()) {
-        updates.shelfCode = bulkShelfCode.trim();
+      // Core columns from the full editor. A field is written only if the
+      // librarian typed a value or explicitly asked to blank it.
+      for (const field of BULK_CORE_FIELDS) {
+        const fieldId = `core:${field.key}`;
+        if (bulkEditClears.has(fieldId)) {
+          updates[field.key] = null;
+          continue;
+        }
+        const raw = bulkEditValues[fieldId];
+        if (raw === undefined || raw.trim() === '') continue;
+        if (field.type === 'number') {
+          const n = Number(raw.trim());
+          if (!Number.isFinite(n)) {
+            throw new Error(t('toast.bulkBadNumber', { label: t(field.labelKey) }));
+          }
+          updates[field.key] = n;
+        } else {
+          updates[field.key] = raw.trim();
+        }
       }
+
+      // Custom attributes go through customFieldsPatch, NOT customFields: the
+      // latter replaces the whole attribute map, so setting one attribute would
+      // erase every other attribute on every selected book. `null` in the patch
+      // clears exactly that one key.
+      const customFieldsPatch: Record<string, string | number | boolean | null> = {};
+      for (const field of customFields) {
+        const fieldId = `cf:${field.key}`;
+        if (bulkEditClears.has(fieldId)) {
+          customFieldsPatch[field.key] = null;
+          continue;
+        }
+        const raw = bulkEditValues[fieldId];
+        // `.trim()` like the core columns above: a box holding only spaces is
+        // an untouched box, not an instruction to write blanks (and not a
+        // clear either — that is the explicit tick).
+        if (raw === undefined || raw.trim() === '') continue;
+        if (field.type === 'number') {
+          const n = Number(raw.trim());
+          if (!Number.isFinite(n)) {
+            throw new Error(t('toast.bulkBadNumber', { label: field.label }));
+          }
+          customFieldsPatch[field.key] = n;
+        } else if (field.type === 'boolean') {
+          customFieldsPatch[field.key] = raw === 'true';
+        } else {
+          customFieldsPatch[field.key] = raw.trim();
+        }
+      }
+      if (Object.keys(customFieldsPatch).length > 0) {
+        updates.customFieldsPatch = customFieldsPatch;
+      }
+
+      // Tags are added/removed rather than replaced, so bulk-tagging a
+      // selection never strips the tags each book already carries.
+      const tagsAdd = parseStringArray(bulkTagsAdd);
+      const tagsRemove = parseStringArray(bulkTagsRemove);
+      if (tagsAdd.length > 0) updates.tagsAdd = tagsAdd;
+      if (tagsRemove.length > 0) updates.tagsRemove = tagsRemove;
 
       if (Object.keys(updates).length === 0) {
         throw new Error(t('toast.bulkRequireValue'));
@@ -3463,10 +3705,10 @@ function App() {
         setMessage(t('toast.bulkAll', { n: success }));
       }
 
-      setBulkStatus('');
-      setBulkShelfCode('');
+      resetBulkEditor();
+      setBulkEditOpen(false);
       // The selection deliberately survives the action — only the user clears it.
-      await Promise.all([loadBooks(), loadRoomSummary()]);
+      await Promise.all([loadBooks(), loadRoomSummary(), loadFacets()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -3563,8 +3805,88 @@ function App() {
     }
   }
 
+  // The server already returns pinned-first; splitting the list here lets the
+  // UI show the two groups distinctly without re-sorting (and therefore without
+  // any risk of the settings list and the book form disagreeing on order).
+  const pinnedCustomFields = useMemo(() => customFields.filter((f) => f.pinned), [customFields]);
+  const unpinnedCustomFields = useMemo(() => customFields.filter((f) => !f.pinned), [customFields]);
+
+  // Pin/unpin in one click. A newly pinned field goes to the END of the pinned
+  // group rather than the top, so pinning one attribute never reshuffles the
+  // ones the librarian has already arranged.
+  async function toggleCustomFieldPin(field: CustomField) {
+    clearStatus();
+    try {
+      const nextPinned = !field.pinned;
+      const nextOrder = nextPinned
+        ? Math.max(0, ...pinnedCustomFields.map((f) => f.sortOrder ?? 0)) + 1
+        : 0;
+      await runAction(() => apiRequest(`/api/custom-fields/${field.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          key: field.key,
+          label: field.label,
+          type: field.type,
+          required: field.required,
+          pinned: nextPinned,
+          sortOrder: nextOrder,
+          enumOptions: field.enumOptions
+        })
+      }));
+      await loadCustomFields();
+      setMessage(nextPinned
+        ? t('toast.customFieldPinned', { label: field.label })
+        : t('toast.customFieldUnpinned', { label: field.label }));
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // Move a pinned field one place up or down by SWAPPING sort orders with its
+  // neighbour. Swapping (rather than renumbering the whole group) keeps this to
+  // two writes no matter how many attributes are pinned.
+  async function moveCustomField(field: CustomField, direction: -1 | 1) {
+    clearStatus();
+    try {
+      const group = pinnedCustomFields;
+      const index = group.findIndex((f) => f.id === field.id);
+      const swapWith = group[index + direction];
+      if (index < 0 || !swapWith) return;
+
+      const save = (f: CustomField, sortOrder: number) =>
+        apiRequest(`/api/custom-fields/${f.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            key: f.key,
+            label: f.label,
+            type: f.type,
+            required: f.required,
+            pinned: f.pinned,
+            sortOrder,
+            enumOptions: f.enumOptions
+          })
+        });
+
+      // If two fields share a sort order (e.g. both freshly pinned) a naive swap
+      // is a no-op, so fall back to explicit consecutive positions.
+      const a = field.sortOrder ?? 0;
+      const b = swapWith.sortOrder ?? 0;
+      // Clamp: the schema's minimum is 0, so moving the first field up from a
+      // tied order would otherwise send -1 and 400.
+      const [nextA, nextB] = a === b ? [Math.max(0, b + direction), b] : [b, a];
+
+      await runAction(async () => {
+        await save(field, nextA);
+        await save(swapWith, nextB);
+      });
+      await loadCustomFields();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   function resetCustomFieldForm() {
-    setFieldForm({ key: '', label: '', type: 'text', required: false, enumOptionsCsv: '' });
+    setFieldForm({ key: '', label: '', type: 'text', required: false, pinned: false, sortOrder: 0, enumOptionsCsv: '' });
     setEditingCustomFieldId(null);
   }
 
@@ -3575,6 +3897,8 @@ function App() {
       label: field.label,
       type: field.type,
       required: field.required,
+      pinned: field.pinned ?? false,
+      sortOrder: field.sortOrder ?? 0,
       enumOptionsCsv: field.enumOptions.join(', ')
     });
   }
@@ -3629,6 +3953,8 @@ function App() {
           label: fieldForm.label.trim(),
           type: fieldForm.type,
           required: fieldForm.required,
+          pinned: fieldForm.pinned,
+          sortOrder: fieldForm.sortOrder,
           enumOptions: normalizedOptions
         })
       }));
@@ -4128,73 +4454,93 @@ function App() {
         <p className="muted small">{t('settings.customFieldsEmpty')}</p>
       );
     }
+    // Render one field. Shared by the pinned group and the rest so the two
+    // groups can never drift apart in behaviour — only in presentation.
+    const renderField = (field: CustomField) => {
+      const v = values[field.key];
+      const idAttr = `cf-${field.key}`;
+      const hasError = errorKeys?.has(`cf:${field.key}`) ?? false;
+      const mark = field.required ? <span className="required-mark"> *</span> : null;
+      if (field.type === 'boolean') {
+        const checked = v === true || v === 'true';
+        return (
+          <label key={field.key} className="checkbox-label cf-bool">
+            <input
+              id={idAttr}
+              type="checkbox"
+              checked={checked}
+              onChange={(e) => setValue(field.key, e.target.checked)}
+            />
+            <span>{field.label}{mark}</span>
+          </label>
+        );
+      }
+      if (field.type === 'enum') {
+        return (
+          <div key={field.key} className="form-field">
+            <label htmlFor={idAttr}>{field.label}{mark}</label>
+            <select
+              id={idAttr}
+              className={hasError ? 'input-error' : undefined}
+              aria-required={field.required || undefined}
+              aria-invalid={hasError || undefined}
+              value={(v as string) ?? ''}
+              onChange={(e) => setValue(field.key, e.target.value || null)}
+            >
+              <option value="">{t('common.none')}</option>
+              {field.enumOptions.map((opt) => (
+                <option key={opt} value={opt}>{opt}</option>
+              ))}
+            </select>
+          </div>
+        );
+      }
+      const inputType = field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text';
+      // Date inputs need YYYY-MM-DD; truncate any ISO timestamp before binding.
+      const displayValue =
+        field.type === 'date' && typeof v === 'string' && v.length >= 10
+          ? v.slice(0, 10)
+          : (v as string | number | null | undefined) ?? '';
+      return (
+        <div key={field.key} className="form-field">
+          <label htmlFor={idAttr}>{field.label}{mark}</label>
+          <input
+            id={idAttr}
+            type={inputType}
+            className={hasError ? 'input-error' : undefined}
+            aria-required={field.required || undefined}
+            aria-invalid={hasError || undefined}
+            value={displayValue === null || displayValue === undefined ? '' : String(displayValue)}
+            onChange={(e) => setValue(field.key, e.target.value)}
+            placeholder={field.key}
+            // Predictive autocomplete for free-text custom fields, drawn from
+            // existing values for this field (title-like uniqueness aside).
+            list={field.type === 'text' ? `suggest-cf-${field.key}` : undefined}
+          />
+        </div>
+      );
+    };
+
+    // The everyday attributes get their own boxed group at the top. The
+    // librarian fills these on nearly every book; alphabetical ordering used to
+    // scatter them through two dozen fields they rarely touch.
     return (
-      <div className="custom-fields-grid">
-        {customFields.map((field) => {
-          const v = values[field.key];
-          const idAttr = `cf-${field.key}`;
-          const hasError = errorKeys?.has(`cf:${field.key}`) ?? false;
-          const mark = field.required ? <span className="required-mark"> *</span> : null;
-          if (field.type === 'boolean') {
-            const checked = v === true || v === 'true';
-            return (
-              <label key={field.key} className="checkbox-label cf-bool">
-                <input
-                  id={idAttr}
-                  type="checkbox"
-                  checked={checked}
-                  onChange={(e) => setValue(field.key, e.target.checked)}
-                />
-                <span>{field.label}{mark}</span>
-              </label>
-            );
-          }
-          if (field.type === 'enum') {
-            return (
-              <div key={field.key} className="form-field">
-                <label htmlFor={idAttr}>{field.label}{mark}</label>
-                <select
-                  id={idAttr}
-                  className={hasError ? 'input-error' : undefined}
-                  aria-required={field.required || undefined}
-                  aria-invalid={hasError || undefined}
-                  value={(v as string) ?? ''}
-                  onChange={(e) => setValue(field.key, e.target.value || null)}
-                >
-                  <option value="">{t('common.none')}</option>
-                  {field.enumOptions.map((opt) => (
-                    <option key={opt} value={opt}>{opt}</option>
-                  ))}
-                </select>
-              </div>
-            );
-          }
-          const inputType = field.type === 'number' ? 'number' : field.type === 'date' ? 'date' : 'text';
-          // Date inputs need YYYY-MM-DD; truncate any ISO timestamp before binding.
-          const displayValue =
-            field.type === 'date' && typeof v === 'string' && v.length >= 10
-              ? v.slice(0, 10)
-              : (v as string | number | null | undefined) ?? '';
-          return (
-            <div key={field.key} className="form-field">
-              <label htmlFor={idAttr}>{field.label}{mark}</label>
-              <input
-                id={idAttr}
-                type={inputType}
-                className={hasError ? 'input-error' : undefined}
-                aria-required={field.required || undefined}
-                aria-invalid={hasError || undefined}
-                value={displayValue === null || displayValue === undefined ? '' : String(displayValue)}
-                onChange={(e) => setValue(field.key, e.target.value)}
-                placeholder={field.key}
-                // Predictive autocomplete for free-text custom fields, drawn from
-                // existing values for this field (title-like uniqueness aside).
-                list={field.type === 'text' ? `suggest-cf-${field.key}` : undefined}
-              />
-            </div>
-          );
-        })}
-      </div>
+      <>
+        {pinnedCustomFields.length > 0 && (
+          <div className="cf-pinned-group">
+            <p className="cf-group-heading">★ {t('settings.pinnedGroup', { n: pinnedCustomFields.length })}</p>
+            <div className="custom-fields-grid">{pinnedCustomFields.map(renderField)}</div>
+          </div>
+        )}
+        {unpinnedCustomFields.length > 0 && (
+          <>
+            {pinnedCustomFields.length > 0 && (
+              <p className="cf-group-heading">{t('settings.otherGroup', { n: unpinnedCustomFields.length })}</p>
+            )}
+            <div className="custom-fields-grid">{unpinnedCustomFields.map(renderField)}</div>
+          </>
+        )}
+      </>
     );
   }
 
@@ -4428,6 +4774,135 @@ function App() {
             <div className="splash-logo">📚</div>
             <h1 className="splash-title">{t('app.brand')}</h1>
             <div className="splash-spinner" />
+          </div>
+        </div>
+      )}
+
+      {/* ═══ BULK EDIT MODAL ═══ */}
+      {/* Reaches every field a bulk edit may touch. The rule the whole panel is
+          built around: a control the librarian did not touch writes NOTHING.
+          An empty box means "leave it alone" — blanking a field across a
+          selection is a separate, explicit "Clear" toggle. */}
+      {bulkEditOpen && canWrite && (
+        <div className="modal-overlay" onClick={closeBulkEditor} role="dialog" aria-modal="true">
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '46rem' }}>
+            <div className="modal-header">
+              <div className="modal-title-block">
+                <h2>{t('library.bulk.editTitle')}</h2>
+                <p className="muted small">
+                  {t('library.bulk.editSubtitle', { n: selectedBookIds.length })}
+                </p>
+              </div>
+            </div>
+
+            <div style={{ padding: '1rem 1.5rem 1.5rem' }}>
+              <p className="muted small" style={{ marginBottom: '1rem' }}>
+                {t('library.bulk.editHint')}
+              </p>
+
+              <h4 className="bulk-section-heading">{t('library.bulk.sectionCore')}</h4>
+              <div className="custom-fields-grid">
+                {/* Bound to the same state as the quick selector in the bar. */}
+                <div className="form-field bulk-field">
+                  <label htmlFor="bulk-status">{t('library.bulk.setStatusAria')}</label>
+                  <select id="bulk-status" value={bulkStatus} onChange={(e) => setBulkStatus(e.target.value)}>
+                    <option value="">{t('library.bulk.unchanged')}</option>
+                    <option value="available">{t('status.available')}</option>
+                    {/* No 'borrowed' — lending goes through the borrow action. */}
+                    <option value="lost">{t('status.lost')}</option>
+                    <option value="maintenance">{t('status.maintenance')}</option>
+                  </select>
+                </div>
+                {BULK_CORE_FIELDS.map((field) => {
+                  const fieldId = `core:${field.key}`;
+                  const cleared = bulkEditClears.has(fieldId);
+                  return (
+                    <div key={fieldId} className="form-field bulk-field">
+                      <label htmlFor={`bulk-${fieldId}`}>{t(field.labelKey)}</label>
+                      <input
+                        id={`bulk-${fieldId}`}
+                        type={field.type === 'number' ? 'number' : 'text'}
+                        value={bulkEditValues[fieldId] ?? ''}
+                        disabled={cleared}
+                        onChange={(e) => setBulkEditValue(fieldId, e.target.value)}
+                        placeholder={cleared ? t('library.bulk.willClear') : t('library.bulk.unchanged')}
+                        list={field.listId}
+                      />
+                      <label className="checkbox-label bulk-clear">
+                        <input
+                          type="checkbox"
+                          checked={cleared}
+                          onChange={() => toggleBulkEditClear(fieldId)}
+                        />
+                        <span className="muted small">{t('library.bulk.clear2')}</span>
+                      </label>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <h4 className="bulk-section-heading">{t('library.bulk.sectionTags')}</h4>
+              <div className="custom-fields-grid">
+                <div className="form-field">
+                  <label htmlFor="bulk-tags-add">{t('library.bulk.tagsAdd')}</label>
+                  <input
+                    id="bulk-tags-add"
+                    value={bulkTagsAdd}
+                    onChange={(e) => setBulkTagsAdd(e.target.value)}
+                    placeholder={t('library.bulk.tagsPh')}
+                  />
+                </div>
+                <div className="form-field">
+                  <label htmlFor="bulk-tags-remove">{t('library.bulk.tagsRemove')}</label>
+                  <input
+                    id="bulk-tags-remove"
+                    value={bulkTagsRemove}
+                    onChange={(e) => setBulkTagsRemove(e.target.value)}
+                    placeholder={t('library.bulk.tagsPh')}
+                  />
+                </div>
+              </div>
+
+              {customFields.length > 0 && (
+                <>
+                  <h4 className="bulk-section-heading">{t('library.bulk.sectionAttrs')}</h4>
+                  {pinnedCustomFields.length > 0 && (
+                    <div className="cf-pinned-group">
+                      <p className="cf-group-heading">★ {t('settings.pinnedGroup', { n: pinnedCustomFields.length })}</p>
+                      <div className="custom-fields-grid">
+                        {pinnedCustomFields.map(renderBulkCustomField)}
+                      </div>
+                    </div>
+                  )}
+                  {unpinnedCustomFields.length > 0 && (
+                    <>
+                      {pinnedCustomFields.length > 0 && (
+                        <p className="cf-group-heading">{t('settings.otherGroup', { n: unpinnedCustomFields.length })}</p>
+                      )}
+                      <div className="custom-fields-grid">
+                        {unpinnedCustomFields.map(renderBulkCustomField)}
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+
+              <div className="modal-actions" style={{ marginTop: '1.25rem' }}>
+                <button className="secondary" onClick={resetBulkEditor}>
+                  {t('library.bulk.resetFields')}
+                </button>
+                <button className="secondary" onClick={closeBulkEditor}>
+                  {t('common.cancel')}
+                </button>
+                <button
+                  className="primary"
+                  disabled={bulkEditPendingCount === 0 || selectedBookIds.length === 0}
+                  onClick={() => void applyBulkBookChanges()}
+                >
+                  {t('library.bulk.applyN', { fields: bulkEditPendingCount, books: selectedBookIds.length })}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -5768,9 +6243,13 @@ function App() {
                         <option value="lost">{t('status.lost')}</option>
                         <option value="maintenance">{t('status.maintenance')}</option>
                       </select>
+                      {/* Same state the modal's Shelf field edits — two inputs
+                          writing one column independently would have let the
+                          librarian set two different shelves and silently get
+                          whichever one the apply order happened to prefer. */}
                       <input
-                        value={bulkShelfCode}
-                        onChange={(e) => setBulkShelfCode(e.target.value)}
+                        value={bulkEditValues['core:shelfCode'] ?? ''}
+                        onChange={(e) => setBulkEditValue('core:shelfCode', e.target.value)}
                         placeholder={t('library.bulk.setShelf')}
                         aria-label={t('library.bulk.setShelfAria')}
                         list="suggest-shelf"
@@ -5778,8 +6257,16 @@ function App() {
                       <button
                         className="primary small"
                         onClick={() => void applyBulkBookChanges()}
-                        disabled={!bulkStatus && !bulkShelfCode.trim()}
-                      >{t('common.apply')}</button>
+                        disabled={bulkEditPendingCount === 0}
+                      >{bulkEditPendingCount > 1
+                        ? t('library.bulk.applyNShort', { fields: bulkEditPendingCount })
+                        : t('common.apply')}</button>
+                      {/* Everything beyond status + shelf lives in a panel, so
+                          the bar stays usable while still reaching every field. */}
+                      <button
+                        className="secondary small"
+                        onClick={() => setBulkEditOpen(true)}
+                      >{t('library.bulk.moreFields')}</button>
                       {canPrintLabels && (
                         <button
                           className="secondary small"
@@ -6284,23 +6771,64 @@ function App() {
 
                   {customFields.length > 0 && (
                     <div className="cf-list">
-                      {customFields.map((f) => (
-                        <div key={f.id} className="cf-row">
-                          <div className="cf-row-text">
-                            <strong>{f.label}</strong>
-                            <span className="muted small">
-                              <code>{f.key}</code> · {f.type}{f.required ? ` ${t('settings.requiredSuffix')}` : ''}
-                              {f.type === 'enum' && f.enumOptions.length > 0 ? ` ${t('settings.optionsSuffix', { n: f.enumOptions.length })}` : ''}
-                            </span>
-                          </div>
-                          {canManageCustomFields && (
-                            <div className="cf-row-actions">
-                              <button className="secondary small" onClick={() => beginCustomFieldEdit(f)}>{t('common.edit')}</button>
-                              <button className="danger small" onClick={() => void deleteCustomField(f)}>{t('common.delete')}</button>
+                      {/* Two groups, in the same order every attribute list uses:
+                          the everyday fields first, then the rest. */}
+                      {pinnedCustomFields.length > 0 && (
+                        <p className="cf-group-heading">
+                          ★ {t('settings.pinnedGroup', { n: pinnedCustomFields.length })}
+                        </p>
+                      )}
+                      {[...pinnedCustomFields, ...unpinnedCustomFields].map((f, index) => {
+                        const isFirstUnpinned =
+                          !f.pinned && index === pinnedCustomFields.length && pinnedCustomFields.length > 0;
+                        return (
+                          <Fragment key={f.id}>
+                            {isFirstUnpinned && (
+                              <p className="cf-group-heading">{t('settings.otherGroup', { n: unpinnedCustomFields.length })}</p>
+                            )}
+                            <div className={f.pinned ? 'cf-row cf-row-pinned' : 'cf-row'}>
+                              <div className="cf-row-text">
+                                <strong>{f.pinned ? '★ ' : ''}{f.label}</strong>
+                                <span className="muted small">
+                                  <code>{f.key}</code> · {f.type}{f.required ? ` ${t('settings.requiredSuffix')}` : ''}
+                                  {f.type === 'enum' && f.enumOptions.length > 0 ? ` ${t('settings.optionsSuffix', { n: f.enumOptions.length })}` : ''}
+                                </span>
+                              </div>
+                              {canManageCustomFields && (
+                                <div className="cf-row-actions">
+                                  {/* One click to pin/unpin — editing the whole
+                                      definition just to move a field to the top
+                                      is more ceremony than the action deserves. */}
+                                  <button
+                                    className={f.pinned ? 'secondary small cf-pin-on' : 'secondary small'}
+                                    onClick={() => void toggleCustomFieldPin(f)}
+                                    title={f.pinned ? t('settings.unpinTitle') : t('settings.pinTitle')}
+                                    aria-pressed={f.pinned}
+                                  >{f.pinned ? '★' : '☆'}</button>
+                                  {f.pinned && (
+                                    <>
+                                      <button
+                                        className="secondary small"
+                                        onClick={() => void moveCustomField(f, -1)}
+                                        title={t('settings.moveUp')}
+                                        aria-label={t('settings.moveUp')}
+                                      >↑</button>
+                                      <button
+                                        className="secondary small"
+                                        onClick={() => void moveCustomField(f, 1)}
+                                        title={t('settings.moveDown')}
+                                        aria-label={t('settings.moveDown')}
+                                      >↓</button>
+                                    </>
+                                  )}
+                                  <button className="secondary small" onClick={() => beginCustomFieldEdit(f)}>{t('common.edit')}</button>
+                                  <button className="danger small" onClick={() => void deleteCustomField(f)}>{t('common.delete')}</button>
+                                </div>
+                              )}
                             </div>
-                          )}
-                        </div>
-                      ))}
+                          </Fragment>
+                        );
+                      })}
                     </div>
                   )}
 
