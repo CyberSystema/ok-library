@@ -37,6 +37,10 @@ type Book = {
   publicationYearEnd?: number | null;
   /** The authored date in the EDTF subset — "1955/1957", "~1850", "19XX". */
   dateEdtf?: string | null;
+  /** MARC 880-style parallel forms; the original script is what displays. */
+  titleRomanized?: string | null;
+  authorRomanized?: string | null;
+  publisherRomanized?: string | null;
   customFields?: Record<string, string | number | boolean | null>;
   version: number;
   publisher?: string | null;
@@ -913,6 +917,34 @@ const CatalogDatalists = React.memo(function CatalogDatalists({ facets }: { face
   );
 });
 
+// ISBN registration groups that mean "this book was published in Greece", and
+// so that a Latin-script title for it is almost certainly a romanization.
+// 960 and 618 are the Greek group identifiers; 978-/979- are the EAN prefixes.
+const GREEK_ISBN_GROUPS = [/^97[89]960/, /^97[89]618/, /^960/, /^618/];
+
+const NON_LATIN_SCRIPT = /[Ͱ-Ͽἀ-῿Ѐ-ӿ가-힯぀-ヿ一-鿿]/;
+const LATIN_LETTER = /[A-Za-z]/;
+
+/**
+ * Is this value a ROMANIZATION rather than the work's own script?
+ *
+ * The librarian's ISBN complaint traced to Open Library serving ALA-LC
+ * romanized MARC for Greek books. With one slot per field the romanized form
+ * simply overwrote the Greek. Detecting it lets the value go to the parallel
+ * field instead, where it is useful rather than destructive.
+ *
+ * Deliberately conservative — it only says yes when the value is pure Latin AND
+ * we have positive evidence the work is not: a Greek ISBN group, or a declared
+ * non-Latin language. A genuinely English book keeps its title in the normal
+ * field, which is the common case and must not regress.
+ */
+function isRomanizedFor(value: string, language: string | null, isbnDigits: string): boolean {
+  if (!LATIN_LETTER.test(value) || NON_LATIN_SCRIPT.test(value)) return false;
+  if (GREEK_ISBN_GROUPS.some((re) => re.test(isbnDigits))) return true;
+  const lang = (language ?? '').trim().toLowerCase();
+  return ['el', 'ell', 'gre', 'ko', 'kor', 'ru', 'rus'].includes(lang);
+}
+
 /**
  * Live feedback under the publication-date field.
  *
@@ -1421,6 +1453,9 @@ function App() {
     isbn: '',
     shelfCode: '',
     publicationYear: '',
+    titleRomanized: '',
+    authorRomanized: '',
+    publisherRomanized: '',
     publisher: '',
     language: '',
     description: ''
@@ -1444,6 +1479,9 @@ function App() {
     isbn: '',
     shelfCode: '',
     publicationYear: '',
+    titleRomanized: '',
+    authorRomanized: '',
+    publisherRomanized: '',
     status: 'available' as BookStatus,
     version: 0,
     publisher: '',
@@ -3106,6 +3144,7 @@ function App() {
       // but doing it on the client too means the URL is clean and the
       // browser cache key stable for repeat lookups.
       const clean = isbnRaw.replace(/[^0-9Xx]/g, '');
+      const isbnDigits = clean;
       const res = await apiRequest<IsbnLookupResult>(`/api/lookup/isbn/${encodeURIComponent(clean)}?source=both`);
       if (res.source === 'none') {
         pushAppToast('error', t('library.add.lookupNone'));
@@ -3120,9 +3159,23 @@ function App() {
           (next as Record<string, string>)[k] = String(v);
           filled += 1;
         };
-        set('title', res.title);
-        set('author', res.author);
-        set('publisher', res.publisher);
+        // A romanized value goes to the PARALLEL field, not over the
+        // vernacular one. Open Library serves ALA-LC romanization for Greek
+        // ("Epiphanios Salaminos Kyprou"), and with only one slot per field
+        // that is what the librarian saw land in the form. Routed here, the
+        // same data becomes a useful searchable alternate form instead.
+        const routeScript = (
+          vernacularKey: 'title' | 'author' | 'publisher',
+          romanizedKey: 'titleRomanized' | 'authorRomanized' | 'publisherRomanized',
+          value: string | null | undefined
+        ) => {
+          if (!value) return;
+          if (isRomanizedFor(value, res.language ?? null, isbnDigits)) set(romanizedKey, value);
+          else set(vernacularKey, value);
+        };
+        routeScript('title', 'titleRomanized', res.title);
+        routeScript('author', 'authorRomanized', res.author);
+        routeScript('publisher', 'publisherRomanized', res.publisher);
         set('language', res.language);
         set('description', res.description);
         if (res.publicationYear) {
@@ -3206,6 +3259,9 @@ function App() {
           publisher: createForm.publisher.trim() || null,
           language: createForm.language.trim() || null,
           description: createForm.description.trim() || null,
+          titleRomanized: createForm.titleRomanized.trim() || null,
+          authorRomanized: createForm.authorRomanized.trim() || null,
+          publisherRomanized: createForm.publisherRomanized.trim() || null,
           dateEdtf,
           tags: [],
           customFields: customFieldsValue,
@@ -3222,6 +3278,9 @@ function App() {
         isbn: '',
         shelfCode: '',
         publicationYear: '',
+    titleRomanized: '',
+    authorRomanized: '',
+    publisherRomanized: '',
         publisher: '',
         language: '',
         description: ''
@@ -3382,6 +3441,9 @@ function App() {
       isbn: book.isbn ?? '',
       shelfCode: book.shelfCode ?? '',
       publicationYear: book.dateEdtf ?? book.publicationYear?.toString() ?? '',
+      titleRomanized: book.titleRomanized ?? '',
+      authorRomanized: book.authorRomanized ?? '',
+      publisherRomanized: book.publisherRomanized ?? '',
       status: book.status,
       version: book.version,
       publisher: book.publisher ?? '',
@@ -3465,6 +3527,9 @@ function App() {
           publisher: editForm.publisher.trim() || null,
           language: editForm.language.trim() || null,
           description: editForm.description.trim() || null,
+          titleRomanized: editForm.titleRomanized.trim() || null,
+          authorRomanized: editForm.authorRomanized.trim() || null,
+          publisherRomanized: editForm.publisherRomanized.trim() || null,
           dateEdtf,
           customFields: customFieldsValue,
           status: editForm.status,
@@ -5180,6 +5245,9 @@ function App() {
       isbn: b.isbn ?? '',
       shelfCode: b.shelfCode ?? '',
       publicationYear: b.dateEdtf ?? b.publicationYear?.toString() ?? '',
+      titleRomanized: b.titleRomanized ?? '',
+      authorRomanized: b.authorRomanized ?? '',
+      publisherRomanized: b.publisherRomanized ?? '',
       status: b.status,
       version: b.version,
       publisher: b.publisher ?? '',
@@ -5674,9 +5742,18 @@ function App() {
                 <h2 className={isPlaceholder(detailBook.title, 'title') || !detailBook.title ? 'is-placeholder' : ''}>
                   {displayTitle(detailBook, t('common.untitled'))}
                 </h2>
+                {/* The romanized reading sits UNDER the vernacular title, the
+                    way a MARC 880 linked field is displayed — never in place
+                    of it. This is the visible half of the ISBN-lookup fix. */}
+                {detailBook.titleRomanized && (
+                  <p className="romanized-line muted small" lang="und-Latn">{detailBook.titleRomanized}</p>
+                )}
                 <p className={`modal-author${isPlaceholder(detailBook.author, 'author') || !detailBook.author ? ' is-placeholder' : ''}`}>
                   {displayAuthor(detailBook, t('common.unknownAuthor'))}
                 </p>
+                {detailBook.authorRomanized && (
+                  <p className="romanized-line muted small" lang="und-Latn">{detailBook.authorRomanized}</p>
+                )}
                 <div className="modal-pills">
                   <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
                   {detailBook.legacyId ? (
@@ -6612,6 +6689,25 @@ function App() {
                           <input list="suggest-author" value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder={t('library.add.authorPh')} />
                         </div>
                       </div>
+                      {/* Parallel (romanized) forms. Only shown once something is
+                          there — normally that means an ISBN lookup returned a
+                          romanized reading, which now lands here instead of
+                          overwriting the Greek title. */}
+                      {(createForm.titleRomanized || createForm.authorRomanized || createForm.publisherRomanized) && (
+                        <div className="romanized-block">
+                          <p className="muted small">{t('library.add.romanizedNote')}</p>
+                          <div className="form-row">
+                            <div>
+                              <label>{t('library.add.titleRomanized')}</label>
+                              <input value={createForm.titleRomanized} onChange={(e) => setCreateForm({ ...createForm, titleRomanized: e.target.value })} />
+                            </div>
+                            <div>
+                              <label>{t('library.add.authorRomanized')}</label>
+                              <input value={createForm.authorRomanized} onChange={(e) => setCreateForm({ ...createForm, authorRomanized: e.target.value })} />
+                            </div>
+                          </div>
+                        </div>
+                      )}
                       {/* ISBN spans its own full-width row so the number stays fully
                           visible while typing and the lookup button sits beside it
                           without squeezing the field into a few characters. */}

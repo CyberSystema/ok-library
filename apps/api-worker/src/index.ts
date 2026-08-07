@@ -1495,17 +1495,22 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 		publisher: payload.publisher ?? null,
 		description: payload.description ?? null,
 		tagsJson,
-		customFieldsJson
+		customFieldsJson,
+		titleRomanized: payload.titleRomanized ?? null,
+		authorRomanized: payload.authorRomanized ?? null,
+		publisherRomanized: payload.publisherRomanized ?? null
 	});
 
 	await c.env.DB.prepare(
 		`INSERT OR IGNORE INTO books (
 			id, title, author, isbn, publication_year, publication_year_end, date_edtf,
 			publisher, language, description,
+			title_romanized, author_romanized, publisher_romanized,
 			room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 			legacy_id, created_at, updated_at, deleted_at,
-			title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+			title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
+			title_romanized_fold, author_romanized_fold, publisher_romanized_fold
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	)
 		.bind(
 			id,
@@ -1518,6 +1523,9 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			payload.publisher ?? null,
 			payload.language ?? null,
 			payload.description ?? null,
+			payload.titleRomanized ?? null,
+			payload.authorRomanized ?? null,
+			payload.publisherRomanized ?? null,
 			payload.roomCode ?? null,
 			payload.shelfCode ?? null,
 			payload.acquisitionDate ?? null,
@@ -1533,7 +1541,10 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			folds.publisher_fold,
 			folds.description_fold,
 			folds.tags_fold,
-			folds.custom_fields_fold
+			folds.custom_fields_fold,
+			folds.title_romanized_fold,
+			folds.author_romanized_fold,
+			folds.publisher_romanized_fold
 		)
 		.run();
 
@@ -1735,16 +1746,21 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 		publisher: (merged.publisher as string | null) ?? null,
 		description: (merged.description as string | null) ?? null,
 		tagsJson: mergedTagsJson,
-		customFieldsJson: mergedCustomFieldsJson
+		customFieldsJson: mergedCustomFieldsJson,
+		titleRomanized: (merged.titleRomanized as string | null) ?? null,
+		authorRomanized: (merged.authorRomanized as string | null) ?? null,
+		publisherRomanized: (merged.publisherRomanized as string | null) ?? null
 	});
 
 	const updateBookStmt = c.env.DB.prepare(
 		`UPDATE books SET
 			title = ?, author = ?, isbn = ?, publication_year = ?, publication_year_end = ?, date_edtf = ?,
 			publisher = ?, language = ?, description = ?,
+			title_romanized = ?, author_romanized = ?, publisher_romanized = ?,
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 			legacy_id = ?, version = ?, updated_at = ?,
-			title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
+			title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?,
+			title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?
 		 WHERE id = ? AND deleted_at IS NULL AND version = ?`
 	)
 		.bind(
@@ -1757,6 +1773,9 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			merged.publisher ?? null,
 			merged.language ?? null,
 			merged.description ?? null,
+			merged.titleRomanized ?? null,
+			merged.authorRomanized ?? null,
+			merged.publisherRomanized ?? null,
 			merged.roomCode ?? null,
 			merged.shelfCode ?? null,
 			merged.acquisitionDate ?? null,
@@ -1773,6 +1792,9 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			mergedFolds.description_fold,
 			mergedFolds.tags_fold,
 			mergedFolds.custom_fields_fold,
+			mergedFolds.title_romanized_fold,
+			mergedFolds.author_romanized_fold,
+			mergedFolds.publisher_romanized_fold,
 			id,
 			// Concurrency guard lives in the WHERE clause, not just the earlier
 			// read: comparing the version and THEN updating is check-then-act, so
@@ -3507,16 +3529,21 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					publisher: row.publisher ?? null,
 					description: row.description ?? null,
 					tagsJson,
-					customFieldsJson
+					customFieldsJson,
+					titleRomanized: row.titleRomanized ?? null,
+					authorRomanized: row.authorRomanized ?? null,
+					publisherRomanized: row.publisherRomanized ?? null
 				});
 				await c.env.DB.prepare(
 					`INSERT OR IGNORE INTO books (
 						id, title, author, isbn, publication_year, publication_year_end, date_edtf,
 						publisher, language, description,
+						title_romanized, author_romanized, publisher_romanized,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 						created_at, updated_at, deleted_at,
-						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
+						title_romanized_fold, author_romanized_fold, publisher_romanized_fold
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						id,
@@ -3529,6 +3556,9 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						row.publisher ?? null,
 						row.language ?? null,
 						row.description ?? null,
+						row.titleRomanized ?? null,
+						row.authorRomanized ?? null,
+						row.publisherRomanized ?? null,
 						row.roomCode ?? null,
 						row.shelfCode ?? null,
 						row.acquisitionDate ?? null,
@@ -3543,7 +3573,10 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						folds.publisher_fold,
 						folds.description_fold,
 						folds.tags_fold,
-						folds.custom_fields_fold
+						folds.custom_fields_fold,
+						folds.title_romanized_fold,
+						folds.author_romanized_fold,
+						folds.publisher_romanized_fold
 					)
 					.run();
 				await replaceBookAttributeValues(c.env, id, customFields);
@@ -3671,16 +3704,21 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					publisher: (merged.publisher as string | null) ?? null,
 					description: (merged.description as string | null) ?? null,
 					tagsJson: mergedTagsJson,
-					customFieldsJson: mergedCustomFieldsJson
+					customFieldsJson: mergedCustomFieldsJson,
+					titleRomanized: (merged.titleRomanized as string | null) ?? null,
+					authorRomanized: (merged.authorRomanized as string | null) ?? null,
+					publisherRomanized: (merged.publisherRomanized as string | null) ?? null
 				});
 
 				const syncUpd = await c.env.DB.prepare(
 					`UPDATE books SET
 						 title = ?, author = ?, isbn = ?, publication_year = ?, publication_year_end = ?, date_edtf = ?,
 						 publisher = ?, language = ?, description = ?,
+						 title_romanized = ?, author_romanized = ?, publisher_romanized = ?,
 						 room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 						 version = ?, updated_at = ?,
-						 title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
+						 title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?,
+						 title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?
 					 WHERE id = ? AND deleted_at IS NULL AND version = ?`
 				)
 					.bind(
@@ -3693,6 +3731,9 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						merged.publisher ?? null,
 						merged.language ?? null,
 						merged.description ?? null,
+						merged.titleRomanized ?? null,
+						merged.authorRomanized ?? null,
+						merged.publisherRomanized ?? null,
 						merged.roomCode ?? null,
 						merged.shelfCode ?? null,
 						merged.acquisitionDate ?? null,
@@ -3708,6 +3749,9 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						mergedFolds.description_fold,
 						mergedFolds.tags_fold,
 						mergedFolds.custom_fields_fold,
+						mergedFolds.title_romanized_fold,
+						mergedFolds.author_romanized_fold,
+						mergedFolds.publisher_romanized_fold,
 						row.id,
 						// Same check-then-act guard as the direct PUT: the write only
 						// lands if the row is still at the version we read.

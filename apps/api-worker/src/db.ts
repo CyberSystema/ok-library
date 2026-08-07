@@ -114,6 +114,9 @@ export async function ensureBootstrapAdmin(env: Env): Promise<void> {
 // passed through with its original key (status, version, id, …).
 const SNAKE_TO_CAMEL_BOOK_FIELDS: Record<string, string> = {
   custom_fields: 'customFields',
+  title_romanized: 'titleRomanized',
+  author_romanized: 'authorRomanized',
+  publisher_romanized: 'publisherRomanized',
   publication_year: 'publicationYear',
   publication_year_end: 'publicationYearEnd',
   date_edtf: 'dateEdtf',
@@ -139,7 +142,10 @@ const INTERNAL_BOOK_COLUMNS = new Set([
   'publisher_fold',
   'description_fold',
   'tags_fold',
-  'custom_fields_fold'
+  'custom_fields_fold',
+  'title_romanized_fold',
+  'author_romanized_fold',
+  'publisher_romanized_fold'
 ]);
 
 export function parseBook(row: Record<string, unknown>): Record<string, unknown> {
@@ -153,6 +159,9 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
   }
   out.customFields = safeJsonParse((row.custom_fields as string) ?? '{}', {});
   out.tags = Array.isArray(row.tags) ? row.tags : safeJsonParse((row.tags as string) ?? '[]', []);
+  out.titleRomanized = row.title_romanized ?? null;
+  out.authorRomanized = row.author_romanized ?? null;
+  out.publisherRomanized = row.publisher_romanized ?? null;
   out.publicationYear = row.publication_year ?? null;
   // Derived on read when absent, so the import paths — which never carry an
   // authored EDTF value — still present a consistent date. A stored NULL simply
@@ -1184,6 +1193,11 @@ export function computeBookFolds(input: {
   description?: string | null;
   tagsJson?: string | null;
   customFieldsJson?: string | null;
+  // MARC 880-style parallel forms. Optional, so the eleven existing call sites
+  // keep compiling and simply produce nulls for them.
+  titleRomanized?: string | null;
+  authorRomanized?: string | null;
+  publisherRomanized?: string | null;
 }): {
   title_fold: string | null;
   author_fold: string | null;
@@ -1192,6 +1206,9 @@ export function computeBookFolds(input: {
   description_fold: string | null;
   tags_fold: string | null;
   custom_fields_fold: string | null;
+  title_romanized_fold: string | null;
+  author_romanized_fold: string | null;
+  publisher_romanized_fold: string | null;
 } {
   const fold = (v: string | null | undefined): string | null => {
     if (v == null) return null;
@@ -1206,7 +1223,10 @@ export function computeBookFolds(input: {
     publisher_fold: fold(input.publisher),
     description_fold: fold(input.description),
     tags_fold: fold(input.tagsJson),
-    custom_fields_fold: fold(input.customFieldsJson)
+    custom_fields_fold: fold(input.customFieldsJson),
+    title_romanized_fold: fold(input.titleRomanized),
+    author_romanized_fold: fold(input.authorRomanized),
+    publisher_romanized_fold: fold(input.publisherRomanized)
   };
 }
 

@@ -51,6 +51,9 @@ export function generateCodeValue(kind: 'qr' | 'barcode'): string {
 
 export type NormalizableBook = {
   title?: string | null;
+  titleRomanized?: string | null;
+  authorRomanized?: string | null;
+  publisherRomanized?: string | null;
   author?: string | null;
   isbn?: string | null;
   publisher?: string | null;
@@ -181,6 +184,14 @@ export function normalizeBookData<T extends NormalizableBook>(input: T): T {
   }
   if (typeof out.publisher === 'string') {
     out.publisher = collapseSpaces(out.publisher) || null;
+  }
+  // Parallel (romanized) forms. NFC-normalized because Open Library returns
+  // ALA-LC romanization DECOMPOSED — "ē" as e + U+0304 — and a decomposed
+  // string never compares or indexes equal to its composed twin.
+  for (const key of ['titleRomanized', 'authorRomanized', 'publisherRomanized'] as const) {
+    if (typeof out[key] === 'string') {
+      out[key] = collapseSpaces((out[key] as string).normalize('NFC')) || null;
+    }
   }
   if (typeof out.language === 'string') {
     out.language = out.language.trim() || null;

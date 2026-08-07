@@ -12,7 +12,7 @@ Usage:
 
 Exit code 0 = everything held. Non-zero = at least one assertion failed.
 """
-import csv, io, json, os, sys, urllib.request, urllib.parse, uuid, zlib, struct
+import csv, io, json, os, sys, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
 
 BASE = os.environ.get("API", "http://127.0.0.1:8787").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -812,6 +812,38 @@ py, _ = mkbook(publicationYear=1999)
 g = get(py)
 check("a plain year mirrors into dateEdtf", g.get("dateEdtf") == "1999", g.get("dateEdtf"))
 check("a plain year gets a matching span end", g.get("publicationYearEnd") == 1999, g.get("publicationYearEnd"))
+
+print("=== 32. REGRESSION: parallel script fields (MARC 880) ===")
+# The librarian's ISBN complaint: metadata lookup filled the form with
+# "greeklish". Open Library serves ALA-LC ROMANIZED MARC for Greek books, and
+# with one slot per field the romanization simply overwrote the Greek. Carrying
+# both — vernacular for display, romanized alongside — is MARC's own answer.
+uniq = uuid.uuid4().hex[:6]
+gtitle = f"ZZITEST Επιφάνιος Σαλαμίνος {uniq}"
+rb, _ = mkbook(title=gtitle, author="ZZ Επιφάνιος",
+               titleRomanized="Epiphanios Salaminos " + uniq,
+               authorRomanized="Epiphanios",
+               publisher="Αποστολική Διακονία", publisherRomanized="Apostolikē Diakonia")
+g = get(rb)
+check("the vernacular title is untouched", g.get("title") == gtitle, g.get("title"))
+check("the romanized title is stored alongside",
+      g.get("titleRomanized") == "Epiphanios Salaminos " + uniq, g.get("titleRomanized"))
+# Open Library returns ALA-LC DECOMPOSED (e + U+0304). A decomposed string never
+# compares or indexes equal to its composed twin, so it must be NFC on the way in.
+check("stored romanization is in NFC",
+      unicodedata.is_normalized("NFC", g.get("publisherRomanized") or ""), g.get("publisherRomanized"))
+
+# Both readings have to find the book, with the DEFAULT search fields — putting
+# the romanized form in `custom_text` made it reachable only if the librarian
+# widened the search, i.e. never.
+for probe in [gtitle[:26], "Epiphanios Salaminos " + uniq, "epiphanios " + uniq]:
+    st, r = call("GET", "/api/books?pageSize=20&partialWords=true&fuzzyTypos=false&q=" + urllib.parse.quote(probe))
+    check(f"found by {probe[:28]!r}", rb in [x["id"] for x in (r or {}).get("items", [])], probe)
+# Publisher is not a default search field, but selecting it must reach both forms.
+for probe in ["Αποστολική", "Apostolike"]:
+    st, r = call("GET", "/api/books?pageSize=20&searchFields=publisher&partialWords=true&fuzzyTypos=false&q="
+                 + urllib.parse.quote(probe))
+    check(f"publisher search finds {probe!r}", rb in [x["id"] for x in (r or {}).get("items", [])], probe)
 
 print("\n=== CLEANUP ===")
 for bid in CREATED:

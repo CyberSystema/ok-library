@@ -2380,3 +2380,12 @@ mark.hl {
    discoverable if the interpretation shows as you type. */
 .edtf-hint { display: block; margin-top: 0.25rem; font-size: 0.75rem; }
 .edtf-hint.is-warn { color: var(--warning); font-weight: 600; }
+
+/* Parallel (romanized) forms — MARC 880. Shown beneath the vernacular value,
+   visually subordinate, so the original script always reads first. */
+.romanized-line { margin: 0.1rem 0 0; font-style: italic; }
+.romanized-block {
+  border-left: 3px solid var(--border);
+  padding-left: 0.75rem;
+  margin: 0.25rem 0 0.5rem;
+}

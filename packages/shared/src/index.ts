@@ -51,6 +51,14 @@ export const BookCoreSchema = z.object({
   // would 400 every save of such a book. The UI still nudges toward a title via
   // the "untitled" smart list and a localized placeholder.
   title: z.string().max(300).default(''),
+  // MARC 880-style parallel forms: the romanized reading of a non-Latin title,
+  // author or publisher. The ORIGINAL script is what displays; these are stored
+  // alongside so they stay searchable and exchangeable instead of overwriting
+  // the vernacular form, which is what made ISBN lookup fill the form with
+  // "Epiphanios Salaminos Kyprou" in place of "Επιφάνιος Σαλαμίνος Κύπρου".
+  titleRomanized: z.string().max(300).optional().nullable(),
+  authorRomanized: z.string().max(200).optional().nullable(),
+  publisherRomanized: z.string().max(200).optional().nullable(),
   // Author is optional: many works legitimately have none (liturgical books,
   // service books, anonymous editions). Stored as an empty string when absent
   // so the NOT NULL column and the "unknown author" placeholder both hold.
