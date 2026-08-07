@@ -869,6 +869,10 @@ function Combobox<T>(props: {
   suppressed?: boolean;
   placeholder?: string;
   required?: boolean;
+  /** Field-level error styling, e.g. the add form's `input-error`. */
+  inputClassName?: string;
+  ariaRequired?: boolean;
+  ariaInvalid?: boolean;
   inputRef?: React.Ref<HTMLInputElement>;
   /** Rendered above the list; used for "N books already have this title". */
   listHeader?: React.ReactNode;
@@ -892,6 +896,9 @@ function Combobox<T>(props: {
       <input
         id={`${props.idPrefix}-input`}
         ref={props.inputRef}
+        className={props.inputClassName}
+        aria-required={props.ariaRequired || undefined}
+        aria-invalid={props.ariaInvalid || undefined}
         value={props.value}
         onChange={(e) => props.onChange(e.target.value)}
         onFocus={props.onFocus}
@@ -950,6 +957,15 @@ function Combobox<T>(props: {
     </div>
   );
 }
+
+type TitleSuggestion = {
+  id: string;
+  title: string;
+  author: string;
+  shelfCode?: string | null;
+  publicationYear?: number | null;
+  isbn?: string | null;
+};
 
 type ValueVariantGroup = { canonical: string; total: number; variants: Array<{ value: string; count: number }> };
 
@@ -1226,9 +1242,14 @@ function App() {
   // single network call lowers the cost per typed name and reduces backend
   // pressure on the API + KV rate limiter.
   const borrowerDebounceRef = useRef<number | null>(null);
-  // Keyboard-navigation cursor inside the suggestion dropdown. -1 means
-  // "no selection yet" — Enter on -1 doesn't pick anything (preserves the
-  // existing "submit the typed value" behavior).
+  // Books already in the catalogue whose title starts with what is being typed
+  // into the add form. A duplicate WARNING, not an autocomplete — see
+  // `searchTitleSuggestions`. Same debounce + sequence-guard pattern as the
+  // borrower search, for the same reasons.
+  const [titleSuggestions, setTitleSuggestions] = useState<TitleSuggestion[]>([]);
+  const [titleSuggestTotal, setTitleSuggestTotal] = useState(0);
+  const titleSuggestSeqRef = useRef(0);
+  const titleSuggestDebounceRef = useRef<number | null>(null);
   const bookHistorySeqRef = useRef(0);
   // Drops results from an earlier loadBooks() call that resolves after a newer
   // one (fast typing / rapid filter changes) so a slow response can't clobber
@@ -2112,6 +2133,56 @@ function App() {
       borrowerDebounceRef.current = null;
       void searchBorrowers(query);
     }, 180);
+  }
+
+  // Titles already in the catalogue that start with what is being typed.
+  //
+  // This is a duplicate warning during entry, NOT an autocomplete. The librarian
+  // asked to be told "you already have this" while typing the title rather than
+  // after saving the record — the existing warning fires post-insert, so the
+  // duplicate is always created before they hear about it.
+  //
+  // Deliberately does not offer the title as a value to accept: titles are
+  // near-unique, and offering one invites picking an existing book's title by
+  // mistake. That is the same reasoning that keeps title out of
+  // /api/books/facets. Picking a row opens that book instead.
+  const MIN_TITLE_SUGGEST = 3;
+
+  async function searchTitleSuggestions(query: string, excludeId?: string): Promise<void> {
+    const seq = ++titleSuggestSeqRef.current;
+    if (query.trim().length < MIN_TITLE_SUGGEST) {
+      setTitleSuggestions([]);
+      setTitleSuggestTotal(0);
+      return;
+    }
+    try {
+      const params = new URLSearchParams({ q: query.trim() });
+      if (excludeId) params.set('excludeId', excludeId);
+      const response = await apiRequest<{ items: TitleSuggestion[]; total: number }>(
+        `/api/books/title-suggest?${params.toString()}`
+      );
+      if (seq !== titleSuggestSeqRef.current) return;
+      setTitleSuggestions(response.items ?? []);
+      setTitleSuggestTotal(response.total ?? 0);
+    } catch {
+      // A failed lookup must never block cataloguing — this is advisory.
+      if (seq !== titleSuggestSeqRef.current) return;
+      setTitleSuggestions([]);
+      setTitleSuggestTotal(0);
+    }
+  }
+
+  function scheduleTitleSuggest(query: string): void {
+    if (titleSuggestDebounceRef.current !== null) {
+      window.clearTimeout(titleSuggestDebounceRef.current);
+    }
+    // Longer than the borrower picker's 180 ms: this fires while typing a whole
+    // title, so coalescing harder keeps the query count (and D1 reads) down
+    // without the warning ever feeling late.
+    titleSuggestDebounceRef.current = window.setTimeout(() => {
+      titleSuggestDebounceRef.current = null;
+      void searchTitleSuggestions(query);
+    }, 300);
   }
 
   // Apply a suggestion picked via keyboard or pointer. Shared between the
@@ -4643,6 +4714,18 @@ function App() {
     void loadBookHistory(book.id);
   }
 
+  // Open a book we only hold an id for — the title-duplicate warning carries a
+  // trimmed row, not a full record, and the detail modal needs the whole thing
+  // (version included, or the first edit would 409).
+  async function openBookDetailById(id: string): Promise<void> {
+    try {
+      const book = await apiRequest<Book>(`/api/books/${id}`);
+      openBookDetail(book);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   function closeDetail() {
     setDetailBook(null);
     setDetailMode('view');
@@ -6045,28 +6128,51 @@ function App() {
                     <h3>{t('library.add.title')}</h3>
                     <form onSubmit={createBook} className="simple-form">
                       <div className="form-row">
-                        <div>
-                          <label>{t('library.add.bookTitle')}<span className="required-mark"> *</span></label>
-                          <input
-                            ref={titleInputRef}
-                            className={createFieldErrors.has('title') ? 'input-error' : undefined}
-                            aria-required="true"
-                            aria-invalid={createFieldErrors.has('title') || undefined}
-                            value={createForm.title}
-                            onChange={(e) => {
-                              setCreateForm({ ...createForm, title: e.target.value });
-                              // Clear the title error as soon as the librarian starts typing.
-                              if (createFieldErrors.has('title')) {
-                                setCreateFieldErrors((prev) => {
-                                  const next = new Set(prev);
-                                  next.delete('title');
-                                  return next;
-                                });
-                              }
-                            }}
-                            placeholder={t('library.add.titlePh')}
-                          />
-                        </div>
+                        {/* Titles already in the catalogue surface HERE, while the
+                            librarian types, rather than as a warning after the
+                            duplicate has already been created. Picking a row
+                            opens that book — it never writes into this field. */}
+                        <Combobox<TitleSuggestion>
+                          idPrefix="add-title"
+                          className="combobox title-combobox"
+                          label={<>{t('library.add.bookTitle')}<span className="required-mark"> *</span></>}
+                          value={createForm.title}
+                          inputRef={titleInputRef}
+                          inputClassName={createFieldErrors.has('title') ? 'input-error' : undefined}
+                          ariaRequired
+                          ariaInvalid={createFieldErrors.has('title')}
+                          onChange={(v) => {
+                            setCreateForm({ ...createForm, title: v });
+                            scheduleTitleSuggest(v);
+                            // Clear the title error as soon as the librarian starts typing.
+                            if (createFieldErrors.has('title')) {
+                              setCreateFieldErrors((prev) => {
+                                const next = new Set(prev);
+                                next.delete('title');
+                                return next;
+                              });
+                            }
+                          }}
+                          items={titleSuggestions}
+                          getKey={(b) => b.id}
+                          onPick={(b) => { void openBookDetailById(b.id); }}
+                          listHeader={
+                            <p className="title-dup-note">
+                              {t('library.add.titleDupNote', { n: fmt(titleSuggestTotal) })}
+                            </p>
+                          }
+                          renderItem={(b) => (
+                            <>
+                              <span className="combo-name">{displayTitle(b, t('common.untitled'))}</span>
+                              <span className="combo-contact muted small">{displayAuthor(b, t('common.unknownAuthor'))}</span>
+                              <span className="combo-stats muted small">
+                                {b.shelfCode ? <span className="shelf-badge">{b.shelfCode}</span> : null}
+                                {b.publicationYear ? <span> · {b.publicationYear}</span> : null}
+                              </span>
+                            </>
+                          )}
+                          placeholder={t('library.add.titlePh')}
+                        />
                         <div>
                           <label>{t('library.add.author')}</label>
                           <input list="suggest-author" value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder={t('library.add.authorPh')} />

@@ -1991,6 +1991,57 @@ mark.hl {
 .combo-name { font-weight: 600; }
 .combo-stats { margin-left: auto; }
 
+/* Title duplicate warning.
+   Styled as a caution, not as an autocomplete: these rows are existing books to
+   inspect, never values to accept. The header sits above the list inside the
+   same absolutely-positioned stack, so it scrolls and dismisses with it. */
+.title-combobox .combobox-list { border-color: var(--warning); }
+.title-dup-note {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 21;
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text);
+  /* --warning-bg already has a dark-theme value, so this needs no override. */
+  background: var(--warning-bg);
+  border: 1px solid var(--warning);
+  border-bottom: none;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+}
+/* Push the list below the note so the two read as one panel. */
+.title-combobox .combobox-list {
+  margin-top: 1.85rem;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+}
+/* Two tidy lines per row instead of the borrower picker's single wrapping line.
+   Catalogue titles here run to 80+ characters ("ΒΙΒΛΙΟΘΗΚΗ ΕΛΛΗΝΩΝ ΠΑΤΕΡΩΝ ΚΑΙ
+   ΕΚΚΛΗΣΙΑΣΤΙΚΩΝ ΣΥΓΓΡΑΦΕΩΝ …"), so wrapping makes eight results unscannable.
+   Truncate the title and keep author/shelf/year on their own line — those are
+   what actually distinguish one volume of a set from another. */
+.title-combobox .combobox-list li {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.15rem;
+}
+.title-combobox .combo-name,
+.title-combobox .combo-contact {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.title-combobox .combo-stats {
+  margin-left: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
 /* Smart-list chip icon spacing */
 .chip-icon { margin-right: 0.05rem; }
 

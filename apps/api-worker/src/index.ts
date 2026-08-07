@@ -35,6 +35,7 @@ import {
 	computeBookFolds,
 	EMBEDDING_MODEL,
 	ensureBootstrapAdmin,
+	foldDiacritics,
 	getBookAttributeValues,
 	getBooksCacheVersion,
 	insertAuditLog,
@@ -930,6 +931,76 @@ app.get('/api/books/ids', async (c) => {
 	// The fuzzy-search path returns rows rather than ids; fall back to mapping.
 	const ids = result.ids ?? result.rows.map((r) => String((r as { id: unknown }).id));
 	return c.json({ ids, total: ids.length });
+});
+
+// Books whose title starts with what the librarian is typing.
+//
+// This is a DUPLICATE WARNING shown during entry, not an autocomplete. The
+// catalogue has ~12.5K titles and they are near-unique, so suggesting one as a
+// value to accept is worse than useless — it invites picking an existing book's
+// title by mistake, which is exactly why title is excluded from
+// /api/books/facets. What the librarian actually asked for is to be told
+// "you already have this" BEFORE typing the whole record, instead of after
+// saving it.
+//
+// Read economy (free tier), in order of importance:
+//  • Prefix range on the indexed fold, not LIKE '%q%'. `title_fold >= q AND
+//    title_fold < q+'￿'` is two index seeks on idx_books_title_author_fold
+//    (migration 0018); a substring scan would be 12,552 row reads per
+//    debounced keystroke, which at everyday use would eat a meaningful slice of
+//    the daily D1 budget for one feature.
+//  • No KV cache. Per-prefix keys would explode the keyspace for a near-zero
+//    hit rate, and KV writes (1,000/day) are the scarcest resource here. A
+//    short private Cache-Control plus the client's debounce is the right trade.
+//
+// Depends on the *_fold backfill: rows written before migration 0012 have a
+// NULL title_fold and are invisible to this query, which is the same blind spot
+// that stopped the post-create duplicate warning from ever firing on imported
+// books. POST /api/admin/normalize-books repairs both.
+//
+// NOTE: registered before `/api/books/:id` so "title-suggest" isn't an id.
+app.get('/api/books/title-suggest', async (c) => {
+	const raw = (c.req.query('q') ?? '').trim();
+	const folded = foldDiacritics(raw);
+	// Below three characters every other book matches, so the list is noise and
+	// the query is at its most expensive.
+	if (folded.length < 3) {
+		return c.json({ items: [], total: 0 });
+	}
+	const excludeId = c.req.query('excludeId') ?? '';
+	// '￿' is above every character that can appear in a folded title, so
+	// [folded, folded+￿) is exactly the set of titles with this prefix.
+	const upperBound = `${folded}￿`;
+
+	const rows = await c.env.DB.prepare(
+		`SELECT id, title, author, shelf_code, publication_year, isbn
+		   FROM books
+		  WHERE deleted_at IS NULL AND title_fold >= ? AND title_fold < ? AND id != ?
+		  ORDER BY title_fold LIMIT 8`
+	).bind(folded, upperBound, excludeId).all<{
+		id: string; title: string; author: string;
+		shelf_code: string | null; publication_year: number | null; isbn: string | null;
+	}>();
+
+	const total = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM books
+		  WHERE deleted_at IS NULL AND title_fold >= ? AND title_fold < ? AND id != ?`
+	).bind(folded, upperBound, excludeId).first<{ n: number }>();
+
+	// Private: these are catalogue rows behind auth, and the response is
+	// per-librarian keystroke state — never store it in a shared cache.
+	c.header('Cache-Control', 'private, max-age=30');
+	return c.json({
+		items: (rows.results ?? []).map((r) => ({
+			id: r.id,
+			title: r.title,
+			author: r.author,
+			shelfCode: r.shelf_code,
+			publicationYear: r.publication_year,
+			isbn: r.isbn
+		})),
+		total: Number(total?.n ?? 0)
+	});
 });
 
 // NOTE: registered before `/api/books/:id` so "facets" isn't captured as an id.

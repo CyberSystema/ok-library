@@ -220,7 +220,8 @@ call("DELETE", f"/api/books/{cb}/cover")
 check("cover delete preserves title", get(cb)["title"] == cs["title"])
 
 print("=== 11. REGRESSION: static /api/books routes are not shadowed by :id ===")
-for path, ok in [("/api/books/trash", (200,)), ("/api/books/duplicates", (200,))]:
+for path, ok in [("/api/books/trash", (200,)), ("/api/books/duplicates", (200,)),
+                 ("/api/books/title-suggest?q=zzz", (200,))]:
     st, _ = call("GET", path)
     check(f"{path} reachable (not 404 from :id)", st in ok, f"status={st}")
 st, _ = call("GET", "/api/books/semantic?q=zz")
@@ -620,6 +621,37 @@ if st == 201:
     CREATED.append(d2["id"])
 check("the duplicate warning sees an existing Greek title",
       any(x["id"] == d1 for x in (d2 or {}).get("duplicateOf") or []), d2)
+
+print("=== 28. REGRESSION: title suggestions warn during entry ===")
+# The librarian asked to be told "you already have this" WHILE typing the title,
+# instead of after the duplicate has been saved. This is a warning list, not an
+# autocomplete — the client never writes a suggestion into the field.
+uniq = uuid.uuid4().hex[:6]
+ts_title = f"ZZITEST Επιφάνιος Σαλαμίνος {uniq}"
+ts_id, _ = mkbook(title=ts_title, author="ZZ Πατήρ")
+# Accent- and case-insensitive, because that is how the folded index works and
+# how a librarian actually types Greek.
+for probe in [ts_title[:24], ts_title[:24].lower(), "zzitest επιφανιος"]:
+    st, r = call("GET", "/api/books/title-suggest?q=" + urllib.parse.quote(probe))
+    hit = any(i["id"] == ts_id for i in (r or {}).get("items", []))
+    check(f"suggests the existing title for {probe!r}", st == 200 and hit, f"{st} {r}")
+st, r = call("GET", "/api/books/title-suggest?q=" + urllib.parse.quote(ts_title[:24]))
+check("a suggestion carries what distinguishes one volume from another",
+      all(k in (r or {}).get("items", [{}])[0] for k in ("id", "title", "author", "shelfCode", "publicationYear")),
+      (r or {}).get("items", [{}])[0])
+check("the total counts every match, not just the page", (r or {}).get("total", 0) >= 1, r)
+# Below the minimum length the query is both useless and at its most expensive.
+st, r = call("GET", "/api/books/title-suggest?q=zz")
+check("a two-character query is refused rather than scanning", (r or {}).get("total") == 0, r)
+# excludeId keeps a book from flagging itself while its own title is being edited.
+st, r = call("GET", "/api/books/title-suggest?q=" + urllib.parse.quote(ts_title[:24]) + f"&excludeId={ts_id}")
+check("excludeId omits the book being edited",
+      not any(i["id"] == ts_id for i in (r or {}).get("items", [])), r)
+# A soft-deleted book must not be offered as a duplicate.
+call("DELETE", f"/api/books/{ts_id}")
+st, r = call("GET", "/api/books/title-suggest?q=" + urllib.parse.quote(ts_title[:24]))
+check("a trashed book is not suggested",
+      not any(i["id"] == ts_id for i in (r or {}).get("items", [])), r)
 
 print("\n=== CLEANUP ===")
 for bid in CREATED:
