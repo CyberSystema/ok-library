@@ -5,6 +5,7 @@ import {
 	CreateBookSchema,
 	GenerateCodeSchema,
 	ReplaceItemsSchema,
+	computeSetGaps,
 	ImportBooksSchema,
 	ImportCatalogSchema,
 	ReturnBookSchema,
@@ -1444,6 +1445,128 @@ app.get('/api/books/semantic', async (c) => {
 
 	return c.json({ items, total: items.length, model: EMBEDDING_MODEL });
 });
+// ─── Multi-part works: which volume is missing? ───────────────────────────
+//
+// "Μπορώ να κάνω έλεγχο … έπειτα να ψάξω ποιο βιβλίο λείπει" — the same
+// question as the facet rail, asked of a set rather than a shelf.
+//
+// Reads the EXISTING data rather than requiring a migration first: `series`
+// is populated on 12,514 books and `volume_num` on 644, which already yields
+// ~930 real multi-book sets. Records formally joined by `set_id` (once the
+// librarian has approved the grouping) take precedence over the inferred form.
+//
+// Clustering is done in the Worker on the diacritic fold — SQLite's LOWER() is
+// ASCII-only and would leave "ΒΙΒΛΙΟΘΗΚΗ" and "Βιβλιοθήκη" as separate sets.
+// Same one-scan-and-aggregate shape as /api/books/facets.
+app.get('/api/books/sets', async (c) => {
+	const minBooks = Math.max(1, Math.min(50, Number(c.req.query('minBooks') ?? 2)));
+	const withGapsOnly = c.req.query('withGapsOnly') === 'true';
+	const limit = Math.min(500, Math.max(1, Number(c.req.query('limit') ?? 200)));
+
+	const cacheVersion = await getBooksCacheVersion(c.env);
+	const cacheKey = `sets:${minBooks}:${withGapsOnly}:${limit}:${cacheVersion}`;
+	if (c.env.CACHE) {
+		try {
+			const cached = await c.env.CACHE.get(cacheKey, 'json');
+			if (cached) return c.json(cached);
+		} catch (error) {
+			console.warn('Sets cache read failed', error);
+		}
+	}
+
+	const rows = await c.env.DB.prepare(
+		`SELECT b.id, b.title, b.author, b.set_id, b.volume_designation, b.custom_fields,
+		        s.title AS set_title, s.expected_volumes
+		   FROM books b
+		   LEFT JOIN book_sets s ON s.id = b.set_id AND s.deleted_at IS NULL
+		  WHERE b.deleted_at IS NULL
+		    AND (b.set_id IS NOT NULL
+		         OR (b.custom_fields IS NOT NULL AND b.custom_fields NOT IN ('', '{}')
+		             AND TRIM(COALESCE(CAST(json_extract(b.custom_fields, '$.series') AS TEXT), '')) <> ''))`
+	).all<{
+		id: string; title: string; author: string; set_id: string | null;
+		volume_designation: string | null; custom_fields: string;
+		set_title: string | null; expected_volumes: number | null;
+	}>();
+
+	type Cluster = {
+		key: string; label: string; setId: string | null; expected: number | null;
+		labels: Map<string, number>; author: string; volumes: Array<string | null>; bookCount: number;
+	};
+	const clusters = new Map<string, Cluster>();
+
+	for (const row of rows.results ?? []) {
+		const cf = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
+		const series = String(row.set_title ?? cf.series ?? '').trim();
+		if (!series) continue;
+		// 7,144 rows have `series` equal to their own title — an import artifact,
+		// not a set. Dropped PER BOOK, so one member whose title happens to match
+		// the series name cannot disqualify a genuine set.
+		if (!row.set_id && foldDiacritics(series) === foldDiacritics(row.title ?? '')) continue;
+
+		const key = row.set_id ?? `series:${foldDiacritics(series)}`;
+		let cluster = clusters.get(key);
+		if (!cluster) {
+			cluster = {
+				key, label: series, setId: row.set_id, expected: row.expected_volumes ?? null,
+				labels: new Map(), author: row.author ?? '', volumes: [], bookCount: 0
+			};
+			clusters.set(key, cluster);
+		}
+		// Display the most frequent original spelling, the way the value facets do.
+		cluster.labels.set(series, (cluster.labels.get(series) ?? 0) + 1);
+		cluster.volumes.push(row.volume_designation ?? (cf.volume_num as string | null) ?? null);
+		cluster.bookCount += 1;
+	}
+
+	const items = [...clusters.values()]
+		.filter((cluster) => cluster.bookCount >= minBooks)
+		.map((cluster) => {
+			const label = [...cluster.labels.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? cluster.label;
+			const gaps = computeSetGaps(cluster.volumes, cluster.expected);
+			return {
+				key: cluster.key,
+				setId: cluster.setId,
+				title: label,
+				sampleAuthor: cluster.author,
+				bookCount: cluster.bookCount,
+				expectedVolumes: cluster.expected,
+				minVol: gaps.minVol,
+				maxVol: gaps.maxVol,
+				unnumbered: gaps.unnumbered,
+				gapsAvailable: gaps.gapsAvailable,
+				// Capped: a report is for acting on, and a thousand-entry list is not.
+				missing: gaps.missing.slice(0, 200),
+				missingCount: gaps.missing.length
+			};
+		})
+		.filter((item) => (withGapsOnly ? item.gapsAvailable && item.missingCount > 0 : true))
+		.sort((a, b) => b.missingCount - a.missingCount || b.bookCount - a.bookCount)
+		.slice(0, limit);
+
+	const response = { items, total: items.length };
+	if (c.env.CACHE) {
+		try {
+			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 86400 });
+		} catch (error) {
+			console.warn('Sets cache write failed', error);
+		}
+	}
+	return c.json(response);
+});
+
+// ─── Facet browser ───────────────────────────────────────────────────────
+// Counts of books per distinct value of one field, for the left-hand rail.
+//
+// Generalized from the old category-only browser because the librarian needs to
+// reconcile the catalogue against the shelves: "μπορώ να κάνω έλεγχο αριθμητικό
+// επιτόπου στο ράφι και αν δεν συμφωνεί ο αριθμός αυτός με τον αριθμό των
+// καταχωρήσεων στη βάση … έπειτα να ψάξω ποιο βιβλίο λείπει." A count is only
+// useful for that if it is exactly reproducible as a filtered list, which is
+// why the `(empty)` predicate below and the one in db.ts must stay identical.
+//
+// The field whitelist lives in db.ts alongside the list filter that has to
+// agree with it — see `resolveEmptyFieldExpr`.
 
 app.get('/api/books/:id', async (c) => {
 	const id = c.req.param('id') ?? '';
@@ -4240,18 +4363,6 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 	});
 });
 
-// ─── Facet browser ───────────────────────────────────────────────────────
-// Counts of books per distinct value of one field, for the left-hand rail.
-//
-// Generalized from the old category-only browser because the librarian needs to
-// reconcile the catalogue against the shelves: "μπορώ να κάνω έλεγχο αριθμητικό
-// επιτόπου στο ράφι και αν δεν συμφωνεί ο αριθμός αυτός με τον αριθμό των
-// καταχωρήσεων στη βάση … έπειτα να ψάξω ποιο βιβλίο λείπει." A count is only
-// useful for that if it is exactly reproducible as a filtered list, which is
-// why the `(empty)` predicate below and the one in db.ts must stay identical.
-//
-// The field whitelist lives in db.ts alongside the list filter that has to
-// agree with it — see `resolveEmptyFieldExpr`.
 app.get('/api/facets', async (c) => {
 	const field = c.req.query('field') ?? 'custom:category_code';
 	// No table alias here: this query has a single unaliased FROM.

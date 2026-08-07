@@ -242,6 +242,118 @@ export function formatEdtfRange(parsed: ParsedEdtf): string {
   return span;
 }
 
+// ─── Multi-part works ──────────────────────────────────────────────────────
+//
+// Volume designations in this catalogue are free text and genuinely varied:
+// "1", "12", "Α'", "τ. 3", "1-2", "ΜΕΡΟΣ Β'". Gap detection is only trustworthy
+// if it is explicit about which of those it can and cannot count.
+
+export type VolumeNumber =
+  | { kind: 'int'; value: number }
+  /** "1-2" — a single physical volume covering a span of the set. */
+  | { kind: 'range'; from: number; to: number }
+  /** Present but not numeric: "Α'", "τ. γ'". Counted, never used for gaps. */
+  | { kind: 'opaque'; raw: string }
+  | { kind: 'missing' };
+
+const GREEK_NUMERALS: Record<string, number> = {
+  Α: 1, Β: 2, Γ: 3, Δ: 4, Ε: 5, Ϛ: 6, ΣΤ: 6, Ζ: 7, Η: 8, Θ: 9, Ι: 10,
+  ΙΑ: 11, ΙΒ: 12, ΙΓ: 13, ΙΔ: 14, ΙΕ: 15, ΙϚ: 16, ΙΣΤ: 16, ΙΖ: 17, ΙΗ: 18, ΙΘ: 19, Κ: 20
+};
+
+export function parseVolumeNumber(raw: string | null | undefined): VolumeNumber {
+  const text = (raw ?? '').trim();
+  if (!text) return { kind: 'missing' };
+
+  if (/^\d{1,4}$/.test(text)) return { kind: 'int', value: Number(text) };
+
+  const range = text.match(/^(\d{1,4})\s*[-–/]\s*(\d{1,4})$/);
+  if (range) {
+    const from = Number(range[1]);
+    const to = Number(range[2]);
+    if (from <= to) return { kind: 'range', from, to };
+  }
+
+  // A number embedded in noise: "τ. 3", "vol. 12", "ΜΕΡΟΣ 2".
+  const embedded = text.match(/(?:^|\D)(\d{1,4})(?:\D|$)/);
+  if (embedded) return { kind: 'int', value: Number(embedded[1]) };
+
+  // Greek alphabetic numerals with the keraia — "Α'", "ΙΒ'" — are how this
+  // collection numbers its patristic volumes, usually behind a word:
+  // "ΜΕΡΟΣ Β'" appears in 110 titles here, so treating it as unnumerable would
+  // blind gap detection to a whole series.
+  //
+  // Each token is tried rather than stripping known prefixes, because JS `\b`
+  // is ASCII-only and never matches a boundary next to a Greek letter — a
+  // prefix list looked right and silently did nothing.
+  const tokens = text.split(/[\s.]+/).filter(Boolean);
+  for (const token of tokens) {
+    const hasKeraia = /[΄'ʹ’´]/.test(token);
+    const greek = token.replace(/[΄'ʹ’´]/g, '').toUpperCase();
+    if (!greek || !Object.prototype.hasOwnProperty.call(GREEK_NUMERALS, greek)) continue;
+    // A bare letter only counts when it IS the whole value. Otherwise the
+    // keraia is required — "Η" is the numeral 8 *and* the Greek definite
+    // article, so "Η ΠΑΛΑΙΑ ΔΙΑΘΗΚΗ" would otherwise be read as volume 8.
+    if (hasKeraia || tokens.length === 1) {
+      return { kind: 'int', value: GREEK_NUMERALS[greek] as number };
+    }
+  }
+
+  return { kind: 'opaque', raw: text };
+}
+
+export type SetGapReport = {
+  /** Volume numbers between the lowest and highest held that are absent. */
+  missing: number[];
+  present: number[];
+  /** Volumes counted but not numerable — reported, never silently dropped. */
+  unnumbered: number;
+  /**
+   * false when gap maths would be misleading rather than merely incomplete:
+   * mostly-opaque numbering, or an implausible span (one typo'd "1997" would
+   * otherwise claim 1,996 missing volumes).
+   */
+  gapsAvailable: boolean;
+  minVol: number | null;
+  maxVol: number | null;
+};
+
+const MAX_PLAUSIBLE_SET_SPAN = 500;
+
+export function computeSetGaps(rawVolumes: Array<string | null | undefined>, expectedVolumes?: number | null): SetGapReport {
+  const present = new Set<number>();
+  let unnumbered = 0;
+
+  for (const raw of rawVolumes) {
+    const parsed = parseVolumeNumber(raw);
+    if (parsed.kind === 'int') present.add(parsed.value);
+    else if (parsed.kind === 'range') {
+      for (let n = parsed.from; n <= parsed.to; n += 1) present.add(n);
+    } else unnumbered += 1;
+  }
+
+  const nums = [...present].sort((a, b) => a - b);
+  const minVol = nums.length ? (nums[0] as number) : null;
+  // An explicit expected count beats inference: a set that should have 29 but
+  // whose tail is entirely absent looks complete at 20 otherwise.
+  const highestHeld = nums.length ? (nums[nums.length - 1] as number) : null;
+  const maxVol = expectedVolumes && highestHeld !== null
+    ? Math.max(expectedVolumes, highestHeld)
+    : highestHeld;
+
+  const span = minVol !== null && maxVol !== null ? maxVol - minVol : 0;
+  const gapsAvailable =
+    nums.length > 0 &&
+    unnumbered <= nums.length &&
+    span <= MAX_PLAUSIBLE_SET_SPAN;
+
+  const missing: number[] = [];
+  if (gapsAvailable && minVol !== null && maxVol !== null) {
+    for (let n = minVol; n <= maxVol; n += 1) if (!present.has(n)) missing.push(n);
+  }
+  return { missing, present: nums, unnumbered, gapsAvailable, minVol, maxVol };
+}
+
 // ─── Holdings ──────────────────────────────────────────────────────────────
 // An Item is one physical copy of a bibliographic record — the shelf-level
 // object, as distinct from the edition it is a copy of. Splitting the two is

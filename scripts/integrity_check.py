@@ -221,7 +221,8 @@ check("cover delete preserves title", get(cb)["title"] == cs["title"])
 
 print("=== 11. REGRESSION: static /api/books routes are not shadowed by :id ===")
 for path, ok in [("/api/books/trash", (200,)), ("/api/books/duplicates", (200,)),
-                 ("/api/books/title-suggest?q=zzz", (200,))]:
+                 ("/api/books/title-suggest?q=zzz", (200,)),
+                 ("/api/books/sets?minBooks=2&limit=5", (200,))]:
     st, _ = call("GET", path)
     check(f"{path} reachable (not 404 from :id)", st in ok, f"status={st}")
 st, _ = call("GET", "/api/books/semantic?q=zz")
@@ -844,6 +845,52 @@ for probe in ["Αποστολική", "Apostolike"]:
     st, r = call("GET", "/api/books?pageSize=20&searchFields=publisher&partialWords=true&fuzzyTypos=false&q="
                  + urllib.parse.quote(probe))
     check(f"publisher search finds {probe!r}", rb in [x["id"] for x in (r or {}).get("items", [])], probe)
+
+print("=== 33. REGRESSION: multi-part sets and gap detection ===")
+# "Έπειτα να ψάξω ποιο βιβλίο λείπει" — the same question as the facet rail,
+# asked of a set. Runs over the EXISTING series/volume_num data, so it works
+# before any grouping migration has been approved.
+setname = "ZZITEST ΣΕΙΡΑ " + uuid.uuid4().hex[:6]
+for vol in ["1", "3", "ΜΕΡΟΣ Δ'"]:      # 2 missing; the Greek numeral is volume 4
+    mkbook(title=f"{setname} τόμος {vol}", customFields={"series": setname, "volume_num": vol})
+# Version-keyed cache: the mkbook writes above already bumped it, but be
+# explicit so a reordering of this section cannot start reading stale counts.
+st, r = call("GET", "/api/books/sets?minBooks=2&limit=500")
+mine = next((x for x in (r or {}).get("items", []) if x["title"] == setname), None)
+check("the set is detected from series + volume_num", mine is not None, (r or {}).get("total"))
+if mine:
+    check("all three volumes counted", mine["bookCount"] == 3, mine["bookCount"])
+    check("a Greek numeral volume is read as a number", mine["maxVol"] == 4, mine)
+    check("the missing volume is reported", mine["missing"] == [2], mine["missing"])
+
+# A record whose `series` equals its own title is an import artifact, not a set —
+# 7,144 rows look like that. Dropped per book, so one such member cannot
+# disqualify a genuine set.
+solo = "ZZITEST SOLO " + uuid.uuid4().hex[:6]
+mkbook(title=solo, customFields={"series": solo})
+mkbook(title=solo + " second", customFields={"series": solo})
+st, r = call("GET", "/api/books/sets?minBooks=2&limit=500")
+found = next((x for x in (r or {}).get("items", []) if x["title"] == solo), None)
+check("a series-equals-title row is excluded, and the set still forms from the rest",
+      found is None or found["bookCount"] == 1, found)
+
+# Unnumerable volumes are counted and reported, never silently dropped, and
+# never used to fabricate a gap list.
+opaque = "ZZITEST ΑΝΑΡΙΘΜΗΤΑ " + uuid.uuid4().hex[:6]
+for label in ["πρώτος τόμος", "δεύτερος τόμος", "τρίτος τόμος"]:
+    mkbook(title=f"{opaque} {label}", customFields={"series": opaque, "volume_num": label})
+st, r = call("GET", "/api/books/sets?minBooks=2&limit=500")
+op = next((x for x in (r or {}).get("items", []) if x["title"] == opaque), None)
+check("an unnumbered set is still listed", op is not None, (r or {}).get("total"))
+if op:
+    check("gap maths is refused rather than guessed", op["gapsAvailable"] is False, op)
+    check("the unnumbered volumes are reported", op["unnumbered"] == 3, op["unnumbered"])
+
+# withGapsOnly must return only sets that actually have one.
+st, r = call("GET", "/api/books/sets?minBooks=2&withGapsOnly=true&limit=500")
+check("withGapsOnly returns only sets with a real gap",
+      all(x["gapsAvailable"] and x["missingCount"] > 0 for x in (r or {}).get("items", [])),
+      [(x["title"][:20], x["missingCount"]) for x in (r or {}).get("items", [])][:3])
 
 print("\n=== CLEANUP ===")
 for bid in CREATED:
