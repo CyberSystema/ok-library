@@ -12,7 +12,7 @@ Usage:
 
 Exit code 0 = everything held. Non-zero = at least one assertion failed.
 """
-import csv, io, json, os, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
+import csv, io, json, os, re, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
 
 BASE = os.environ.get("API", "http://127.0.0.1:8787").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -1094,6 +1094,102 @@ st, r = call("POST", "/api/import/marcxml", raw=bad.encode(), ctype="application
 check("a record with no 245$a is skipped and reported",
       st == 200 and (r or {}).get("skipped") == 1 and (r or {}).get("problems"), r)
 call("PUT", "/api/library-settings", {"isil": None})
+
+print("=== 37. REGRESSION: SRU and OAI-PMH ===")
+# The two protocols another library reads this catalogue with. Both are PUBLIC
+# and unauthenticated by definition — a harvester has no account — so the first
+# thing to prove is that they stay shut until the librarian opens them.
+def anon(path):
+    """Deliberately WITHOUT a token: these endpoints must work for strangers."""
+    req = urllib.request.Request(BASE + path, method="GET")
+    for _ in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                time.sleep(12); req = urllib.request.Request(BASE + path, method="GET"); continue
+            return e.code, e.read().decode()
+    return 429, ""
+
+call("PUT", "/api/library-settings", {"publicSharing": None})
+st, body = anon("/api/oai?verb=Identify")
+check("OAI is closed until sharing is enabled", st == 503 and "not published" in body, f"{st} {body[:90]}")
+st, body = anon("/api/sru?operation=explain")
+check("SRU is closed until sharing is enabled", st == 503 and "diagnostic" in body, f"{st} {body[:90]}")
+
+call("PUT", "/api/library-settings",
+     {"publicSharing": "on", "isil": "GR-ZZTEST", "libraryName": "ZZ Test Library"})
+try:
+    st, body = anon("/api/oai?verb=Identify")
+    check("OAI Identify answers without a token", st == 200 and "<Identify>" in body, f"{st} {body[:90]}")
+    check("Identify names the repository by ISIL", "<repositoryIdentifier>GR-ZZTEST<" in body, body[:300])
+    # We soft-delete and keep the row, so withdrawals CAN be reported forever.
+    # Claiming "persistent" is a promise loadOaiPage has to keep.
+    check("Identify declares persistent deletions", "<deletedRecord>persistent</deletedRecord>" in body, body[:300])
+
+    st, body = anon("/api/oai?verb=ListRecords&metadataPrefix=oai_dc")
+    check("ListRecords returns a page", st == 200 and "<dc:title>" in body, f"{st} {body[:120]}")
+    token = re.search(r'<resumptionToken[^>]*>([^<]+)</resumptionToken>', body)
+    check("a resumption token is issued when more remain", token is not None, body[-300:])
+    if token:
+        first_ids = set(re.findall(r"<identifier>(.*?)</identifier>", body))
+        st, body2 = anon("/api/oai?verb=ListRecords&resumptionToken=" + urllib.parse.quote(token.group(1)))
+        second_ids = set(re.findall(r"<identifier>(.*?)</identifier>", body2))
+        check("resuming returns the NEXT page, not the same one",
+              st == 200 and second_ids and not (second_ids & first_ids), len(second_ids & first_ids))
+
+    # A soft-deleted book must be reported as a tombstone, or a harvester keeps
+    # serving a book the library has withdrawn.
+    db, _ = mkbook(title="ZZITEST oai deleted " + uuid.uuid4().hex[:6])
+    call("DELETE", f"/api/books/{db}")
+    st, body = anon(f"/api/oai?verb=GetRecord&metadataPrefix=oai_dc&identifier=oai:GR-ZZTEST:{db}")
+    check("a withdrawn record is reported as deleted, not hidden",
+          st == 200 and 'status="deleted"' in body, body[:200])
+    call("POST", f"/api/books/{db}/restore")
+
+    for qs, expect in [("verb=Bogus", "badVerb"),
+                       ("verb=ListSets", "noSetHierarchy"),
+                       ("verb=ListRecords&metadataPrefix=zzz", "cannotDisseminateFormat"),
+                       ("verb=ListRecords&resumptionToken=notbase64", "badResumptionToken"),
+                       ("verb=ListRecords&metadataPrefix=oai_dc&resumptionToken=x", "badArgument")]:
+        st, body = anon("/api/oai?" + qs)
+        got = re.search(r'code="([^"]+)"', body)
+        check(f"OAI {qs[:44]} -> {expect}", got is not None and got.group(1) == expect,
+              got.group(1) if got else body[:120])
+
+    st, body = anon("/api/sru?operation=explain")
+    check("SRU explain advertises its indexes and schemas",
+          st == 200 and "<indexInfo>" in body and "marcxml" in body and "dc-v1.1" in body, body[:150])
+
+    sru_title = urllib.parse.quote(before["title"][:24]) if before else urllib.parse.quote("ZZITEST")
+    st, body = anon(f"/api/sru?operation=searchRetrieve&query=dc.title%3D{sru_title}&maximumRecords=1")
+    check("SRU searchRetrieve returns MARCXML", st == 200 and "<leader>" in body, body[:150])
+    st, body = anon(f"/api/sru?operation=searchRetrieve&query=dc.title%3D{sru_title}&maximumRecords=1&recordSchema=dc")
+    check("SRU can return Dublin Core", st == 200 and "oai_dc:dc" in body, body[:150])
+
+    # SRU must agree with the catalogue's own search. A protocol that answers a
+    # different number than the UI is worse than no protocol.
+    st, r = call("GET", "/api/books?pageSize=1&searchFields=author&partialWords=true&fuzzyTypos=false&q=MIGNE")
+    internal = (r or {}).get("total", -1)
+    st, body = anon("/api/sru?operation=searchRetrieve&query=dc.creator%3DMIGNE&maximumRecords=1")
+    sru_total = int((re.search(r"<numberOfRecords>(\d+)</numberOfRecords>", body) or ["", "-2"])[1])
+    check("SRU counts agree with the internal search", sru_total == internal, f"sru={sru_total} internal={internal}")
+
+    # Unsupported CQL must be REFUSED. Implementing a fraction and ignoring the
+    # rest returns results that do not answer the question asked.
+    for query, diag in [("dc.title=a or dc.title=b", "37"), ("(dc.title=a)", "38"), ("bogus.idx=x", "16")]:
+        st, body = anon("/api/sru?operation=searchRetrieve&query=" + urllib.parse.quote(query))
+        got = re.search(r"diagnostic/1/(\d+)", body)
+        check(f"SRU refuses {query[:24]!r}", got is not None and got.group(1) == diag,
+              got.group(1) if got else body[:120])
+
+    # Nothing beyond bibliographic data may leak through a public endpoint.
+    st, body = anon("/api/sru?operation=searchRetrieve&query=ZZITEST&maximumRecords=5")
+    for leaked in ["borrower", "ZZ Borrower", "@example", "password"]:
+        check(f"SRU does not expose {leaked!r}", leaked.lower() not in body.lower(), leaked)
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": None, "isil": None, "libraryName": None})
 
 print("\n=== CLEANUP ===")
 for bid in CREATED:

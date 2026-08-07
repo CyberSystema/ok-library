@@ -53,6 +53,7 @@ import {
 	resolveEmptyFieldExpr,
 	getLibrarySettings,
 	loadMarcExtrasForBooks,
+	loadOaiPage,
 	ensurePrimaryItem,
 	setItemsDeleted,
 	restoreItemsDeletedAt,
@@ -81,6 +82,20 @@ import {
 	toMarcXml
 } from './marc';
 import type { ParsedMarcRecord } from './marc';
+import {
+	decodeResumptionToken,
+	encodeResumptionToken,
+	oaiDatestamp,
+	oaiError,
+	oaiIdentifier,
+	oaiIdentify,
+	oaiResponse,
+	parseCql,
+	parseOaiIdentifier,
+	sruDiagnostic,
+	sruExplain,
+	xmlEscape
+} from './protocols';
 import type { AuthClaims, Env } from './types';
 import { deterministicUuid, generateCodeValue, newId, normalizeBookData, normalizeCode, nowIso, safeJsonParse, toCsv } from './utils';
 
@@ -371,8 +386,16 @@ app.use('/api/*', async (c, next) => {
     || /\/export$/.test(path)
   );
 
+  // SRU and OAI-PMH are UNAUTHENTICATED and world-reachable, so they get their
+  // own bucket rather than sharing one with signed-in staff: a harvester
+  // looping must never be able to exhaust the librarian's own allowance, and
+  // the account has 100k requests/day in total.
+  const isPublicProtocol = method === 'GET' && (path === '/api/sru' || path === '/api/oai');
+
   if (isAuthLogin) {
     await enforceRateLimit(c, 'login', 20);
+  } else if (isPublicProtocol) {
+    await enforceRateLimit(c, 'harvest', 60);
   } else if (isCoverWrite) {
     await enforceRateLimit(c, 'cover', 30);
   } else if (isMutating) {
@@ -578,6 +601,15 @@ app.post('/api/auth/logout', async (c) => {
 
 app.use('/api/*', async (c, next) => {
 	if (c.req.path === '/api/health' || c.req.path === '/api/auth/login' || c.req.path === '/api/auth/logout') {
+		await next();
+		return;
+	}
+	// SRU and OAI-PMH are the two protocols other libraries read this catalogue
+	// with, and both are unauthenticated by definition — a harvester has no
+	// account here. They are read-only, expose bibliographic records ONLY, and
+	// stay switched off until the librarian turns on `publicSharing`, so nothing
+	// leaves the building by default. See the handlers for the guard.
+	if (c.req.method === 'GET' && (c.req.path === '/api/sru' || c.req.path === '/api/oai')) {
 		await next();
 		return;
 	}
@@ -1477,7 +1509,7 @@ app.put('/api/library-settings', requirePermission('setup'), async (c) => {
 	const payload = z.record(z.string().max(64), z.string().max(300).nullable()).parse(await c.req.json());
 	// Whitelisted: this is a key/value table, and an open write would let any
 	// admin invent settings nothing reads.
-	const allowed = new Set(['isil', 'libraryName', 'libraryPlace', 'catalogueLanguage']);
+	const allowed = new Set(['isil', 'libraryName', 'libraryPlace', 'catalogueLanguage', 'publicSharing', 'adminEmail']);
 	const now = nowIso();
 	const statements: D1PreparedStatement[] = [];
 	for (const [key, value] of Object.entries(payload)) {
@@ -3873,6 +3905,299 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 // is added alongside, for exchange. Streamed page by page rather than built in
 // memory: 12.5K MARCXML records is several megabytes, and a Worker that
 // assembles the whole string first will run out of room long before it finishes.
+// ─── SRU and OAI-PMH ───────────────────────────────────────────────────────
+//
+// The two protocols another library reads a catalogue with. Both public, both
+// read-only, both bibliographic records only — never borrowers, loans, staff,
+// or item barcodes.
+//
+// OFF until `publicSharing` is turned on in Settings. Publishing a catalogue is
+// outward-facing and effectively irreversible once harvesters have cached it,
+// so it is the librarian's decision to make, not a default.
+const HARVEST_PAGE_SIZE = 100;
+
+async function sharingEnabled(env: Env): Promise<{ on: boolean; settings: Record<string, string | null> }> {
+  const settings = await getLibrarySettings(env);
+  return { on: (settings.publicSharing ?? '').toLowerCase() === 'on', settings };
+}
+
+/** Assemble the standard-format view of a page of books in one go. */
+async function marcInputsForRows(
+  env: Env, rows: Array<Record<string, unknown>>, isil: string | null
+) {
+  const ids = rows.map((r) => String(r.id));
+  const [itemsByBook, extras] = await Promise.all([
+    loadItemsForBooks(env, ids),
+    loadMarcExtrasForBooks(env, ids)
+  ]);
+  return rows.map((row) => {
+    const id = String(row.id);
+    const extra = extras.get(id);
+    return {
+      row,
+      input: bookRowToMarcInput(row, {
+        items: itemsByBook.get(id) ?? [],
+        contributors: extra?.contributors,
+        subjects: extra?.subjects,
+        seriesTitle: extra?.seriesTitle,
+        isil
+      })
+    };
+  });
+}
+
+app.get('/api/sru', async (c) => {
+	const { on, settings } = await sharingEnabled(c.env);
+	const url = new URL(c.req.url);
+	const q = (name: string) => url.searchParams.get(name) ?? '';
+
+	if (!on) {
+		return c.body(
+			sruDiagnostic('1', 'public sharing is disabled', 'This catalogue is not published'),
+			503, { 'Content-Type': 'application/xml; charset=utf-8' }
+		);
+	}
+
+	const operation = q('operation') || 'explain';
+	const total = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL').first<{ n: number }>();
+
+	if (operation === 'explain') {
+		return c.body(
+			sruExplain(url.origin + url.pathname, settings.libraryName ?? 'OK Library', Number(total?.n ?? 0)),
+			200, { 'Content-Type': 'application/xml; charset=utf-8' }
+		);
+	}
+	if (operation !== 'searchRetrieve') {
+		return c.body(sruDiagnostic('4', operation, 'Unsupported operation'), 200,
+			{ 'Content-Type': 'application/xml; charset=utf-8' });
+	}
+
+	const schema = (q('recordSchema') || 'marcxml').toLowerCase();
+	if (!['marcxml', 'dc', 'info:srw/schema/1/marcxml-v1.1', 'info:srw/schema/1/dc-v1.1'].includes(schema)) {
+		return c.body(sruDiagnostic('66', schema, 'Unknown record schema'), 200,
+			{ 'Content-Type': 'application/xml; charset=utf-8' });
+	}
+	const asDc = schema.includes('dc');
+
+	const parsed = parseCql(q('query'));
+	if (!parsed.ok) {
+		return c.body(sruDiagnostic(parsed.diagnostic, parsed.detail, 'Query not supported'), 200,
+			{ 'Content-Type': 'application/xml; charset=utf-8' });
+	}
+
+	// CQL indexes map onto the search the catalogue already has, rather than a
+	// second query path that could disagree with it.
+	const searchFields = new Set<string>();
+	const words: string[] = [];
+	let year: number | undefined;
+	let language: string | undefined;
+	for (const term of parsed.terms) {
+		if (term.index === 'date') { const n = Number(term.value); if (Number.isInteger(n)) year = n; continue; }
+		if (term.index === 'language') { language = term.value; continue; }
+		words.push(term.value);
+		if (term.index !== 'any') searchFields.add(term.index);
+	}
+
+	const startRecord = Math.max(1, Number(q('startRecord') || '1'));
+	const maximumRecords = Math.min(100, Math.max(0, Number(q('maximumRecords') || '10')));
+
+	const result = await queryBooksWithFilters(c.env, {
+		q: words.join(' '),
+		qMode: 'all',
+		partialWords: true,
+		// Deterministic for a protocol client: an SRU caller paging through
+		// results must get a stable set, not fuzzy near-misses that shift.
+		fuzzyTypos: false,
+		searchFields: searchFields.size ? [...searchFields].join(',') : undefined,
+		year,
+		language,
+		customFilters: [],
+		sortBy: 'title', sortDir: 'asc',
+		page: Math.floor((startRecord - 1) / Math.max(1, maximumRecords)) + 1,
+		pageSize: Math.max(1, maximumRecords)
+	});
+
+	const rendered = maximumRecords === 0 ? [] : await marcInputsForRows(c.env, result.rows, settings.isil ?? null);
+	const records = rendered.map(({ input }, i) => [
+		'    <record>',
+		`      <recordSchema>${asDc ? 'info:srw/schema/1/dc-v1.1' : 'info:srw/schema/1/marcxml-v1.1'}</recordSchema>`,
+		'      <recordPacking>xml</recordPacking>',
+		'      <recordData>',
+		asDc ? toDublinCoreXml(input) : toMarcXml(input),
+		'      </recordData>',
+		`      <recordPosition>${startRecord + i}</recordPosition>`,
+		'    </record>'
+	].join('\n'));
+
+	const nextPosition = startRecord + rendered.length;
+	const body = [
+		'<?xml version="1.0" encoding="UTF-8"?>',
+		'<searchRetrieveResponse xmlns="http://www.loc.gov/zing/srw/">',
+		'  <version>1.2</version>',
+		`  <numberOfRecords>${result.total}</numberOfRecords>`,
+		records.length ? '  <records>' : '',
+		...records,
+		records.length ? '  </records>' : '',
+		nextPosition <= result.total ? `  <nextRecordPosition>${nextPosition}</nextRecordPosition>` : '',
+		'</searchRetrieveResponse>'
+	].filter(Boolean).join('\n');
+
+	return c.body(body, 200, { 'Content-Type': 'application/xml; charset=utf-8' });
+});
+
+app.get('/api/oai', async (c) => {
+	const url = new URL(c.req.url);
+	const requestUrl = url.origin + url.pathname;
+	const responseDate = oaiDatestamp(new Date().toISOString());
+	const q = (name: string) => url.searchParams.get(name) ?? '';
+	const xml = (body: string) => c.body(body, 200, { 'Content-Type': 'text/xml; charset=utf-8' });
+
+	const { on, settings } = await sharingEnabled(c.env);
+	if (!on) {
+		return c.body(
+			oaiError(requestUrl, 'badArgument', 'This catalogue is not published', responseDate),
+			503, { 'Content-Type': 'text/xml; charset=utf-8' }
+		);
+	}
+	const isil = settings.isil ?? null;
+	const host = url.host;
+	const verb = q('verb');
+
+	if (verb === 'Identify') {
+		const earliest = await c.env.DB.prepare('SELECT MIN(updated_at) AS d FROM books').first<{ d: string | null }>();
+		return xml(oaiIdentify(requestUrl, {
+			repositoryName: settings.libraryName ?? 'OK Library',
+			baseUrl: requestUrl,
+			adminEmail: settings.adminEmail ?? `admin@${host}`,
+			earliestDatestamp: oaiDatestamp(earliest?.d),
+			responseDate, isil
+		}));
+	}
+
+	if (verb === 'ListMetadataFormats') {
+		return xml(oaiResponse(requestUrl, verb, {}, [
+			'  <ListMetadataFormats>',
+			'    <metadataFormat>',
+			'      <metadataPrefix>oai_dc</metadataPrefix>',
+			'      <schema>http://www.openarchives.org/OAI/2.0/oai_dc.xsd</schema>',
+			'      <metadataNamespace>http://www.openarchives.org/OAI/2.0/oai_dc/</metadataNamespace>',
+			'    </metadataFormat>',
+			'    <metadataFormat>',
+			'      <metadataPrefix>marcxml</metadataPrefix>',
+			'      <schema>http://www.loc.gov/standards/marcxml/schema/MARC21slim.xsd</schema>',
+			'      <metadataNamespace>http://www.loc.gov/MARC21/slim</metadataNamespace>',
+			'    </metadataFormat>',
+			'  </ListMetadataFormats>'
+		].join('\n'), responseDate));
+	}
+
+	if (verb === 'ListSets') {
+		// No set hierarchy: sets would have to mean something stable to a
+		// harvester, and this catalogue's categories are still being reorganised.
+		return xml(oaiError(requestUrl, 'noSetHierarchy', 'This repository has no sets', responseDate));
+	}
+
+	if (verb === 'GetRecord') {
+		const prefix = q('metadataPrefix');
+		if (!['oai_dc', 'marcxml'].includes(prefix)) {
+			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate));
+		}
+		const bookId = parseOaiIdentifier(q('identifier'));
+		if (!bookId) return xml(oaiError(requestUrl, 'idDoesNotExist', 'Malformed identifier', responseDate));
+		const row = await c.env.DB.prepare('SELECT * FROM books WHERE id = ?').bind(bookId).first();
+		if (!row) return xml(oaiError(requestUrl, 'idDoesNotExist', 'No such record', responseDate));
+
+		const parsedRow = parseBook(row as Record<string, unknown>);
+		const identifier = oaiIdentifier(isil, host, bookId);
+		const datestamp = oaiDatestamp(String(parsedRow.updatedAt ?? ''));
+		if (parsedRow.deletedAt) {
+			return xml(oaiResponse(requestUrl, verb, { identifier: q('identifier'), metadataPrefix: prefix }, [
+				'  <GetRecord>', '    <record>',
+				`      <header status="deleted"><identifier>${xmlEscape(identifier)}</identifier><datestamp>${datestamp}</datestamp></header>`,
+				'    </record>', '  </GetRecord>'
+			].join('\n'), responseDate));
+		}
+		const [{ input }] = await marcInputsForRows(c.env, [parsedRow], isil);
+		return xml(oaiResponse(requestUrl, verb, { identifier: q('identifier'), metadataPrefix: prefix }, [
+			'  <GetRecord>', '    <record>',
+			`      <header><identifier>${xmlEscape(identifier)}</identifier><datestamp>${datestamp}</datestamp></header>`,
+			'      <metadata>',
+			prefix === 'marcxml' ? toMarcXml(input) : toDublinCoreXml(input),
+			'      </metadata>',
+			'    </record>', '  </GetRecord>'
+		].join('\n'), responseDate));
+	}
+
+	if (verb === 'ListRecords' || verb === 'ListIdentifiers') {
+		const token = q('resumptionToken');
+		let offset = 0;
+		let prefix = q('metadataPrefix');
+		let from = q('from') || undefined;
+		let until = q('until') || undefined;
+
+		if (token) {
+			// The spec forbids combining a resumption token with other arguments —
+			// the token already carries them, and honouring both would silently
+			// change the harvest mid-run.
+			for (const other of ['metadataPrefix', 'from', 'until', 'set']) {
+				if (url.searchParams.get(other)) {
+					return xml(oaiError(requestUrl, 'badArgument', `"${other}" cannot be combined with resumptionToken`, responseDate));
+				}
+			}
+			const state = decodeResumptionToken(token);
+			if (!state) return xml(oaiError(requestUrl, 'badResumptionToken', 'Token is not valid', responseDate));
+			({ offset, prefix } = state);
+			from = state.from; until = state.until;
+		} else if (!['oai_dc', 'marcxml'].includes(prefix)) {
+			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate));
+		}
+
+		const page = await loadOaiPage(c.env, { from, until, offset, limit: HARVEST_PAGE_SIZE });
+		if (page.rows.length === 0) {
+			return xml(oaiError(requestUrl, 'noRecordsMatch', 'No records in that range', responseDate));
+		}
+
+		const wantMetadata = verb === 'ListRecords';
+		// A deleted record has no metadata to render, only a tombstone header —
+		// so only the live ones need the expensive assembly.
+		const live = page.rows.filter((r) => !r.deletedAt);
+		const rendered = wantMetadata ? await marcInputsForRows(c.env, live, isil) : [];
+		const byId = new Map(rendered.map(({ row, input }) => [String(row.id), input]));
+
+		const entries = page.rows.map((row) => {
+			const id = String(row.id);
+			const identifier = oaiIdentifier(isil, host, id);
+			const datestamp = oaiDatestamp(String(row.updatedAt ?? ''));
+			const header = row.deletedAt
+				? `      <header status="deleted"><identifier>${xmlEscape(identifier)}</identifier><datestamp>${datestamp}</datestamp></header>`
+				: `      <header><identifier>${xmlEscape(identifier)}</identifier><datestamp>${datestamp}</datestamp></header>`;
+			if (!wantMetadata) return header.replace(/^ {6}/, '    ');
+			if (row.deletedAt) return ['    <record>', header, '    </record>'].join('\n');
+			const input = byId.get(id);
+			return [
+				'    <record>', header, '      <metadata>',
+				prefix === 'marcxml' ? toMarcXml(input!) : toDublinCoreXml(input!),
+				'      </metadata>', '    </record>'
+			].join('\n');
+		});
+
+		const nextOffset = offset + page.rows.length;
+		const more = nextOffset < page.total;
+		const resumption = more
+			? `  <resumptionToken completeListSize="${page.total}" cursor="${offset}">`
+				+ xmlEscape(encodeResumptionToken({ offset: nextOffset, from, until, prefix }))
+				+ '</resumptionToken>'
+			// An empty token signals "this was the last page" per the spec.
+			: `  <resumptionToken completeListSize="${page.total}" cursor="${offset}"></resumptionToken>`;
+
+		return xml(oaiResponse(requestUrl, verb,
+			token ? { resumptionToken: token } : { metadataPrefix: prefix, from: from ?? '', until: until ?? '' },
+			[`  <${verb}>`, ...entries, resumption, `  </${verb}>`].join('\n'), responseDate));
+	}
+
+	return xml(oaiError(requestUrl, 'badVerb', verb ? `Unknown verb "${verb}"` : 'No verb supplied', responseDate));
+});
+
 app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian: true }), async (c) => {
 	const format = c.req.query('format') === 'json' ? 'json' : 'marcxml';
 	const settings = await getLibrarySettings(c.env);

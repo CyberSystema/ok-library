@@ -706,6 +706,38 @@ export async function loadMarcExtrasForBooks(
   return out;
 }
 
+/**
+ * Records for an OAI-PMH harvest window.
+ *
+ * Its own query rather than queryBooksWithFilters, because harvesting has
+ * requirements the browse path does not: ordered by `updated_at` so a resumption
+ * token is a stable cursor, filtered on that same column, and it must INCLUDE
+ * soft-deleted rows — a harvester that never hears about a withdrawal keeps
+ * serving the book forever. `deletedRecord: persistent` in Identify is a promise
+ * this query is what keeps.
+ */
+export async function loadOaiPage(
+  env: Env,
+  opts: { from?: string; until?: string; offset: number; limit: number }
+): Promise<{ rows: Array<Record<string, unknown>>; total: number }> {
+  const where: string[] = ['1=1'];
+  const values: unknown[] = [];
+  if (opts.from) { where.push('updated_at >= ?'); values.push(opts.from); }
+  if (opts.until) { where.push('updated_at <= ?'); values.push(opts.until); }
+  const whereSql = `WHERE ${where.join(' AND ')}`;
+
+  const [countRes, rowsRes] = await Promise.all([
+    env.DB.prepare(`SELECT COUNT(*) AS n FROM books ${whereSql}`).bind(...values).first<{ n: number }>(),
+    env.DB.prepare(
+      `SELECT * FROM books ${whereSql} ORDER BY updated_at ASC, id ASC LIMIT ? OFFSET ?`
+    ).bind(...values, opts.limit, opts.offset).all<Record<string, unknown>>()
+  ]);
+  return {
+    rows: (rowsRes.results ?? []).map(parseBook),
+    total: Number(countRes?.n ?? 0)
+  };
+}
+
 /** The institution's own identifiers — MARC 040/852, OAI-PMH repository id. */
 export async function getLibrarySettings(env: Env): Promise<Record<string, string | null>> {
   const rows = await env.DB.prepare('SELECT key, value FROM library_settings').all<{ key: string; value: string | null }>();
