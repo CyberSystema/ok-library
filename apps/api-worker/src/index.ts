@@ -6,6 +6,8 @@ import {
 	GenerateCodeSchema,
 	ReplaceItemsSchema,
 	computeSetGaps,
+	LinkAuthoritiesSchema,
+	UpsertAuthoritySchema,
 	ImportBooksSchema,
 	ImportCatalogSchema,
 	ReturnBookSchema,
@@ -1445,6 +1447,188 @@ app.get('/api/books/semantic', async (c) => {
 
 	return c.json({ items, total: items.length, model: EMBEDDING_MODEL });
 });
+// ─── Authority control ────────────────────────────────────────────────────
+//
+// One controlled term with a preferred form and the variants that mean the same
+// thing. Names, corporate bodies, publishers and subject headings are all the
+// same kind of object, so one table serves them.
+//
+// Nothing here is compulsory: the free-text `author`/`publisher` columns stay
+// authoritative until a book is explicitly linked, so the catalogue keeps
+// working untouched while the librarian converts at their own pace.
+
+app.get('/api/authorities', async (c) => {
+	const kind = c.req.query('kind');
+	const q = (c.req.query('q') ?? '').trim();
+	const limit = Math.min(200, Math.max(1, Number(c.req.query('limit') ?? 50)));
+
+	const where: string[] = ['a.deleted_at IS NULL'];
+	const values: unknown[] = [];
+	if (kind) { where.push('a.kind = ?'); values.push(kind); }
+	if (q) {
+		// Matches the preferred form OR any variant — the whole point of holding
+		// variants is that the librarian can type the spelling they remember.
+		const folded = foldDiacritics(q);
+		where.push(`(a.preferred_form_fold LIKE ?
+		             OR EXISTS (SELECT 1 FROM authority_variants v
+		                         WHERE v.authority_id = a.id AND v.form_fold LIKE ?))`);
+		values.push(`${folded}%`, `${folded}%`);
+	}
+
+	const rows = await c.env.DB.prepare(
+		`SELECT a.*, (SELECT COUNT(*) FROM book_authorities ba WHERE ba.authority_id = a.id) AS use_count
+		   FROM authorities a WHERE ${where.join(' AND ')}
+		  ORDER BY use_count DESC, a.preferred_form ASC LIMIT ?`
+	).bind(...values, limit).all<Record<string, unknown>>();
+
+	return c.json({
+		items: (rows.results ?? []).map((r) => ({
+			id: r.id,
+			kind: r.kind,
+			preferredForm: r.preferred_form,
+			preferredFormRomanized: r.preferred_form_romanized,
+			source: r.source,
+			viafId: r.viaf_id,
+			lcId: r.lc_id,
+			isni: r.isni,
+			dates: r.dates,
+			notes: r.notes,
+			useCount: Number(r.use_count ?? 0)
+		}))
+	});
+});
+
+app.post('/api/authorities', requirePermission('books.write', { librarian: true }), async (c) => {
+	const payload = UpsertAuthoritySchema.parse(await c.req.json());
+	const now = nowIso();
+	const id = newId('auth');
+	const preferred = payload.preferredForm.trim();
+
+	// One preferred form per kind. Two authority records for the same person is
+	// the problem this table exists to solve, so it must not be creatable here.
+	const clash = await c.env.DB.prepare(
+		'SELECT id FROM authorities WHERE kind = ? AND preferred_form_fold = ? AND deleted_at IS NULL LIMIT 1'
+	).bind(payload.kind, foldDiacritics(preferred)).first<{ id: string }>();
+	if (clash) throw new HTTPException(409, { message: 'An authority with that preferred form already exists' });
+
+	const statements: D1PreparedStatement[] = [
+		c.env.DB.prepare(
+			`INSERT INTO authorities (id, kind, preferred_form, preferred_form_romanized, preferred_form_fold,
+			                          source, viaf_id, lc_id, isni, dates, notes, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		).bind(
+			id, payload.kind, preferred, payload.preferredFormRomanized ?? null, foldDiacritics(preferred),
+			payload.source, payload.viafId ?? null, payload.lcId ?? null, payload.isni ?? null,
+			payload.dates ?? null, payload.notes ?? null, now, now
+		)
+	];
+	for (const variant of payload.variants) {
+		const form = variant.trim();
+		if (!form || foldDiacritics(form) === foldDiacritics(preferred)) continue;
+		statements.push(
+			c.env.DB.prepare(
+				'INSERT INTO authority_variants (id, authority_id, form, form_fold, created_at) VALUES (?, ?, ?, ?, ?)'
+			).bind(newId('avar'), id, form, foldDiacritics(form), now)
+		);
+	}
+	await runAtomic(c.env, statements);
+	await insertAuditLog(c.env, c.get('user').sub, 'authority.create', 'authority', id, {
+		kind: payload.kind, preferredForm: preferred
+	});
+	return c.json({ id }, 201);
+});
+
+app.get('/api/books/:id/authorities', async (c) => {
+	const id = c.req.param('id') ?? '';
+	const rows = await c.env.DB.prepare(
+		`SELECT ba.role, ba.seq, a.id, a.kind, a.preferred_form, a.preferred_form_romanized, a.dates
+		   FROM book_authorities ba JOIN authorities a ON a.id = ba.authority_id
+		  WHERE ba.book_id = ? AND a.deleted_at IS NULL
+		  ORDER BY ba.role ASC, ba.seq ASC`
+	).bind(id).all<Record<string, unknown>>();
+	return c.json({
+		bookId: id,
+		links: (rows.results ?? []).map((r) => ({
+			authorityId: r.id,
+			kind: r.kind,
+			role: r.role,
+			preferredForm: r.preferred_form,
+			preferredFormRomanized: r.preferred_form_romanized,
+			dates: r.dates
+		}))
+	});
+});
+
+// Whole-list replace, same shape as attributes and holdings.
+app.put('/api/books/:id/authorities', requirePermission('books.write', { librarian: true }), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
+	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+
+	const payload = LinkAuthoritiesSchema.parse(await c.req.json());
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [
+		c.env.DB.prepare('DELETE FROM book_authorities WHERE book_id = ?').bind(id)
+	];
+	payload.links.forEach((link, index) => {
+		statements.push(
+			c.env.DB.prepare(
+				`INSERT OR REPLACE INTO book_authorities (book_id, authority_id, role, seq, created_at)
+				 VALUES (?, ?, ?, ?, ?)`
+			).bind(id, link.authorityId, link.role, index, now)
+		);
+	});
+	await runAtomic(c.env, statements);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.authorities.replace', 'book', id, {
+		count: payload.links.length
+	});
+	return c.json({ bookId: id, count: payload.links.length });
+});
+
+// Soft delete. The links go with it via ON DELETE CASCADE only on a hard
+// delete, so they are cleared explicitly — a book must not keep pointing at a
+// heading the librarian has retired.
+app.delete('/api/authorities/:id', requirePermission('books.write', { librarian: true }), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const now = nowIso();
+	await runAtomic(c.env, [
+		c.env.DB.prepare('DELETE FROM book_authorities WHERE authority_id = ?').bind(id),
+		c.env.DB.prepare('UPDATE authorities SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
+			.bind(now, now, id)
+	]);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'authority.delete', 'authority', id, {});
+	return c.body(null, 204);
+});
+
+// Propose subject headings from the category labels already in the catalogue.
+//
+// Preview only — it creates nothing. 629 distinct `category_label` values are
+// the librarian's own vocabulary already, so they are the obvious seed for a
+// controlled subject list, but which of them are real headings is a judgement
+// call and belongs with the person who wrote them.
+app.get('/api/authorities/subject-candidates', requirePermission('books.write', { librarian: true }), async (c) => {
+	const limit = Math.min(1000, Math.max(1, Number(c.req.query('limit') ?? 500)));
+	const rows = await c.env.DB.prepare(
+		`SELECT CAST(json_extract(custom_fields, '$.category_label') AS TEXT) AS label, COUNT(*) AS n
+		   FROM books
+		  WHERE deleted_at IS NULL
+		    AND TRIM(COALESCE(CAST(json_extract(custom_fields, '$.category_label') AS TEXT), '')) <> ''
+		  GROUP BY label ORDER BY n DESC LIMIT ?`
+	).bind(limit).all<{ label: string; n: number }>();
+
+	const existing = await c.env.DB.prepare(
+		"SELECT preferred_form_fold FROM authorities WHERE kind = 'subject' AND deleted_at IS NULL"
+	).all<{ preferred_form_fold: string }>();
+	const known = new Set((existing.results ?? []).map((r) => r.preferred_form_fold));
+
+	return c.json({
+		items: (rows.results ?? [])
+			.map((r) => ({ label: r.label, bookCount: Number(r.n ?? 0), alreadyExists: known.has(foldDiacritics(r.label)) }))
+	});
+});
+
 // ─── Multi-part works: which volume is missing? ───────────────────────────
 //
 // "Μπορώ να κάνω έλεγχο … έπειτα να ψάξω ποιο βιβλίο λείπει" — the same

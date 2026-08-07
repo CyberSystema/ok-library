@@ -892,6 +892,59 @@ check("withGapsOnly returns only sets with a real gap",
       all(x["gapsAvailable"] and x["missingCount"] > 0 for x in (r or {}).get("items", [])),
       [(x["title"][:20], x["missingCount"]) for x in (r or {}).get("items", [])][:3])
 
+print("=== 34. REGRESSION: authority control and subjects ===")
+# Names are free text, so one person is several people — the value-consistency
+# tool already finds 61 author and 67 publisher fold-groups. An authority record
+# is the cure rather than the after-the-fact merge: one preferred form, and the
+# variants point at it.
+uniq = uniq = uuid.uuid4().hex[:6]
+pref = f"ZZ Μίγνε, Ζ.-Π. {uniq}"
+st, auth = call("POST", "/api/authorities", {
+    "kind": "person", "preferredForm": pref, "preferredFormRomanized": "Migne, J.-P.",
+    "dates": "1800-1875", "variants": [f"ZZ ΜΙΓΝΕ {uniq}", f"ZZ J.-P. MIGNE {uniq}"]})
+check("an authority is created", st == 201, f"{st} {auth}")
+aid = (auth or {}).get("id")
+
+# The whole point of holding variants: the librarian types the spelling they
+# remember and still lands on the one preferred form.
+for probe in [pref[:14], pref[:14].lower(), f"ZZ ΜΙΓΝΕ {uniq}", f"ZZ J.-P. MIGNE {uniq}"]:
+    st, r = call("GET", "/api/authorities?kind=person&q=" + urllib.parse.quote(probe))
+    found = [x for x in (r or {}).get("items", []) if x["id"] == aid]
+    check(f"variant {probe!r} resolves to the preferred form",
+          bool(found) and found[0]["preferredForm"] == pref, f"{st} {r}")
+
+# Two records for the same person is exactly what this table exists to prevent,
+# so it must not be creatable — and the check has to be accent-insensitive.
+st, dup = call("POST", "/api/authorities",
+               {"kind": "person", "preferredForm": pref.upper(), "variants": []})
+check("a duplicate preferred form is refused", st == 409, f"{st} {dup}")
+
+# Roles are MARC relator codes, which is what a MARC export needs in $4/$e and
+# what finally gives `editor`/`translator` a standard home.
+ab, _ = mkbook()
+st, r = call("PUT", f"/api/books/{ab}/authorities", {"links": [{"authorityId": aid, "role": "edt"}]})
+check("an authority links to a book", st == 200, f"{st} {r}")
+st, links = call("GET", f"/api/books/{ab}/authorities")
+row = ((links or {}).get("links") or [{}])[0]
+check("the link carries its MARC relator", row.get("role") == "edt", row)
+check("the link resolves the preferred form", row.get("preferredForm") == pref, row)
+# Whole-list replace, same contract as attributes and holdings.
+st, r = call("PUT", f"/api/books/{ab}/authorities", {"links": []})
+st, links = call("GET", f"/api/books/{ab}/authorities")
+check("replacing with an empty list unlinks", (links or {}).get("links") == [], links)
+
+# Free text stays authoritative until a book is linked, so nothing breaks
+# mid-transition.
+check("the book's free-text author is untouched by linking",
+      get(ab).get("author") == "ZZ Author", get(ab).get("author"))
+
+st, r = call("GET", "/api/authorities/subject-candidates?limit=5")
+check("subject candidates come from the existing category labels",
+      len((r or {}).get("items", [])) > 0 and all("bookCount" in x for x in r["items"]), r)
+
+if aid:
+    call("DELETE", f"/api/authorities/{aid}")
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

@@ -242,6 +242,53 @@ export function formatEdtfRange(parsed: ParsedEdtf): string {
   return span;
 }
 
+// ─── Authority control ─────────────────────────────────────────────────────
+//
+// One controlled term: a preferred form, the variants that mean the same thing,
+// and optionally an id in an external file. Covers names, corporate bodies,
+// publishers and subject headings, because they are the same kind of object.
+
+export const AuthorityKindSchema = z.enum(['person', 'corporate', 'publisher', 'subject', 'uniform_title']);
+export const AuthoritySourceSchema = z.enum(['local', 'lcsh', 'viaf', 'lc', 'imported']);
+
+// MARC relator codes. Not an invented enum — this is what a MARC export needs
+// in $4/$e, and it gives the existing `editor`/`translator` attributes a
+// standard home. 'sub' is our marker for a subject heading.
+export const MARC_RELATORS = [
+  'aut', // author
+  'edt', // editor
+  'trl', // translator
+  'ill', // illustrator
+  'cmp', // composer
+  'com', // compiler
+  'ctb', // contributor
+  'pbl', // publisher
+  'aui', // author of introduction
+  'ann', // annotator
+  'sub'  // subject (our marker, not a real relator)
+] as const;
+export const MarcRelatorSchema = z.enum(MARC_RELATORS);
+
+export const UpsertAuthoritySchema = z.object({
+  kind: AuthorityKindSchema,
+  preferredForm: z.string().min(1).max(300),
+  preferredFormRomanized: z.string().max(300).optional().nullable(),
+  source: AuthoritySourceSchema.default('local'),
+  viafId: z.string().max(64).optional().nullable(),
+  lcId: z.string().max(64).optional().nullable(),
+  isni: z.string().max(64).optional().nullable(),
+  dates: z.string().max(64).optional().nullable(),
+  notes: z.string().max(2000).optional().nullable(),
+  variants: z.array(z.string().min(1).max(300)).max(50).default([])
+});
+
+export const LinkAuthoritiesSchema = z.object({
+  links: z.array(z.object({
+    authorityId: z.string().min(1),
+    role: MarcRelatorSchema.default('aut')
+  })).max(100)
+});
+
 // ─── Multi-part works ──────────────────────────────────────────────────────
 //
 // Volume designations in this catalogue are free text and genuinely varied:
