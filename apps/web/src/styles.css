@@ -239,7 +239,7 @@ label {
   flex-shrink: 0;
 }
 .navbar-brand h1 { font-size: 1.1875rem; letter-spacing: -0.01em; }
-.navbar-right { display: flex; align-items: center; gap: 0.75rem; }
+.navbar-right { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
 .desktop-download { display: inline-flex; align-items: center; gap: 0.55rem; }
 
 /* Vivid gradient "download" pill — the navbar call-to-action. */
@@ -403,7 +403,10 @@ label {
 /* ================== BOOK GRID ================== */
 .book-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  /* `min(300px, 100%)` rather than a bare 300px: on a viewport narrower than
+     the track minimum, a plain minmax(300px, …) keeps the track at 300px and
+     the grid overflows its container. */
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
   gap: 0.875rem;
   margin-bottom: 1rem;
 }
@@ -417,6 +420,11 @@ label {
   align-items: flex-start;
   cursor: pointer;
   transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
+  /* A grid/flex item defaults to `min-width: auto`, so it refuses to shrink
+     below the min-content width of its own nowrap contents — the title, the
+     shelf badge and the meta chips. That pushed a single-column track to 373px
+     inside a 317px grid on a phone, and the whole page scrolled sideways. */
+  min-width: 0;
 }
 .book-card:hover {
   border-color: var(--accent);
@@ -2205,6 +2213,36 @@ mark.hl {
   .search-bar { flex-direction: column; }
   .search-bar .search-field, .search-bar .filter-field { width: 100%; min-width: unset; flex: unset; }
   .search-bar .search-actions { flex-direction: row; }
+
+  /* The navbar is a fixed-height sticky row that cannot wrap, so on a phone its
+     548px of controls simply pushed the page sideways. Drop the two that a
+     phone has no use for — you cannot install a desktop build on it — and let
+     the brand truncate instead of forcing width. */
+  .simple-navbar { padding: 0 0.75rem; gap: 0.5rem; }
+  .desktop-download { display: none; }
+  .navbar-brand { min-width: 0; }
+  .navbar-brand h1 {
+    font-size: 1rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .navbar-right { gap: 0.4rem; }
+  .navbar-right .secondary.small { padding-left: 0.5rem; padding-right: 0.5rem; font-size: 0.75rem; }
+}
+
+/* Below ~420px the five navbar controls leave the wordmark about 44px against
+   the 79px it needs, so it renders as "OK …". Drop it and keep the logo, which
+   carries the identity on its own — a deliberate choice reads better than a
+   truncation that looks like a bug. */
+@media (max-width: 420px) {
+  .navbar-brand h1 {
+    position: absolute;
+    width: 1px; height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
 }
 @media (max-width: 480px) {
   .stats-row { grid-template-columns: repeat(2, 1fr); gap: 0.625rem; }
