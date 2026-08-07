@@ -1,6 +1,7 @@
 import { HTTPException } from 'hono/http-exception';
 import { defaultPbkdf2Iterations, generateSaltHex, hashPasswordPbkdf2 } from './auth';
 import type { AuthClaims, Env } from './types';
+import { checkIsbn } from '@ok-library/shared';
 import { normalizeCode, nowIso, safeJsonParse } from './utils';
 
 type CustomFieldDef = {
@@ -159,6 +160,11 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
   }
   out.customFields = safeJsonParse((row.custom_fields as string) ?? '{}', {});
   out.tags = Array.isArray(row.tags) ? row.tags : safeJsonParse((row.tags as string) ?? '[]', []);
+  // Computed, not stored: a pure function of the ISBN, so there is no column to
+  // keep in sync and no write path to remember. `false` means the check digit
+  // does not match — a warning, never a reason the book cannot be saved.
+  out.isbnValid = row.isbn ? checkIsbn(String(row.isbn)).valid : null;
+  out.ddc = row.ddc ?? null;
   out.titleRomanized = row.title_romanized ?? null;
   out.authorRomanized = row.author_romanized ?? null;
   out.publisherRomanized = row.publisher_romanized ?? null;

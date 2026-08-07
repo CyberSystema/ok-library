@@ -945,6 +945,29 @@ check("subject candidates come from the existing category labels",
 if aid:
     call("DELETE", f"/api/authorities/{aid}")
 
+print("=== 35. REGRESSION: identifiers, language codes, library settings ===")
+# Check digits are validated but NEVER block. Small publishers really do print a
+# wrong one, and refusing would make the book uncatalogueable — the librarian is
+# transcribing what is on the page.
+bad, _ = mkbook(isbn="978-960-315-733-6")     # last digit deliberately wrong
+good, _ = mkbook(isbn="978-960-315-733-5")    # the real ISBN from the catalogue
+check("a book with a bad check digit still saves", get(bad) is not None)
+check("a bad check digit is flagged", get(bad).get("isbnValid") is False, get(bad).get("isbnValid"))
+check("a good check digit passes", get(good).get("isbnValid") is True, get(good).get("isbnValid"))
+# ISBN-10 books must not be reported as invalid just for being short.
+ten, _ = mkbook(isbn="960-315-265-X")
+check("a valid ISBN-10 is accepted", get(ten).get("isbnValid") is True, get(ten).get("isbnValid"))
+
+# The institution's own record. Needed by MARC 040/852, OAI-PMH and SRU.
+st, r = call("GET", "/api/library-settings")
+check("library settings are readable", st == 200 and "catalogueLanguage" in (r or {}).get("settings", {}), r)
+st, _ = call("PUT", "/api/library-settings", {"isil": "ZZ-TEST", "notAKey": "x"})
+st, r = call("GET", "/api/library-settings")
+check("a known setting is written", (r or {}).get("settings", {}).get("isil") == "ZZ-TEST", r)
+check("an unknown key is ignored rather than stored",
+      "notAKey" not in (r or {}).get("settings", {}), r)
+call("PUT", "/api/library-settings", {"isil": None})
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

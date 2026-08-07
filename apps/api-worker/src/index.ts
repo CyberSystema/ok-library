@@ -1447,6 +1447,41 @@ app.get('/api/books/semantic', async (c) => {
 
 	return c.json({ items, total: items.length, model: EMBEDDING_MODEL });
 });
+// ─── The library itself ───────────────────────────────────────────────────
+//
+// Who this catalogue belongs to. MARC 040/852, the OAI-PMH repository
+// identifier and an SRU response all need it, and the ISIL is how an
+// institution is named in shared records.
+app.get('/api/library-settings', async (c) => {
+	const rows = await c.env.DB.prepare('SELECT key, value FROM library_settings').all<{ key: string; value: string | null }>();
+	const out: Record<string, string | null> = {};
+	for (const r of rows.results ?? []) out[r.key] = r.value;
+	return c.json({ settings: out });
+});
+
+app.put('/api/library-settings', requirePermission('setup'), async (c) => {
+	const payload = z.record(z.string().max(64), z.string().max(300).nullable()).parse(await c.req.json());
+	// Whitelisted: this is a key/value table, and an open write would let any
+	// admin invent settings nothing reads.
+	const allowed = new Set(['isil', 'libraryName', 'libraryPlace', 'catalogueLanguage']);
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [];
+	for (const [key, value] of Object.entries(payload)) {
+		if (!allowed.has(key)) continue;
+		statements.push(
+			c.env.DB.prepare(
+				`INSERT INTO library_settings (key, value, updated_at) VALUES (?, ?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+			).bind(key, value?.trim() || null, now)
+		);
+	}
+	if (statements.length > 0) await runAtomic(c.env, statements);
+	await insertAuditLog(c.env, c.get('user').sub, 'librarySettings.update', 'system', null, {
+		keys: Object.keys(payload).filter((k) => allowed.has(k))
+	});
+	return c.json({ ok: true, updated: statements.length });
+});
+
 // ─── Authority control ────────────────────────────────────────────────────
 //
 // One controlled term with a preferred form and the variants that mean the same

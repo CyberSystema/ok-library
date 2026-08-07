@@ -242,6 +242,82 @@ export function formatEdtfRange(parsed: ParsedEdtf): string {
   return span;
 }
 
+// ─── Standard identifiers ──────────────────────────────────────────────────
+//
+// Validated but NEVER blocking. A librarian transcribing what is printed in the
+// book must always be able to save it — small publishers really do print ISBNs
+// with a wrong check digit, and refusing would make the book uncatalogueable.
+// The warning tells them; a smart list gathers them for review later.
+
+export function isbn10CheckDigit(first9: string): string {
+  let sum = 0;
+  for (let i = 0; i < 9; i += 1) sum += (10 - i) * Number(first9[i]);
+  const check = (11 - (sum % 11)) % 11;
+  return check === 10 ? 'X' : String(check);
+}
+
+export function isbn13CheckDigit(first12: string): string {
+  let sum = 0;
+  for (let i = 0; i < 12; i += 1) sum += Number(first12[i]) * (i % 2 === 0 ? 1 : 3);
+  return String((10 - (sum % 10)) % 10);
+}
+
+export type IsbnCheck = { normalized: string; length: 10 | 13 | null; valid: boolean };
+
+export function checkIsbn(raw: string | null | undefined): IsbnCheck {
+  const s = (raw ?? '').replace(/[^0-9Xx]/g, '').toUpperCase();
+  if (s.length === 10) return { normalized: s, length: 10, valid: isbn10CheckDigit(s.slice(0, 9)) === s[9] };
+  if (s.length === 13) return { normalized: s, length: 13, valid: isbn13CheckDigit(s.slice(0, 12)) === s[12] };
+  return { normalized: s, length: null, valid: false };
+}
+
+/**
+ * ISBN-10 → ISBN-13, for MATCHING only.
+ *
+ * The same book carries a 10-digit ISBN on an old printing and a 13-digit one
+ * on a new; a lookup or a duplicate check that compares them literally misses.
+ * The stored value is left exactly as the librarian entered it.
+ */
+export function isbn10To13(raw: string | null | undefined): string | null {
+  const c = checkIsbn(raw);
+  if (c.length !== 10) return null;
+  const core = `978${c.normalized.slice(0, 9)}`;
+  return core + isbn13CheckDigit(core);
+}
+
+export function checkIssn(raw: string | null | undefined): { normalized: string; valid: boolean } {
+  const s = (raw ?? '').replace(/[^0-9Xx]/g, '').toUpperCase();
+  if (s.length !== 8) return { normalized: s, valid: false };
+  let sum = 0;
+  for (let i = 0; i < 7; i += 1) sum += Number(s[i]) * (8 - i);
+  const rem = 11 - (sum % 11);
+  const check = rem === 11 ? '0' : rem === 10 ? 'X' : String(rem);
+  return { normalized: s, valid: check === s[7] };
+}
+
+// ─── Language codes (ISO 639-2/B) ──────────────────────────────────────────
+//
+// The catalogue stores two-letter uppercase codes ("EL", "KO") sometimes joined
+// with commas ("EL,EN"). MARC 041 wants three-letter ISO 639-2/B codes, one per
+// subfield. This maps what is actually in the data; anything unrecognised is
+// passed through rather than guessed at.
+const ISO639_1_TO_2B: Record<string, string> = {
+  el: 'gre', en: 'eng', ko: 'kor', ru: 'rus', fr: 'fre', de: 'ger', it: 'ita',
+  es: 'spa', la: 'lat', bg: 'bul', cs: 'cze', tr: 'tur', ar: 'ara', he: 'heb',
+  sr: 'srp', ro: 'rum', uk: 'ukr', pl: 'pol', pt: 'por', nl: 'dut', sv: 'swe',
+  fi: 'fin', hu: 'hun', ka: 'geo', hy: 'arm', zh: 'chi', ja: 'jpn'
+};
+
+/** Split a stored language value into ISO 639-2/B codes: "EL,EN" → ["gre","eng"]. */
+export function toIso639_2(raw: string | null | undefined): string[] {
+  return (raw ?? '')
+    .split(/[,;/|]+/)
+    .map((part) => part.trim().toLowerCase())
+    .filter(Boolean)
+    .map((part) => ISO639_1_TO_2B[part] ?? (part.length === 3 ? part : part))
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+}
+
 // ─── Authority control ─────────────────────────────────────────────────────
 //
 // One controlled term: a preferred form, the variants that mean the same thing,
