@@ -2471,3 +2471,33 @@ mark.hl {
   height: 1.2em;
   margin-bottom: 0.35rem;
 }
+
+/* ===== ISO 2789 report ===== */
+.iso-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.iso-grid h4 {
+  margin: 0 0 0.4rem;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+.iso-list { list-style: none; margin: 0; padding: 0; font-size: 0.8125rem; }
+.iso-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.2rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.iso-list li span:last-child { font-variant-numeric: tabular-nums; font-weight: 600; }
+.iso-list .mono { font-family: ui-monospace, monospace; }
+
+/* The per-copy editor is folded away: most records have one copy and the
+   defaults are usually right, but the fields must be reachable. */
+.copies-editor { margin-top: 0.75rem; }
+.copies-editor summary { cursor: pointer; font-size: 0.8125rem; font-weight: 600; color: var(--accent); }

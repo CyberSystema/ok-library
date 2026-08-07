@@ -12,7 +12,7 @@ import {
   useToast
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
-import { formatEdtfRange, parseEdtf } from '@ok-library/shared';
+import { formatEdtfRange, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
 import { cacheGet, cacheSet, cacheBustPrefixes, cacheClear } from './cache';
 import { OnboardingCourse } from './onboarding';
 import './styles.css';
@@ -130,6 +130,24 @@ type ActiveBorrow = {
   shelfCode?: string | null;
   barcode?: string | null;
   renewalCount?: number;
+};
+
+type Iso2789Report = {
+  period: { from: string; to: string };
+  library: { isil: string | null; name: string | null; place: string | null };
+  stockBaselineDate: string | null;
+  collection: {
+    titles: number; items: number; serialTitles: number;
+    byDocumentCategory: Array<{ category: string; items: number }>;
+    byLanguage: Array<{ language: string; titles: number }>;
+  };
+  flow: {
+    additions: number;
+    withdrawals: { total: number; byReason: Array<{ reason: string; items: number }> };
+    loans: number; itemsLent: number; renewedLoans: number; activeBorrowers: number;
+  };
+  users: { registered: number; byCategory: Array<{ category: string; borrowers: number }> };
+  caveats: string[];
 };
 
 type ScanHit = {
@@ -1185,6 +1203,9 @@ type Item = {
   itemType: string;
   status: BookStatus;
   condition?: string | null;
+  // When this COPY entered the collection. The record's own createdAt is the
+  // import timestamp for the whole legacy catalogue, so it cannot stand in.
+  acquisitionDate?: string | null;
   notes?: string | null;
   version: number;
 };
@@ -1849,6 +1870,11 @@ function App() {
   // then Enter, so the surface it needs is just a focused text input.
   const [scanHit, setScanHit] = useState<ScanHit | null>(null);
   const [barcodeBusy, setBarcodeBusy] = useState(false);
+  // ISO 2789: the international library statistics return.
+  const [isoReport, setIsoReport] = useState<Iso2789Report | null>(null);
+  const [isoBusy, setIsoBusy] = useState(false);
+  const [isoFrom, setIsoFrom] = useState(`${new Date().getUTCFullYear()}-01-01`);
+  const [isoTo, setIsoTo] = useState(new Date().toISOString().slice(0, 10));
   const [mergeLoading, setMergeLoading] = useState(false);
   const [mergeScanned, setMergeScanned] = useState(false);
   const [variantsScanned, setVariantsScanned] = useState(false);
@@ -4058,6 +4084,19 @@ function App() {
     }
   }
 
+  async function runIso2789() {
+    clearStatus();
+    setIsoBusy(true);
+    try {
+      const qs = `from=${encodeURIComponent(isoFrom + 'T00:00:00.000Z')}&to=${encodeURIComponent(isoTo + 'T23:59:59.999Z')}`;
+      setIsoReport(await apiRequest<Iso2789Report>(`/api/reports/iso2789?${qs}`));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setIsoBusy(false);
+    }
+  }
+
   async function loadHolds() {
     if (!canSeeCirculation) return;
     try {
@@ -4096,6 +4135,45 @@ function App() {
         ? t('toast.holdCancelledPassed', { name: res.passedOnTo })
         : t('toast.holdCancelled'));
       await Promise.all([loadHolds(), hold.bookId ? loadBookHolds(hold.bookId) : Promise.resolve()]);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  /**
+   * Edit one field on one copy.
+   *
+   * PUT /api/books/:id/items is a whole-array replace, so every copy has to be
+   * resent — sending only the edited one would delete the rest. The version is
+   * carried for the optimistic-concurrency check the endpoint performs.
+   */
+  async function updateCopyFields(book: Book, index: number, patch: Record<string, unknown>) {
+    clearStatus();
+    const items = (book.items ?? []).map((it, i) => ({
+      id: it.id,
+      barcode: it.barcode ?? null,
+      copyNumber: it.copyNumber,
+      volumeNum: it.volumeNum ?? null,
+      volumeLabel: it.volumeLabel ?? null,
+      roomCode: it.roomCode ?? null,
+      shelfCode: it.shelfCode ?? null,
+      callNumber: it.callNumber ?? null,
+      itemType: it.itemType ?? 'book',
+      status: it.status,
+      condition: it.condition ?? null,
+      acquisitionDate: it.acquisitionDate ?? null,
+      notes: it.notes ?? null,
+      ...(i === index ? patch : {})
+    }));
+    try {
+      await runAction(() => apiRequest(`/api/books/${book.id}/items`, {
+        method: 'PUT',
+        body: JSON.stringify({ items, expectedVersion: book.version })
+      }));
+      setMessage(t('copies.saved'));
+      const fresh = await apiRequest<Book>(`/api/books/${book.id}`);
+      setDetailBook(fresh);
+      await loadBooks();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -4777,6 +4855,24 @@ function App() {
       setError((e as Error).message);
     } finally {
       setBarcodeBusy(false);
+    }
+  }
+
+  /** Fetch a CSV through the authenticated client and save it. */
+  async function downloadWithAuth(path: string, filename: string) {
+    clearStatus();
+    try {
+      const csv = await runAction(() => apiRequest<string>(path, undefined, true));
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setMessage(t('toast.csvDownloaded'));
+    } catch (e) {
+      setError((e as Error).message);
     }
   }
 
@@ -6424,7 +6520,7 @@ function App() {
                       whenever a record is held more than once — for a single
                       copy the location is already in the header badge, and
                       repeating it would be noise. */}
-                  {(detailBook.items?.length ?? 0) > 1 && (
+                  {(detailBook.items?.length ?? 0) > 0 && (
                     <div className="detail-section">
                       <div className="detail-section-title">
                         {t('library.copies.heading', { n: fmt(detailBook.items?.length ?? 0) })}
@@ -6439,10 +6535,51 @@ function App() {
                             </span>
                             {item.volumeNum && <span className="meta-chip">{item.volumeNum}</span>}
                             {item.barcode && <span className="meta-chip mono">{item.barcode}</span>}
+                            {item.itemType && item.itemType !== 'book' && (
+                              <span className="meta-chip">{t(`itemType.${item.itemType}`)}</span>
+                            )}
                             <span className={`status-badge status-${item.status}`}>{t(`status.${item.status}`)}</span>
                           </li>
                         ))}
                       </ul>
+                      {/* What kind of thing each copy is, and when it was
+                          acquired. Both columns have existed since the holdings
+                          layer and neither has ever had a screen, which is why
+                          every copy reads 'book' with no acquisition date and
+                          why ISO 2789 cannot report additions or medium. */}
+                      {canWrite && (
+                        <details className="copies-editor">
+                          <summary>{t('copies.editHeading')}</summary>
+                          <p className="muted small" style={{ margin: '0.5rem 0' }}>{t('copies.editIntro')}</p>
+                          {(detailBook.items ?? []).map((item, idx) => (
+                            <div className="form-row" key={item.id}>
+                              <div>
+                                <label htmlFor={`ct-${item.id}`}>
+                                  {t('library.copies.nth', { n: item.copyNumber })} · {t('policies.itemType')}
+                                </label>
+                                <select
+                                  id={`ct-${item.id}`}
+                                  value={String(item.itemType ?? 'book')}
+                                  onChange={(e) => void updateCopyFields(detailBook, idx, { itemType: e.target.value })}
+                                >
+                                  {ITEM_TYPES.map((it) => <option key={it} value={it}>{t(`itemType.${it}`)}</option>)}
+                                </select>
+                              </div>
+                              <div>
+                                <label htmlFor={`ca-${item.id}`}>{t('copies.acquired')}</label>
+                                <input
+                                  id={`ca-${item.id}`}
+                                  type="date"
+                                  value={isoToLocalDateInput(item.acquisitionDate ?? '')}
+                                  onChange={(e) => void updateCopyFields(detailBook, idx, {
+                                    acquisitionDate: e.target.value ? endOfLocalDayIso(e.target.value) : null
+                                  })}
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </details>
+                      )}
                     </div>
                   )}
 
@@ -6797,6 +6934,93 @@ function App() {
                   <div className="section-header-actions">
                     <button className="secondary small" onClick={() => void loadStats()}>{t('common.refresh')}</button>
                   </div>
+                </div>
+
+                {/* ISO 2789 — the return a library files, rather than the
+                    dashboard's point-in-time counts. */}
+                <div className="card">
+                  <h3>{t('iso.heading')}</h3>
+                  <p className="muted small" style={{ marginBottom: '0.75rem' }}>{t('iso.intro')}</p>
+                  <div className="search-bar" style={{ alignItems: 'flex-end' }}>
+                    <div className="filter-field">
+                      <label htmlFor="iso-from">{t('iso.from')}</label>
+                      <input id="iso-from" type="date" value={isoFrom} onChange={(e) => setIsoFrom(e.target.value)} />
+                    </div>
+                    <div className="filter-field">
+                      <label htmlFor="iso-to">{t('iso.to')}</label>
+                      <input id="iso-to" type="date" value={isoTo} onChange={(e) => setIsoTo(e.target.value)} />
+                    </div>
+                    <div className="search-actions">
+                      <span aria-hidden="true" className="field-spacer" />
+                      <button className="primary" disabled={isoBusy} onClick={() => void runIso2789()}>
+                        {isoBusy ? t('iso.running') : t('iso.run')}
+                      </button>
+                    </div>
+                  </div>
+
+                  {isoReport && (
+                    <div style={{ marginTop: '1rem' }}>
+                      {isoReport.stockBaselineDate && (
+                        <p className="muted small">{t('iso.baseline', { date: isoReport.stockBaselineDate.slice(0, 10) })}</p>
+                      )}
+                      <div className="stats-row" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', marginTop: '0.5rem' }}>
+                        <div className="stat-box"><span className="stat-box-label">{t('iso.titles')}</span><span className="stat-box-value">{fmt(isoReport.collection.titles)}</span></div>
+                        <div className="stat-box accent"><span className="stat-box-label">{t('iso.items')}</span><span className="stat-box-value">{fmt(isoReport.collection.items)}</span></div>
+                        <div className="stat-box"><span className="stat-box-label">{t('iso.loans')}</span><span className="stat-box-value">{fmt(isoReport.flow.loans)}</span></div>
+                        <div className="stat-box"><span className="stat-box-label">{t('iso.activeBorrowers')}</span><span className="stat-box-value">{fmt(isoReport.flow.activeBorrowers)}</span></div>
+                      </div>
+
+                      <div className="iso-grid">
+                        <section>
+                          <h4>{t('iso.byCategory')}</h4>
+                          <ul className="iso-list">
+                            {isoReport.collection.byDocumentCategory.map((r) => (
+                              <li key={r.category}><span>{t(`itemType.${r.category}`)}</span><span>{fmt(r.items)}</span></li>
+                            ))}
+                          </ul>
+                        </section>
+                        <section>
+                          <h4>{t('iso.byLanguage')}</h4>
+                          <ul className="iso-list">
+                            {isoReport.collection.byLanguage.slice(0, 12).map((r) => (
+                              <li key={r.language}><span className="mono">{r.language}</span><span>{fmt(r.titles)}</span></li>
+                            ))}
+                          </ul>
+                        </section>
+                        <section>
+                          <h4>{t('iso.flow')}</h4>
+                          <ul className="iso-list">
+                            <li><span>{t('iso.additions')}</span><span>{fmt(isoReport.flow.additions)}</span></li>
+                            <li><span>{t('iso.withdrawals')}</span><span>{fmt(isoReport.flow.withdrawals.total)}</span></li>
+                            <li><span>{t('iso.itemsLent')}</span><span>{fmt(isoReport.flow.itemsLent)}</span></li>
+                            <li><span>{t('iso.renewed')}</span><span>{fmt(isoReport.flow.renewedLoans)}</span></li>
+                            <li><span>{t('iso.serials')}</span><span>{fmt(isoReport.collection.serialTitles)}</span></li>
+                            <li><span>{t('iso.users')}</span><span>{fmt(isoReport.users.registered)}</span></li>
+                          </ul>
+                        </section>
+                      </div>
+
+                      {/* The caveats sit WITH the numbers. A figure quoted
+                          without its qualification is how a report misleads. */}
+                      {isoReport.caveats.length > 0 && (
+                        <div className="merge-preview" style={{ marginTop: '0.75rem' }}>
+                          <p className="small" style={{ margin: 0, fontWeight: 600 }}>{t('iso.caveats')}</p>
+                          <ul style={{ margin: '0.35rem 0 0', paddingLeft: '1.1rem' }}>
+                            {isoReport.caveats.map((cav, i) => (
+                              <li key={i} className="muted small">{cav}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      <div className="button-group" style={{ marginTop: '0.75rem' }}>
+                        <button className="secondary small" onClick={() => {
+                          const qs = `from=${encodeURIComponent(isoFrom + 'T00:00:00.000Z')}&to=${encodeURIComponent(isoTo + 'T23:59:59.999Z')}`;
+                          void downloadWithAuth(`/api/reports/iso2789.csv?${qs}`, `iso2789-${isoFrom}.csv`);
+                        }}>{t('iso.download')}</button>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {!stats ? (

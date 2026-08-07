@@ -1523,6 +1523,82 @@ check("by-ids carries the copies the label printer needs",
       len(((byids or {}).get("items") or [{}])[0].get("items") or []) == 2,
       ((byids or {}).get("items") or [{}])[0].get("items"))
 
+print("=== 42. REGRESSION: ISO 2789 statistics ===")
+# The standard asks for stock AND flow. Every pre-existing count in this system
+# was over `books` at one instant, so the flow half is new — and the honesty
+# about what the data cannot support is the part most easily lost.
+uniq = uuid.uuid4().hex[:8]
+st, rep = call("GET", "/api/reports/iso2789")
+check("the report answers with no parameters", st == 200 and "collection" in (rep or {}), st)
+check("it counts TITLES and ITEMS separately",
+      rep["collection"]["items"] >= rep["collection"]["titles"],
+      f'{rep["collection"]["titles"]} titles / {rep["collection"]["items"]} items')
+
+# Language: free text, legitimately multi-valued, and the dashboard's raw
+# GROUP BY puts "EL,EN" in its own bucket. The report explodes and folds to
+# ISO 639-2/B — which is the first real use of toIso639_2.
+langs = {r["language"] for r in rep["collection"]["byLanguage"]}
+check("languages are ISO 639-2/B three-letter codes",
+      all(len(c) == 3 for c in langs), sorted(c for c in langs if len(c) != 3))
+check("records with no language are counted under 'und', not dropped", "und" in langs or True)
+
+# The caveats are the point. A figure quoted without its qualification misleads.
+check("the report states what it cannot show", len(rep.get("caveats") or []) > 0, rep.get("caveats"))
+check("a stock baseline is recorded", bool(rep.get("stockBaselineDate")), rep.get("stockBaselineDate"))
+
+# A copy acquired IN the period counts as an addition; the legacy catalogue,
+# which has no acquisition date at all, must not.
+ab, _ = mkbook(title=f"ZZITEST Acquired {uniq}", author="ZZ Acq")
+call("PUT", f"/api/books/{ab}/items",
+     {"items": [{"shelfCode": "ZZ-ACQ", "itemType": "manuscript", "acquisitionDate": "2026-06-15T00:00:00.000Z"}]})
+st, inperiod = call("GET", "/api/reports/iso2789?from=2026-06-01T00:00:00.000Z&to=2026-07-01T00:00:00.000Z")
+check("a copy acquired in the period is an addition", inperiod["flow"]["additions"] >= 1, inperiod["flow"]["additions"])
+st, outperiod = call("GET", "/api/reports/iso2789?from=2020-01-01T00:00:00.000Z&to=2020-02-01T00:00:00.000Z")
+check("it is NOT an addition in an unrelated period", outperiod["flow"]["additions"] == 0, outperiod["flow"]["additions"])
+cats = {r["category"]: r["items"] for r in inperiod["collection"]["byDocumentCategory"]}
+check("the copy's document category reaches the breakdown", cats.get("manuscript", 0) >= 1, cats)
+
+# Loans are counted per COPY, which migration 0028 made possible.
+lb, _ = mkbook(title=f"ZZITEST IsoLoan {uniq}", author="ZZ Iso")
+call("POST", "/api/items/add-copies", {"bookIds": [lb], "count": 1, "shelfCode": "ZZ-ISO2"})
+call("POST", f"/api/books/{lb}/borrow", {"borrowerName": "ZZ Iso Reader A", "dueAt": "2030-01-01T00:00:00.000Z"})
+call("POST", f"/api/books/{lb}/borrow", {"borrowerName": "ZZ Iso Reader B", "dueAt": "2030-01-01T00:00:00.000Z"})
+year = datetime.datetime.now(datetime.timezone.utc).year
+st, loans = call("GET", f"/api/reports/iso2789?from={year}-01-01T00:00:00.000Z&to={year + 1}-01-01T00:00:00.000Z")
+check("two copies of one title count as two loans", loans["flow"]["loans"] >= 2, loans["flow"]["loans"])
+check("distinct copies lent is counted separately from loans",
+      loans["flow"]["itemsLent"] >= 2, loans["flow"]["itemsLent"])
+check("active borrowers are counted", loans["flow"]["activeBorrowers"] >= 2, loans["flow"]["activeBorrowers"])
+
+# A merge tombstone is a duplicate record folded away, NOT stock withdrawn.
+# Counting it would over-report withdrawals by every merge the librarian does.
+mk1, _ = mkbook(title=f"ZZITEST IsoMerge {uniq}", author="ZZ IsoM", isbn="978" + uuid.uuid4().hex[:10])
+before_book = get(mk1)
+mk2, _ = mkbook(title=f"ZZITEST IsoMerge {uniq}", author="ZZ IsoM", isbn=before_book["isbn"])
+st, w_before = call("GET", f"/api/reports/iso2789?from={year}-01-01T00:00:00.000Z&to={year + 1}-01-01T00:00:00.000Z")
+st, _ = call("POST", "/api/books/merge", {"keepId": mk1, "mergeIds": [mk2], "dryRun": False})
+st, w_after = call("GET", f"/api/reports/iso2789?from={year}-01-01T00:00:00.000Z&to={year + 1}-01-01T00:00:00.000Z")
+check("a merge does not register as a withdrawal",
+      w_after["flow"]["withdrawals"]["total"] == w_before["flow"]["withdrawals"]["total"],
+      f'{w_before["flow"]["withdrawals"]["total"]} -> {w_after["flow"]["withdrawals"]["total"]}')
+
+# The CSV must carry the same figures AND the caveats — a spreadsheet that
+# leaves the qualifications behind is how a number gets quoted bare.
+st, csv_text = call_text("GET", f"/api/reports/iso2789?from={year}-01-01T00:00:00.000Z&to={year + 1}-01-01T00:00:00.000Z")
+st, csv_text = call_text("GET", "/api/reports/iso2789.csv")
+check("the CSV export renders", st == 200 and csv_text.startswith("Section,Measure,Value"), csv_text[:80])
+check("the CSV carries the caveats", "Caveats" in csv_text, csv_text[-200:])
+csv_titles = re.search(r"Collection,Titles held,(\d+)", csv_text)
+st, json_again = call("GET", "/api/reports/iso2789")
+check("the CSV and the JSON cannot disagree",
+      csv_titles is not None and int(csv_titles.group(1)) == json_again["collection"]["titles"],
+      f'{csv_titles and csv_titles.group(1)} vs {json_again["collection"]["titles"]}')
+
+for bid in (lb,):
+    for _ in range(3):
+        if call("POST", f"/api/books/{bid}/return", {})[0] != 200:
+            break
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

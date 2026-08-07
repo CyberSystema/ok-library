@@ -17,6 +17,7 @@ import {
 	ITEM_TYPES,
 	code128Svg,
 	formatItemBarcode,
+	toIso639_2,
 	ImportCatalogSchema,
 	ReturnBookSchema,
 	SyncPushSchema,
@@ -3080,6 +3081,252 @@ app.post('/api/books/:id/return', requirePermission('circulation', { librarian: 
 		heldFor: filledHold ? { id: filledHold.id, borrowerName: filledHold.borrowerName, expiresAt: filledHold.expiresAt } : null,
 		copiesAvailable: await countLendableItems(c.env, bookId ?? '')
 	});
+});
+
+// ─── ISO 2789 — international library statistics ───────────────────────────
+//
+// The standard asks for stock AND flow: how much is held, and how much was
+// added, withdrawn and lent in a reporting period. Every existing count in this
+// system is over `books` at a single instant, so the flow half is new.
+//
+// The report is deliberately honest about what it cannot know. This catalogue
+// arrived as one import: `books.created_at` is the same timestamp for all
+// 12,528 records and `items.acquisition_date` is NULL on every copy. Reporting
+// that as 12,528 acquisitions on one day would be a fabrication, so stock held
+// at the baseline is reported as a baseline and additions are counted only
+// after it. `caveats` carries the reasons to the reader of the report rather
+// than leaving them to be discovered.
+//
+// Gated on 'dashboard' — the first server-side use of that permission, which
+// until now only hid a tab. A report aggregating circulation and borrower
+// activity is a materially more sensitive surface than a shelf count.
+
+/**
+ * Split a free-text language field into ISO 639-2/B codes.
+ *
+ * `toIso639_2` already splits and folds — it shipped with the standards work
+ * and has had no caller until now, which is why MARC 041 still emits the raw
+ * two-letter value. This is its first real use.
+ */
+function explodeLanguages(raw: string | null | undefined): string[] {
+	const codes = toIso639_2(raw);
+	// One bucket for "not recorded" rather than dropping the record: 231 books
+	// have no language, and a breakdown that silently omits them does not add up
+	// to the collection size. 'und' is the ISO 639-2 code for exactly this.
+	return codes.length > 0 ? codes : ['und'];
+}
+
+app.get('/api/reports/iso2789', requirePermission('dashboard', { librarian: true }), async (c) => {
+	// Default to the calendar year so the common case needs no parameters.
+	const now = new Date();
+	const from = c.req.query('from') || `${now.getUTCFullYear()}-01-01T00:00:00.000Z`;
+	const to = c.req.query('to') || now.toISOString();
+	if (Number.isNaN(Date.parse(from)) || Number.isNaN(Date.parse(to))) {
+		throw new HTTPException(400, { message: 'from and to must be ISO dates' });
+	}
+	if (from >= to) throw new HTTPException(400, { message: 'from must be before to' });
+
+	const settings = await getLibrarySettings(c.env);
+	const baseline = settings.stockBaselineDate ?? null;
+
+	const [stock, byType, byLang, serials, additions, withdrawals, loansAgg, borrowers, quality] = await Promise.all([
+		// B.2.1 / B.2.2 — titles and physical items. Every existing count in this
+		// system is over records; a two-copy record understates holdings by one.
+		c.env.DB.prepare(
+			`SELECT (SELECT COUNT(*) FROM books WHERE deleted_at IS NULL) AS titles,
+			        (SELECT COUNT(*) FROM items WHERE deleted_at IS NULL) AS items`
+		).first<{ titles: number; items: number }>(),
+
+		// Collection by document category.
+		c.env.DB.prepare(
+			`SELECT COALESCE(NULLIF(TRIM(item_type), ''), 'other') AS k, COUNT(*) AS n
+			   FROM items WHERE deleted_at IS NULL GROUP BY k ORDER BY n DESC`
+		).all<{ k: string; n: number }>(),
+
+		// Language is free text and legitimately multi-valued ("EL,EN"), so the
+		// raw GROUP BY the dashboard uses puts a bilingual book in its own bucket.
+		// Exploded and folded to ISO 639-2/B in the Worker.
+		c.env.DB.prepare(
+			`SELECT language AS k, COUNT(*) AS n FROM books WHERE deleted_at IS NULL GROUP BY language`
+		).all<{ k: string | null; n: number }>(),
+
+		c.env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL AND bib_level = 'serial'`
+		).first<{ n: number }>(),
+
+		// B.2.3 additions. Only copies with a real acquisition date count; the
+		// legacy import has none and is reported as the baseline instead.
+		c.env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM items
+			  WHERE deleted_at IS NULL AND acquisition_date IS NOT NULL
+			    AND acquisition_date >= ? AND acquisition_date < ?`
+		).bind(from, to).first<{ n: number }>(),
+
+		// B.2.4 withdrawals, EXCLUDING merge tombstones. Those are duplicate
+		// records folded together, not books withdrawn from stock — counting them
+		// would over-report by every merge the librarian performs.
+		c.env.DB.prepare(
+			`SELECT COALESCE(i.withdrawal_reason, 'unrecorded') AS k, COUNT(*) AS n
+			   FROM items i JOIN books b ON b.id = i.book_id
+			  WHERE i.deleted_at IS NOT NULL AND i.deleted_at >= ? AND i.deleted_at < ?
+			    AND b.merged_into IS NULL
+			  GROUP BY k`
+		).bind(from, to).all<{ k: string; n: number }>(),
+
+		// B.4 loans. Counted per COPY, which is what the standard means and what
+		// migration 0028 finally made possible.
+		c.env.DB.prepare(
+			`SELECT COUNT(*) AS loans,
+			        COUNT(DISTINCT item_id) AS itemsLent,
+			        COUNT(DISTINCT borrower_id) AS activeBorrowers,
+			        SUM(CASE WHEN renewal_count > 0 THEN 1 ELSE 0 END) AS renewed
+			   FROM borrow_transactions WHERE borrowed_at >= ? AND borrowed_at < ?`
+		).bind(from, to).first<{ loans: number; itemsLent: number; activeBorrowers: number; renewed: number }>(),
+
+		// B.1 registered users by category.
+		c.env.DB.prepare(
+			`SELECT COALESCE(NULLIF(TRIM(category), ''), 'standard') AS k, COUNT(*) AS n
+			   FROM borrowers GROUP BY k ORDER BY n DESC`
+		).all<{ k: string; n: number }>(),
+
+		// What the figures above cannot see. Reported, not hidden.
+		c.env.DB.prepare(
+			`SELECT (SELECT COUNT(*) FROM items WHERE deleted_at IS NULL AND acquisition_date IS NULL) AS noAcquisitionDate,
+			        (SELECT COUNT(*) FROM books WHERE deleted_at IS NULL AND TRIM(COALESCE(language,'')) = '') AS noLanguage,
+			        (SELECT COUNT(*) FROM items WHERE deleted_at IS NULL AND TRIM(COALESCE(item_type,'')) IN ('', 'book')) AS untypedCopies,
+			        (SELECT COUNT(*) FROM borrow_transactions WHERE borrowed_at >= ?1 AND borrowed_at < ?2 AND borrower_id IS NULL) AS anonymousLoans,
+			        (SELECT COUNT(*) FROM books WHERE merged_into IS NOT NULL AND deleted_at >= ?1 AND deleted_at < ?2) AS mergeTombstones`
+		).bind(from, to).first<{
+			noAcquisitionDate: number; noLanguage: number; untypedCopies: number;
+			anonymousLoans: number; mergeTombstones: number;
+		}>()
+	]);
+
+	// Fold the exploded language buckets together.
+	const langTotals = new Map<string, number>();
+	for (const row of byLang.results ?? []) {
+		for (const code of explodeLanguages(row.k)) {
+			langTotals.set(code, (langTotals.get(code) ?? 0) + Number(row.n));
+		}
+	}
+
+	const caveats: string[] = [];
+	const noAcq = Number(quality?.noAcquisitionDate ?? 0);
+	if (noAcq > 0) {
+		caveats.push(
+			`${noAcq} copies have no acquisition date. They are stock held at the baseline`
+			+ `${baseline ? ` (${baseline.slice(0, 10)})` : ''}, not additions in any period.`
+		);
+	}
+	if (Number(quality?.untypedCopies ?? 0) > 0) {
+		caveats.push(
+			`${quality?.untypedCopies} copies are recorded as the default document category 'book'. `
+			+ 'The breakdown by category is only as good as that field.'
+		);
+	}
+	if (Number(quality?.noLanguage ?? 0) > 0) {
+		caveats.push(`${quality?.noLanguage} records have no language; they are counted under 'und'.`);
+	}
+	// The language breakdown legitimately sums to MORE than the title count: a
+	// bilingual record is held in both languages. Said out loud, because a
+	// column that does not add up looks like an error otherwise.
+	const langSum = [...langTotals.values()].reduce((a, b) => a + b, 0);
+	if (langSum > Number(stock?.titles ?? 0)) {
+		caveats.push(
+			`The language breakdown totals ${langSum} against ${stock?.titles} titles: a record in `
+			+ 'more than one language is counted under each.'
+		);
+	}
+	if (Number(quality?.anonymousLoans ?? 0) > 0) {
+		caveats.push(
+			`${quality?.anonymousLoans} loans in this period have no borrower attached, so the `
+			+ 'active-borrower figure understates them.'
+		);
+	}
+	if (Number(quality?.mergeTombstones ?? 0) > 0) {
+		caveats.push(
+			`${quality?.mergeTombstones} records were withdrawn by the duplicate-merge tool in this `
+			+ 'period. They are duplicate records folded together, not stock withdrawn, and are excluded.'
+		);
+	}
+
+	return c.json({
+		period: { from, to },
+		library: { isil: settings.isil ?? null, name: settings.libraryName ?? null, place: settings.libraryPlace ?? null },
+		stockBaselineDate: baseline,
+		collection: {
+			titles: Number(stock?.titles ?? 0),
+			items: Number(stock?.items ?? 0),
+			serialTitles: Number(serials?.n ?? 0),
+			byDocumentCategory: (byType.results ?? []).map((r) => ({ category: r.k, items: Number(r.n) })),
+			byLanguage: [...langTotals.entries()]
+				.sort((a, b) => b[1] - a[1])
+				.map(([language, titles]) => ({ language, titles }))
+		},
+		flow: {
+			additions: Number(additions?.n ?? 0),
+			withdrawals: {
+				total: (withdrawals.results ?? []).reduce((n, r) => n + Number(r.n), 0),
+				byReason: (withdrawals.results ?? []).map((r) => ({ reason: r.k, items: Number(r.n) }))
+			},
+			loans: Number(loansAgg?.loans ?? 0),
+			itemsLent: Number(loansAgg?.itemsLent ?? 0),
+			renewedLoans: Number(loansAgg?.renewed ?? 0),
+			activeBorrowers: Number(loansAgg?.activeBorrowers ?? 0)
+		},
+		users: {
+			registered: (borrowers.results ?? []).reduce((n, r) => n + Number(r.n), 0),
+			byCategory: (borrowers.results ?? []).map((r) => ({ category: r.k, borrowers: Number(r.n) }))
+		},
+		caveats
+	});
+});
+
+app.get('/api/reports/iso2789.csv', requirePermission('dashboard', { librarian: true }), async (c) => {
+	const url = new URL(c.req.url);
+	url.pathname = '/api/reports/iso2789';
+	// Re-enter the JSON handler rather than duplicating the twelve queries; the
+	// two must never be able to disagree about a figure.
+	const res = await app.fetch(new Request(url.toString(), { headers: c.req.raw.headers }), c.env, c.executionCtx);
+	const data = await res.json() as Record<string, any>;
+
+	const rows: Array<{ Section: string; Measure: string; Value: string | number }> = [
+		{ Section: 'Period', Measure: 'From', Value: data.period.from },
+		{ Section: 'Period', Measure: 'To', Value: data.period.to },
+		{ Section: 'Library', Measure: 'ISIL', Value: data.library.isil ?? '' },
+		{ Section: 'Library', Measure: 'Name', Value: data.library.name ?? '' },
+		{ Section: 'Collection', Measure: 'Titles held', Value: data.collection.titles },
+		{ Section: 'Collection', Measure: 'Physical items held', Value: data.collection.items },
+		{ Section: 'Collection', Measure: 'Serial titles held', Value: data.collection.serialTitles },
+		...data.collection.byDocumentCategory.map((r: any) => ({
+			Section: 'Collection by document category', Measure: r.category, Value: r.items
+		})),
+		...data.collection.byLanguage.map((r: any) => ({
+			Section: 'Collection by language', Measure: r.language, Value: r.titles
+		})),
+		{ Section: 'Flow', Measure: 'Additions', Value: data.flow.additions },
+		{ Section: 'Flow', Measure: 'Withdrawals', Value: data.flow.withdrawals.total },
+		...data.flow.withdrawals.byReason.map((r: any) => ({
+			Section: 'Withdrawals by reason', Measure: r.reason, Value: r.items
+		})),
+		{ Section: 'Flow', Measure: 'Loans', Value: data.flow.loans },
+		{ Section: 'Flow', Measure: 'Distinct items lent', Value: data.flow.itemsLent },
+		{ Section: 'Flow', Measure: 'Loans renewed', Value: data.flow.renewedLoans },
+		{ Section: 'Flow', Measure: 'Active borrowers', Value: data.flow.activeBorrowers },
+		{ Section: 'Users', Measure: 'Registered borrowers', Value: data.users.registered },
+		...data.users.byCategory.map((r: any) => ({
+			Section: 'Users by category', Measure: r.category, Value: r.borrowers
+		})),
+		// The caveats travel WITH the numbers. A spreadsheet that leaves them
+		// behind is how a figure gets quoted without its qualification.
+		...data.caveats.map((text: string, i: number) => ({
+			Section: 'Caveats', Measure: `Note ${i + 1}`, Value: text
+		}))
+	];
+
+	c.header('Content-Type', 'text/csv; charset=utf-8');
+	c.header('Content-Disposition', `attachment; filename="iso2789-${String(data.period.from).slice(0, 10)}.csv"`);
+	return c.body(toCsv(rows, ['Section', 'Measure', 'Value']));
 });
 
 // ─── Item barcodes ─────────────────────────────────────────────────────────

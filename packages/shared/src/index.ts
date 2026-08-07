@@ -328,7 +328,16 @@ const ISO639_1_TO_2B: Record<string, string> = {
   el: 'gre', en: 'eng', ko: 'kor', ru: 'rus', fr: 'fre', de: 'ger', it: 'ita',
   es: 'spa', la: 'lat', bg: 'bul', cs: 'cze', tr: 'tur', ar: 'ara', he: 'heb',
   sr: 'srp', ro: 'rum', uk: 'ukr', pl: 'pol', pt: 'por', nl: 'dut', sv: 'swe',
-  fi: 'fin', hu: 'hun', ka: 'geo', hy: 'arm', zh: 'chi', ja: 'jpn'
+  fi: 'fin', hu: 'hun', ka: 'geo', hy: 'arm', zh: 'chi', ja: 'jpn',
+  // Added after the first ISO 2789 run reported these as raw two-letter codes
+  // because they were missing here. Church Slavonic above all — it is the
+  // liturgical language of the tradition this collection serves, not an
+  // afterthought — plus the Balkan and mission-field languages actually on
+  // these shelves.
+  cu: 'chu', sq: 'alb', mk: 'mac', sl: 'slv', sk: 'slo', hr: 'hrv',
+  no: 'nor', da: 'dan', et: 'est', lv: 'lav', lt: 'lit', be: 'bel',
+  sw: 'swa', hi: 'hin', fa: 'per', am: 'amh', syr: 'syr', cop: 'cop',
+  ge: 'geo', grc: 'grc'
 };
 
 /** Split a stored language value into ISO 639-2/B codes: "EL,EN" → ["gre","eng"]. */
