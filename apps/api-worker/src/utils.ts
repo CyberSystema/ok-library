@@ -65,12 +65,38 @@ function collapseSpaces(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+// Greek (incl. Coptic) and Greek Extended (polytonic) blocks.
+const GREEK_LETTER = /[Ͱ-Ͽἀ-῿]/;
+
+/**
+ * Upper-case a room/shelf code the way its own language does.
+ *
+ * Plain `.toUpperCase()` is wrong for Greek: it maps ί → Ί, so the librarian's
+ * back-shelf "19-000 πίσω" was being stored as "19-000 ΠΊΣΩ". Greek orthography
+ * drops the tonos when a word is written in capitals — the correct form is
+ * "19-000 ΠΙΣΩ" — and ICU's `el` tailoring knows that, including the ΐ/ΰ and
+ * disjunctive-eta cases a hand-written accent map would miss.
+ *
+ * The Greek path is taken ONLY when the string actually contains a Greek
+ * letter, so every existing Latin/numeric code upper-cases byte-identically to
+ * before and the healing pass (POST /api/admin/normalize-books) rewrites only
+ * the handful of rows that need it.
+ *
+ * MUST be used on both sides of a comparison. `shelfExact` in db.ts upper-cases
+ * the bound value separately; if the two ever disagree, "select every book on
+ * this shelf" silently matches nothing.
+ */
+export function normalizeCode(value: string): string {
+  const trimmed = value.trim();
+  return GREEK_LETTER.test(trimmed) ? trimmed.toLocaleUpperCase('el') : trimmed.toUpperCase();
+}
+
 /**
  * Normalizes book fields before persistence:
  * - Collapses multiple spaces and trims text fields (title, author, publisher, …)
  * - Strips hyphens/spaces from ISBN and upper-cases it
  * - Trims language, description, acquisitionDate
- * - Upper-cases roomCode / shelfCode
+ * - Upper-cases roomCode / shelfCode (locale-aware — see `normalizeCode`)
  * - Deduplicates tags (case-insensitive) and removes empty entries
  * - Trims string-typed custom field values
  */
@@ -107,10 +133,10 @@ export function normalizeBookData<T extends NormalizableBook>(input: T): T {
     out.description = out.description.trim() || null;
   }
   if (typeof out.roomCode === 'string') {
-    out.roomCode = out.roomCode.trim().toUpperCase() || null;
+    out.roomCode = normalizeCode(out.roomCode) || null;
   }
   if (typeof out.shelfCode === 'string') {
-    out.shelfCode = out.shelfCode.trim().toUpperCase() || null;
+    out.shelfCode = normalizeCode(out.shelfCode) || null;
   }
   if (typeof out.acquisitionDate === 'string') {
     out.acquisitionDate = out.acquisitionDate.trim() || null;

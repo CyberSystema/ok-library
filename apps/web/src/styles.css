@@ -859,8 +859,28 @@ label {
   flex-direction: column;
   gap: 0.2rem;
 }
-.attr-key { font-size: 0.6875rem; font-weight: 700; text-transform: capitalize; letter-spacing: 0.04em; color: var(--text-muted); }
+/* No text-transform: the key is now the attribute's authored label ("Place of
+   Publication", "Τόπος έκδοσης"), not a name derived from the raw field key, so
+   it must render exactly as the librarian wrote it. */
+.attr-key { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.04em; color: var(--text-muted); }
 .attr-value { font-size: 0.9rem; font-weight: 500; color: var(--text); word-break: break-word; }
+
+/* Group headings inside the attribute section — shown only when there is more
+   than one group, so a book with just everyday attributes stays uncluttered. */
+.attr-group-heading {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0.85rem 0 0.4rem;
+}
+.attr-group-heading:first-child { margin-top: 0; }
+
+/* Values whose attribute definition was deleted. Still shown — the data is
+   real — but visually set apart so it reads as "needs attention", not as a
+   normal field. */
+.attr-tile.is-orphan { border-style: dashed; opacity: 0.85; }
 
 /* Borrow history */
 .history-list { display: flex; flex-direction: column; gap: 0.5rem; }

@@ -80,6 +80,29 @@ def get(bid):
     return r if st == 200 else None
 
 
+def put_custom_field(fid, body):
+    """Update an attribute definition, driving the book sweep to completion.
+
+    Renaming a key or changing a type rewrites every book carrying the
+    attribute, so the server does it in PAGES — one request cannot fit ~12.5K
+    rewrites inside the Workers subrequest budget. It reports
+    `sweepComplete: false` while rows remain, and only writes the definition
+    row on the final page (which is what makes an interrupted run resumable
+    rather than corrupting). Callers must loop; the web client does the same.
+
+    Returns (status, last_response, pages).
+    """
+    offset, pages, st, r = 0, 0, None, None
+    for _ in range(500):
+        q = f"?sweepOffset={offset}" if offset else ""
+        st, r = call("PUT", f"/api/custom-fields/{fid}{q}", body)
+        pages += 1
+        if st != 200 or (r or {}).get("sweepComplete") is not False:
+            break
+        offset = (r or {}).get("nextSweepOffset", offset)
+    return st, r, pages
+
+
 TOKEN = login()
 
 print("=== 1. CREATE round-trips every field ===")
@@ -348,9 +371,12 @@ if st == 201:
     fid = (fdef or {}).get("id")
     tb, _ = mkbook(customFields={fkey: "1234"})
     tb2, _ = mkbook(customFields={fkey: "not a number"})
-    st, r = call("PUT", f"/api/custom-fields/{fid}",
-                 {"key": fkey, "label": "ZZ Type Test", "type": "number", "required": False, "enumOptions": []})
+    st, r, pages = put_custom_field(fid, {"key": fkey, "label": "ZZ Type Test", "type": "number",
+                                          "required": False, "enumOptions": []})
     check("type change accepted", st == 200, f"{st} {r}")
+    # The sweep is paged; it must actually converge rather than stopping partway
+    # and leaving half the catalogue on the old type.
+    check("the paged sweep converged", (r or {}).get("sweepComplete") is True, f"pages={pages} {r}")
     check("a convertible value was converted, not dropped", get(tb)["customFields"].get(fkey) == 1234,
           get(tb)["customFields"])
     check("an unconvertible value was dropped", fkey not in get(tb2)["customFields"], get(tb2)["customFields"])
@@ -359,12 +385,25 @@ if st == 201:
     check("book with the converted value is still editable", st == 200, st)
     st, _ = call("PUT", f"/api/books/{tb2}", {"version": get(tb2)["version"], "shelfCode": "ZZ-T2"})
     check("book whose value was dropped is still editable", st == 200, st)
+    # number -> text is the direction the `pages`/extent migration takes, and it
+    # must be LOSSLESS: a page count becomes the string "1234", never a dropped
+    # value, so "σ. 351-700" becomes recordable without costing existing data.
+    st, r, _ = put_custom_field(fid, {"key": fkey, "label": "ZZ Type Test", "type": "text",
+                                      "required": False, "enumOptions": []})
+    check("number -> text accepted", st == 200, f"{st} {r}")
+    check("number -> text preserved the value as a string",
+          get(tb)["customFields"].get(fkey) == "1234", get(tb)["customFields"])
+    st, _ = call("PUT", f"/api/books/{tb}", {"version": get(tb)["version"], "customFields": {fkey: "σ. 351-700"}})
+    check("a page RANGE is accepted once the attribute is text", st == 200, st)
+    check("the range round-trips intact", get(tb)["customFields"].get(fkey) == "σ. 351-700",
+          get(tb)["customFields"])
     # A rename must move the value, and re-running it must be harmless.
     fkey2 = fkey + "r"
-    st, _ = call("PUT", f"/api/custom-fields/{fid}",
-                 {"key": fkey2, "label": "ZZ Type Test", "type": "number", "required": False, "enumOptions": []})
+    st, _, _ = put_custom_field(fid, {"key": fkey2, "label": "ZZ Type Test", "type": "text",
+                                      "required": False, "enumOptions": []})
     check("rename accepted", st == 200, st)
-    check("rename moved the value to the new key", get(tb)["customFields"].get(fkey2) == 1234, get(tb)["customFields"])
+    check("rename moved the value to the new key", get(tb)["customFields"].get(fkey2) == "σ. 351-700",
+          get(tb)["customFields"])
     call("DELETE", f"/api/custom-fields/{fid}")
 else:
     print(f"  (could not create test custom field: {st}; skipped)")
@@ -375,7 +414,10 @@ print("=== 22. REGRESSION: bulk-setting one attribute must not wipe the others =
 # selected book — silently, because most definitions are optional.
 bulk_ids = []
 for _ in range(2):
-    bid_, _sent = mkbook(customFields={"series": "Original", "category_label": "KEEP", "pages": 42},
+    # `copies_count` is the numeric attribute here. `pages` used to be, but it
+    # now holds ISBD extent as free text ("σ. 351-700"), so it can no longer
+    # stand in for "a number-typed attribute".
+    bid_, _sent = mkbook(customFields={"series": "Original", "category_label": "KEEP", "copies_count": 42},
                          tags=["keepme"])
     bulk_ids.append(bid_)
 muts = []
@@ -391,7 +433,7 @@ g = get(bulk_ids[0])
 check("patched attribute set", g["customFields"].get("series") == "New", g["customFields"])
 check("new attribute added", g["customFields"].get("signature_notes") == "bulk", g["customFields"])
 check("untouched attribute survived", g["customFields"].get("category_label") == "KEEP", g["customFields"])
-check("untouched numeric attribute survived", g["customFields"].get("pages") == 42, g["customFields"])
+check("untouched numeric attribute survived", g["customFields"].get("copies_count") == 42, g["customFields"])
 check("core field applied alongside", g["shelfCode"] == "ZZ-BULK", g["shelfCode"])
 check("existing tag survived tagsAdd", "keepme" in g.get("tags", []), g.get("tags"))
 check("tag was added", "bulkA" in g.get("tags", []), g.get("tags"))
@@ -413,10 +455,10 @@ check("tagsRemove removed only the named tag",
 st, r = call("POST", "/api/sync/push", {"mutations": [{"operation": "update_book",
     "clientMutationId": uuid.uuid4().hex, "clientTimestamp": "2026-07-22T00:00:00.000Z",
     "payload": {"id": bulk_ids[0], "data": {"version": get(bulk_ids[0])["version"],
-        "customFieldsPatch": {"pages": "not a number"}}}}]})
+        "customFieldsPatch": {"copies_count": "not a number"}}}}]})
 check("a bad value for a number attribute is refused",
       (r or {}).get("results", [{}])[0].get("status") == "error", r)
-check("the refused bulk write changed nothing", get(bulk_ids[0])["customFields"].get("pages") == 42,
+check("the refused bulk write changed nothing", get(bulk_ids[0])["customFields"].get("copies_count") == 42,
       get(bulk_ids[0])["customFields"])
 
 # The direct PUT must behave identically, or the two paths drift.
@@ -513,6 +555,71 @@ if st == 201:
     call("DELETE", f"/api/custom-fields/{rid}")
 else:
     print(f"  (could not create required test field: {st}; skipped)")
+
+print("=== 25. REGRESSION: Greek shelf codes keep Greek orthography ===")
+# Codes are stored upper-cased. Plain .toUpperCase() maps ί -> Ί, so the
+# librarian's back shelf "19-000 πίσω" was persisted as "19-000 ΠΊΣΩ" — Greek
+# drops the tonos in capitals, so that spelling is simply wrong, and it split
+# one shelf into two as far as filters and facets were concerned.
+gb, _ = mkbook(shelfCode="19-000 πίσω")
+got = get(gb)
+check("Greek shelf code loses the tonos when upper-cased",
+      got["shelfCode"] == "19-000 ΠΙΣΩ", repr(got["shelfCode"]))
+# The write side and the query side must agree, or "select every book on this
+# shelf" silently returns nothing. Legacy rows written before the fix still hold
+# the tonos spelling, so that has to keep matching too.
+for probe in ["19-000 πίσω", "19-000 ΠΙΣΩ", "19-000 ΠΊΣΩ"]:
+    st, r = call("GET", "/api/books/ids?shelfExact=" + urllib.parse.quote(probe))
+    check(f"shelfExact finds it when typed {probe!r}", gb in ((r or {}).get("ids") or []), f"{st} {r}")
+st, r = call("GET", "/api/books?shelfCode=" + urllib.parse.quote("πίσω") + "&pageSize=100")
+check("the shelf substring filter matches lower-case Greek",
+      any(i["id"] == gb for i in (r or {}).get("items", [])), st)
+# Latin codes must upper-case byte-identically to before, so the healing pass
+# rewrites only the handful of Greek rows.
+lb, _ = mkbook(shelfCode="a-12")
+check("a Latin shelf code is unchanged by the locale-aware path",
+      get(lb)["shelfCode"] == "A-12", get(lb)["shelfCode"])
+
+print("=== 26. REGRESSION: list responses carry no internal search columns ===")
+# `SELECT b.*` picks up the seven *_fold columns and parseBook used to pass them
+# straight through — a second, accent-folded copy of every record, measured at
+# roughly half of each page of results. Nothing outside the Worker reads them.
+st, r = call("GET", "/api/books?pageSize=5")
+leaked = sorted({k for item in (r or {}).get("items", []) for k in item if k.endswith("_fold")})
+check("no *_fold columns in the book list", not leaked, leaked)
+check("no *_fold columns on a single book", not [k for k in get(gb) if k.endswith("_fold")],
+      [k for k in get(gb) if k.endswith("_fold")])
+
+print("=== 27. REGRESSION: normalize-books backfills missing folds ===")
+# Migration 0012 added the *_fold columns but skipped the backfill, relying on
+# the books_fts triggers' COALESCE(fold, raw). FTS stayed correct, but anything
+# reading a fold column DIRECTLY went blind — including the duplicate warning
+# after each create, which probes `title_fold IS ?` (NULL IS 'κλημης' is false).
+# The healing pass must repair that, and must not churn rows that are fine.
+off, backfilled, pages_ = 0, 0, 0
+while pages_ < 200:
+    st, r = call("POST", f"/api/admin/normalize-books?limit=500&offset={off}")
+    if st != 200:
+        break
+    backfilled += (r or {}).get("foldsBackfilled", 0)
+    pages_ += 1
+    if (r or {}).get("processed", 0) < 500:
+        break
+    off = r["nextOffset"]
+check("the healing pass reports a fold-backfill count", st == 200 and "foldsBackfilled" in (r or {}), f"{st} {r}")
+# Run to convergence twice: the second pass must find nothing left to do, which
+# is what proves it is idempotent rather than rewriting the catalogue on a timer.
+st, r2 = call("POST", "/api/admin/normalize-books?limit=500&offset=0")
+check("a converged catalogue needs no further backfill", (r2 or {}).get("foldsBackfilled") == 0, r2)
+# And with folds present, the duplicate warning actually fires.
+dupe_title = "ZZITEST Κλήμης Ῥώμης " + uuid.uuid4().hex[:6]
+d1, _ = mkbook(title=dupe_title, author="ZZ Πατήρ")
+st, d2 = call("POST", "/api/books", {"title": dupe_title, "author": "ZZ Πατήρ", "isbn": None,
+                                     "tags": [], "customFields": {}})
+if st == 201:
+    CREATED.append(d2["id"])
+check("the duplicate warning sees an existing Greek title",
+      any(x["id"] == d1 for x in (d2 or {}).get("duplicateOf") or []), d2)
 
 print("\n=== CLEANUP ===")
 for bid in CREATED:

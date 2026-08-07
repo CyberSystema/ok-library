@@ -74,11 +74,13 @@ type CatalogRow = {
   customFields: Record<string, string | number | boolean | null>;
 };
 
+type CustomFieldType = 'text' | 'number' | 'boolean' | 'date' | 'enum';
+
 type CustomField = {
   id: string;
   key: string;
   label: string;
-  type: 'text' | 'number' | 'boolean' | 'date' | 'enum';
+  type: CustomFieldType;
   required: boolean;
   // Pinned attributes lead every attribute list, ordered by sortOrder. Optional
   // so a client running against an API that predates the columns still parses.
@@ -305,6 +307,42 @@ function displayTitle(book: { title: string }, placeholder: string = TITLE_PLACE
 function displayAuthor(book: { author: string }, placeholder: string = AUTHOR_PLACEHOLDER): string {
   const trimmed = book.author?.trim() ?? '';
   return trimmed === '' || trimmed === AUTHOR_PLACEHOLDER ? placeholder : trimmed;
+}
+
+// Render one custom-attribute value for display.
+//
+// Module scope on purpose: the detail view, the overview table and the CSV-ish
+// surfaces must all format a boolean or a date the same way. Definition-aware,
+// because the raw JSON is `true` / an ISO timestamp and neither is something to
+// show a librarian. Falls back to String() when no definition exists, which is
+// what keeps values from a since-deleted attribute readable rather than blank.
+function formatCustomValue(
+  def: { type: CustomFieldType } | undefined,
+  value: unknown,
+  yes: string,
+  no: string
+): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'boolean') return value ? yes : no;
+  if (def?.type === 'boolean') {
+    const s = String(value).trim().toLowerCase();
+    if (['true', '1', 'yes', 'y', 'on', 'ναι'].includes(s)) return yes;
+    if (['false', '0', 'no', 'n', 'off', 'οχι', 'όχι'].includes(s)) return no;
+  }
+  if (def?.type === 'date') {
+    const text = String(value).trim();
+    // Stored as a full ISO timestamp; the librarian only ever entered a day.
+    const parsed = new Date(text);
+    if (!Number.isNaN(parsed.getTime())) return text.slice(0, 10);
+  }
+  return String(value);
+}
+
+// A custom-attribute value counts as present only if it would render as
+// something. Shared so "is this cell empty?" means the same in the detail view
+// and in the table's missing-value highlighting.
+function hasCustomValue(value: unknown): boolean {
+  return value !== null && value !== undefined && String(value).trim() !== '';
 }
 
 function joinApiUrl(path: string): string {
@@ -2717,10 +2755,15 @@ function App() {
       // Bonus: if there's a `pages` custom field defined and it's currently
       // blank, prefill it too. Keeps the catalog UX consistent with the
       // existing pages field used by the LIBRARY catalogue import.
+      //
+      // `pages` holds ISBD extent and is now free text ("σ. 351-700"), but a
+      // library seeded before that change may still have it typed as a number,
+      // so accept either and hand the value over in the shape that field wants.
       if (res.pages !== null && res.pages !== undefined) {
-        const pagesField = customFields.find((f) => f.key === 'pages' && f.type === 'number');
+        const pagesField = customFields.find((f) => f.key === 'pages' && (f.type === 'text' || f.type === 'number'));
         if (pagesField && (createAttrValues[pagesField.key] === undefined || createAttrValues[pagesField.key] === '')) {
-          setCreateAttrValues((prev) => ({ ...prev, [pagesField.key]: res.pages as number }));
+          const value = pagesField.type === 'number' ? (res.pages as number) : String(res.pages);
+          setCreateAttrValues((prev) => ({ ...prev, [pagesField.key]: value }));
           filled += 1;
         }
       }
@@ -3811,6 +3854,43 @@ function App() {
   const pinnedCustomFields = useMemo(() => customFields.filter((f) => f.pinned), [customFields]);
   const unpinnedCustomFields = useMemo(() => customFields.filter((f) => !f.pinned), [customFields]);
 
+  // The attributes to show on the open book, grouped for display.
+  //
+  // Walks the DEFINITIONS (server-ordered pinned-first) and looks each value up,
+  // rather than walking the book's own keys. That is what gives the read view
+  // the attribute's real label and the same everyday-first order as the edit
+  // form. Anything left on the book without a matching definition — an
+  // attribute that was deleted after books were tagged with it — is collected
+  // as an orphan and still rendered, because hiding it would make real data
+  // unreachable from the UI.
+  const detailAttributeGroups = useMemo(() => {
+    const values = detailBook?.customFields ?? {};
+    const yes = t('common.yes');
+    const no = t('common.no');
+    const toEntry = (f: CustomField) => ({
+      key: f.key,
+      label: f.label,
+      value: formatCustomValue(f, values[f.key], yes, no)
+    });
+    const keep = (e: { value: string }) => e.value !== '';
+
+    const pinned = pinnedCustomFields.map(toEntry).filter(keep);
+    const other = unpinnedCustomFields.map(toEntry).filter(keep);
+
+    const known = new Set(customFields.map((f) => f.key));
+    const orphans = Object.entries(values)
+      .filter(([key, v]) => !known.has(key) && hasCustomValue(v))
+      .map(([key, v]) => ({
+        key,
+        // No definition means no label to show, so fall back to the old derived
+        // spelling — it is the only name this value has ever had.
+        label: key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim(),
+        value: formatCustomValue(undefined, v, yes, no)
+      }));
+
+    return { pinned, other, orphans, total: pinned.length + other.length + orphans.length };
+  }, [detailBook, customFields, pinnedCustomFields, unpinnedCustomFields, t]);
+
   // Pin/unpin in one click. A newly pinned field goes to the END of the pinned
   // group rather than the top, so pinning one attribute never reshuffles the
   // ones the librarian has already arranged.
@@ -3945,19 +4025,35 @@ function App() {
 
       const path = editingCustomFieldId ? `/api/custom-fields/${editingCustomFieldId}` : '/api/custom-fields';
       const method = editingCustomFieldId ? 'PUT' : 'POST';
+      const body = JSON.stringify({
+        key: normalizedKey,
+        label: fieldForm.label.trim(),
+        type: fieldForm.type,
+        required: fieldForm.required,
+        pinned: fieldForm.pinned,
+        sortOrder: fieldForm.sortOrder,
+        enumOptions: normalizedOptions
+      });
 
-      await runAction(() => apiRequest<{ id: string }>(path, {
-        method,
-        body: JSON.stringify({
-          key: normalizedKey,
-          label: fieldForm.label.trim(),
-          type: fieldForm.type,
-          required: fieldForm.required,
-          pinned: fieldForm.pinned,
-          sortOrder: fieldForm.sortOrder,
-          enumOptions: normalizedOptions
-        })
-      }));
+      // Renaming a key or changing a type rewrites every book that carries the
+      // attribute. The server does that in PAGES so one request can't exceed the
+      // Workers subrequest budget on a 12.5K-book catalogue, and reports
+      // `sweepComplete: false` while rows remain. Drive it to completion here —
+      // stopping early would leave half the catalogue on the old key/type. The
+      // definition row is only written on the final page, so an interrupted loop
+      // is resumable rather than corrupting.
+      let sweepOffset = 0;
+      for (let guard = 0; guard < 500; guard += 1) {
+        const query = sweepOffset > 0 ? `?sweepOffset=${sweepOffset}` : '';
+        const res = await runAction(() => apiRequest<{
+          id: string;
+          sweepComplete?: boolean;
+          nextSweepOffset?: number;
+        }>(`${path}${query}`, { method, body }));
+        if (res?.sweepComplete !== false) break;
+        sweepOffset = res.nextSweepOffset ?? sweepOffset;
+        setMessage(t('toast.customFieldMigrating', { n: fmt(sweepOffset) }));
+      }
 
       resetCustomFieldForm();
       await loadCustomFields();
@@ -5171,21 +5267,60 @@ function App() {
                     )}
                   </div>
 
-                  {/* Custom field attributes */}
-                  {detailBook.customFields &&
-                    Object.entries(detailBook.customFields).filter(([, v]) => v !== null && v !== undefined && v !== '').length > 0 && (
+                  {/* Custom field attributes, driven by the DEFINITIONS rather
+                      than by whatever keys happen to be on the book. That gives
+                      three things the old Object.entries walk could not: the
+                      attribute's real label instead of a name derived from the
+                      raw key, the everyday (pinned) group first, and a stable
+                      order that matches the edit form. Values whose definition
+                      has since been deleted are still shown — under "Other", so
+                      data the librarian typed never silently disappears. */}
+                  {detailAttributeGroups.total > 0 && (
                     <div className="detail-section">
                       <div className="detail-section-title">{t('detail.attributes')}</div>
-                      <div className="attr-grid">
-                        {Object.entries(detailBook.customFields).map(([key, value]) =>
-                          value !== null && value !== undefined && value !== '' ? (
-                            <div key={key} className="attr-tile">
-                              <span className="attr-key">{key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim()}</span>
-                              <span className="attr-value">{String(value)}</span>
-                            </div>
-                          ) : null
-                        )}
-                      </div>
+                      {detailAttributeGroups.pinned.length > 0 && (
+                        <>
+                          {detailAttributeGroups.other.length + detailAttributeGroups.orphans.length > 0 && (
+                            <div className="attr-group-heading">{t('detail.attributes.everyday')}</div>
+                          )}
+                          <div className="attr-grid">
+                            {detailAttributeGroups.pinned.map((a) => (
+                              <div key={a.key} className="attr-tile">
+                                <span className="attr-key">{a.label}</span>
+                                <span className="attr-value">{a.value}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                      {detailAttributeGroups.other.length > 0 && (
+                        <>
+                          {detailAttributeGroups.pinned.length > 0 && (
+                            <div className="attr-group-heading">{t('detail.attributes.other')}</div>
+                          )}
+                          <div className="attr-grid">
+                            {detailAttributeGroups.other.map((a) => (
+                              <div key={a.key} className="attr-tile">
+                                <span className="attr-key">{a.label}</span>
+                                <span className="attr-value">{a.value}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                      {detailAttributeGroups.orphans.length > 0 && (
+                        <>
+                          <div className="attr-group-heading">{t('detail.attributes.unrecognised')}</div>
+                          <div className="attr-grid">
+                            {detailAttributeGroups.orphans.map((a) => (
+                              <div key={a.key} className="attr-tile is-orphan">
+                                <span className="attr-key">{a.label}</span>
+                                <span className="attr-value">{a.value}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </>
+                      )}
                     </div>
                   )}
 

@@ -86,7 +86,9 @@ const DEFAULT_BOOK_STRUCTURE: DefaultBookStructureColumn[] = [
 	{ label: 'Language', coreKey: 'language' },
 	{ label: 'Translator', customKey: 'translator', customType: 'text' },
 	{ label: 'Cover Type', customKey: 'coverType', customType: 'text' },
-	{ label: 'Pages', customKey: 'pages', customType: 'number' },
+	// Extent, not a page count — free text per ISBD area 5 / MARC 300$a, so
+	// "σ. 351-700" and "156,[3]σ." are recordable. Matches CATALOG_CUSTOM_FIELDS.
+	{ label: 'Pages', customKey: 'pages', customType: 'text' },
 	{ label: 'Condition', customKey: 'condition', customType: 'text' },
 	{ label: 'Shelf Location', coreKey: 'shelfCode' },
 	{ label: 'Description', coreKey: 'description' },
@@ -2629,13 +2631,54 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 	let retypedBooks = 0;
 	const bookUpdates: D1PreparedStatement[] = [];
 
+	// The sweep is PAGED, like POST /api/admin/normalize-books and
+	// POST /api/admin/rebuild-search-index.
+	//
+	// It used to load every non-deleted row and emit the rewrites in one
+	// invocation. On this catalogue (~12.5K books) a type change is ~232 batched
+	// statements in a single request — well past the Workers subrequest budget —
+	// so retyping an attribute was simply impossible once the collection grew.
+	//
+	// What is paged is the WRITES, not the reads. Scanning rows costs one
+	// subrequest per page no matter how many rows come back, while every 50
+	// rewrites costs another. So the scan window is deliberately large and the
+	// stop condition is the write cap: a change that touches a handful of books
+	// finishes in 3 calls instead of 13, and one that touches all of them still
+	// stays inside the budget. That matters beyond tidiness — mutations are rate
+	// limited (180/min), so a chattier sweep can throttle itself mid-migration.
+	//
+	// Resumability was already the design here: the definition row is written
+	// LAST (see below), so a page that hasn't finished leaves the OLD definition
+	// in place and the next call recomputes oldKey/newKey identically.
+	const SWEEP_WRITE_CAP = 500; // 10 D1 batches
+	const sweepLimit = Math.min(20000, Math.max(1, Number(c.req.query('sweepLimit') ?? 5000)));
+	const sweepOffset = Math.max(0, Number(c.req.query('sweepOffset') ?? 0));
+	let sweepScanned = 0;
+	let sweepComplete = true;
+
 	if (needsBookSweep) {
-		const books = await c.env.DB.prepare('SELECT id, custom_fields FROM books WHERE deleted_at IS NULL').all<{
+		const books = await c.env.DB.prepare(
+			'SELECT id, custom_fields FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?'
+		).bind(sweepLimit, sweepOffset).all<{
 			id: string;
 			custom_fields: string;
 		}>();
 
-		for (const row of books.results ?? []) {
+		const fetched = books.results ?? [];
+		// A full page means there may be more. Ordering is by primary key and the
+		// sweep only ever rewrites rows (never inserts or deletes), so the offset
+		// window stays stable across calls and an already-migrated row re-scanned
+		// on a retry is simply a no-op.
+		sweepComplete = fetched.length < sweepLimit;
+
+		for (const row of fetched) {
+			// Stop at the write cap and report where we got to, so the next call
+			// resumes from this exact row rather than redoing the page.
+			if (bookUpdates.length >= SWEEP_WRITE_CAP) {
+				sweepComplete = false;
+				break;
+			}
+			sweepScanned += 1;
 			const values = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
 			let changed = false;
 			let renamedThisRow = false;
@@ -2691,6 +2734,23 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 		}
 	}
 
+	// More pages to go: leave the definition untouched so the next call derives
+	// the same oldKey/newKey, and hand the caller the offset to resume from.
+	if (!sweepComplete) {
+		if (bookUpdates.length > 0) {
+			await bumpBooksCacheVersion(c.env);
+		}
+		return c.json({
+			id,
+			sweepComplete: false,
+			nextSweepOffset: sweepOffset + sweepScanned,
+			scanned: sweepScanned,
+			renamedBooks,
+			clearedEnumBooks,
+			retypedBooks
+		});
+	}
+
 	// The definition is updated LAST, deliberately.
 	//
 	// It used to go first (batched with the opening slice of book rewrites).
@@ -2732,7 +2792,8 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 		retypedBooks
 	});
 
-	return c.json({ id, renamedBooks, clearedEnumBooks, retypedBooks });
+	// Counters are per-page; a caller that looped accumulates its own totals.
+	return c.json({ id, sweepComplete: true, renamedBooks, clearedEnumBooks, retypedBooks });
 });
 
 app.delete('/api/custom-fields/:id', requirePermission('customFields.manage', { librarian: true }), async (c) => {
@@ -3596,11 +3657,14 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 
 	const rows = await c.env.DB.prepare(
 		`SELECT id, title, author, isbn, publisher, language, description,
-		        room_code, shelf_code, acquisition_date, tags, custom_fields
+		        room_code, shelf_code, acquisition_date, tags, custom_fields,
+		        title_fold, author_fold, isbn_fold, publisher_fold,
+		        description_fold, tags_fold, custom_fields_fold
 		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
 	).bind(limit, offset).all<Record<string, unknown>>();
 
 	let updated = 0;
+	let foldsBackfilled = 0;
 	const processed = rows.results?.length ?? 0;
 	const now = nowIso();
 	const updates: D1PreparedStatement[] = [];
@@ -3622,7 +3686,7 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 
 		const n = normalizeBookData(original);
 
-		const changed =
+		const textChanged =
 			n.title !== original.title ||
 			n.author !== original.author ||
 			n.isbn !== original.isbn ||
@@ -3635,7 +3699,25 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 			JSON.stringify(n.tags) !== JSON.stringify(original.tags) ||
 			JSON.stringify(n.customFields) !== JSON.stringify(original.customFields);
 
-		if (!changed) continue;
+		// Migration 0012 added the *_fold columns but deliberately skipped the
+		// backfill, relying on the books_fts triggers' COALESCE(fold, raw). That
+		// keeps FTS correct, but every query that reads a fold column DIRECTLY is
+		// blind to an un-backfilled row — including the duplicate warning shown
+		// after each book is added, which probes `title_fold IS ?`. `NULL IS
+		// 'κλημης'` is false, so the warning currently cannot see a single
+		// imported book. A row can be textually clean and still need this, so it
+		// has to be its own trigger rather than part of `textChanged`.
+		const needsFoldBackfill =
+			(row.title_fold == null && (n.title ?? '') !== '') ||
+			(row.author_fold == null && (n.author ?? '') !== '') ||
+			(row.isbn_fold == null && (n.isbn ?? '') !== '') ||
+			(row.publisher_fold == null && (n.publisher ?? '') !== '') ||
+			(row.description_fold == null && (n.description ?? '') !== '') ||
+			(row.tags_fold == null && (n.tags ?? []).length > 0) ||
+			(row.custom_fields_fold == null && Object.keys(n.customFields ?? {}).length > 0);
+
+		if (!textChanged && !needsFoldBackfill) continue;
+		if (needsFoldBackfill) foldsBackfilled++;
 
 		const tagsJson = JSON.stringify(n.tags);
 		const customFieldsJson = JSON.stringify(n.customFields);
@@ -3687,10 +3769,13 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 	const totalBooks = countResult?.n ?? 0;
 
 	await insertAuditLog(c.env, c.get('user').sub, 'admin.normalizeBooks', 'book', null, {
-		processed, updated, offset, limit
+		processed, updated, foldsBackfilled, offset, limit
 	});
 
-	return c.json({ processed, updated, unchanged: processed - updated, offset, nextOffset: offset + processed, totalBooks });
+	return c.json({
+		processed, updated, foldsBackfilled,
+		unchanged: processed - updated, offset, nextOffset: offset + processed, totalBooks
+	});
 });
 
 // ─── Rebuild the full-text search index ───────────────────────────────────────
@@ -4328,28 +4413,35 @@ app.get('/api/me/permissions', async (c) => {
 // the rows idempotently — re-running the same xlsx updates existing books in
 // place via the legacy_id key, instead of creating duplicates.
 
+// `pinnedOrder` mirrors what migrations 0019 and 0020 did to the live
+// catalogue, so a fresh install opens with the same everyday group the
+// librarian already works in. It is applied ONLY when the definition is
+// created — see the seed loop below for why.
 const CATALOG_CUSTOM_FIELDS: Array<{
 	key: string;
 	label: string;
 	type: 'text' | 'number' | 'boolean' | 'date';
+	pinnedOrder?: number;
 }> = [
 	{ key: 'series', label: 'Series', type: 'text' },
 	{ key: 'volume_label', label: 'Volume Label', type: 'text' },
-	{ key: 'volume_num', label: 'Volume Number', type: 'text' },
-	{ key: 'editor', label: 'Editor', type: 'text' },
+	{ key: 'volume_num', label: 'Volume Number', type: 'text', pinnedOrder: 8 },
+	{ key: 'editor', label: 'Editor', type: 'text', pinnedOrder: 4 },
 	{ key: 'translator', label: 'Translator', type: 'text' },
-	{ key: 'place_of_publication', label: 'Place of Publication', type: 'text' },
-	{ key: 'edition', label: 'Edition', type: 'text' },
+	{ key: 'place_of_publication', label: 'Place of Publication', type: 'text', pinnedOrder: 7 },
+	{ key: 'edition', label: 'Edition', type: 'text', pinnedOrder: 3 },
 	{ key: 'category_code', label: 'Category Code', type: 'text' },
-	{ key: 'category_label', label: 'Category Label', type: 'text' },
-	{ key: 'cover_type', label: 'Cover Type', type: 'text' },
-	{ key: 'pages', label: 'Pages', type: 'number' },
-	{ key: 'condition', label: 'Condition', type: 'text' },
+	{ key: 'category_label', label: 'Category Label', type: 'text', pinnedOrder: 9 },
+	{ key: 'cover_type', label: 'Cover Type', type: 'text', pinnedOrder: 2 },
+	// Extent, not a page count: ISBD area 5 / MARC 300$a is free text, so a
+	// volume continuing the previous one's pagination reads "σ. 351-700".
+	{ key: 'pages', label: 'Pages', type: 'text', pinnedOrder: 6 },
+	{ key: 'condition', label: 'Condition', type: 'text', pinnedOrder: 1 },
 	{ key: 'isbn_10', label: 'ISBN-10', type: 'text' },
 	{ key: 'issn', label: 'ISSN', type: 'text' },
 	{ key: 'additional_isbns', label: 'Additional ISBNs', type: 'text' },
 	{ key: 'has_illustrations', label: 'Has Illustrations', type: 'boolean' },
-	{ key: 'illustration_type', label: 'Illustration Type', type: 'text' },
+	{ key: 'illustration_type', label: 'Illustration Type', type: 'text', pinnedOrder: 5 },
 	{ key: 'signed_copy', label: 'Signed Copy', type: 'boolean' },
 	{ key: 'signature_notes', label: 'Signature Notes', type: 'text' },
 	{ key: 'copies_count', label: 'Copies Count', type: 'number' },
@@ -4373,6 +4465,10 @@ app.post('/api/setup/library-catalog', requirePermission('setup'), async (c) => 
 			.first<{ id: string } | null>();
 
 		if (existing) {
+			// Deliberately does NOT touch pinned/sort_order. Placement is the
+			// librarian's, rearranged from Settings; re-running setup on a live
+			// install must not silently shuffle their everyday group back to the
+			// seed order.
 			await c.env.DB.prepare(
 				`UPDATE custom_field_definitions
 				   SET label = ?, field_type = ?, required = 0, enum_options = '[]',
@@ -4385,10 +4481,13 @@ app.post('/api/setup/library-catalog', requirePermission('setup'), async (c) => 
 		} else {
 			await c.env.DB.prepare(
 				`INSERT INTO custom_field_definitions
-					(id, field_key, label, field_type, required, enum_options, created_at, updated_at, deleted_at)
-				 VALUES (?, ?, ?, ?, 0, '[]', ?, ?, NULL)`
+					(id, field_key, label, field_type, required, enum_options, created_at, updated_at, deleted_at, pinned, sort_order)
+				 VALUES (?, ?, ?, ?, 0, '[]', ?, ?, NULL, ?, ?)`
 			)
-				.bind(crypto.randomUUID(), field.key, field.label, field.type, now, now)
+				.bind(
+					crypto.randomUUID(), field.key, field.label, field.type, now, now,
+					field.pinnedOrder ? 1 : 0, field.pinnedOrder ?? 0
+				)
 				.run();
 			created += 1;
 		}

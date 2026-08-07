@@ -1,7 +1,7 @@
 import { HTTPException } from 'hono/http-exception';
 import { defaultPbkdf2Iterations, generateSaltHex, hashPasswordPbkdf2 } from './auth';
 import type { AuthClaims, Env } from './types';
-import { nowIso, safeJsonParse } from './utils';
+import { normalizeCode, nowIso, safeJsonParse } from './utils';
 
 type CustomFieldDef = {
   id: string;
@@ -125,12 +125,28 @@ const SNAKE_TO_CAMEL_BOOK_FIELDS: Record<string, string> = {
   deleted_at: 'deletedAt'
 };
 
+// Internal search-index columns. `SELECT b.*` picks them up and parseBook used
+// to pass them straight through, so every list response carried a second,
+// accent-folded copy of the whole record: measured at 398 bytes/row against
+// 395 bytes/row of useful text, i.e. roughly half of every page of results.
+// Nothing outside the Worker reads them (verified across apps/web/src).
+const INTERNAL_BOOK_COLUMNS = new Set([
+  'title_fold',
+  'author_fold',
+  'isbn_fold',
+  'publisher_fold',
+  'description_fold',
+  'tags_fold',
+  'custom_fields_fold'
+]);
+
 export function parseBook(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(row)) {
     // Skip the snake_case copy if we know the camelCase key — keeps responses
     // small and prevents API consumers from depending on the legacy spelling.
     if (key in SNAKE_TO_CAMEL_BOOK_FIELDS) continue;
+    if (INTERNAL_BOOK_COLUMNS.has(key)) continue;
     out[key] = value;
   }
   out.customFields = safeJsonParse((row.custom_fields as string) ?? '{}', {});
@@ -532,14 +548,19 @@ export async function queryBooksWithFilters(
     // safety) so every author-less book surfaces in this smart list.
     where.push("(b.author = '(Unknown)' OR b.author IS NULL OR TRIM(b.author) = '')");
   }
+  // Substring + case-insensitive so "06" matches "06-005", "06-105", etc.
+  // SQLite's LOWER() is ASCII-only, so it cannot case-fold Greek — a librarian
+  // typing "πισω" would never reach the stored "ΠΙΣΩ". Codes are persisted
+  // upper-cased by normalizeCode, so upper-casing the needle the SAME way lets
+  // the plain LIKE match Greek too, and the LOWER() pair still covers the
+  // ASCII half for any legacy row that predates normalization.
   if (opts.roomCode) {
-    // Substring + case-insensitive so "06" matches "06-005", "06-105", etc.
-    where.push('LOWER(b.room_code) LIKE LOWER(?)');
-    values.push(`%${opts.roomCode}%`);
+    where.push('(LOWER(b.room_code) LIKE LOWER(?) OR b.room_code LIKE ?)');
+    values.push(`%${opts.roomCode}%`, `%${normalizeCode(opts.roomCode)}%`);
   }
   if (opts.shelfCode) {
-    where.push('LOWER(b.shelf_code) LIKE LOWER(?)');
-    values.push(`%${opts.shelfCode}%`);
+    where.push('(LOWER(b.shelf_code) LIKE LOWER(?) OR b.shelf_code LIKE ?)');
+    values.push(`%${opts.shelfCode}%`, `%${normalizeCode(opts.shelfCode)}%`);
   }
   // EXACT "same as this book" criteria, used by the criteria-based selection
   // ("select every book by this author / on this shelf / from this publisher").
@@ -561,8 +582,16 @@ export async function queryBooksWithFilters(
     values.push(foldDiacritics(opts.publisherExact), opts.publisherExact.trim());
   }
   if (opts.shelfExact !== undefined) {
-    where.push("UPPER(TRIM(COALESCE(b.shelf_code, ''))) = ?");
-    values.push(opts.shelfExact.trim().toUpperCase());
+    // Two bound forms, because Greek has two upper-case spellings in play:
+    // `normalizeCode` produces the correct accent-less "ΠΙΣΩ", while rows
+    // written before that fix hold "ΠΊΣΩ" from a plain .toUpperCase(). Matching
+    // both means "select every book on this shelf" keeps working during the
+    // window before POST /api/admin/normalize-books has healed the catalogue.
+    // For every non-Greek code the two forms are identical and this degenerates
+    // to the original single comparison.
+    const shelfTrimmed = opts.shelfExact.trim();
+    where.push("(UPPER(TRIM(COALESCE(b.shelf_code, ''))) = ? OR TRIM(COALESCE(b.shelf_code, '')) = ?)");
+    values.push(shelfTrimmed.toUpperCase(), normalizeCode(shelfTrimmed));
   }
   for (const filter of opts.customFilters) {
     // json_extract validates the path; key is constrained to [a-zA-Z0-9_] in custom_field schema.
