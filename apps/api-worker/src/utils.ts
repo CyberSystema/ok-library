@@ -121,6 +121,19 @@ export function reconcileBookDates<T extends {
   dateEdtf?: string | null;
 }>(input: T): T {
   const out = { ...input } as Record<string, unknown>;
+
+  // ABSENT means "leave this alone" — the same contract every other field
+  // honours in a partial update. Only an explicit null clears.
+  //
+  // Getting this wrong is silent data loss: a bulk edit that sets a shelf code
+  // sends neither date field, and treating that as "no date" collapsed a
+  // 1955/1957 bound-with back to a bare 1955. Exactly the trap UpdateBookSchema
+  // was already written to avoid for title/author/tags — it reappeared here
+  // because this function runs on the incoming payload, not the merged row.
+  const hasEdtf = Object.prototype.hasOwnProperty.call(out, 'dateEdtf') && out.dateEdtf !== undefined;
+  const hasYear = Object.prototype.hasOwnProperty.call(out, 'publicationYear') && out.publicationYear !== undefined;
+  if (!hasEdtf && !hasYear) return out as T;
+
   const raw = typeof out.dateEdtf === 'string' ? out.dateEdtf.trim() : '';
 
   if (raw) {
@@ -137,11 +150,13 @@ export function reconcileBookDates<T extends {
     return out as T;
   }
 
+  // An explicitly-cleared EDTF value, or a bare year from an older client / the
+  // offline queue: mirror the year across so the two never disagree.
   out.dateEdtf = null;
   if (typeof out.publicationYear === 'number') {
     out.dateEdtf = String(out.publicationYear);
     out.publicationYearEnd = out.publicationYear;
-  } else if (out.publicationYear === null) {
+  } else {
     out.publicationYearEnd = null;
   }
   return out as T;

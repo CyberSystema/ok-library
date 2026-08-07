@@ -12,7 +12,7 @@ Usage:
 
 Exit code 0 = everything held. Non-zero = at least one assertion failed.
 """
-import csv, io, json, os, sys, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
+import csv, io, json, os, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
 
 BASE = os.environ.get("API", "http://127.0.0.1:8787").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -28,15 +28,23 @@ def call(method, path, body=None, raw=None, ctype=None, token=None):
         data = json.dumps(body).encode(); headers["Content-Type"] = "application/json"
     elif raw is not None:
         data = raw; headers["Content-Type"] = ctype or "application/octet-stream"
-    req = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=90) as r:
-            t = r.read().decode()
-            return r.status, (json.loads(t) if t.strip() else None)
-    except urllib.error.HTTPError as e:
-        t = e.read().decode()
-        try: return e.code, (json.loads(t) if t.strip() else None)
-        except Exception: return e.code, {"raw": t[:300]}
+    # The suite makes more mutations than the 180/min limiter allows, so back off
+    # and retry on a 429 rather than turning the limiter down — it is a real
+    # protection for the D1 write budget and should be exercised, not disabled.
+    for attempt in range(6):
+        req = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                t = r.read().decode()
+                return r.status, (json.loads(t) if t.strip() else None)
+        except urllib.error.HTTPError as e:
+            t = e.read().decode()
+            if e.code == 429 and attempt < 5:
+                time.sleep(12)
+                continue
+            try: return e.code, (json.loads(t) if t.strip() else None)
+            except Exception: return e.code, {"raw": t[:300]}
+    return 429, {"error": "rate limited after retries"}
 
 
 def call_text(method, path, token=None):
@@ -705,10 +713,15 @@ for fld in ["shelfCode", "language", "publicationYear", "publisher",
         check(f"facet {fld} puts the (empty) bucket first",
               items[0].get("isEmpty") is True or not any(i.get("isEmpty") for i in items),
               items[0])
-    # Untruncated facets must account for every book.
-    if not fac.get("truncated"):
+    # Untruncated facets must account for every book — EXCEPT the location ones,
+    # where a record held in two places is genuinely in two buckets and the sum
+    # legitimately exceeds the catalogue. The server flags that as `overlapping`.
+    if not fac.get("truncated") and not fac.get("overlapping"):
         check(f"facet {fld} counts sum to the catalogue",
               fac.get("shownCount") == library_total, f"{fac.get('shownCount')} vs {library_total}")
+    elif fac.get("overlapping"):
+        check(f"facet {fld} accounts for at least every book",
+              fac.get("shownCount") >= library_total, f"{fac.get('shownCount')} vs {library_total}")
     for bucket in [i for i in items if i["isEmpty"]][:1] + [i for i in items if not i["isEmpty"]][:1]:
         if bucket["isEmpty"]:
             st, r = call("GET", f"/api/books?pageSize=1&emptyField={urllib.parse.quote(fld)}")
@@ -826,6 +839,29 @@ sy, _ = mkbook(dateEdtf="1955", publicationYear=None, title="ZZITEST singleyear 
 st, r = call("GET", "/api/books?pageSize=100&year=1956&q=ZZITEST+singleyear&partialWords=true&fuzzyTypos=false")
 check("a single-year book is not matched by a neighbouring year",
       sy not in [x["id"] for x in (r or {}).get("items", [])], (r or {}).get("total"))
+
+# A date must survive an edit that never mentions it. A bulk "set shelf code"
+# sends neither date field, and treating absent as "no date" collapsed a
+# 1955/1957 bound-with back to a bare 1955 — the same silent loss
+# UpdateBookSchema already guards against for title/author/tags.
+sv, _ = mkbook(dateEdtf="1955/1957", publicationYear=None)
+st, r = call("PUT", f"/api/books/{sv}", {"shelfCode": "ZZ-SURV", "version": get(sv)["version"]})
+g = get(sv)
+check("a partial edit does not destroy the date range",
+      (g.get("dateEdtf"), g.get("publicationYearEnd")) == ("1955/1957", 1957),
+      (g.get("dateEdtf"), g.get("publicationYearEnd")))
+st, r = call("POST", "/api/sync/push", {"mutations": [{"operation": "update_book",
+    "clientMutationId": uuid.uuid4().hex, "clientTimestamp": "2026-08-07T00:00:00.000Z",
+    "payload": {"id": sv, "data": {"version": get(sv)["version"], "customFieldsPatch": {"series": "ZZ"}}}}]})
+g = get(sv)
+check("a bulk patch does not destroy it either",
+      (g.get("dateEdtf"), g.get("publicationYearEnd")) == ("1955/1957", 1957),
+      (g.get("dateEdtf"), g.get("publicationYearEnd")))
+# An EXPLICIT clear must still clear, or the field becomes unerasable.
+st, r = call("PUT", f"/api/books/{sv}", {"dateEdtf": None, "publicationYear": None, "version": get(sv)["version"]})
+g = get(sv)
+check("an explicit clear still clears the date",
+      g.get("dateEdtf") is None and g.get("publicationYear") is None, g.get("dateEdtf"))
 
 # Unparseable dates are KEPT, never rejected — the librarian is transcribing
 # what the book says, and refusing would lose the only note of it.

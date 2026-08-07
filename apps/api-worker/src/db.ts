@@ -650,6 +650,70 @@ const FACET_COLUMNS: Record<string, string> = {
   isbn: 'isbn'
 };
 
+/**
+ * Everything the MARC / Dublin Core view of a record needs, for many books at
+ * once.
+ *
+ * Batched deliberately: an export walks the whole catalogue, and doing four
+ * lookups per book would be ~50,000 D1 round-trips. Three grouped queries per
+ * page instead, keyed by book id.
+ */
+export async function loadMarcExtrasForBooks(
+  env: Env,
+  bookIds: string[]
+): Promise<Map<string, {
+  contributors: Array<{ name: string; role: string; dates?: string | null; kind?: string | null }>;
+  subjects: Array<{ term: string; source?: string | null }>;
+  seriesTitle: string | null;
+}>> {
+  const out = new Map<string, {
+    contributors: Array<{ name: string; role: string; dates?: string | null; kind?: string | null }>;
+    subjects: Array<{ term: string; source?: string | null }>;
+    seriesTitle: string | null;
+  }>();
+  const safe = bookIds.filter((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id));
+  if (safe.length === 0) return out;
+  for (const id of safe) out.set(id, { contributors: [], subjects: [], seriesTitle: null });
+  const ph = safe.map(() => '?').join(',');
+
+  const links = await env.DB.prepare(
+    `SELECT ba.book_id, ba.role, a.kind, a.preferred_form, a.dates, a.source
+       FROM book_authorities ba JOIN authorities a ON a.id = ba.authority_id
+      WHERE a.deleted_at IS NULL AND ba.book_id IN (${ph})
+      ORDER BY ba.seq ASC`
+  ).bind(...safe).all<{
+    book_id: string; role: string; kind: string; preferred_form: string;
+    dates: string | null; source: string | null;
+  }>();
+  for (const r of links.results ?? []) {
+    const entry = out.get(r.book_id);
+    if (!entry) continue;
+    // A subject authority is a 650, everyone else is a name added entry.
+    if (r.kind === 'subject') entry.subjects.push({ term: r.preferred_form, source: r.source });
+    else entry.contributors.push({ name: r.preferred_form, role: r.role, dates: r.dates, kind: r.kind });
+  }
+
+  const sets = await env.DB.prepare(
+    `SELECT b.id AS book_id, s.title
+       FROM books b JOIN book_sets s ON s.id = b.set_id
+      WHERE s.deleted_at IS NULL AND b.id IN (${ph})`
+  ).bind(...safe).all<{ book_id: string; title: string }>();
+  for (const r of sets.results ?? []) {
+    const entry = out.get(r.book_id);
+    if (entry) entry.seriesTitle = r.title;
+  }
+
+  return out;
+}
+
+/** The institution's own identifiers — MARC 040/852, OAI-PMH repository id. */
+export async function getLibrarySettings(env: Env): Promise<Record<string, string | null>> {
+  const rows = await env.DB.prepare('SELECT key, value FROM library_settings').all<{ key: string; value: string | null }>();
+  const out: Record<string, string | null> = {};
+  for (const r of rows.results ?? []) out[r.key] = r.value;
+  return out;
+}
+
 // Fields that live on the COPIES rather than the record. Faceting and filtering
 // on these has to go through `items`, or a book held in two places is only ever
 // counted at one of them.

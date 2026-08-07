@@ -50,6 +50,8 @@ import {
 	replaceBookAttributeValues,
 	recordSyncMutation,
 	resolveEmptyFieldExpr,
+	getLibrarySettings,
+	loadMarcExtrasForBooks,
 	ensurePrimaryItem,
 	setItemsDeleted,
 	restoreItemsDeletedAt,
@@ -67,6 +69,14 @@ import {
 	vectorizeBook,
 	withTxn
 } from './db';
+import {
+	bookRowToMarcInput,
+	MARCXML_COLLECTION_CLOSE,
+	MARCXML_COLLECTION_OPEN,
+	toDublinCoreXml,
+	toMarcJson,
+	toMarcXml
+} from './marc';
 import type { AuthClaims, Env } from './types';
 import { deterministicUuid, generateCodeValue, newId, normalizeBookData, normalizeCode, nowIso, safeJsonParse, toCsv } from './utils';
 
@@ -1856,13 +1866,13 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 	await c.env.DB.prepare(
 		`INSERT OR IGNORE INTO books (
 			id, title, author, isbn, publication_year, publication_year_end, date_edtf,
-			publisher, language, description,
+			publisher, language, description, ddc,
 			title_romanized, author_romanized, publisher_romanized,
 			room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 			legacy_id, created_at, updated_at, deleted_at,
 			title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
 			title_romanized_fold, author_romanized_fold, publisher_romanized_fold
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	)
 		.bind(
 			id,
@@ -1875,6 +1885,7 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			payload.publisher ?? null,
 			payload.language ?? null,
 			payload.description ?? null,
+			payload.ddc ?? null,
 			payload.titleRomanized ?? null,
 			payload.authorRomanized ?? null,
 			payload.publisherRomanized ?? null,
@@ -2107,7 +2118,7 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	const updateBookStmt = c.env.DB.prepare(
 		`UPDATE books SET
 			title = ?, author = ?, isbn = ?, publication_year = ?, publication_year_end = ?, date_edtf = ?,
-			publisher = ?, language = ?, description = ?,
+			publisher = ?, language = ?, description = ?, ddc = ?,
 			title_romanized = ?, author_romanized = ?, publisher_romanized = ?,
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 			legacy_id = ?, version = ?, updated_at = ?,
@@ -2125,6 +2136,7 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			merged.publisher ?? null,
 			merged.language ?? null,
 			merged.description ?? null,
+			merged.ddc ?? null,
 			merged.titleRomanized ?? null,
 			merged.authorRomanized ?? null,
 			merged.publisherRomanized ?? null,
@@ -3685,6 +3697,115 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 	return c.json({ importedRows, updatedRows, skippedRows }, 201);
 });
 
+// ─── Standard-format export ───────────────────────────────────────────────
+//
+// MARC 21 (as MARCXML or MARC-in-JSON) and Dublin Core, so this catalogue can
+// be handed to another library, a union catalogue, or a migration.
+//
+// The XLSX and CSV routes are untouched and remain the everyday export — this
+// is added alongside, for exchange. Streamed page by page rather than built in
+// memory: 12.5K MARCXML records is several megabytes, and a Worker that
+// assembles the whole string first will run out of room long before it finishes.
+app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian: true }), async (c) => {
+	const format = c.req.query('format') === 'json' ? 'json' : 'marcxml';
+	const settings = await getLibrarySettings(c.env);
+	const isil = settings.isil ?? null;
+	const pageSize = 200;
+
+	const stream = new ReadableStream({
+		async start(controller) {
+			const enc = new TextEncoder();
+			const write = (s: string) => controller.enqueue(enc.encode(s));
+			write(format === 'json' ? '[\n' : MARCXML_COLLECTION_OPEN + '\n');
+			let page = 1;
+			let first = true;
+			try {
+				for (;;) {
+					const result = await queryBooksWithFilters(c.env, {
+						sortBy: 'updatedAt', sortDir: 'desc', page, pageSize,
+						customFilters: [],
+						// The total is discarded on every page, so don't pay for the
+						// COUNT(*) scan 63 times over.
+						skipCount: true
+					});
+					if (result.rows.length === 0) break;
+					const ids = result.rows.map((r) => String((r as { id: unknown }).id));
+					const [itemsByBook, extras] = await Promise.all([
+						loadItemsForBooks(c.env, ids),
+						loadMarcExtrasForBooks(c.env, ids)
+					]);
+					for (const row of result.rows) {
+						const id = String((row as { id: unknown }).id);
+						const extra = extras.get(id);
+						const input = bookRowToMarcInput(row as Record<string, unknown>, {
+							items: itemsByBook.get(id) ?? [],
+							contributors: extra?.contributors,
+							subjects: extra?.subjects,
+							seriesTitle: extra?.seriesTitle,
+							isil
+						});
+						if (format === 'json') {
+							write((first ? '' : ',\n') + JSON.stringify(toMarcJson(input)));
+						} else {
+							write(toMarcXml(input) + '\n');
+						}
+						first = false;
+					}
+					if (result.rows.length < pageSize) break;
+					page += 1;
+				}
+				write(format === 'json' ? '\n]\n' : MARCXML_COLLECTION_CLOSE + '\n');
+			} catch (error) {
+				console.warn('MARC export failed mid-stream', error);
+				// The response has already begun, so the only honest signal left is
+				// an unterminated document — better than a truncated one that looks
+				// complete and silently loses the tail of the catalogue.
+				controller.error(error);
+				return;
+			}
+			controller.close();
+		}
+	});
+
+	return new Response(stream, {
+		headers: {
+			'Content-Type': format === 'json' ? 'application/json; charset=utf-8' : 'application/xml; charset=utf-8',
+			'Content-Disposition': `attachment; filename="books.${format === 'json' ? 'marc.json' : 'marcxml'}"`
+		}
+	});
+});
+
+// One record, in whichever standard format the caller asks for. This is also
+// what SRU and OAI-PMH render through.
+app.get('/api/books/:id/marc', async (c) => {
+	const id = c.req.param('id') ?? '';
+	const row = await c.env.DB.prepare('SELECT * FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
+	if (!row) throw new HTTPException(404, { message: 'Book not found' });
+	const settings = await getLibrarySettings(c.env);
+	const [items, extras] = await Promise.all([
+		loadBookItems(c.env, id),
+		loadMarcExtrasForBooks(c.env, [id])
+	]);
+	const extra = extras.get(id);
+	const input = bookRowToMarcInput(parseBook(row as Record<string, unknown>), {
+		items, contributors: extra?.contributors, subjects: extra?.subjects,
+		seriesTitle: extra?.seriesTitle, isil: settings.isil ?? null
+	});
+
+	const format = c.req.query('format') ?? 'marcxml';
+	if (format === 'json') return c.json(toMarcJson(input));
+	if (format === 'dc') {
+		return c.body(
+			`<?xml version="1.0" encoding="UTF-8"?>\n${toDublinCoreXml(input)}\n`,
+			200, { 'Content-Type': 'application/xml; charset=utf-8' }
+		);
+	}
+	return c.body(
+		`${MARCXML_COLLECTION_OPEN}\n${toMarcXml(input)}\n${MARCXML_COLLECTION_CLOSE}\n`,
+		200, { 'Content-Type': 'application/xml; charset=utf-8' }
+	);
+});
+
 app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: true }), async (c) => {
 	// Route the export through the same query path the list endpoint uses
 	// so FTS5, fold-aware accent-insensitive matching, fuzzy mode, and every
@@ -3889,13 +4010,13 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				await c.env.DB.prepare(
 					`INSERT OR IGNORE INTO books (
 						id, title, author, isbn, publication_year, publication_year_end, date_edtf,
-						publisher, language, description,
+						publisher, language, description, ddc,
 						title_romanized, author_romanized, publisher_romanized,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 						created_at, updated_at, deleted_at,
 						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
 						title_romanized_fold, author_romanized_fold, publisher_romanized_fold
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						id,
@@ -3908,6 +4029,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						row.publisher ?? null,
 						row.language ?? null,
 						row.description ?? null,
+						row.ddc ?? null,
 						row.titleRomanized ?? null,
 						row.authorRomanized ?? null,
 						row.publisherRomanized ?? null,
@@ -4065,7 +4187,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				const syncUpd = await c.env.DB.prepare(
 					`UPDATE books SET
 						 title = ?, author = ?, isbn = ?, publication_year = ?, publication_year_end = ?, date_edtf = ?,
-						 publisher = ?, language = ?, description = ?,
+						 publisher = ?, language = ?, description = ?, ddc = ?,
 						 title_romanized = ?, author_romanized = ?, publisher_romanized = ?,
 						 room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 						 version = ?, updated_at = ?,
@@ -4083,6 +4205,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						merged.publisher ?? null,
 						merged.language ?? null,
 						merged.description ?? null,
+						merged.ddc ?? null,
 						merged.titleRomanized ?? null,
 						merged.authorRomanized ?? null,
 						merged.publisherRomanized ?? null,

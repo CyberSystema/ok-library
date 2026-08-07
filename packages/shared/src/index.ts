@@ -75,6 +75,10 @@ export const BookCoreSchema = z.object({
   // Accepted in the schema only so the type flows through the write paths;
   // `reconcileBookDates` overwrites it on every write.
   publicationYearEnd: z.number().int().min(1000).max(3000).optional().nullable(),
+  // Dewey Decimal, alongside the local shelf classification rather than
+  // replacing it — no re-shelving, but imported records keep their DDC and the
+  // catalogue gains a standard subject handle. MARC 082.
+  ddc: z.string().max(40).optional().nullable(),
   publisher: z.string().max(200).optional().nullable(),
   // Catalogues frequently use multi-language tags like "EL,EN,FR" so we keep
   // the field free-form text rather than enumerated.
