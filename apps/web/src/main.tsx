@@ -9,11 +9,30 @@ import {
   highlight,
   normalizeForCompare,
   useConfirm,
-  useToast
+  useToast,
+  StatCard, SectionHeader, EdtfHint, Combobox, Dialog
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
 import { formatEdtfRange, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
 import { cacheGet, cacheSet, cacheBustPrefixes, cacheClear } from './cache';
+// The network layer now lives in api.ts. main.tsx exports nothing, so anything a
+// screen outside this file needs has to be reachable from there instead.
+import {
+  API_BASE, PAGE_SIZE, DEBOUNCE_MS, IMPORT_CHUNK_SIZE, IMPORT_MIN_CHUNK_SIZE,
+  apiRequest, joinApiUrl, sleep, newMutationId,
+  setAuthToken, setUnauthorizedHandler, subscribeNetStatus,
+  ApiRequestError, SpreadsheetRowMissingError, OfflineWriteBlockedError,
+  isOfflineWriteBlockedError, isPayloadTooLargeError,
+  type NetStatus
+} from './api';
+import type {
+  BookStatus, Book, Borrower, SmartList, CatalogRow, CustomFieldType, CustomField,
+  SessionUser, LoginResponse, SessionResponse, ActiveBorrow, Iso2789Report, ScanHit,
+  LoanPolicy, Hold, AuditLogItem, StaffRole, StaffUser, BorrowHistoryItem, RoomSummaryItem,
+  FacetItem, SetSummary, FacetResponse, AppSection, StatsResponse, Theme, DuplicateEntry,
+  DuplicateGroup, CatalogFacets, SearchMode, SearchField, Item, TitleSuggestion,
+  ValueVariantGroup, MergeCandidateItem, MergeCandidateBook, MergeCandidateGroup, MergePreview
+} from './types';
 import { OnboardingCourse } from './onboarding';
 import './styles.css';
 
@@ -22,243 +41,27 @@ async function loadXlsx() {
   return await import('xlsx');
 }
 
-type BookStatus = 'available' | 'borrowed' | 'lost' | 'maintenance';
 
-type Book = {
-  id: string;
-  title: string;
-  author: string;
-  status: BookStatus;
-  roomCode?: string | null;
-  shelfCode?: string | null;
-  isbn?: string | null;
-  publicationYear?: number | null;
-  /** Latest year the date can denote; equals publicationYear for a single date. */
-  publicationYearEnd?: number | null;
-  /** The authored date in the EDTF subset — "1955/1957", "~1850", "19XX". */
-  dateEdtf?: string | null;
-  /** MARC 880-style parallel forms; the original script is what displays. */
-  titleRomanized?: string | null;
-  authorRomanized?: string | null;
-  publisherRomanized?: string | null;
-  customFields?: Record<string, string | number | boolean | null>;
-  version: number;
-  publisher?: string | null;
-  language?: string | null;
-  description?: string | null;
-  legacyId?: string | null;
-  coverUrl?: string | null;
-  /** The physical copies. A record can be held in more than one place. */
-  items?: Item[];
-};
 
-type Borrower = {
-  id: string;
-  name: string;
-  contact?: string | null;
-  totalLoans: number;
-  openLoans: number;
-  overdueLoans: number;
-};
 
-// Smart lists are pre-saved filter combinations the user can apply with one click.
-// Each entry maps to query-string params understood by /api/books.
-type SmartList = {
-  key: string;
-  icon: string;
-  label: string;
-  // Returns the filter params; the caller spreads these into the URLSearchParams.
-  params: Record<string, string>;
-};
 
-type CatalogRow = {
-  legacyId?: string | null;
-  title?: string | null;
-  author?: string | null;
-  isbn?: string | null;
-  publicationYear?: number | null;
-  publisher?: string | null;
-  language?: string | null;
-  description?: string | null;
-  shelfCode?: string | null;
-  needsReview?: boolean;
-  customFields: Record<string, string | number | boolean | null>;
-};
 
-type CustomFieldType = 'text' | 'number' | 'boolean' | 'date' | 'enum';
 
-type CustomField = {
-  id: string;
-  key: string;
-  label: string;
-  type: CustomFieldType;
-  required: boolean;
-  // Pinned attributes lead every attribute list, ordered by sortOrder. Optional
-  // so a client running against an API that predates the columns still parses.
-  pinned?: boolean;
-  sortOrder?: number;
-  enumOptions: string[];
-};
 
-type SessionUser = { id: string; username: string; role: string; needsOnboarding?: boolean };
 
-type LoginResponse = {
-  user: SessionUser;
-  // Present so clients on browsers that block the cross-site auth cookie
-  // (Safari/WebKit ITP) can authenticate via an Authorization: Bearer header.
-  token?: string;
-};
 
-type SessionResponse = {
-  user: SessionUser;
-};
 
-type ActiveBorrow = {
-  id: string;
-  bookId: string;
-  title: string;
-  author: string;
-  borrowerName: string;
-  borrowerContact?: string | null;
-  borrowedAt: string;
-  dueAt: string;
-  isOverdue: boolean;
-  // WHICH copy is out. A record can have several on loan at once since the
-  // holdings layer, so a loan row that named only the title was ambiguous.
-  itemId?: string | null;
-  copyNumber?: number | null;
-  shelfCode?: string | null;
-  barcode?: string | null;
-  renewalCount?: number;
-};
 
-type Iso2789Report = {
-  period: { from: string; to: string };
-  library: { isil: string | null; name: string | null; place: string | null };
-  stockBaselineDate: string | null;
-  collection: {
-    titles: number; items: number; serialTitles: number;
-    byDocumentCategory: Array<{ category: string; items: number }>;
-    byLanguage: Array<{ language: string; titles: number }>;
-  };
-  flow: {
-    additions: number;
-    withdrawals: { total: number; byReason: Array<{ reason: string; items: number }> };
-    loans: number; itemsLent: number; renewedLoans: number; activeBorrowers: number;
-  };
-  users: { registered: number; byCategory: Array<{ category: string; borrowers: number }> };
-  caveats: string[];
-};
 
-type ScanHit = {
-  book: Book;
-  item: Item | null;
-  items: Item[];
-  openLoan: { id: string; borrower_name: string; due_at: string; item_id: string | null; renewal_count: number } | null;
-};
 
-// ── Loan policies, holds and renewals ───────────────────────────────────────
-type LoanPolicy = {
-  id?: string;
-  borrowerCategory: string;
-  itemType: string;
-  loanDays: number;
-  renewalLimit: number;
-  renewalDays: number | null;
-  maxConcurrentLoans: number | null;
-  lendable: boolean;
-  notes?: string | null;
-};
-type Hold = {
-  id: string;
-  bookId?: string;
-  title?: string;
-  author?: string;
-  position?: number;
-  borrowerId?: string | null;
-  borrowerName: string;
-  borrowerContact?: string | null;
-  status: 'waiting' | 'ready' | 'fulfilled' | 'cancelled' | 'expired';
-  itemId?: string | null;
-  copyNumber?: number | null;
-  shelfCode?: string | null;
-  placedAt: string;
-  readyAt?: string | null;
-  expiresAt?: string | null;
-};
 
-type AuditLogItem = {
-  id: string;
-  actor_id: string;
-  action: string;
-  entity_type: string;
-  entity_id?: string | null;
-  created_at: string;
-};
 
-type StaffRole = 'admin' | 'librarian' | 'viewer';
 
-type StaffUser = {
-  id: string;
-  username: string;
-  role: StaffRole;
-  active: number;
-  created_at: string;
-  updated_at: string;
-};
 
-type BorrowHistoryItem = {
-  id: string;
-  itemId?: string | null;
-  borrowerName: string;
-  borrowerContact?: string | null;
-  borrowedAt: string;
-  dueAt: string;
-  returnedAt?: string | null;
-  notes?: string | null;
-  wasOverdue: boolean;
-};
 
-type RoomSummaryItem = {
-  id: string;
-  code: string;
-  name: string;
-  description?: string | null;
-  total_books: number;
-  available_books: number;
-  borrowed_books: number;
-  lost_books: number;
-  maintenance_books: number;
-};
 
-type FacetItem = {
-  value: string;
-  /** The "nothing recorded here" bucket, always sorted first by the server. */
-  isEmpty: boolean;
-  count: number;
-};
 
-type SetSummary = {
-  key: string;
-  setId: string | null;
-  title: string;
-  sampleAuthor: string;
-  bookCount: number;
-  minVol: number | null;
-  maxVol: number | null;
-  unnumbered: number;
-  gapsAvailable: boolean;
-  missing: number[];
-  missingCount: number;
-};
 
-type FacetResponse = {
-  field: string;
-  totalBooks: number;
-  truncated: boolean;
-  shownCount: number;
-  items: FacetItem[];
-};
 
 // Fields the rail can group by. Core fields first, then every custom attribute
 // (appended at runtime from the live definitions, everyday ones first). Must
@@ -276,32 +79,8 @@ const CORE_FACET_CHOICES: Array<{ key: string; labelKey: string }> = [
   { key: 'status', labelKey: 'detail.statusRow' }
 ];
 
-type AppSection = 'dashboard' | 'books' | 'circulation' | 'import' | 'settings';
 
-type StatsResponse = {
-  byStatus: Array<{ status: string; count: number }>;
-  byLanguage: Array<{ language: string; count: number }>;
-  byYear: Array<{ bucket: string; count: number }>;
-  completeness: {
-    total: number;
-    withIsbn: number;
-    withShelf: number;
-    withPublisher: number;
-    withYear: number;
-    untitled: number;
-    unknownAuthor: number;
-  };
-  recentlyUpdated: Array<{
-    id: string;
-    title: string;
-    author: string;
-    legacyId: string | null;
-    updatedAt: string;
-  }>;
-  topShelves: Array<{ shelfCode: string; count: number }>;
-};
 
-type Theme = 'light' | 'dark';
 
 // Saved smart lists rendered as one-click filter chips. The keys must be stable
 // because they're used to highlight the active chip. The label is resolved at
@@ -317,27 +96,7 @@ const SMART_LISTS: Array<SmartList & { labelKey: string }> = [
   { key: 'recently-added',   icon: '🕒', labelKey: 'library.smart.recent',         label: 'Recently added',   params: { sortBy: 'updatedAt', sortDir: 'desc' } }
 ];
 
-type DuplicateEntry = { id: string; title: string; author: string; isbn: string | null };
-type DuplicateGroup = DuplicateEntry[];
-type CatalogFacets = {
-  // No `titles`: title is intentionally excluded from autocomplete (unique-ish
-  // values, and suggesting them risks picking an existing book's title).
-  authors: string[];
-  publishers: string[];
-  languages: string[];
-  shelfCodes: string[];
-  // Per-custom-field distinct values (text fields only), keyed by field key.
-  customFields: Record<string, string[]>;
-};
-type SearchMode = 'all' | 'any' | 'exact';
-type SearchField = 'title' | 'author' | 'isbn' | 'publisher' | 'language' | 'description' | 'roomCode' | 'shelfCode' | 'tags' | 'custom';
 
-const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
-const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
-const IMPORT_CHUNK_SIZE = 500;
-const IMPORT_MIN_CHUNK_SIZE = 1;
-const PAGE_SIZE = 50;
-const DEBOUNCE_MS = 350;
 // The book-list filter params, built in ONE place so the grid query and the
 // "select all matching" query can never drift apart — if they did, the librarian
 // would select a different set than the one they are looking at. Pure (takes the
@@ -508,51 +267,6 @@ function hasCustomValue(value: unknown): boolean {
   return value !== null && value !== undefined && String(value).trim() !== '';
 }
 
-function joinApiUrl(path: string): string {
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  return `${API_BASE}${normalizedPath}`;
-}
-
-// ─── Bearer-token auth (Safari/cross-site-cookie fallback) ────────────────────
-// The API issues an HttpOnly session cookie, but it is a *cross-site* cookie
-// (the web app and API are on different registrable sites — pages.dev vs
-// workers.dev). Safari/WebKit ITP blocks/purges cross-site cookies, so the
-// cookie never rides along and every request comes back 401 → "no books".
-// The API also accepts `Authorization: Bearer <token>` and returns the token in
-// the login body, so we persist it and send it on every request. This works in
-// every browser (and inside the Electron desktop shell) regardless of cookies.
-const AUTH_TOKEN_KEY = 'ok-library-token-v1';
-
-function readStoredToken(): string | null {
-  try {
-    return localStorage.getItem(AUTH_TOKEN_KEY);
-  } catch {
-    // Safari Private Browsing / disabled storage — degrade to in-memory only.
-    return null;
-  }
-}
-
-let authToken: string | null = readStoredToken();
-
-function setAuthToken(token: string | null): void {
-  authToken = token;
-  try {
-    if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
-    else localStorage.removeItem(AUTH_TOKEN_KEY);
-  } catch {
-    // In-memory `authToken` still works for the rest of the session.
-  }
-}
-
-// Invoked by apiRequest whenever the server rejects auth (401). The App wires
-// this to drop back to the login screen. Guarded by the App so the first-load
-// session probe (which 401s for anonymous visitors) doesn't show a spurious
-// "session expired" message.
-let onUnauthorized: (() => void) | null = null;
-function setUnauthorizedHandler(fn: (() => void) | null): void {
-  onUnauthorized = fn;
-}
-
 // ─── Desktop app downloads ────────────────────────────────────────────────────
 // Installers are published to GitHub Releases; `latest/download/<asset>` always
 // resolves to the newest release's asset, so the button never needs updating.
@@ -666,321 +380,10 @@ const RESERVED_ATTRIBUTE_KEYS = new Set([
   'deletedAt'
 ]);
 
-class ApiRequestError extends Error {
-  status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
-/**
- * Thrown by `normalizeSpreadsheetRow` when a row has no title/author. The
- * import loop catches it by class — we used to match the localized error
- * message via `String.includes(...)`, which silently broke for non-English
- * UI languages (Korean/Greek/Russian) and let the whole import die on the
- * first missing-title row instead of skipping that row.
- */
-class SpreadsheetRowMissingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SpreadsheetRowMissingError';
-  }
-}
-
-/**
- * Thrown synchronously (before fetch) when the user attempts a write
- * (POST/PUT/PATCH/DELETE) while the browser reports it is offline. We refuse
- * to even attempt the request because queuing offline writes would risk
- * silent conflicts and data loss in the remote D1 — the source of truth.
- */
-class OfflineWriteBlockedError extends Error {
-  constructor(message = 'You are offline. Please reconnect before saving changes.') {
-    super(message);
-    this.name = 'OfflineWriteBlockedError';
-  }
-}
-
-function isOfflineWriteBlockedError(err: unknown): err is OfflineWriteBlockedError {
-  return err instanceof OfflineWriteBlockedError;
-}
-
-/** Generate a v4-ish UUID without crypto.randomUUID (Safari < 15.4 fallback). */
-function newMutationId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  // RFC4122 v4 fallback
-  const bytes = new Uint8Array(16);
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-function isPayloadTooLargeError(error: unknown): boolean {
-  if (!(error instanceof ApiRequestError)) {
-    return false;
-  }
-
-  if (error.status === 413) {
-    return true;
-  }
-
-  // A 400 is the server REJECTING the rows (bad custom field, missing title) —
-  // never a size complaint. Matching the bare word "payload" used to catch the
-  // server's own "Invalid import payload." message, so a validation error was
-  // mistaken for an oversized request: the importer kept halving the chunk and,
-  // once it hit the minimum, silently dropped rows one at a time.
-  if (error.status === 400) {
-    return false;
-  }
-
-  return /too big|too large|entity too large|request too large/i.test(error.message);
-}
-
-// Cache-bust families: keys whose paths start with any of these are
-// invalidated after a mutation succeeds. We list both the singular and
-// related collection paths so e.g. POSTing /api/borrow/return also clears
 // /api/books and /api/stats which depend on borrow state.
-const CACHE_BUST_FAMILIES = [
-  'GET /api/books',
-  'GET /api/custom-fields',
-  'GET /api/rooms',
-  'GET /api/categories',
-  'GET /api/facets',
-  'GET /api/stats',
-  'GET /api/borrow',
-  'GET /api/borrowers',
-  'GET /api/needs-review-count',
-  'GET /api/audit-logs',
-  'GET /api/users',
-  // The session response carries `needsOnboarding` and the current role. Left
-  // out, a cached copy kept re-launching the finished onboarding course, and a
-  // role change stayed invisible until the cache expired.
-  'GET /api/auth/session',
-  'GET /api/me'
-];
 
-// Simple network-status signal so the UI can surface a banner when we're
-// serving cached data instead of a fresh response. Updated whenever a GET
-// either uses the cache as a fallback or successfully revalidates.
-type NetStatus = 'online' | 'offline';
-let lastNetStatus: NetStatus = 'online';
-const netListeners = new Set<(s: NetStatus) => void>();
-function setNetStatus(next: NetStatus) {
-  if (next === lastNetStatus) return;
-  lastNetStatus = next;
-  for (const fn of netListeners) {
-    try { fn(next); } catch { /* ignore listener errors */ }
-  }
-}
-function subscribeNetStatus(fn: (s: NetStatus) => void): () => void {
-  netListeners.add(fn);
-  fn(lastNetStatus);
-  return () => netListeners.delete(fn);
-}
 
-function isLikelyNetworkError(err: unknown): boolean {
-  // `fetch` throws a TypeError when the connection itself fails (DNS, CORS
-  // preflight blocked, offline, server unreachable). HTTP error responses
-  // come back as our `ApiRequestError` and must NOT trigger cache fallback.
-  return err instanceof TypeError;
-}
 
-async function apiRequest<T>(
-  path: string,
-  init?: RequestInit,
-  raw = false
-): Promise<T> {
-  const method = (init?.method ?? 'GET').toUpperCase();
-  const isWrite = method !== 'GET' && method !== 'HEAD';
-  const cacheKey = method === 'GET' && !raw ? `GET ${path}` : null;
-
-  // Hard-block writes while offline. We refuse to even attempt the fetch so
-  // the user sees an immediate, explicit error instead of a confusing
-  // "TypeError" mid-save and never has the impression a write succeeded
-  // when it did not. This is intentional: writes go to the remote D1 only.
-  if (isWrite && typeof navigator !== 'undefined' && navigator.onLine === false) {
-    setNetStatus('offline');
-    throw new OfflineWriteBlockedError();
-  }
-
-  // Idempotency: every write gets a stable client-generated id. The server
-  // stores `(id -> response)` in `mutation_log` so retries after a lost
-  // response (network drop between server commit and client ACK) return
-  // the original result instead of double-applying the mutation.
-  const mutationId = isWrite ? newMutationId() : null;
-
-  // Retry policy for writes only. GETs are handled by the cache fallback.
-  // We retry on connection failures (TypeError) and transient server states
-  // (408/425/429/5xx). We do NOT retry on 4xx (except 408/425/429) because
-  // those are deterministic client errors — retrying would just fail again.
-  const maxAttempts = isWrite ? 4 : 1;
-  const baseDelayMs = 400;
-
-  let lastErr: unknown;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let response: Response;
-    try {
-      response = await fetch(joinApiUrl(path), {
-        ...init,
-        // Keep sending the cookie for browsers that accept it; the API prefers
-        // the bearer token when both are present, so this is a harmless dual path.
-        credentials: 'include',
-        headers: {
-          ...(raw ? {} : { 'Content-Type': 'application/json' }),
-          ...(mutationId ? { 'X-Client-Mutation-Id': mutationId } : {}),
-          // Bearer fallback — the only auth that survives Safari's cross-site
-          // cookie blocking. No-op until we have a token (i.e. before login).
-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-          ...(init?.headers ?? {})
-        }
-      });
-    } catch (err) {
-      lastErr = err;
-      // Connection-level failure. For cached GETs we degrade gracefully and
-      // return the last successful response so the UI can keep working.
-      if (cacheKey && isLikelyNetworkError(err)) {
-        const cached = await cacheGet<T>(cacheKey);
-        if (cached) {
-          setNetStatus('offline');
-          return cached.value;
-        }
-      }
-      // For writes, retry transient connection failures with backoff.
-      if (isWrite && isLikelyNetworkError(err) && attempt < maxAttempts) {
-        await sleep(backoffDelay(baseDelayMs, attempt));
-        continue;
-      }
-      // Surface as offline before bubbling so the UI flips its banner.
-      if (isLikelyNetworkError(err)) setNetStatus('offline');
-      throw err;
-    }
-
-    if (!response.ok) {
-      // Retry transient server errors for writes only.
-      const transient = response.status === 408 || response.status === 425
-        || response.status === 429 || response.status >= 500;
-      if (isWrite && transient && attempt < maxAttempts) {
-        // Drain body so the connection can be reused.
-        try { await response.text(); } catch { /* ignore */ }
-        await sleep(backoffDelay(baseDelayMs, attempt, response.headers.get('retry-after')));
-        continue;
-      }
-
-      const responseText = await response.text();
-      const errorBody = (() => {
-        try {
-          return JSON.parse(responseText) as { error?: string; requestId?: string };
-        } catch {
-          return { error: response.statusText };
-        }
-      })();
-
-      if (response.status === 401) {
-        // The stored bearer token (if any) is no longer valid — drop it so we
-        // don't keep overriding a possibly-valid cookie with a dead token, and
-        // notify the app so it can return to the login screen instead of leaving
-        // the user on a stale "logged-in" shell with no data.
-        setAuthToken(null);
-        if (onUnauthorized) {
-          try { onUnauthorized(); } catch { /* ignore handler errors */ }
-        }
-        throw new ApiRequestError(401, 'Session expired. Please sign in again.');
-      }
-
-      const message = errorBody.requestId
-        ? `${errorBody.error ?? `Request failed with status ${response.status}`} (ref: ${errorBody.requestId})`
-        : (errorBody.error ?? `Request failed with status ${response.status}`);
-      throw new ApiRequestError(response.status, message);
-    }
-
-    if (raw) {
-      setNetStatus('online');
-      return (await response.text()) as T;
-    }
-
-    // A 204 No Content (and any other empty body) has nothing to parse — DELETE
-    // endpoints return this. Calling response.json() on an empty body throws
-    // "JSON.parse: unexpected end of data", so read the text first and only
-    // parse when there is something there.
-    const bodyText = await response.text();
-    const payload = (bodyText ? JSON.parse(bodyText) : undefined) as T;
-    setNetStatus('online');
-
-    // Persist successful GETs to cache (fire-and-forget) and invalidate
-    // cached entries after any successful mutation. Both run after the value
-    // is parsed so failures here can't fail the request itself.
-    if (cacheKey) {
-      void cacheSet(cacheKey, payload);
-    } else if (isWrite) {
-      void cacheBustPrefixes(CACHE_BUST_FAMILIES);
-    }
-
-    return payload;
-  }
-
-  // All retries exhausted.
-  throw lastErr instanceof Error ? lastErr : new Error('Request failed');
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Exponential backoff with jitter and respect for an HTTP `Retry-After`
- * header (seconds). attempt is 1-based.
- */
-function backoffDelay(baseMs: number, attempt: number, retryAfter?: string | null): number {
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds * 1000, 10_000);
-  }
-  const exp = baseMs * Math.pow(3, attempt - 1); // 400, 1200, 3600, 10800
-  const jitter = Math.random() * baseMs;
-  return Math.min(exp + jitter, 10_000);
-}
-
-function StatCard({ title, value, subtitle }: { title: string; value: string | number; subtitle: string }) {
-  return (
-    <article className="stat-card">
-      <p className="stat-title">{title}</p>
-      <p className="stat-value">{value}</p>
-      <p className="stat-subtitle">{subtitle}</p>
-    </article>
-  );
-}
-
-function SectionHeader({
-  eyebrow,
-  title,
-  description,
-  aside
-}: {
-  eyebrow: string;
-  title: string;
-  description: string;
-  aside?: React.ReactNode;
-}) {
-  return (
-    <div className="section-header">
-      <div>
-        <p className="section-eyebrow">{eyebrow}</p>
-        <h2>{title}</h2>
-        <p className="panel-help">{description}</p>
-      </div>
-      {aside ? <div className="section-header-aside">{aside}</div> : null}
-    </div>
-  );
-}
 
 // Autocomplete option lists for the add/edit book forms. Memoized on `facets`
 // so the ~4000 <option> nodes are only rebuilt when the catalog values change —
@@ -1058,191 +461,11 @@ function displayBookDate(book: { dateEdtf?: string | null; publicationYear?: num
   return book.publicationYear ? String(book.publicationYear) : '';
 }
 
-function EdtfHint({ value, t }: { value: string; t: (k: string, v?: Record<string, string | number>) => string }) {
-  const raw = value.trim();
-  if (!raw) return <span className="edtf-hint muted small">{t('library.add.dateHint')}</span>;
-  const parsed = parseEdtf(raw);
-  if (!parsed) return <span className="edtf-hint is-warn">{t('library.add.dateUnparsed')}</span>;
-  if (!parsed.isRange && parsed.qualifier === 'exact') return null;
-  return <span className="edtf-hint muted small">{t('library.add.dateReads', { span: formatEdtfRange(parsed) })}</span>;
-}
 
-/**
- * A text input with a keyboard-navigable suggestion list.
- *
- * Extracted from the borrower picker, which was the only real typeahead in the
- * app, so the title-duplicate warning can reuse the same interaction rather
- * than growing a second, subtly different one. Behaviour is preserved exactly —
- * in particular the three details that are easy to get wrong:
- *
- *  • `onMouseDown` + `preventDefault`, not `onClick`. The input's blur fires
- *    first on click and would tear the list down before the pick registers.
- *  • Enter only picks when something is highlighted, so pressing Enter with the
- *    list merely open still submits the surrounding form.
- *  • Arrow keys wrap around, and the highlight resets whenever a new result set
- *    arrives — otherwise index 3 of the old list silently becomes index 3 of
- *    the new one.
- *
- * `onPick` is shared by the keyboard and pointer paths so the two cannot drift.
- */
-function Combobox<T>(props: {
-  idPrefix: string;
-  label?: React.ReactNode;
-  value: string;
-  onChange: (value: string) => void;
-  onFocus?: () => void;
-  onPick: (item: T) => void;
-  items: T[];
-  getKey: (item: T) => string;
-  renderItem: (item: T) => React.ReactNode;
-  /** Hide the list without clearing it — e.g. once a choice is locked in. */
-  suppressed?: boolean;
-  placeholder?: string;
-  required?: boolean;
-  /** Field-level error styling, e.g. the add form's `input-error`. */
-  inputClassName?: string;
-  ariaRequired?: boolean;
-  ariaInvalid?: boolean;
-  inputRef?: React.Ref<HTMLInputElement>;
-  /** Rendered above the list; used for "N books already have this title". */
-  listHeader?: React.ReactNode;
-  /** Rendered inside the positioned wrapper, below the input. */
-  footer?: React.ReactNode;
-  className?: string;
-}) {
-  const { items, suppressed, onPick, getKey } = props;
-  const [highlight, setHighlight] = useState(-1);
-  const [dismissed, setDismissed] = useState(false);
 
-  // A new result set invalidates any position in the old one.
-  useEffect(() => { setHighlight(-1); setDismissed(false); }, [items]);
 
-  const open = items.length > 0 && !suppressed && !dismissed;
-  const listId = `${props.idPrefix}-suggestion-list`;
 
-  return (
-    <div className={props.className ?? 'combobox'}>
-      {props.label !== undefined && <label htmlFor={`${props.idPrefix}-input`}>{props.label}</label>}
-      <input
-        id={`${props.idPrefix}-input`}
-        ref={props.inputRef}
-        className={props.inputClassName}
-        aria-required={props.ariaRequired || undefined}
-        aria-invalid={props.ariaInvalid || undefined}
-        value={props.value}
-        onChange={(e) => props.onChange(e.target.value)}
-        onFocus={props.onFocus}
-        onKeyDown={(e) => {
-          if (!open) return;
-          if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            setHighlight((i) => (i + 1) % items.length);
-          } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            setHighlight((i) => (i <= 0 ? items.length - 1 : i - 1));
-          } else if (e.key === 'Enter' && highlight >= 0) {
-            e.preventDefault();
-            const picked = items[highlight];
-            if (picked !== undefined) onPick(picked);
-          } else if (e.key === 'Escape') {
-            e.preventDefault();
-            setDismissed(true);
-            setHighlight(-1);
-          }
-        }}
-        placeholder={props.placeholder}
-        required={props.required}
-        autoComplete="off"
-        role="combobox"
-        aria-autocomplete="list"
-        aria-expanded={open}
-        aria-controls={listId}
-        aria-activedescendant={
-          open && highlight >= 0 && items[highlight]
-            ? `${props.idPrefix}-opt-${getKey(items[highlight] as T)}`
-            : undefined
-        }
-      />
-      {open && (
-        <>
-          {props.listHeader}
-          <ul className="combobox-list" role="listbox" id={listId}>
-            {items.map((item, i) => (
-              <li
-                key={getKey(item)}
-                id={`${props.idPrefix}-opt-${getKey(item)}`}
-                role="option"
-                aria-selected={highlight === i}
-                className={highlight === i ? 'is-active' : undefined}
-                onMouseEnter={() => setHighlight(i)}
-                onMouseDown={(e) => { e.preventDefault(); onPick(item); }}
-              >
-                {props.renderItem(item)}
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-      {props.footer}
-    </div>
-  );
-}
 
-// One physical copy of a record — the object on the shelf, as distinct from the
-// edition it is a copy of.
-type Item = {
-  id: string;
-  bookId: string;
-  copyNumber: number;
-  barcode?: string | null;
-  volumeNum?: string | null;
-  volumeLabel?: string | null;
-  roomCode?: string | null;
-  shelfCode?: string | null;
-  callNumber?: string | null;
-  itemType: string;
-  status: BookStatus;
-  condition?: string | null;
-  // When this COPY entered the collection. The record's own createdAt is the
-  // import timestamp for the whole legacy catalogue, so it cannot stand in.
-  acquisitionDate?: string | null;
-  notes?: string | null;
-  version: number;
-};
-
-type TitleSuggestion = {
-  id: string;
-  title: string;
-  author: string;
-  shelfCode?: string | null;
-  publicationYear?: number | null;
-  isbn?: string | null;
-};
-
-type ValueVariantGroup = { canonical: string; total: number; variants: Array<{ value: string; count: number }> };
-
-// ── Duplicate-record merge ──────────────────────────────────────────────────
-// Two records for one book, each holding one copy, is what the catalogue looked
-// like before there was a holdings layer. Merging folds them into one record
-// with two copies — the shape the shelves actually have.
-type MergeCandidateItem = {
-  id: string; shelfCode: string | null; roomCode: string | null;
-  copyNumber: number; status: string; barcode: string | null;
-};
-type MergeCandidateBook = {
-  id: string; title: string; author: string; isbn: string | null; publisher: string | null;
-  dateEdtf: string | null; legacyId: string | null; updatedAt: string;
-  filledFields: number; openLoans: number; items: MergeCandidateItem[];
-};
-type MergeCandidateGroup = { key: string; differingFields: string[]; books: MergeCandidateBook[] };
-type MergePreview = {
-  wouldFillFields: Record<string, unknown>;
-  wouldRescueAttributes: Record<string, unknown>;
-  wouldAddTags: string[];
-  copiesAfter: number;
-  copiesMoving: Array<{ shelfCode: string | null; copyNumber: number }>;
-  recordsRemoved: number;
-};
 
 // One row of the "value consistency" tool: shows the fold-equivalent spellings
 // of a value with their book counts, lets the librarian pick (or type) the
@@ -1447,111 +670,7 @@ function MergeGroupCard({ group, t, onPreview, onMerge }: {
   );
 }
 
-/**
- * The one dialog primitive.
- *
- * Six overlays each reimplemented this pattern and each implemented a different
- * incomplete subset: `role="dialog" aria-modal="true"` was on the click-away
- * BACKDROP rather than on the dialog box, none had an accessible name, none
- * moved focus in, none trapped Tab, none restored focus on close, and Escape
- * was wired for three of them in one place and one of them in another.
- *
- * `ContextMenuView` already had a correct focus-restore implementation; this
- * lifts that approach so the next overlay inherits it instead of the gaps.
- *
- * WCAG 2.4.3 (focus order), 4.1.2 (name, role, value), 2.1.2 (no keyboard trap
- * — Tab cycles WITHIN the dialog, which is what aria-modal already promises AT
- * users and what Tab did not honour).
- */
-function Dialog({ onClose, labelledBy, label, className, style, children, initialFocus }: {
-  onClose: () => void;
-  /** Id of the heading inside. Preferred over `label` — it names the dialog with its own title. */
-  labelledBy?: string;
-  label?: string;
-  className?: string;
-  style?: React.CSSProperties;
-  children: React.ReactNode;
-  initialFocus?: 'first' | 'container';
-}) {
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  // Captured on mount, before focus moves: this is what focus goes back to.
-  const returnToRef = useRef<HTMLElement | null>(null);
 
-  useEffect(() => {
-    returnToRef.current = document.activeElement as HTMLElement | null;
-    const box = boxRef.current;
-    if (box) {
-      const focusable = box.querySelectorAll<HTMLElement>(FOCUSABLE);
-      const target = initialFocus === 'container' ? box : (focusable[0] ?? box);
-      // The container itself needs a tabindex to be focusable at all; -1 keeps
-      // it out of the tab sequence while allowing programmatic focus.
-      if (target === box) box.setAttribute('tabindex', '-1');
-      target.focus();
-    }
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      // Only restore if focus is still inside the dialog being torn down —
-      // otherwise a dialog that opened another one would yank focus back.
-      returnToRef.current?.focus?.();
-    };
-  }, [initialFocus]);
-
-  function onKeyDown(e: React.KeyboardEvent) {
-    if (e.key === 'Escape') {
-      e.stopPropagation();
-      onClose();
-      return;
-    }
-    if (e.key !== 'Tab') return;
-    const box = boxRef.current;
-    if (!box) return;
-    const items = [...box.querySelectorAll<HTMLElement>(FOCUSABLE)]
-      .filter((el) => el.offsetParent !== null || el === document.activeElement);
-    if (items.length === 0) return;
-    const first = items[0];
-    const last = items[items.length - 1];
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
-  }
-
-  return (
-    // The backdrop is a backdrop: it is not the dialog and must not claim the
-    // role. Click-away stays, but only when the click started on the backdrop
-    // itself, so a drag that ends outside the box does not close it.
-    <div
-      className="modal-overlay"
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
-      onKeyDown={onKeyDown}
-    >
-      <div
-        ref={boxRef}
-        className={className ?? 'modal'}
-        style={style}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={labelledBy}
-        aria-label={labelledBy ? undefined : label}
-        onMouseDown={(e) => e.stopPropagation()}
-      >
-        {children}
-      </div>
-    </div>
-  );
-}
-
-/** Everything a keyboard can land on. Used by the focus trap and by initial focus. */
-const FOCUSABLE = [
-  'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
-  'select:not([disabled])', 'textarea:not([disabled])', 'summary',
-  '[tabindex]:not([tabindex="-1"])'
-].join(',');
 
 // ── Custom right-click context menu ─────────────────────────────────────────
 // A single app-owned menu that replaces the browser's native one on the app's

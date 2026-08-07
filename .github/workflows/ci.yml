@@ -29,6 +29,9 @@ jobs:
       - name: Typecheck (all workspaces)
         run: npm run typecheck
 
+      - name: Check i18n locale parity
+        run: npm run check:i18n
+
       - name: Build web app
         run: npm --workspace apps/web run build
 

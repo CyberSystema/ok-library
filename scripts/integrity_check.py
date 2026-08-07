@@ -1693,9 +1693,13 @@ def _read(name):
 
 try:
     css = _read("styles.css")
-    tsx = _read("main.tsx")
     ui = _read("ui.tsx")
     i18n = _read("i18n.tsx")
+    # The app's TSX as one corpus, not one file. Step 0 moved Dialog, Combobox
+    # and friends into ui.tsx and this section failed — correctly, but for the
+    # wrong reason: these are assertions about the APP, and pinning them to a
+    # filename makes a refactor look like a regression.
+    tsx = "\n".join(_read(n) for n in ("main.tsx", "ui.tsx", "api.ts", "types.ts"))
 
     # `outline: none` without a measured replacement is how focus disappears.
     # One global :focus-visible rule replaced six sites; if a new one appears,
@@ -1766,10 +1770,18 @@ try:
 
     # The one dialog primitive. Six overlays each got this wrong differently.
     check("a shared Dialog primitive exists", "function Dialog({" in tsx, "missing")
+    # `.modal-overlay` is the backdrop. Exactly ONE place may render it — the
+    # Dialog primitive — and it must not carry the dialog role itself. Searching
+    # the whole corpus is what found the confirm dialog, which had rolled its
+    # own overlay and was missed while this only read main.tsx.
+    overlays = re.findall(r'className="modal-overlay"', tsx)
+    check("only the Dialog primitive renders a backdrop", len(overlays) == 1, len(overlays))
     check("no overlay claims the dialog role on its backdrop",
-          'className="modal-overlay" onClick' not in tsx, "an overlay still does")
-    check("every Dialog is named", tsx.count("<Dialog onClose") == tsx.count("labelledBy="),
-          f'{tsx.count("<Dialog onClose")} dialogs, {tsx.count("labelledBy=")} named')
+          'className="modal-overlay" onClick' not in tsx and 'modal-overlay" role=' not in tsx,
+          "an overlay still does")
+    main_only = _read("main.tsx")
+    check("every Dialog is named", main_only.count("<Dialog onClose") == main_only.count("labelledBy="),
+          f'{main_only.count("<Dialog onClose")} dialogs, {main_only.count("labelledBy=")} named')
 
     # Error toasts are the only channel for validation failures, so a timeout
     # on them is a time limit on reading them — SC 2.2.1.
