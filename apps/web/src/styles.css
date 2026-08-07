@@ -1009,6 +1009,20 @@ label {
   border: 0;
 }
 
+/* Facet rail: field selector, and the "(not filled in)" bucket which is always
+   the first row because it is the one the librarian is hunting for. */
+.category-rail-field {
+  width: 100%;
+  font-size: 0.8125rem;
+  padding: 0.35rem 0.5rem;
+  margin-bottom: 0.4rem;
+}
+.category-rail-item.is-empty-bucket .cat-text {
+  font-style: italic;
+  color: var(--warning);
+}
+.category-rail-item.is-empty-bucket .cat-count { color: var(--warning); font-weight: 700; }
+
 /* Borrow history */
 .history-list { display: flex; flex-direction: column; gap: 0.5rem; }
 .history-item {

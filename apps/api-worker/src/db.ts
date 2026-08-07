@@ -436,6 +436,39 @@ function buildFtsQuery(opts: {
   return formatted.join(joiner);
 }
 
+// Fields the facet rail can group by, and that the `(empty)` bucket can filter
+// on. Whitelisted: a field name never reaches the SQL text unchecked, and a
+// custom key's JSON path is BOUND rather than interpolated.
+//
+// Shared by /api/facets (which counts) and queryBooksWithFilters (which lists),
+// deliberately — the two must agree on what "empty" means or the rail's counts
+// stop reproducing as lists, which is the one thing the librarian relies on
+// when reconciling the catalogue against a shelf.
+const FACET_COLUMNS: Record<string, string> = {
+  shelfCode: 'shelf_code',
+  roomCode: 'room_code',
+  language: 'language',
+  status: 'status',
+  publisher: 'publisher',
+  publicationYear: 'publication_year',
+  title: 'title',
+  author: 'author',
+  isbn: 'isbn'
+};
+
+export function resolveEmptyFieldExpr(
+  field: string,
+  prefix = 'b.'
+): { expr: string; bind: string[] } | null {
+  if (field.startsWith('custom:')) {
+    const key = field.slice('custom:'.length);
+    if (!/^[a-zA-Z0-9_]+$/.test(key)) return null;
+    return { expr: `json_extract(${prefix}custom_fields, ?)`, bind: [`$.${key}`] };
+  }
+  const column = FACET_COLUMNS[field];
+  return column ? { expr: `${prefix}${column}`, bind: [] } : null;
+}
+
 export async function queryBooksWithFilters(
   env: Env,
   opts: {
@@ -456,6 +489,11 @@ export async function queryBooksWithFilters(
     missingShelf?: boolean;
     untitled?: boolean;
     unknownAuthor?: boolean;
+    /** Facet-rail selection: one exact value of a whitelisted field. */
+    facetField?: string;
+    facetValue?: string;
+    /** "Nothing recorded in this field" — the facet rail's `(empty)` bucket. */
+    emptyField?: string;
     includeDeleted?: boolean;
     sortBy: string;
     sortDir: 'asc' | 'desc';
@@ -547,6 +585,29 @@ export async function queryBooksWithFilters(
     // form or a JSON/sync import leaves author blank. Match both (plus NULL for
     // safety) so every author-less book surfaces in this smart list.
     where.push("(b.author = '(Unknown)' OR b.author IS NULL OR TRIM(b.author) = '')");
+  }
+  // Facet-rail selection.
+  //
+  // Both predicates are character-for-character what /api/facets groups by, and
+  // they have to stay that way: the librarian compares a shelf's count here
+  // against the books physically on it, so a count that doesn't reproduce as a
+  // list is worse than no count. That is also why these don't reuse the
+  // existing `language`/`shelfCode`/`custom_<key>` filters — those match
+  // loosely (synonyms, substrings, or value-equals-'' which misses absent keys)
+  // and would return a different number than the rail advertised.
+  if (opts.facetField && opts.facetValue !== undefined && opts.facetValue !== '') {
+    const spec = resolveEmptyFieldExpr(opts.facetField);
+    if (spec) {
+      where.push(`TRIM(COALESCE(CAST(${spec.expr} AS TEXT), '')) = ?`);
+      values.push(...spec.bind, opts.facetValue);
+    }
+  }
+  if (opts.emptyField) {
+    const spec = resolveEmptyFieldExpr(opts.emptyField);
+    if (spec) {
+      where.push(`TRIM(COALESCE(CAST(${spec.expr} AS TEXT), '')) = ''`);
+      values.push(...spec.bind);
+    }
   }
   // Substring + case-insensitive so "06" matches "06-005", "06-105", etc.
   // SQLite's LOWER() is ASCII-only, so it cannot case-fold Greek — a librarian

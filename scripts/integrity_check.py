@@ -653,6 +653,50 @@ st, r = call("GET", "/api/books/title-suggest?q=" + urllib.parse.quote(ts_title[
 check("a trashed book is not suggested",
       not any(i["id"] == ts_id for i in (r or {}).get("items", [])), r)
 
+print("=== 29. REGRESSION: facet counts reproduce exactly as filtered lists ===")
+# The librarian counts a shelf by hand and compares it with the rail. A count
+# that doesn't open a list of the same size is worse than no count, so EVERY
+# bucket — including "(not filled in)" — has to round-trip. This is also what
+# catches a missing `isFullyUnfiltered` entry: without it a filtered view would
+# serve the memoized unfiltered total instead of its own.
+st, unfiltered = call("GET", "/api/books?pageSize=1")
+library_total = (unfiltered or {}).get("total", 0)
+for fld in ["shelfCode", "language", "publicationYear", "publisher",
+            "custom:category_code", "custom:category_label", "custom:pages"]:
+    st, fac = call("GET", "/api/facets?field=" + urllib.parse.quote(fld))
+    if st != 200:
+        check(f"facet {fld} is available", False, f"{st} {fac}")
+        continue
+    items = (fac or {}).get("items", [])
+    check(f"facet {fld} reports the library total",
+          fac.get("totalBooks") == library_total, f"{fac.get('totalBooks')} vs {library_total}")
+    # The empty bucket must be FIRST, or a high-cardinality field's LIMIT drops
+    # the one row the librarian is looking for. (629 category labels vs a 600
+    # cap did exactly that.)
+    if items:
+        check(f"facet {fld} puts the (empty) bucket first",
+              items[0].get("isEmpty") is True or not any(i.get("isEmpty") for i in items),
+              items[0])
+    # Untruncated facets must account for every book.
+    if not fac.get("truncated"):
+        check(f"facet {fld} counts sum to the catalogue",
+              fac.get("shownCount") == library_total, f"{fac.get('shownCount')} vs {library_total}")
+    for bucket in [i for i in items if i["isEmpty"]][:1] + [i for i in items if not i["isEmpty"]][:1]:
+        if bucket["isEmpty"]:
+            st, r = call("GET", f"/api/books?pageSize=1&emptyField={urllib.parse.quote(fld)}")
+            name = "(empty)"
+        else:
+            st, r = call("GET", "/api/books?pageSize=1&facetField=" + urllib.parse.quote(fld)
+                         + "&facetValue=" + urllib.parse.quote(bucket["value"]))
+            name = bucket["value"][:24]
+        check(f"{fld} / {name}: rail count == list total",
+              (r or {}).get("total") == bucket["count"], f"{(r or {}).get('total')} vs {bucket['count']}")
+# An unknown field must 400 rather than return a plausible empty facet.
+st, r = call("GET", "/api/facets?field=notafield")
+check("an unknown facet field is rejected", st == 400, f"{st} {r}")
+st, r = call("GET", "/api/facets?field=" + urllib.parse.quote("custom:bad key"))
+check("a malformed custom key is rejected", st == 400, f"{st} {r}")
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

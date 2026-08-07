@@ -276,6 +276,21 @@ export const BookFilterQuerySchema = z.object({
   missingShelf: ZodQueryBoolean.optional(),
   untitled: ZodQueryBoolean.optional(),
   unknownAuthor: ZodQueryBoolean.optional(),
+  // Facet-rail selection. `facetField` + `facetValue` matches ONE exact value of
+  // a whitelisted field; `emptyField` matches "nothing recorded here" — the
+  // rail's `(empty)` bucket.
+  //
+  // These exist rather than reusing `language`/`shelfCode`/`custom_<key>`
+  // because those apply looser predicates: `language` resolves synonyms and
+  // matches as a substring (so "EL" also catches "EL,EN"), `shelfCode` is a
+  // substring match, and `custom_<key>=` compares the extracted value to ''
+  // which misses rows where the key is absent altogether. Any of those makes
+  // the rail's count differ from the list it opens — and the librarian is using
+  // that exact pair to reconcile the catalogue against a physical shelf, so a
+  // count that doesn't reproduce is worse than no count at all.
+  facetField: z.string().max(80).optional(),
+  facetValue: z.string().max(200).optional(),
+  emptyField: z.string().max(80).optional(),
   includeDeleted: ZodQueryBoolean.optional(),
   sortBy: z.enum(['title', 'author', 'updatedAt', 'publicationYear', 'status']).default('updatedAt'),
   sortDir: z.enum(['asc', 'desc']).default('desc'),

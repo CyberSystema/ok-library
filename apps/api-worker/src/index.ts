@@ -44,6 +44,7 @@ import {
 	queryBooksWithFilters,
 	replaceBookAttributeValues,
 	recordSyncMutation,
+	resolveEmptyFieldExpr,
 	runAtomic,
 	semanticSearchBookIds,
 	semanticSearchEnabled,
@@ -822,7 +823,8 @@ app.get('/api/books', async (c) => {
 		&& !query.status && !query.language && !query.year
 		&& query.yearMin === undefined && query.yearMax === undefined
 		&& !query.roomCode && !query.shelfCode && !query.missingIsbn && !query.missingShelf
-		&& !query.untitled && !query.unknownAuthor && customFilters.length === 0 && !includeDeleted;
+		&& !query.untitled && !query.unknownAuthor && !query.emptyField && !query.facetField
+		&& customFilters.length === 0 && !includeDeleted;
 	const totalKey = `books:total:${cacheVersion}`;
 	let cachedTotal: number | undefined;
 	if (isFullyUnfiltered && c.env.CACHE) {
@@ -841,6 +843,9 @@ app.get('/api/books', async (c) => {
 		missingShelf: query.missingShelf,
 		untitled: query.untitled,
 		unknownAuthor: query.unknownAuthor,
+		facetField: query.facetField,
+		facetValue: query.facetValue,
+		emptyField: query.emptyField,
 		includeDeleted,
 		skipCount: cachedTotal !== undefined
 	});
@@ -919,6 +924,9 @@ app.get('/api/books/ids', async (c) => {
 		missingShelf: query.missingShelf,
 		untitled: query.untitled,
 		unknownAuthor: query.unknownAuthor,
+		facetField: query.facetField,
+		facetValue: query.facetValue,
+		emptyField: query.emptyField,
 		includeDeleted: false,
 		authorExact,
 		publisherExact,
@@ -3951,9 +3959,113 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 	});
 });
 
+// ─── Facet browser ───────────────────────────────────────────────────────
+// Counts of books per distinct value of one field, for the left-hand rail.
+//
+// Generalized from the old category-only browser because the librarian needs to
+// reconcile the catalogue against the shelves: "μπορώ να κάνω έλεγχο αριθμητικό
+// επιτόπου στο ράφι και αν δεν συμφωνεί ο αριθμός αυτός με τον αριθμό των
+// καταχωρήσεων στη βάση … έπειτα να ψάξω ποιο βιβλίο λείπει." A count is only
+// useful for that if it is exactly reproducible as a filtered list, which is
+// why the `(empty)` predicate below and the one in db.ts must stay identical.
+//
+// The field whitelist lives in db.ts alongside the list filter that has to
+// agree with it — see `resolveEmptyFieldExpr`.
+app.get('/api/facets', async (c) => {
+	const field = c.req.query('field') ?? 'custom:category_code';
+	// No table alias here: this query has a single unaliased FROM.
+	const resolved = resolveEmptyFieldExpr(field, '');
+	if (!resolved) {
+		// A typo must fail loudly rather than return a plausible empty facet.
+		throw new HTTPException(400, { message: `Unknown facet field: ${field}` });
+	}
+	const limit = Math.min(1000, Math.max(1, Number(c.req.query('limit') ?? 600)));
+
+	const cacheVersion = await getBooksCacheVersion(c.env);
+	const cacheKey = `facet:${field}:${limit}:${cacheVersion}`;
+	if (c.env.CACHE) {
+		try {
+			const cached = await c.env.CACHE.get(cacheKey, 'json');
+			if (cached) return c.json(cached);
+		} catch (error) {
+			console.warn('Facet cache read failed', error);
+		}
+	}
+
+	// `is_empty` is its own bucket rather than a magic value, so a real value of
+	// "" can never be confused with "no value recorded".
+	//
+	// Sorted is_empty DESC so the gap bucket is row one. That is not cosmetic:
+	// with 629 distinct category labels against a 600 limit, sorting it last
+	// truncated it away entirely — the rail silently lost the single row the
+	// librarian most needs, and the counts stopped summing to the catalogue.
+	const emptyExpr = `CASE WHEN TRIM(COALESCE(CAST(${resolved.expr} AS TEXT), '')) = '' THEN 1 ELSE 0 END`;
+	const valueExpr = `CASE WHEN TRIM(COALESCE(CAST(${resolved.expr} AS TEXT), '')) = '' THEN '' ELSE CAST(${resolved.expr} AS TEXT) END`;
+	const rows = await c.env.DB.prepare(
+		`SELECT ${emptyExpr} AS is_empty, ${valueExpr} AS value, COUNT(*) AS count
+		   FROM books
+		  WHERE deleted_at IS NULL
+		  GROUP BY is_empty, value
+		  ORDER BY is_empty DESC, count DESC, value ASC
+		  LIMIT ?`
+	).bind(...resolved.bind, ...resolved.bind, ...resolved.bind, limit).all<{
+		is_empty: number; value: string | null; count: number;
+	}>();
+
+	// The library total comes from the key the list handler already memoizes, so
+	// the rail's "All" row can never disagree with the unfiltered list.
+	let totalBooks: number | null = null;
+	const totalKey = `books:total:${cacheVersion}`;
+	if (c.env.CACHE) {
+		try {
+			const t = await c.env.CACHE.get(totalKey);
+			if (t !== null && t !== undefined) totalBooks = Number(t);
+		} catch { /* fall through to counting */ }
+	}
+	if (totalBooks === null) {
+		const t = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL').first<{ n: number }>();
+		totalBooks = Number(t?.n ?? 0);
+		if (c.env.CACHE) {
+			try { await c.env.CACHE.put(totalKey, String(totalBooks), { expirationTtl: 3600 }); } catch { /* best effort */ }
+		}
+	}
+
+	const items = (rows.results ?? []).map((r) => ({
+		value: r.value ?? '',
+		isEmpty: Number(r.is_empty) === 1,
+		count: Number(r.count ?? 0)
+	}));
+	// A high-cardinality field (3,827 publishers) will hit the limit. Say so
+	// rather than let the rail imply its counts add up to the whole catalogue —
+	// the librarian is using these numbers to check a shelf against reality.
+	const response = {
+		field,
+		totalBooks,
+		truncated: items.length >= limit,
+		shownCount: items.reduce((sum, i) => sum + i.count, 0),
+		items
+	};
+	if (c.env.CACHE) {
+		try {
+			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 86400 });
+		} catch (error) {
+			console.warn('Facet cache write failed', error);
+		}
+	}
+	return c.json(response);
+});
+
 // Category browser: aggregates books by their `category_code` custom field.
-// Cached for 60 s in KV so a 12K-book sidebar loads instantly. Cache keys are
-// invalidated on book writes via the same version mechanism the list query uses.
+// Kept as its own route because CACHE_BUST_FAMILIES and the desktop shell name
+// it, and because it still owns the code+label shape the rail's chips expect.
+//
+// The label column is deliberately gone. It used to be
+// MAX(json_extract(custom_fields, '$.category_label')), which is always NULL in
+// this catalogue: `category_code` and `category_label` have ZERO overlap
+// (8,117 books carry only a code, 4,099 only a label — they arrived from
+// different import sheets). So the join could never produce a name, and the
+// 4,099 label-only books were invisible in the rail entirely. They are two
+// independent facets, and /api/facets now exposes both.
 app.get('/api/categories', async (c) => {
 	const cacheVersion = await getBooksCacheVersion(c.env);
 	const cacheKey = `categories:${cacheVersion}`;
@@ -3969,7 +4081,6 @@ app.get('/api/categories', async (c) => {
 	const rows = await c.env.DB.prepare(
 		`SELECT
 			json_extract(custom_fields, '$.category_code') AS code,
-			MAX(json_extract(custom_fields, '$.category_label')) AS label,
 			COUNT(*) AS count
 		 FROM books
 		 WHERE deleted_at IS NULL
@@ -3978,11 +4089,11 @@ app.get('/api/categories', async (c) => {
 		 GROUP BY code
 		 ORDER BY count DESC, code ASC
 		 LIMIT 500`
-	).all<{ code: string | null; label: string | null; count: number }>();
+	).all<{ code: string | null; count: number }>();
 
 	const items = (rows.results ?? []).map((r) => ({
 		code: r.code ?? '',
-		label: r.label,
+		label: null,
 		count: Number(r.count ?? 0)
 	}));
 

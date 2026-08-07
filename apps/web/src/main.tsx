@@ -157,11 +157,32 @@ type RoomSummaryItem = {
   maintenance_books: number;
 };
 
-type CategoryItem = {
-  code: string;
-  label: string | null;
+type FacetItem = {
+  value: string;
+  /** The "nothing recorded here" bucket, always sorted first by the server. */
+  isEmpty: boolean;
   count: number;
 };
+
+type FacetResponse = {
+  field: string;
+  totalBooks: number;
+  truncated: boolean;
+  shownCount: number;
+  items: FacetItem[];
+};
+
+// Fields the rail can group by. Core fields first, then every custom attribute
+// (appended at runtime from the live definitions, everyday ones first). Must
+// stay a subset of the server's whitelist in db.ts `resolveEmptyFieldExpr`.
+const CORE_FACET_CHOICES: Array<{ key: string; labelKey: string }> = [
+  { key: 'shelfCode', labelKey: 'library.add.shelf' },
+  { key: 'publisher', labelKey: 'library.add.publisher' },
+  { key: 'publicationYear', labelKey: 'library.add.year' },
+  { key: 'language', labelKey: 'library.add.language' },
+  { key: 'roomCode', labelKey: 'library.bulk.field.roomCode' },
+  { key: 'status', labelKey: 'detail.statusRow' }
+];
 
 type AppSection = 'dashboard' | 'books' | 'circulation' | 'import' | 'settings';
 
@@ -239,7 +260,10 @@ function buildBookFilterParams(f: {
   status: string;
   filterLanguage: string;
   filterYear: string;
-  categoryFilter: string;
+  /** Facet rail: which field is being browsed, and the bucket clicked in it. */
+  facetField: string;
+  facetValue: string;
+  facetEmpty: boolean;
   needsReviewFilter: boolean;
   shelfFilter: string;
   smartListKey: string;
@@ -261,7 +285,14 @@ function buildBookFilterParams(f: {
     const yr = Number(f.filterYear);
     if (Number.isInteger(yr) && yr >= 1000 && yr <= 3000) query.set('year', f.filterYear);
   }
-  if (f.categoryFilter) query.set('custom_category_code', f.categoryFilter);
+  // Facet selection goes through the dedicated facetField/emptyField params
+  // rather than the looser per-field filters, so the list the librarian opens
+  // holds exactly the number the rail showed. See the schema comment.
+  if (f.facetEmpty) query.set('emptyField', f.facetField);
+  else if (f.facetValue) {
+    query.set('facetField', f.facetField);
+    query.set('facetValue', f.facetValue);
+  }
   if (f.needsReviewFilter) query.set('custom_needs_review', '1');
   if (f.shelfFilter) query.set('shelfCode', f.shelfFilter);
   // Apply the active smart-list's filters last so it composes with the rest.
@@ -628,6 +659,7 @@ const CACHE_BUST_FAMILIES = [
   'GET /api/custom-fields',
   'GET /api/rooms',
   'GET /api/categories',
+  'GET /api/facets',
   'GET /api/stats',
   'GET /api/borrow',
   'GET /api/borrowers',
@@ -1273,8 +1305,14 @@ function App() {
   // Guards the prefs writer against clobbering stored values on first mount.
   const prefsHydratedRef = useRef(false);
   const [jumpPage, setJumpPage] = useState('');
-  const [categories, setCategories] = useState<CategoryItem[]>([]);
-  const [categoryFilter, setCategoryFilter] = useState<string>('');
+  // Facet rail: the field being browsed, the bucket selected in it, and what
+  // the server reported for that field.
+  const [facetField, setFacetField] = useState('custom:category_code');
+  const [facetValue, setFacetValue] = useState('');
+  const [facetEmpty, setFacetEmpty] = useState(false);
+  const [facetItems, setFacetItems] = useState<FacetItem[]>([]);
+  const [facetTotalBooks, setFacetTotalBooks] = useState<number | null>(null);
+  const [facetTruncated, setFacetTruncated] = useState(false);
   const [needsReviewFilter, setNeedsReviewFilter] = useState(false);
   const [smartListKey, setSmartListKey] = useState<string>('');
   const [borrowerSuggestions, setBorrowerSuggestions] = useState<Borrower[]>([]);
@@ -2159,7 +2197,6 @@ function App() {
       // audit logs + staff users are admin-only endpoints — loading them for a
       // librarian/viewer is a guaranteed 403 + a wasted Workers request each.
       ...(isAdminUser ? [loadAuditLogs(), loadStaffUsers()] : []),
-      loadCategories(),
       loadNeedsReviewCount(),
       loadStats(),
       loadMyPermissions()
@@ -2369,15 +2406,43 @@ function App() {
     }
   }
 
-  async function loadCategories() {
-    const cached = await cacheGet<{ items: CategoryItem[] }>('GET /api/categories');
-    if (cached) setCategories(cached.value.items ?? []);
-    try {
-      const response = await apiRequest<{ items: CategoryItem[] }>('/api/categories');
-      setCategories(response.items ?? []);
-    } catch {
-      if (!cached) setCategories([]);
+  // ONE field at a time, never a prefetch of all of them. Each miss is a
+  // 12.5K-row scan and a KV write, and KV writes (1,000/day) are the tightest
+  // budget in the system — the rail must not spend eight of them because the
+  // librarian opened it.
+  const loadFacet = useCallback(async (field: string) => {
+    const path = `/api/facets?field=${encodeURIComponent(field)}`;
+    const cached = await cacheGet<FacetResponse>(`GET ${path}`);
+    if (cached && cached.value.field === field) {
+      setFacetItems(cached.value.items ?? []);
+      setFacetTotalBooks(cached.value.totalBooks ?? null);
+      setFacetTruncated(Boolean(cached.value.truncated));
     }
+    try {
+      const response = await apiRequest<FacetResponse>(path);
+      setFacetItems(response.items ?? []);
+      setFacetTotalBooks(response.totalBooks ?? null);
+      setFacetTruncated(Boolean(response.truncated));
+    } catch {
+      if (!cached) { setFacetItems([]); setFacetTruncated(false); }
+    }
+  }, []);
+
+  function clearFacetSelection() {
+    setFacetValue('');
+    setFacetEmpty(false);
+    setCurrentPage(1);
+  }
+
+  function selectFacet(item: FacetItem) {
+    if (item.isEmpty) {
+      setFacetEmpty((on) => !on);
+      setFacetValue('');
+    } else {
+      setFacetEmpty(false);
+      setFacetValue((v) => (v === item.value ? '' : item.value));
+    }
+    setCurrentPage(1);
   }
 
   async function loadNeedsReviewCount() {
@@ -2436,7 +2501,10 @@ function App() {
     setAuditItems([]);
     setStaffUsers([]);
     setBookHistory([]);
-    setCategories([]);
+    setFacetItems([]);
+    setFacetTotalBooks(null);
+    setFacetTruncated(false);
+    clearFacetSelection();
     setMyPermissions(null);
     setPermissionMatrix(null);
     setShowOnboarding(false);
@@ -2593,7 +2661,7 @@ function App() {
 
       const query = buildBookFilterParams({
         q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-        status, filterLanguage, filterYear, categoryFilter,
+        status, filterLanguage, filterYear, facetField, facetValue, facetEmpty,
         needsReviewFilter, shelfFilter, smartListKey, smartLists: SMART_LISTS
       });
       query.set('sortBy', sortBy);
@@ -2634,7 +2702,7 @@ function App() {
     }
   }, [
     currentPage, q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-    status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
+    status, filterLanguage, filterYear, facetField, facetValue, facetEmpty, needsReviewFilter,
     shelfFilter, sortBy, sortDir, smartListKey, searchEngine, t, setError
   ]);
 
@@ -2643,7 +2711,7 @@ function App() {
     if (!loggedIn || !didBootstrapData) return;
     const signature = JSON.stringify({
       q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-      status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
+      status, filterLanguage, filterYear, facetField, facetValue, facetEmpty, needsReviewFilter,
       shelfFilter, sortBy, sortDir, smartListKey, searchEngine
     });
     if (signature === lastSearchSignatureRef.current) return;
@@ -2655,7 +2723,7 @@ function App() {
   }, [
     loggedIn, didBootstrapData,
     q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-    status, filterLanguage, filterYear, categoryFilter, needsReviewFilter,
+    status, filterLanguage, filterYear, facetField, facetValue, facetEmpty, needsReviewFilter,
     shelfFilter, sortBy, sortDir, smartListKey, searchEngine,
     loadBooks
   ]);
@@ -3115,7 +3183,7 @@ function App() {
         }
       }
 
-      await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadNeedsReviewCount()]);
+      await Promise.all([loadBooks(), loadRoomSummary(), loadFacet(facetField), loadNeedsReviewCount()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -3356,7 +3424,7 @@ function App() {
           : prev
       );
       setDetailMode('view');
-      await Promise.all([loadBooks(), loadCategories(), loadNeedsReviewCount(), loadRoomSummary()]);
+      await Promise.all([loadBooks(), loadFacet(facetField), loadNeedsReviewCount(), loadRoomSummary()]);
     } catch (e) {
       // Version conflict: the book changed since it was opened. Re-fetch the
       // latest and refresh the form's version + baseline so a second save
@@ -3649,7 +3717,7 @@ function App() {
   function selectAllMatchingFilters() {
     const query = buildBookFilterParams({
       q, qExclude, qMode, partialWords, fuzzyTypos, searchFields,
-      status, filterLanguage, filterYear, categoryFilter,
+      status, filterLanguage, filterYear, facetField, facetValue, facetEmpty,
       needsReviewFilter, shelfFilter, smartListKey, smartLists: SMART_LISTS
     });
     void addMatchingToSelection(query, t('library.bulk.criteria.currentView'));
@@ -4778,6 +4846,23 @@ function App() {
     void loadBookHistory(book.id);
   }
 
+  // Core fields plus every custom attribute, everyday-first (the definitions
+  // already arrive in that order).
+  const facetChoices = useMemo(
+    () => [
+      ...CORE_FACET_CHOICES.map((f) => ({ key: f.key, label: t(f.labelKey) })),
+      ...customFields.map((f) => ({ key: `custom:${f.key}`, label: f.label }))
+    ],
+    [customFields, t]
+  );
+
+  // Refetch when the browsed field changes. Writes trigger an explicit reload
+  // at each mutation site, the way the category rail already did.
+  useEffect(() => {
+    if (!loggedIn) return;
+    void loadFacet(facetField);
+  }, [loggedIn, facetField, loadFacet]);
+
   // ─── table view ──────────────────────────────────────────────────────────
   // Every column the table COULD show: the core book fields plus one per custom
   // attribute, generated from the definitions so the list stays in the same
@@ -5110,13 +5195,16 @@ function App() {
     return items;
   }
 
-  function buildCategoryMenu(cat: CategoryItem): CtxItem[] {
+  function buildFacetMenu(item: FacetItem): CtxItem[] {
     const items: CtxItem[] = [];
-    const active = categoryFilter === cat.code;
-    items.push({ label: t('ctx.filterCategory'), icon: '📂', disabled: active, onClick: () => { setCategoryFilter(cat.code); setCurrentPage(1); } });
-    if (categoryFilter) items.push({ label: t('ctx.clearCategoryFilter'), icon: '✖️', onClick: () => { setCategoryFilter(''); setCurrentPage(1); } });
+    const active = item.isEmpty ? facetEmpty : facetValue === item.value;
+    const label = item.isEmpty ? t('library.facets.empty') : item.value;
+    items.push({ label: t('ctx.filterCategory'), icon: '📂', disabled: active, onClick: () => selectFacet(item) });
+    if (facetValue || facetEmpty) {
+      items.push({ label: t('ctx.clearCategoryFilter'), icon: '✖️', onClick: clearFacetSelection });
+    }
     items.push({ sep: true });
-    items.push({ label: t('ctx.copyName'), onClick: () => copyText(cat.label ? `${cat.code} ${cat.label}` : cat.code, t('ctx.copyName')) });
+    items.push({ label: t('ctx.copyName'), onClick: () => copyText(label, t('ctx.copyName')) });
     return items;
   }
 
@@ -6167,14 +6255,17 @@ function App() {
                       </button>
                     );
                   })}
-                  {categoryFilter && (
+                  {(facetValue || facetEmpty) && (
                     <button
                       type="button"
                       className="chip is-active"
-                      onClick={() => setCategoryFilter('')}
+                      onClick={clearFacetSelection}
                       title={t('library.categoryFilterTitle')}
                     >
-                      {t('library.categoryChip', { code: categoryFilter })}
+                      {t('library.facets.chip', {
+                        field: facetChoices.find((f) => f.key === facetField)?.label ?? facetField,
+                        value: facetEmpty ? t('library.facets.empty') : facetValue
+                      })}
                       <span className="chip-x">✕</span>
                     </button>
                   )}
@@ -6190,11 +6281,32 @@ function App() {
 
                 <div className={`library-layout${showCategoryRail ? '' : ' no-rail'}`}>
                   {showCategoryRail && (
+                    /* Facet browser. Was category-only; now it groups by any of
+                       the fields in FACET_CHOICES, because the librarian uses
+                       these counts to reconcile the catalogue against the
+                       shelves: "μπορώ να κάνω έλεγχο αριθμητικό επιτόπου στο
+                       ράφι και αν δεν συμφωνεί … έπειτα να ψάξω ποιο βιβλίο
+                       λείπει." Every bucket, including "(not filled in)", opens
+                       a list holding exactly the number shown. */
                     <aside className="category-rail">
                       <div className="category-rail-head">
                         <h3>{t('library.cats.title')}</h3>
-                        <span className="muted small">{t('library.cats.totalCount', { n: categories.length })}</span>
+                        <span className="muted small">
+                          {facetTruncated
+                            ? t('library.facets.truncated', { n: fmt(facetItems.length) })
+                            : t('library.cats.totalCount', { n: facetItems.length })}
+                        </span>
                       </div>
+                      <select
+                        className="category-rail-field"
+                        value={facetField}
+                        onChange={(e) => { setFacetField(e.target.value); clearFacetSelection(); }}
+                        title={t('library.facets.fieldTitle')}
+                      >
+                        {facetChoices.map((f) => (
+                          <option key={f.key} value={f.key}>{f.label}</option>
+                        ))}
+                      </select>
                       <input
                         className="category-rail-search"
                         placeholder={t('library.cats.filter')}
@@ -6205,41 +6317,46 @@ function App() {
                         <li>
                           <button
                             type="button"
-                            className={`category-rail-item${!categoryFilter ? ' is-active' : ''}`}
-                            aria-pressed={!categoryFilter}
-                            onClick={() => setCategoryFilter('')}
+                            className={`category-rail-item${!facetValue && !facetEmpty ? ' is-active' : ''}`}
+                            aria-pressed={!facetValue && !facetEmpty}
+                            onClick={clearFacetSelection}
                           >
                             <span className="cat-label">{t('library.cats.all')}</span>
-                            <span className="cat-count">{fmt(totalBooksCount)}</span>
+                            {/* The LIBRARY total, from the same memoized key the
+                                unfiltered list uses. It used to render the
+                                current filtered total, so applying any other
+                                filter silently changed the "All" row. */}
+                            <span className="cat-count">{fmt(facetTotalBooks ?? totalBooksCount)}</span>
                           </button>
                         </li>
-                        {categories
-                          .filter((c) => {
-                            const q = categoryRailQuery.trim().toLowerCase();
-                            if (!q) return true;
-                            return (
-                              c.code.toLowerCase().includes(q) ||
-                              (c.label ?? '').toLowerCase().includes(q)
-                            );
+                        {facetItems
+                          .filter((item) => {
+                            const needle = categoryRailQuery.trim().toLowerCase();
+                            if (!needle) return true;
+                            if (item.isEmpty) return false;
+                            return item.value.toLowerCase().includes(needle);
                           })
-                          .map((c) => (
-                            <li key={c.code}>
-                              <button
-                                type="button"
-                                className={`category-rail-item${categoryFilter === c.code ? ' is-active' : ''}`}
-                                aria-pressed={categoryFilter === c.code}
-                                onClick={() => setCategoryFilter(c.code)}
-                                onContextMenu={(e) => openContextMenu(e, buildCategoryMenu(c), c.label ? `${c.code} ${c.label}` : c.code)}
-                                title={c.label ?? c.code}
-                              >
-                                <span className="cat-label">
-                                  <span className="cat-code">{c.code}</span>
-                                  {c.label ? <span className="cat-text"> {c.label}</span> : null}
-                                </span>
-                                <span className="cat-count">{fmt(c.count)}</span>
-                              </button>
-                            </li>
-                          ))}
+                          .map((item) => {
+                            const active = item.isEmpty ? facetEmpty : facetValue === item.value;
+                            const label = item.isEmpty ? t('library.facets.empty') : item.value;
+                            return (
+                              <li key={item.isEmpty ? ' empty' : item.value}>
+                                <button
+                                  type="button"
+                                  className={`category-rail-item${active ? ' is-active' : ''}${item.isEmpty ? ' is-empty-bucket' : ''}`}
+                                  aria-pressed={active}
+                                  onClick={() => selectFacet(item)}
+                                  onContextMenu={(e) => openContextMenu(e, buildFacetMenu(item), label)}
+                                  title={label}
+                                >
+                                  <span className="cat-label">
+                                    <span className="cat-text">{label}</span>
+                                  </span>
+                                  <span className="cat-count">{fmt(item.count)}</span>
+                                </button>
+                              </li>
+                            );
+                          })}
                       </ul>
                     </aside>
                   )}
@@ -6590,7 +6707,7 @@ function App() {
                         setFilterLanguage('');
                         setFilterYear('');
                         setShelfFilter('');
-                        setCategoryFilter('');
+                        clearFacetSelection();
                         setNeedsReviewFilter(false);
                         setSmartListKey('');
                         setCurrentPage(1);
@@ -6804,7 +6921,7 @@ function App() {
                             // librarian can see and retry it.
                             const deleted = new Set(okIds);
                             setSelectedBookIds((prev) => prev.filter((id) => !deleted.has(id)));
-                            await Promise.all([loadBooks(), loadRoomSummary(), loadCategories(), loadStats()]);
+                            await Promise.all([loadBooks(), loadRoomSummary(), loadFacet(facetField), loadStats()]);
                           } catch (e) {
                             setError((e as Error).message);
                           }
@@ -6835,7 +6952,7 @@ function App() {
                       <p style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>📚</p>
                       <p style={{ fontWeight: 600 }}>{t('library.empty.title')}</p>
                       <p className="muted small">
-                        {q || categoryFilter || needsReviewFilter || status || filterLanguage || filterYear || shelfFilter || smartListKey
+                        {q || facetValue || facetEmpty || needsReviewFilter || status || filterLanguage || filterYear || shelfFilter || smartListKey
                           ? t('library.empty.filtered')
                           : t('library.empty.bare')}
                       </p>
