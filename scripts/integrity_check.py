@@ -230,7 +230,8 @@ check("cover delete preserves title", get(cb)["title"] == cs["title"])
 print("=== 11. REGRESSION: static /api/books routes are not shadowed by :id ===")
 for path, ok in [("/api/books/trash", (200,)), ("/api/books/duplicates", (200,)),
                  ("/api/books/title-suggest?q=zzz", (200,)),
-                 ("/api/books/sets?minBooks=2&limit=5", (200,))]:
+                 ("/api/books/sets?minBooks=2&limit=5", (200,)),
+                 ("/api/books/merge-candidates?limit=1", (200,))]:
     st, _ = call("GET", path)
     check(f"{path} reachable (not 404 from :id)", st in ok, f"status={st}")
 st, _ = call("GET", "/api/books/semantic?q=zz")
@@ -1190,6 +1191,133 @@ try:
         check(f"SRU does not expose {leaked!r}", leaked.lower() not in body.lower(), leaked)
 finally:
     call("PUT", "/api/library-settings", {"publicSharing": None, "isil": None, "libraryName": None})
+
+print("=== 38. REGRESSION: merging duplicate records ===")
+# The cleanup the holdings layer exists for: a book catalogued once per shelf
+# becomes ONE record with two copies. A merge deletes records, so every check
+# here is about what must NOT be lost on the way.
+uniq = uuid.uuid4().hex[:8]
+keep_id, _ = mkbook(
+    title=f"ZZITEST Διπλότυπο {uniq}", author="ΖΖ Διπλός",
+    publisher="ZZ Publisher", publicationYear=1970, isbn="978" + uuid.uuid4().hex[:10],
+    shelfCode="ZZ-FRONT", description="", tags=["zz-keep"],
+    customFields={"pages": "200σ."})
+lose_body = get(keep_id)
+lose_id, _ = mkbook(
+    title=f"ZZITEST Διπλότυπο {uniq}", author="ΖΖ Διπλός",
+    publisher="ZZ Publisher", publicationYear=1970, isbn=lose_body["isbn"],
+    # Values the KEEPER lacks. A merge that drops these has destroyed cataloguing.
+    shelfCode="ZZ-BACK", description="ZZ rescued description", tags=["zz-lose"],
+    customFields={"pages": "200σ.", "edition": "ZZ rescued edition"})
+
+st, r = call("GET", "/api/books/merge-candidates?limit=50&q="
+             + urllib.parse.quote(f"ZZITEST Διπλότυπο {uniq}"))
+grp = next((g for g in (r or {}).get("groups", [])
+            if any(b["id"] == keep_id for b in g.get("books", []))), None)
+check("the strict scan finds the pair", st == 200 and grp is not None
+      and {b["id"] for b in grp["books"]} == {keep_id, lose_id}, f"{st} {(r or {}).get('total')}")
+
+# The title filter is folded on both sides — an accent typed or not typed must
+# find the same group, the same contract the catalogue's search keeps.
+st, unaccented = call("GET", "/api/books/merge-candidates?limit=50&q="
+                      + urllib.parse.quote(f"ZZITEST Διπλοτυπο {uniq}"))
+check("the filter ignores accents",
+      any(any(b["id"] == keep_id for b in g["books"]) for g in (unaccented or {}).get("groups", [])),
+      (unaccented or {}).get("total"))
+if grp:
+    check("the group reports which fields differ",
+          "description" in grp["differingFields"], grp["differingFields"])
+    check("the group shows each record's copies",
+          sorted(i["shelfCode"] for b in grp["books"] for i in b["items"]) == ["ZZ-BACK", "ZZ-FRONT"],
+          [[i["shelfCode"] for i in b["items"]] for b in grp["books"]])
+
+# A dry run must change NOTHING. This is the whole basis for showing a preview.
+st, prev = call("POST", "/api/books/merge", {"keepId": keep_id, "mergeIds": [lose_id], "dryRun": True})
+check("a dry run reports the resulting copy count", st == 200 and prev.get("copiesAfter") == 2, f"{st} {prev}")
+check("a dry run names the blank fields it would fill",
+      "description" in (prev.get("wouldFillFields") or {}), prev.get("wouldFillFields"))
+check("a dry run names the attributes it would rescue",
+      "edition" in (prev.get("wouldRescueAttributes") or {}), prev.get("wouldRescueAttributes"))
+check("a dry run wrote nothing", get(lose_id) is not None and len(get(keep_id)["items"]) == 1)
+
+# A record on loan must be refused: the loan points at it, and moving that
+# rewrites a borrower's history under them.
+st, _ = call("POST", f"/api/books/{lose_id}/borrow",
+             {"borrowerName": "ZZ Merge Borrower", "dueAt": "2030-01-01T00:00:00.000Z"})
+check("the loan fixture was borrowed", st in (200, 201), st)
+st, r = call("POST", "/api/books/merge", {"keepId": keep_id, "mergeIds": [lose_id], "dryRun": False})
+check("merging a record that is on loan is refused", st == 409, f"{st} {r}")
+call("POST", f"/api/books/{lose_id}/return", {})
+
+# Loan HISTORY, by contrast, must follow the book: the borrower's record of
+# having read it cannot evaporate because a cataloguer tidied up.
+st, hist_before = call("GET", f"/api/books/{lose_id}/history")
+loans_before = len((hist_before or {}).get("items") or [])
+check("the folded record has loan history to carry", loans_before >= 1, loans_before)
+
+st, res = call("POST", "/api/books/merge", {"keepId": keep_id, "mergeIds": [lose_id], "dryRun": False})
+check("the merge succeeds", st == 200 and res.get("copiesMoved") == 1, f"{st} {res}")
+after = get(keep_id)
+check("both shelves are now copies of one record",
+      sorted(i["shelfCode"] for i in (after.get("items") or [])) == ["ZZ-BACK", "ZZ-FRONT"],
+      after.get("items"))
+check("copies are renumbered 1..n",
+      sorted(i["copyNumber"] for i in (after.get("items") or [])) == [1, 2],
+      [i["copyNumber"] for i in (after.get("items") or [])])
+check("a blank field is filled from the folded record",
+      after.get("description") == "ZZ rescued description", after.get("description"))
+check("an attribute only the folded record had survives",
+      (after.get("customFields") or {}).get("edition") == "ZZ rescued edition", after.get("customFields"))
+check("tags from both records survive",
+      set(after.get("tags") or []) == {"zz-keep", "zz-lose"}, after.get("tags"))
+check("the folded record is gone from the catalogue", get(lose_id) is None)
+st, hist_after = call("GET", f"/api/books/{keep_id}/history")
+check("the folded record's loan history moved to the keeper",
+      len((hist_after or {}).get("items") or []) >= loans_before,
+      f"{loans_before} -> {len((hist_after or {}).get('items') or [])}")
+
+# The forwarding address, and the invariant that a live record has a copy.
+st, trash = call("GET", "/api/books/trash?pageSize=100")
+tomb = next((b for b in (trash or {}).get("items", []) if b["id"] == lose_id), None)
+check("the folded record is a tombstone pointing at the keeper",
+      tomb is not None and tomb.get("mergedInto") == keep_id, tomb and tomb.get("mergedInto"))
+
+# The catalogue must never show a book with no copy — the healing pass enforces
+# that, and restoring a merged record is the one path that can violate it.
+st, _ = call("POST", f"/api/books/{lose_id}/restore")
+restored = get(lose_id)
+check("a restored record is no longer forwarding",
+      restored is not None and not restored.get("mergedInto"), restored and restored.get("mergedInto"))
+check("a restored record gets a copy back rather than none",
+      restored is not None and len(restored.get("items") or []) == 1, restored and restored.get("items"))
+check("restoring did not steal a copy back from the keeper",
+      len(get(keep_id).get("items") or []) == 2, get(keep_id).get("items"))
+
+# The kept record must be findable, and the folded one must not resurface.
+st, found = call("GET", "/api/books?pageSize=10&partialWords=true&fuzzyTypos=false&q="
+                 + urllib.parse.quote(f"ZZITEST Διπλότυπο {uniq}"))
+check("search still finds the merged title", (found or {}).get("total", 0) >= 1, (found or {}).get("total"))
+
+# A merge into itself is a no-op, not a self-destructing record.
+st, r = call("POST", "/api/books/merge", {"keepId": keep_id, "mergeIds": [keep_id], "dryRun": False})
+check("a record cannot be merged into itself", st == 400, f"{st} {r}")
+check("the self-merge left the record intact", get(keep_id) is not None)
+
+# A record that ABSORBED a merge is pointed at by a tombstone, and `merged_into`
+# is a real foreign key. Without clearing it the keeper can never be purged —
+# the delete fails and the record is stuck in the trash forever.
+pk, _ = mkbook(title=f"ZZITEST Purge {uniq}", author="ZZ Purge")
+pl, _ = mkbook(title=f"ZZITEST Purge {uniq}", author="ZZ Purge")
+st, r = call("POST", "/api/books/merge", {"keepId": pk, "mergeIds": [pl], "dryRun": False})
+check("the purge fixture merged", st == 200, f"{st} {r}")
+call("DELETE", f"/api/books/{pk}")
+st, r = call("DELETE", f"/api/books/{pk}/purge")
+check("a record that absorbed a merge can still be purged", st == 204, f"{st} {r}")
+st, trash2 = call("GET", "/api/books/trash?pageSize=100")
+orphan = next((b for b in (trash2 or {}).get("items", []) if b["id"] == pl), None)
+check("its tombstone loses the dangling forwarding address",
+      orphan is not None and not orphan.get("mergedInto"), orphan and orphan.get("mergedInto"))
+call("DELETE", f"/api/books/{pl}/purge")
 
 print("\n=== CLEANUP ===")
 for bid in CREATED:

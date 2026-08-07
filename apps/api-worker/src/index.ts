@@ -8,6 +8,7 @@ import {
 	ReplaceItemsSchema,
 	computeSetGaps,
 	LinkAuthoritiesSchema,
+	MergeBooksSchema,
 	UpsertAuthoritySchema,
 	ImportBooksSchema,
 	ImportCatalogSchema,
@@ -60,6 +61,7 @@ import {
 	ITEM_BACKED_FACETS,
 	loadBookItems,
 	loadItemsForBooks,
+	loadMergeCandidateGroups,
 	parseItem,
 	syncBookFromItems,
 	runAtomic,
@@ -1843,6 +1845,289 @@ app.get('/api/books/sets', async (c) => {
 // The field whitelist lives in db.ts alongside the list filter that has to
 // agree with it — see `resolveEmptyFieldExpr`.
 
+// ─── Merging duplicate records ────────────────────────────────────────────
+//
+// The librarian catalogued ~44 books twice, once per shelf, because before the
+// holdings layer there was no other way to record a second exemplar. Each of
+// those pairs should be ONE record with two copies.
+//
+// Everything here is preview-first. A merge soft-deletes records and moves
+// their holdings; the operator sees the exact consequences before anything
+// moves, and 5 of those 44 have no twin at all — a genuinely different book or
+// a typo — so this can never be a script that runs unattended.
+
+/** Fields compared side by side so the operator can see what differs. */
+const MERGE_COMPARE_FIELDS = [
+	'title', 'author', 'isbn', 'publisher', 'language', 'dateEdtf', 'ddc',
+	'description', 'legacyId', 'titleRomanized', 'authorRomanized'
+] as const;
+
+app.get('/api/books/merge-candidates', requirePermission('books.write', { librarian: true }), async (c) => {
+	const limit = Math.min(100, Math.max(1, Number(c.req.query('limit') ?? 25)));
+	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
+	// Default strict: on this catalogue the loose match finds 367 groups, most
+	// of them different printings that must NOT be merged. Strict is the
+	// back-shelf duplication the librarian actually asked to clean up.
+	const strict = c.req.query('match') !== 'loose';
+	const { groups, total } = await loadMergeCandidateGroups(c.env, {
+		limit, offset, strict, q: c.req.query('q') ?? ''
+	});
+
+	const allIds = groups.flatMap((g) => g.bookIds);
+	if (allIds.length === 0) return c.json({ groups: [], total, limit, offset });
+
+	const ph = allIds.map(() => '?').join(',');
+	const [rows, itemsByBook] = await Promise.all([
+		c.env.DB.prepare(`SELECT * FROM books WHERE id IN (${ph})`).bind(...allIds).all<Record<string, unknown>>(),
+		loadItemsForBooks(c.env, allIds)
+	]);
+	const byId = new Map((rows.results ?? []).map((r) => [String(r.id), parseBook(r)]));
+
+	// Open loans block a merge, so surface them here rather than letting the
+	// operator pick a group and only then discover it cannot proceed.
+	const loans = await c.env.DB.prepare(
+		`SELECT book_id, COUNT(*) AS n FROM borrow_transactions
+		  WHERE returned_at IS NULL AND book_id IN (${ph}) GROUP BY book_id`
+	).bind(...allIds).all<{ book_id: string; n: number }>();
+	const openLoans = new Map((loans.results ?? []).map((r) => [r.book_id, Number(r.n)]));
+
+	return c.json({
+		total, limit, offset,
+		groups: groups.map((g) => {
+			const books = g.bookIds.map((id) => byId.get(id)).filter(Boolean) as Array<Record<string, unknown>>;
+			// Which fields actually differ across the group — the operator only
+			// needs to look at those, not at every column.
+			const differing = MERGE_COMPARE_FIELDS.filter((f) => {
+				const seen = new Set(books.map((b) => JSON.stringify(b[f] ?? null)));
+				return seen.size > 1;
+			});
+			return {
+				key: g.key,
+				differingFields: differing,
+				books: books.map((b) => ({
+					id: b.id,
+					title: b.title,
+					author: b.author,
+					isbn: b.isbn,
+					publisher: b.publisher,
+					dateEdtf: b.dateEdtf,
+					legacyId: b.legacyId,
+					updatedAt: b.updatedAt,
+					// How many attributes carry a value — the fullest record is
+					// usually the right one to keep.
+					filledFields: MERGE_COMPARE_FIELDS.filter((f) => {
+						const v = b[f];
+						return v !== null && v !== undefined && String(v).trim() !== '';
+					}).length + Object.values((b.customFields ?? {}) as Record<string, unknown>)
+						.filter((v) => v !== null && v !== undefined && String(v).trim() !== '').length,
+					openLoans: openLoans.get(String(b.id)) ?? 0,
+					items: (itemsByBook.get(String(b.id)) ?? []).map((i) => ({
+						id: i.id, shelfCode: i.shelfCode, roomCode: i.roomCode,
+						copyNumber: i.copyNumber, status: i.status, barcode: i.barcode
+					}))
+				}))
+			};
+		})
+	});
+});
+
+app.post('/api/books/merge', requirePermission('books.write', { librarian: true }), async (c) => {
+	const payload = MergeBooksSchema.parse(await c.req.json());
+	const mergeIds = payload.mergeIds.filter((id) => id !== payload.keepId);
+	if (mergeIds.length === 0) throw new HTTPException(400, { message: 'Nothing to merge into the kept record' });
+
+	const ids = [payload.keepId, ...mergeIds];
+	const ph = ids.map(() => '?').join(',');
+	const rows = await c.env.DB.prepare(
+		`SELECT * FROM books WHERE id IN (${ph}) AND deleted_at IS NULL`
+	).bind(...ids).all<Record<string, unknown>>();
+	const byId = new Map((rows.results ?? []).map((r) => [String(r.id), parseBook(r)]));
+
+	const keeper = byId.get(payload.keepId);
+	if (!keeper) throw new HTTPException(404, { message: 'The record to keep was not found' });
+	const missing = mergeIds.filter((id) => !byId.has(id));
+	if (missing.length) throw new HTTPException(404, { message: `Not found: ${missing.join(', ')}` });
+
+	// A record on loan cannot be merged away: the loan points at the book, and
+	// moving it would rewrite the borrower's history under them.
+	const loans = await c.env.DB.prepare(
+		`SELECT book_id FROM borrow_transactions WHERE returned_at IS NULL AND book_id IN (${mergeIds.map(() => '?').join(',')})`
+	).bind(...mergeIds).all<{ book_id: string }>();
+	if ((loans.results ?? []).length > 0) {
+		throw new HTTPException(409, {
+			message: 'Cannot merge a record that is on loan. Return it first.'
+		});
+	}
+
+	// Fill the keeper's BLANKS from the records being folded in — a merge must
+	// never lose a value someone typed. A field the keeper already has always
+	// wins; this only rescues what would otherwise be deleted with the loser.
+	const filled: Record<string, unknown> = {};
+	const rescuedCustom: Record<string, unknown> = { ...((keeper.customFields ?? {}) as Record<string, unknown>) };
+	const blank = (v: unknown) => v === null || v === undefined || String(v).trim() === '';
+	for (const id of mergeIds) {
+		const loser = byId.get(id) as Record<string, unknown>;
+		for (const f of MERGE_COMPARE_FIELDS) {
+			// legacyId is UNIQUE — copying it across would collide with the row we
+			// are about to soft-delete, which still holds it.
+			if (f === 'legacyId') continue;
+			if (blank(keeper[f]) && blank(filled[f]) && !blank(loser[f])) filled[f] = loser[f];
+		}
+		for (const [k, v] of Object.entries((loser.customFields ?? {}) as Record<string, unknown>)) {
+			if (blank(rescuedCustom[k]) && !blank(v)) rescuedCustom[k] = v;
+		}
+	}
+	const mergedTags = Array.from(new Set([
+		...((keeper.tags ?? []) as string[]),
+		...mergeIds.flatMap((id) => ((byId.get(id)?.tags ?? []) as string[]))
+	]));
+
+	const itemsByBook = await loadItemsForBooks(c.env, ids);
+	const movingItems = mergeIds.flatMap((id) => itemsByBook.get(id) ?? []);
+	const keeperItems = itemsByBook.get(payload.keepId) ?? [];
+
+	if (payload.dryRun) {
+		return c.json({
+			dryRun: true,
+			keepId: payload.keepId,
+			mergeIds,
+			// Exactly what would change, so the operator judges before committing.
+			wouldFillFields: filled,
+			wouldRescueAttributes: Object.fromEntries(
+				Object.entries(rescuedCustom).filter(([k, v]) =>
+					blank(((keeper.customFields ?? {}) as Record<string, unknown>)[k]) && !blank(v))
+			),
+			wouldAddTags: mergedTags.filter((t) => !((keeper.tags ?? []) as string[]).includes(t)),
+			copiesAfter: keeperItems.length + movingItems.length,
+			copiesMoving: movingItems.map((i) => ({ shelfCode: i.shelfCode, copyNumber: i.copyNumber })),
+			recordsRemoved: mergeIds.length
+		});
+	}
+
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [];
+	const mergePh = mergeIds.map(() => '?').join(',');
+
+	// The copies move — this IS the merge. Renumbered so the survivor's copies
+	// read 1..n rather than repeating whatever numbers they had apart.
+	let copyNumber = keeperItems.length;
+	for (const item of movingItems) {
+		copyNumber += 1;
+		statements.push(
+			c.env.DB.prepare('UPDATE items SET book_id = ?, copy_number = ?, updated_at = ? WHERE id = ?')
+				.bind(payload.keepId, copyNumber, now, item.id)
+		);
+	}
+
+	// Everything else that points at a book has to follow it, or it is orphaned:
+	// loan history (so a borrower's record stays intact), printed codes, and
+	// authority links.
+	statements.push(
+		c.env.DB.prepare(`UPDATE borrow_transactions SET book_id = ? WHERE book_id IN (${mergePh})`).bind(payload.keepId, ...mergeIds),
+		c.env.DB.prepare(`UPDATE code_assignments SET book_id = ? WHERE book_id IN (${mergePh})`).bind(payload.keepId, ...mergeIds),
+		// OR IGNORE: the same authority may already be linked to the keeper, and
+		// (book_id, authority_id, role) is the primary key.
+		c.env.DB.prepare(
+			`INSERT OR IGNORE INTO book_authorities (book_id, authority_id, role, seq, created_at)
+			 SELECT ?, authority_id, role, seq, ? FROM book_authorities WHERE book_id IN (${mergePh})`
+		).bind(payload.keepId, now, ...mergeIds),
+		c.env.DB.prepare(`DELETE FROM book_authorities WHERE book_id IN (${mergePh})`).bind(...mergeIds),
+		// Serial run statements ("vol. 1–10, 12 missing") describe the title, so
+		// they belong to whichever record survives it.
+		c.env.DB.prepare(`UPDATE serial_holdings SET book_id = ? WHERE book_id IN (${mergePh})`).bind(payload.keepId, ...mergeIds),
+		// A bound-with link says "this work is also in that physical volume". If
+		// the keeper is already linked to the same item the row is redundant.
+		c.env.DB.prepare(
+			`INSERT OR IGNORE INTO bound_with_items (item_id, book_id, seq, created_at)
+			 SELECT item_id, ?, seq, ? FROM bound_with_items WHERE book_id IN (${mergePh})`
+		).bind(payload.keepId, now, ...mergeIds),
+		c.env.DB.prepare(`DELETE FROM bound_with_items WHERE book_id IN (${mergePh})`).bind(...mergeIds),
+		// The normalized attribute table mirrors custom_fields. Only rows for
+		// definitions the keeper has no value for can move — UNIQUE(book_id,
+		// attribute_definition_id) — which matches the "keeper's value wins" rule
+		// applied to custom_fields above.
+		c.env.DB.prepare(
+			`INSERT OR IGNORE INTO book_attribute_values (id, book_id, attribute_definition_id, value_json, created_at, updated_at)
+			 SELECT LOWER(HEX(RANDOMBLOB(16))), ?, attribute_definition_id, value_json, ?, ?
+			   FROM book_attribute_values WHERE book_id IN (${mergePh})`
+		).bind(payload.keepId, now, now, ...mergeIds),
+		c.env.DB.prepare(`DELETE FROM book_attribute_values WHERE book_id IN (${mergePh})`).bind(...mergeIds)
+	);
+
+	// Apply the rescued values to the keeper.
+	const merged = normalizeBookData({
+		...keeper,
+		...filled,
+		customFields: rescuedCustom,
+		tags: mergedTags
+	} as Record<string, unknown>) as Record<string, unknown>;
+	const tagsJson = JSON.stringify(merged.tags ?? []);
+	const cfJson = JSON.stringify(await validateCustomFields(c.env, merged.customFields as Record<string, unknown>));
+	const folds = computeBookFolds({
+		title: merged.title as string, author: merged.author as string,
+		isbn: (merged.isbn as string | null) ?? null, publisher: (merged.publisher as string | null) ?? null,
+		description: (merged.description as string | null) ?? null,
+		tagsJson, customFieldsJson: cfJson,
+		titleRomanized: (merged.titleRomanized as string | null) ?? null,
+		authorRomanized: (merged.authorRomanized as string | null) ?? null,
+		publisherRomanized: (merged.publisherRomanized as string | null) ?? null
+	});
+	statements.push(
+		c.env.DB.prepare(
+			`UPDATE books SET title = ?, author = ?, isbn = ?, publisher = ?, language = ?, description = ?,
+			        ddc = ?, date_edtf = ?, publication_year = ?, publication_year_end = ?,
+			        title_romanized = ?, author_romanized = ?, publisher_romanized = ?,
+			        tags = ?, custom_fields = ?, updated_at = ?, version = version + 1,
+			        title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?,
+			        tags_fold = ?, custom_fields_fold = ?,
+			        title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?
+			  WHERE id = ?`
+		).bind(
+			merged.title, merged.author, merged.isbn ?? null, merged.publisher ?? null,
+			merged.language ?? null, merged.description ?? null, merged.ddc ?? null,
+			merged.dateEdtf ?? null, merged.publicationYear ?? null, merged.publicationYearEnd ?? null,
+			merged.titleRomanized ?? null, merged.authorRomanized ?? null, merged.publisherRomanized ?? null,
+			tagsJson, cfJson, now,
+			folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold, folds.description_fold,
+			folds.tags_fold, folds.custom_fields_fold,
+			folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
+			payload.keepId
+		),
+		// The tombstone. `merged_into` is the forwarding address for an old label,
+		// a bookmarked URL, or an OAI-PMH harvester holding the identifier.
+		c.env.DB.prepare(
+			`UPDATE books SET deleted_at = ?, merged_into = ?, updated_at = ?, version = version + 1
+			  WHERE id IN (${mergePh})`
+		).bind(now, payload.keepId, now, ...mergeIds)
+	);
+
+	for (let i = 0; i < statements.length; i += 40) {
+		await runAtomic(c.env, statements.slice(i, i + 40));
+	}
+	await syncBookFromItems(c.env, payload.keepId);
+	await bumpBooksCacheVersion(c.env);
+	// The folded-in records must stop coming back from semantic search.
+	for (const id of mergeIds) runAfterResponse(c, () => unvectorizeBook(c.env, id));
+	await insertAuditLog(c.env, c.get('user').sub, 'book.merge', 'book', payload.keepId, {
+		mergedIds: mergeIds,
+		filledFields: Object.keys(filled),
+		copiesMoved: movingItems.length,
+		// Item id → where it came from. Restoring a merged record cannot infer
+		// this (the copy is not deleted, just re-parented), so the log is the
+		// only record of which copy belonged to which record before the merge.
+		movedItems: movingItems.map((i) => ({ itemId: i.id, from: i.bookId }))
+	});
+
+	return c.json({
+		dryRun: false,
+		keepId: payload.keepId,
+		mergedIds: mergeIds,
+		copiesMoved: movingItems.length,
+		copiesAfter: (await loadBookItems(c.env, payload.keepId)).length,
+		filledFields: Object.keys(filled)
+	});
+});
+
 app.get('/api/books/:id', async (c) => {
 	const id = c.req.param('id') ?? '';
 	if (!id) {
@@ -2317,10 +2602,14 @@ app.post('/api/books/:id/restore', requirePermission('books.delete'), async (c) 
 	// already removed. Restoring all of them would put books back on shelves
 	// they are not on.
 	const trashed = await c.env.DB.prepare(
-		'SELECT deleted_at FROM books WHERE id = ? AND deleted_at IS NOT NULL'
-	).bind(id).first<{ deleted_at: string }>();
+		'SELECT deleted_at, merged_into, shelf_code, room_code FROM books WHERE id = ? AND deleted_at IS NOT NULL'
+	).bind(id).first<{ deleted_at: string; merged_into: string | null; shelf_code: string | null; room_code: string | null }>();
 	const result = await c.env.DB.prepare(
-		`UPDATE books SET deleted_at = NULL, updated_at = ?, version = version + 1
+		// Clearing `merged_into` is part of coming back: the record is no longer
+		// forwarding anywhere. Its copies stay with the keeper — they were moved,
+		// not deleted — so the fresh copy minted below is what puts it on a shelf
+		// again. The merge's audit log names the item ids if they must go back.
+		`UPDATE books SET deleted_at = NULL, merged_into = NULL, updated_at = ?, version = version + 1
 		 WHERE id = ? AND deleted_at IS NOT NULL`
 	).bind(now, id).run();
 
@@ -2357,7 +2646,26 @@ app.post('/api/books/:id/restore', requirePermission('books.delete'), async (c) 
 	// Bring the copies back with the record — restore must return it to the
 	// shelf it was on, not leave it holdings-less.
 	await restoreItemsDeletedAt(c.env, id, trashed?.deleted_at ?? null);
-	await insertAuditLog(c.env, c.get('user').sub, 'book.restore', 'book', id, {});
+	// A merged-away record has no copies to restore — they left with the merge.
+	// Every live record must have at least one copy (the invariant the healing
+	// pass enforces), so mint one. NOT `ensurePrimaryItem`: its deterministic
+	// `itm_<bookId>` is the very row that moved to the keeper, and re-inserting
+	// it would collide.
+	if (trashed?.merged_into) {
+		const live = await c.env.DB.prepare(
+			'SELECT COUNT(*) AS n FROM items WHERE book_id = ? AND deleted_at IS NULL'
+		).bind(id).first<{ n: number }>();
+		if (Number(live?.n ?? 0) === 0) {
+			await c.env.DB.prepare(
+				`INSERT INTO items (id, book_id, copy_number, room_code, shelf_code, item_type, status,
+				                    created_at, updated_at, version)
+				 VALUES (?, ?, 1, ?, ?, 'book', 'available', ?, ?, 0)`
+			).bind(newId('itm'), id, trashed.room_code, trashed.shelf_code, now, now).run();
+		}
+	}
+	await insertAuditLog(c.env, c.get('user').sub, 'book.restore', 'book', id, {
+		unmergedFrom: trashed?.merged_into ?? null
+	});
 	return c.json({ id, restored: true });
 });
 
@@ -2388,6 +2696,11 @@ app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) 
 		// Before the book row: items hold an FK to it, and purge is a hard delete.
 		c.env.DB.prepare('DELETE FROM bound_with_items WHERE book_id = ?').bind(id),
 		c.env.DB.prepare('DELETE FROM items WHERE book_id = ?').bind(id),
+		// A record that absorbed a merge is pointed at by its tombstones, and
+		// `merged_into` is a real foreign key — without this the DELETE below
+		// fails and the record can never leave the trash. There is no forwarding
+		// address left to keep once the destination is gone.
+		c.env.DB.prepare('UPDATE books SET merged_into = NULL WHERE merged_into = ?').bind(id),
 		c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id)
 	]);
 

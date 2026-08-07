@@ -1192,6 +1192,46 @@ label {
 .variant-merge-row input { flex: 1 1 auto; min-width: 0; }
 .variant-merge-row button { flex: 0 0 auto; }
 
+/* ===== Duplicate-record merge tool ===== */
+/* The comparison is the point: the librarian decides which record survives by
+   reading the rows side by side, so the table scrolls inside the card rather
+   than pushing the page sideways. */
+.merge-group { overflow-x: auto; }
+.merge-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+.merge-table th {
+  text-align: left;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  font-weight: 700;
+  padding: 0 0.5rem 0.35rem;
+  white-space: nowrap;
+}
+.merge-table td { padding: 0.35rem 0.5rem; border-top: 1px solid var(--border); vertical-align: top; }
+.merge-table tr.is-keeper td { background: var(--accent-light); }
+/* The pickers are the only interactive cells; the global `input { width: 100% }`
+   would otherwise stretch them across the column. */
+.merge-table input[type="radio"],
+.merge-table input[type="checkbox"] { width: auto; flex: 0 0 auto; margin: 0; }
+.merge-table .badge.warn {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 100px;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  color: var(--warning);
+  background: var(--warning-bg);
+}
+.merge-preview {
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.65rem;
+  border-left: 3px solid var(--accent);
+  background: var(--bg);
+  border-radius: var(--radius-sm);
+}
+
 .chip {
   display: inline-flex;
   align-items: center;

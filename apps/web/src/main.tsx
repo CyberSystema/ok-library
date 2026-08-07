@@ -1155,6 +1155,29 @@ type TitleSuggestion = {
 
 type ValueVariantGroup = { canonical: string; total: number; variants: Array<{ value: string; count: number }> };
 
+// ── Duplicate-record merge ──────────────────────────────────────────────────
+// Two records for one book, each holding one copy, is what the catalogue looked
+// like before there was a holdings layer. Merging folds them into one record
+// with two copies — the shape the shelves actually have.
+type MergeCandidateItem = {
+  id: string; shelfCode: string | null; roomCode: string | null;
+  copyNumber: number; status: string; barcode: string | null;
+};
+type MergeCandidateBook = {
+  id: string; title: string; author: string; isbn: string | null; publisher: string | null;
+  dateEdtf: string | null; legacyId: string | null; updatedAt: string;
+  filledFields: number; openLoans: number; items: MergeCandidateItem[];
+};
+type MergeCandidateGroup = { key: string; differingFields: string[]; books: MergeCandidateBook[] };
+type MergePreview = {
+  wouldFillFields: Record<string, unknown>;
+  wouldRescueAttributes: Record<string, unknown>;
+  wouldAddTags: string[];
+  copiesAfter: number;
+  copiesMoving: Array<{ shelfCode: string | null; copyNumber: number }>;
+  recordsRemoved: number;
+};
+
 // One row of the "value consistency" tool: shows the fold-equivalent spellings
 // of a value with their book counts, lets the librarian pick (or type) the
 // canonical form, and merge the rest into it.
@@ -1189,6 +1212,166 @@ function VariantGroupCard({ group, mergeLabel, keepLabel, onMerge }: {
           disabled={!canonical.trim() || group.variants.every((v) => v.value === canonical)}
           onClick={() => onMerge(canonical.trim())}
         >{mergeLabel}</button>
+      </div>
+    </div>
+  );
+}
+
+// One duplicate group: pick the record that survives, tick the ones folded into
+// it, preview, then merge. Nothing is decided for the librarian — the catalogue
+// legitimately contains different printings that share a title and an author,
+// and only a person can tell those from a record entered twice.
+function MergeGroupCard({ group, t, onPreview, onMerge }: {
+  group: MergeCandidateGroup;
+  t: (key: string, vars?: Record<string, string | number>) => string;
+  onPreview: (keepId: string, mergeIds: string[]) => Promise<MergePreview | null>;
+  onMerge: (keepId: string, mergeIds: string[]) => Promise<boolean>;
+}) {
+  // Default to the fullest record: merging INTO the emptier one would mean
+  // rescuing every field across, and the result is the same record either way.
+  const fullest = [...group.books].sort((a, b) => b.filledFields - a.filledFields)[0];
+  const [keepId, setKeepId] = useState(fullest?.id ?? '');
+  const [chosen, setChosen] = useState<Set<string>>(() => new Set(group.books.map((b) => b.id)));
+  const [preview, setPreview] = useState<MergePreview | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const mergeIds = group.books.map((b) => b.id).filter((id) => id !== keepId && chosen.has(id));
+  // A record on loan cannot be folded away: the loan points at it, and moving
+  // that would rewrite a borrower's history under them.
+  const blocked = group.books.filter((b) => mergeIds.includes(b.id) && b.openLoans > 0);
+  const canMerge = mergeIds.length > 0 && blocked.length === 0 && !busy && !done;
+
+  // Every record in a group has the SAME title — that is what put them in one
+  // group — so a label built from the title alone reads identically on every
+  // row to a screen reader. The shelf is what actually tells them apart, and it
+  // is the reason the duplicate exists.
+  function describe(b: MergeCandidateBook): string {
+    const where = b.items.map((i) => i.shelfCode).filter(Boolean).join(', ');
+    return where ? `${b.title} — ${where}` : b.title;
+  }
+
+  function toggle(id: string) {
+    setPreview(null);
+    setChosen((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  if (done) {
+    return (
+      <div className="variant-group">
+        <p className="muted small" style={{ margin: 0 }}>✓ {t('settings.merge.doneRow', { n: mergeIds.length + 1 })}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="variant-group merge-group">
+      <table className="merge-table">
+        <thead>
+          <tr>
+            <th scope="col">{t('settings.merge.keep')}</th>
+            <th scope="col">{t('settings.merge.fold')}</th>
+            <th scope="col">{t('library.add.bookTitle')}</th>
+            <th scope="col">{t('library.add.publisher')}</th>
+            <th scope="col">{t('library.add.year')}</th>
+            <th scope="col">{t('settings.merge.copies')}</th>
+            <th scope="col">{t('settings.merge.filled')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {group.books.map((b) => (
+            <tr key={b.id} className={b.id === keepId ? 'is-keeper' : ''}>
+              <td>
+                <input
+                  type="radio"
+                  name={`keep-${group.key}`}
+                  checked={b.id === keepId}
+                  aria-label={t('settings.merge.keepThis', { title: describe(b) })}
+                  onChange={() => { setKeepId(b.id); setPreview(null); }}
+                />
+              </td>
+              <td>
+                <input
+                  type="checkbox"
+                  checked={b.id !== keepId && chosen.has(b.id)}
+                  disabled={b.id === keepId}
+                  aria-label={t('settings.merge.foldThis', { title: describe(b) })}
+                  onChange={() => toggle(b.id)}
+                />
+              </td>
+              <td>
+                {b.title}
+                {b.author ? <span className="muted small"> · {b.author}</span> : null}
+                {b.openLoans > 0 ? <span className="badge warn">{t('settings.merge.onLoan')}</span> : null}
+              </td>
+              <td className="muted small">{b.publisher || '—'}</td>
+              <td className="muted small">{b.dateEdtf || '—'}</td>
+              <td className="muted small">
+                {b.items.length === 0 ? '—' : b.items.map((i) => i.shelfCode || '—').join(', ')}
+              </td>
+              <td className="muted small">{b.filledFields}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      {group.differingFields.length > 0 && (
+        <p className="muted small" style={{ margin: '0.5rem 0 0' }}>
+          {t('settings.merge.differs', { fields: group.differingFields.join(', ') })}
+        </p>
+      )}
+      {blocked.length > 0 && (
+        <p className="small" style={{ margin: '0.5rem 0 0', color: 'var(--danger)' }}>
+          {t('settings.merge.blockedLoan')}
+        </p>
+      )}
+
+      {preview && (
+        <div className="merge-preview">
+          <p className="small" style={{ margin: 0 }}>
+            {t('settings.merge.previewCopies', { n: preview.copiesAfter, removed: preview.recordsRemoved })}
+          </p>
+          {Object.keys(preview.wouldFillFields).length > 0 && (
+            <p className="muted small" style={{ margin: '0.25rem 0 0' }}>
+              {t('settings.merge.previewFills', { fields: Object.keys(preview.wouldFillFields).join(', ') })}
+            </p>
+          )}
+          {Object.keys(preview.wouldRescueAttributes).length > 0 && (
+            <p className="muted small" style={{ margin: '0.25rem 0 0' }}>
+              {t('settings.merge.previewAttrs', { fields: Object.keys(preview.wouldRescueAttributes).join(', ') })}
+            </p>
+          )}
+          {preview.wouldAddTags.length > 0 && (
+            <p className="muted small" style={{ margin: '0.25rem 0 0' }}>
+              {t('settings.merge.previewTags', { tags: preview.wouldAddTags.join(', ') })}
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="variant-merge-row" style={{ justifyContent: 'flex-end' }}>
+        <button
+          type="button"
+          className="secondary small"
+          disabled={mergeIds.length === 0 || busy}
+          onClick={async () => {
+            setBusy(true);
+            try { setPreview(await onPreview(keepId, mergeIds)); } finally { setBusy(false); }
+          }}
+        >{t('settings.merge.preview')}</button>
+        <button
+          type="button"
+          className="primary small"
+          disabled={!canMerge}
+          onClick={async () => {
+            setBusy(true);
+            try { if (await onMerge(keepId, mergeIds)) setDone(true); } finally { setBusy(false); }
+          }}
+        >{t('settings.merge.doIt', { n: mergeIds.length })}</button>
       </div>
     </div>
   );
@@ -1605,6 +1788,13 @@ function App() {
   type VariantField = 'author' | 'publisher' | 'language' | 'shelfCode' | 'title';
   const [variantField, setVariantField] = useState<VariantField>('publisher');
   const [valueVariants, setValueVariants] = useState<ValueVariantGroup[]>([]);
+  // Duplicate-record merge tool.
+  const [mergeGroups, setMergeGroups] = useState<MergeCandidateGroup[]>([]);
+  const [mergeTotal, setMergeTotal] = useState(0);
+  const [mergeStrict, setMergeStrict] = useState(true);
+  const [mergeQuery, setMergeQuery] = useState('');
+  const [mergeLoading, setMergeLoading] = useState(false);
+  const [mergeScanned, setMergeScanned] = useState(false);
   const [variantsScanned, setVariantsScanned] = useState(false);
   const [variantsLoading, setVariantsLoading] = useState(false);
   const [showDuplicatesPanel, setShowDuplicatesPanel] = useState(false);
@@ -3417,6 +3607,61 @@ function App() {
       await Promise.all([loadValueVariants(field), loadBooks(), loadFacets()]);
     } catch (e) {
       setError((e as Error).message);
+    }
+  }
+
+  async function loadMergeCandidates(strict: boolean) {
+    clearStatus();
+    setMergeStrict(strict);
+    setMergeLoading(true);
+    try {
+      const res = await apiRequest<{ groups: MergeCandidateGroup[]; total: number }>(
+        `/api/books/merge-candidates?limit=50&match=${strict ? 'strict' : 'loose'}`
+        + `&q=${encodeURIComponent(mergeQuery.trim())}`
+      );
+      setMergeGroups(res.groups ?? []);
+      setMergeTotal(res.total ?? 0);
+      setMergeScanned(true);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setMergeLoading(false);
+    }
+  }
+
+  // Dry run: the server reports exactly what it would change and writes nothing.
+  async function previewMerge(keepId: string, mergeIds: string[]): Promise<MergePreview | null> {
+    clearStatus();
+    try {
+      return await apiRequest<MergePreview>('/api/books/merge', {
+        method: 'POST',
+        body: JSON.stringify({ keepId, mergeIds, dryRun: true })
+      });
+    } catch (e) {
+      setError((e as Error).message);
+      return null;
+    }
+  }
+
+  async function performMerge(keepId: string, mergeIds: string[]): Promise<boolean> {
+    const ok = await confirm({
+      title: t('settings.merge.confirmTitle'),
+      body: t('settings.merge.confirmBody', { n: mergeIds.length }),
+      confirmLabel: t('settings.merge.confirmOk')
+    });
+    if (!ok) return false;
+    clearStatus();
+    try {
+      const res = await runAction(() => apiRequest<{ copiesMoved: number; copiesAfter: number }>('/api/books/merge', {
+        method: 'POST',
+        body: JSON.stringify({ keepId, mergeIds, dryRun: false })
+      }));
+      setMessage(t('settings.merge.merged', { n: mergeIds.length, copies: res.copiesAfter }));
+      await Promise.all([loadBooks(), loadFacets()]);
+      return true;
+    } catch (e) {
+      setError((e as Error).message);
+      return false;
     }
   }
 
@@ -8261,6 +8506,58 @@ function App() {
                               mergeLabel={t('settings.vc.merge')}
                               keepLabel={t('settings.vc.useAsCanonical')}
                               onMerge={(canon) => void consolidateVariantGroup(variantField, g, canon)}
+                            />
+                          ))}
+                        </div>
+                      )
+                    )}
+                  </div>
+                )}
+
+                {/* Duplicate records → one record, many copies */}
+                {canWrite && (
+                  <div className="card">
+                    <h3>{t('settings.merge.heading')}</h3>
+                    <p className="muted small" style={{ marginBottom: '1rem' }}>{t('settings.merge.intro')}</p>
+                    <div className="search-bar" style={{ alignItems: 'flex-end' }}>
+                      <div className="filter-field">
+                        <label>{t('settings.merge.match')}</label>
+                        <select
+                          value={mergeStrict ? 'strict' : 'loose'}
+                          onChange={(e) => { setMergeStrict(e.target.value === 'strict'); setMergeScanned(false); setMergeGroups([]); }}
+                        >
+                          <option value="strict">{t('settings.merge.matchStrict')}</option>
+                          <option value="loose">{t('settings.merge.matchLoose')}</option>
+                        </select>
+                      </div>
+                      <div className="filter-field">
+                        <label>{t('settings.merge.filter')}</label>
+                        <input
+                          value={mergeQuery}
+                          placeholder={t('settings.merge.filterHint')}
+                          onChange={(e) => { setMergeQuery(e.target.value); setMergeScanned(false); }}
+                        />
+                      </div>
+                      <div className="search-actions">
+                        <label>.</label>
+                        <button className="secondary" disabled={mergeLoading} onClick={() => void loadMergeCandidates(mergeStrict)}>
+                          {mergeLoading ? t('settings.vc.scanning') : t('settings.vc.scan')}
+                        </button>
+                      </div>
+                    </div>
+                    {mergeScanned && !mergeLoading && (
+                      mergeGroups.length === 0 ? (
+                        <p className="muted small" style={{ marginTop: '0.75rem' }}>{t('settings.merge.none')}</p>
+                      ) : (
+                        <div style={{ marginTop: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                          <p className="muted small">{t('settings.merge.foundNote', { n: mergeTotal, shown: mergeGroups.length })}</p>
+                          {mergeGroups.map((g) => (
+                            <MergeGroupCard
+                              key={g.key}
+                              group={g}
+                              t={t}
+                              onPreview={previewMerge}
+                              onMerge={performMerge}
                             />
                           ))}
                         </div>

@@ -142,6 +142,25 @@ export const BookSchema = CreateBookSchema.extend({
   version: z.number().int().min(0)
 });
 
+/**
+ * Fold duplicate records into copies of one survivor.
+ *
+ * The librarian catalogued ~44 books twice because each also sits on a back
+ * shelf. With holdings, each of those pairs should be ONE record with two
+ * copies — this is that cleanup.
+ *
+ * `dryRun` is the default on the client: a merge soft-deletes records and moves
+ * their holdings, and the operator needs to see exactly what would happen
+ * first. Never run unattended over the catalogue.
+ */
+export const MergeBooksSchema = z.object({
+  /** The record that survives and absorbs the others. */
+  keepId: z.string().min(1),
+  /** Records folded into it. Soft-deleted, with a `merged_into` forwarding address. */
+  mergeIds: z.array(z.string().min(1)).min(1).max(20),
+  dryRun: z.boolean().default(true)
+});
+
 // ─── Publication dates (EDTF) ──────────────────────────────────────────────
 //
 // A plain integer year cannot say what an old theological collection actually

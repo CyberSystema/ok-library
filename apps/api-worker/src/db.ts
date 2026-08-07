@@ -128,7 +128,8 @@ const SNAKE_TO_CAMEL_BOOK_FIELDS: Record<string, string> = {
   cover_url: 'coverUrl',
   created_at: 'createdAt',
   updated_at: 'updatedAt',
-  deleted_at: 'deletedAt'
+  deleted_at: 'deletedAt',
+  merged_into: 'mergedInto'
 };
 
 // Internal search-index columns. `SELECT b.*` picks them up and parseBook used
@@ -182,6 +183,9 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
   out.createdAt = row.created_at ?? null;
   out.updatedAt = row.updated_at ?? null;
   out.deletedAt = row.deleted_at ?? null;
+  // The forwarding address left by a merge. Only ever set on a soft-deleted
+  // row, so the trash view can say where the record went.
+  out.mergedInto = row.merged_into ?? null;
   return out;
 }
 
@@ -735,6 +739,77 @@ export async function loadOaiPage(
   return {
     rows: (rowsRes.results ?? []).map(parseBook),
     total: Number(countRes?.n ?? 0)
+  };
+}
+
+/**
+ * Groups of records that look like the same book catalogued more than once.
+ *
+ * Grouped on the accent+case fold of title AND author together — title alone
+ * would propose merging "ΠΟΙΗΜΑΤΑ" by four different poets. Blank authors are
+ * folded to one bucket so the catalogue's author-less entries still group.
+ *
+ * Read-only. Deciding whether two records are the same book is a judgement the
+ * librarian makes; this only narrows the field.
+ *
+ * Two strictnesses, because title+author alone finds 367 groups in this
+ * catalogue and most are NOT the back-shelf duplication — two printings of the
+ * same work by the same author legitimately share both. `strict` also requires
+ * the publisher, the year and the ISBN to agree, which is the shape of a record
+ * that was copied rather than catalogued twice, and is the safe bulk case.
+ */
+export async function loadMergeCandidateGroups(
+  env: Env,
+  opts: { limit: number; offset: number; strict?: boolean; q?: string }
+): Promise<{ groups: Array<{ key: string; bookIds: string[] }>; total: number }> {
+  // `IFNULL(fold, raw)` because rows written before migration 0012 can still
+  // have a null fold; without it those books would never be offered.
+  const parts = [
+    `IFNULL(b.title_fold, LOWER(TRIM(b.title)))`,
+    `IFNULL(b.author_fold, LOWER(TRIM(b.author)))`
+  ];
+  if (opts.strict) {
+    parts.push(
+      `IFNULL(b.publisher_fold, LOWER(TRIM(COALESCE(b.publisher, ''))))`,
+      `COALESCE(CAST(b.publication_year AS TEXT), '')`,
+      `IFNULL(b.isbn_fold, LOWER(TRIM(COALESCE(b.isbn, ''))))`
+    );
+  }
+  const keyExpr = parts.join(` || CHAR(31) || `);
+
+  // Narrowing by title, so the librarian can work one shelf or one series at a
+  // time instead of a 367-group list. Folded on both sides, matching how the
+  // rest of the catalogue searches: an accent typed or not typed is the same.
+  const q = foldDiacritics((opts.q ?? '').trim());
+  const where = `WHERE b.deleted_at IS NULL AND TRIM(COALESCE(b.title, '')) <> ''`
+    + (q ? ` AND IFNULL(b.title_fold, LOWER(TRIM(b.title))) LIKE ?` : '');
+  const filterArgs = q ? [`%${q.replace(/[%_]/g, '')}%`] : [];
+
+  const [countRes, rows] = await Promise.all([
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT ${keyExpr} AS k FROM books b
+          ${where}
+          GROUP BY k HAVING COUNT(*) > 1)`
+    ).bind(...filterArgs).first<{ n: number }>(),
+    env.DB.prepare(
+      `SELECT ${keyExpr} AS k, GROUP_CONCAT(b.id) AS ids, COUNT(*) AS n
+         FROM books b
+        ${where}
+        GROUP BY k HAVING COUNT(*) > 1
+        ORDER BY n DESC, k ASC
+        LIMIT ? OFFSET ?`
+    ).bind(...filterArgs, opts.limit, opts.offset).all<{ k: string; ids: string; n: number }>()
+  ]);
+
+  return {
+    total: Number(countRes?.n ?? 0),
+    // CHAR(31) is a separator, not content: it cannot occur in a catalogue
+    // string, which is the point, but it must not travel to the client either.
+    groups: (rows.results ?? []).map((r) => ({
+      key: (r.k ?? '').replaceAll('\u001f', ' · '),
+      bookIds: (r.ids ?? '').split(',').filter(Boolean)
+    }))
   };
 }
 
