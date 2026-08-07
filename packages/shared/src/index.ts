@@ -120,6 +120,64 @@ export const BookSchema = CreateBookSchema.extend({
   version: z.number().int().min(0)
 });
 
+// ─── Holdings ──────────────────────────────────────────────────────────────
+// An Item is one physical copy of a bibliographic record — the shelf-level
+// object, as distinct from the edition it is a copy of. Splitting the two is
+// what lets one record be held twice (front shelf and back shelf) without
+// cataloguing it twice.
+
+export const ItemCoreSchema = z.object({
+  // Free text: real volume designations are "Α'", "τ. 3", "1-2".
+  volumeNum: z.string().max(64).optional().nullable(),
+  volumeLabel: z.string().max(300).optional().nullable(),
+  roomCode: z.string().max(64).optional().nullable(),
+  shelfCode: z.string().max(64).optional().nullable(),
+  callNumber: z.string().max(120).optional().nullable(),
+  itemType: z.string().max(40).default('book'),
+  condition: z.string().max(120).optional().nullable(),
+  acquisitionDate: ISODateTimeSchema.optional().nullable(),
+  notes: z.string().max(2000).optional().nullable(),
+  // Code 128 payload. Unique across the catalogue when present.
+  barcode: z.string().max(64).optional().nullable()
+});
+
+export const ItemSchema = ItemCoreSchema.extend({
+  id: z.string().min(1),
+  bookId: z.string().min(1),
+  copyNumber: z.number().int().min(1),
+  status: BookStatusSchema,
+  createdAt: ISODateTimeSchema,
+  updatedAt: ISODateTimeSchema,
+  version: z.number().int().min(0)
+});
+
+// Whole-array replace, mirroring PUT /api/books/:id/attributes — the form edits
+// a book's copies as one list, and replace keeps the offline queue trivial.
+// `id` is optional: present means "update this copy", absent means "add one".
+export const ReplaceItemsSchema = z.object({
+  expectedVersion: z.number().int().min(0).optional(),
+  items: z.array(
+    ItemCoreSchema.extend({
+      id: z.string().min(1).optional(),
+      // Status is owned by the circulation flow, never by this form.
+      copyNumber: z.number().int().min(1).optional()
+    })
+  ).max(200)
+});
+
+// Add N copies to each of the given books, optionally overriding where they go.
+// This is the answer to "29 volumes, each also on the back shelf" — one action
+// instead of 29 re-typed records.
+export const AddCopiesSchema = z.object({
+  bookIds: z.array(z.string().min(1)).min(1).max(500),
+  copies: z.number().int().min(1).max(10).default(1),
+  shelfCode: z.string().max(64).optional().nullable(),
+  roomCode: z.string().max(64).optional().nullable(),
+  // A second exemplar of the same volume is not a new position in a set, so
+  // the volume designation is dropped unless explicitly kept.
+  copyVolume: z.boolean().default(false)
+});
+
 export const BorrowBookSchema = z.object({
   // Either pick an existing borrower (preferred — gives them a profile + history)…
   borrowerId: z.string().min(1).optional().nullable(),

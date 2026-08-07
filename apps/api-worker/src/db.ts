@@ -436,6 +436,178 @@ function buildFtsQuery(opts: {
   return formatted.join(joiner);
 }
 
+// ─── Holdings ──────────────────────────────────────────────────────────────
+
+const SNAKE_TO_CAMEL_ITEM_FIELDS: Record<string, string> = {
+  book_id: 'bookId',
+  copy_number: 'copyNumber',
+  volume_num: 'volumeNum',
+  volume_label: 'volumeLabel',
+  room_code: 'roomCode',
+  shelf_code: 'shelfCode',
+  call_number: 'callNumber',
+  item_type: 'itemType',
+  acquisition_date: 'acquisitionDate',
+  created_at: 'createdAt',
+  updated_at: 'updatedAt',
+  deleted_at: 'deletedAt'
+};
+
+export function parseItem(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[SNAKE_TO_CAMEL_ITEM_FIELDS[key] ?? key] = value;
+  }
+  return out;
+}
+
+export async function loadBookItems(env: Env, bookId: string): Promise<Array<Record<string, unknown>>> {
+  const rows = await env.DB.prepare(
+    `SELECT * FROM items WHERE book_id = ? AND deleted_at IS NULL
+      ORDER BY copy_number ASC, created_at ASC, id ASC`
+  ).bind(bookId).all<Record<string, unknown>>();
+  return (rows.results ?? []).map(parseItem);
+}
+
+/**
+ * Load the copies for many books at once, keyed by book id.
+ *
+ * The list view renders a location per row, and doing that with one query per
+ * book would be 50 extra D1 round-trips per page. Ids are interpolated after a
+ * strict shape check because SQLite has no array binding — the same approach
+ * `/api/books/by-ids` already takes.
+ */
+export async function loadItemsForBooks(
+  env: Env,
+  bookIds: string[]
+): Promise<Map<string, Array<Record<string, unknown>>>> {
+  const out = new Map<string, Array<Record<string, unknown>>>();
+  const safe = bookIds.filter((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id));
+  if (safe.length === 0) return out;
+  const placeholders = safe.map(() => '?').join(',');
+  const rows = await env.DB.prepare(
+    `SELECT * FROM items WHERE deleted_at IS NULL AND book_id IN (${placeholders})
+      ORDER BY copy_number ASC, created_at ASC, id ASC`
+  ).bind(...safe).all<Record<string, unknown>>();
+  for (const row of rows.results ?? []) {
+    const parsed = parseItem(row);
+    const key = String(parsed.bookId);
+    const list = out.get(key);
+    if (list) list.push(parsed);
+    else out.set(key, [parsed]);
+  }
+  return out;
+}
+
+/**
+ * Make sure a record has a primary copy, and that it carries the record's own
+ * location.
+ *
+ * The single-book form still edits `books.shelf_code` directly — it is one
+ * book in one place, and making the librarian open a holdings editor to move it
+ * would be worse, not better. So the write flows record → primary copy here,
+ * and `syncBookFromItems` flows the other way when the copies themselves are
+ * edited. A book created before this layer existed, or created by an old
+ * offline client, gets its copy minted on the next write rather than staying
+ * invisible to every location filter.
+ */
+export async function ensurePrimaryItem(
+  env: Env,
+  bookId: string,
+  book: { shelfCode?: string | null; roomCode?: string | null; status?: string; acquisitionDate?: string | null }
+): Promise<void> {
+  const now = nowIso();
+  const primary = await env.DB.prepare(
+    `SELECT id FROM items WHERE book_id = ? AND deleted_at IS NULL
+      ORDER BY copy_number ASC, created_at ASC, id ASC LIMIT 1`
+  ).bind(bookId).first<{ id: string }>();
+
+  if (primary) {
+    await env.DB.prepare(
+      'UPDATE items SET shelf_code = ?, room_code = ?, updated_at = ? WHERE id = ?'
+    ).bind(book.shelfCode ?? null, book.roomCode ?? null, now, primary.id).run();
+    return;
+  }
+  await env.DB.prepare(
+    `INSERT INTO items (id, book_id, copy_number, room_code, shelf_code, item_type, status,
+                        acquisition_date, created_at, updated_at, version)
+     VALUES (?, ?, 1, ?, ?, 'book', ?, ?, ?, ?, 0)`
+  ).bind(
+    `itm_${bookId.replace(/-/g, '')}`,
+    bookId,
+    book.roomCode ?? null,
+    book.shelfCode ?? null,
+    // Never mint a copy already on loan; circulation owns that transition.
+    book.status === 'borrowed' ? 'borrowed' : (book.status ?? 'available'),
+    book.acquisitionDate ?? null,
+    now, now
+  ).run();
+}
+
+/**
+ * Soft-delete a record's copies alongside the record itself.
+ *
+ * Only touches copies that are currently live. A copy the librarian removed
+ * earlier stays removed, and — because the stamp it carries is the book's own
+ * deletion time — `restoreItemsDeletedAt` can tell the two apart.
+ */
+export async function setItemsDeleted(env: Env, bookId: string, deletedAt: string): Promise<void> {
+  await env.DB.prepare(
+    'UPDATE items SET deleted_at = ?, updated_at = ? WHERE book_id = ? AND deleted_at IS NULL'
+  ).bind(deletedAt, nowIso(), bookId).run();
+}
+
+/**
+ * Bring back exactly the copies that the book's deletion took down.
+ *
+ * Matching on the deletion timestamp matters: clearing `deleted_at` for every
+ * copy of the record would resurrect ones the librarian had deliberately
+ * removed beforehand, silently putting books back on shelves they are not on.
+ * Caught by the regression gate — the naive version restored a third copy.
+ */
+export async function restoreItemsDeletedAt(
+  env: Env,
+  bookId: string,
+  deletedAt: string | null
+): Promise<void> {
+  if (!deletedAt) return;
+  await env.DB.prepare(
+    'UPDATE items SET deleted_at = NULL, updated_at = ? WHERE book_id = ? AND deleted_at = ?'
+  ).bind(nowIso(), bookId, deletedAt).run();
+}
+
+/**
+ * Keep the record's own location and status agreeing with its copies.
+ *
+ * `books.shelf_code` / `room_code` / `status` stay populated deliberately: the
+ * CSV export, the label printer, sorting and every existing consumer read them,
+ * and rewriting all of that at once would be a far riskier change than keeping
+ * one derived value honest. The record now shows its PRIMARY copy's location
+ * (lowest copy_number), and is available if ANY copy is.
+ *
+ * Location *filtering* does not use these — it queries items directly, so a
+ * book held in two places is found under both.
+ */
+export async function syncBookFromItems(env: Env, bookId: string): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE books SET
+       shelf_code = (SELECT i.shelf_code FROM items i
+                      WHERE i.book_id = books.id AND i.deleted_at IS NULL
+                      ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1),
+       room_code  = (SELECT i.room_code FROM items i
+                      WHERE i.book_id = books.id AND i.deleted_at IS NULL
+                      ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1),
+       status = CASE
+         WHEN EXISTS (SELECT 1 FROM items i WHERE i.book_id = books.id AND i.deleted_at IS NULL
+                                              AND i.status = 'available') THEN 'available'
+         ELSE COALESCE((SELECT i.status FROM items i
+                         WHERE i.book_id = books.id AND i.deleted_at IS NULL
+                         ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1), books.status)
+       END
+     WHERE id = ?`
+  ).bind(bookId).run();
+}
+
 // Fields the facet rail can group by, and that the `(empty)` bucket can filter
 // on. Whitelisted: a field name never reaches the SQL text unchecked, and a
 // custom key's JSON path is BOUND rather than interpolated.
@@ -454,6 +626,14 @@ const FACET_COLUMNS: Record<string, string> = {
   title: 'title',
   author: 'author',
   isbn: 'isbn'
+};
+
+// Fields that live on the COPIES rather than the record. Faceting and filtering
+// on these has to go through `items`, or a book held in two places is only ever
+// counted at one of them.
+export const ITEM_BACKED_FACETS: Record<string, string> = {
+  shelfCode: 'shelf_code',
+  roomCode: 'room_code'
 };
 
 export function resolveEmptyFieldExpr(
@@ -574,7 +754,10 @@ export async function queryBooksWithFilters(
     where.push("(b.isbn IS NULL OR TRIM(b.isbn) = '')");
   }
   if (opts.missingShelf) {
-    where.push("(b.shelf_code IS NULL OR TRIM(b.shelf_code) = '')");
+    // "Unshelved" means no copy has a location — a record with one copy on a
+    // shelf and one still unplaced is not lost, so it must not appear here.
+    where.push(`NOT EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
+                             AND TRIM(COALESCE(i.shelf_code, '')) <> '')`);
   }
   if (opts.untitled) {
     where.push("(b.title = '(Untitled)' OR b.title IS NULL OR TRIM(b.title) = '')");
@@ -596,31 +779,57 @@ export async function queryBooksWithFilters(
   // loosely (synonyms, substrings, or value-equals-'' which misses absent keys)
   // and would return a different number than the rail advertised.
   if (opts.facetField && opts.facetValue !== undefined && opts.facetValue !== '') {
-    const spec = resolveEmptyFieldExpr(opts.facetField);
-    if (spec) {
-      where.push(`TRIM(COALESCE(CAST(${spec.expr} AS TEXT), '')) = ?`);
-      values.push(...spec.bind, opts.facetValue);
+    const itemColumn = ITEM_BACKED_FACETS[opts.facetField];
+    if (itemColumn) {
+      // "has a copy there" — the same thing the facet counted.
+      where.push(`EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
+                           AND TRIM(COALESCE(i.${itemColumn}, '')) = ?)`);
+      values.push(opts.facetValue);
+    } else {
+      const spec = resolveEmptyFieldExpr(opts.facetField);
+      if (spec) {
+        where.push(`TRIM(COALESCE(CAST(${spec.expr} AS TEXT), '')) = ?`);
+        values.push(...spec.bind, opts.facetValue);
+      }
     }
   }
   if (opts.emptyField) {
-    const spec = resolveEmptyFieldExpr(opts.emptyField);
-    if (spec) {
-      where.push(`TRIM(COALESCE(CAST(${spec.expr} AS TEXT), '')) = ''`);
-      values.push(...spec.bind);
+    const itemColumn = ITEM_BACKED_FACETS[opts.emptyField];
+    if (itemColumn) {
+      // "NO copy has one" — a record with one shelved and one unplaced copy is
+      // not missing a location, so it must not be listed here.
+      where.push(`NOT EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
+                               AND TRIM(COALESCE(i.${itemColumn}, '')) <> '')`);
+    } else {
+      const spec = resolveEmptyFieldExpr(opts.emptyField);
+      if (spec) {
+        where.push(`TRIM(COALESCE(CAST(${spec.expr} AS TEXT), '')) = ''`);
+        values.push(...spec.bind);
+      }
     }
   }
+  // Location filters run over the book's COPIES, not the record.
+  //
+  // A record can now be held in more than one place — the whole point of the
+  // holdings layer — so asking "what is on shelf 19-000 ΠΙΣΩ" has to mean "which
+  // records have a copy there". Matching `books.shelf_code` would only ever see
+  // the primary copy and would silently omit the back-shelf duplicates the
+  // librarian created the copies for.
+  //
   // Substring + case-insensitive so "06" matches "06-005", "06-105", etc.
-  // SQLite's LOWER() is ASCII-only, so it cannot case-fold Greek — a librarian
+  // SQLite's LOWER() is ASCII-only and cannot case-fold Greek — a librarian
   // typing "πισω" would never reach the stored "ΠΙΣΩ". Codes are persisted
   // upper-cased by normalizeCode, so upper-casing the needle the SAME way lets
   // the plain LIKE match Greek too, and the LOWER() pair still covers the
   // ASCII half for any legacy row that predates normalization.
   if (opts.roomCode) {
-    where.push('(LOWER(b.room_code) LIKE LOWER(?) OR b.room_code LIKE ?)');
+    where.push(`EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
+                         AND (LOWER(i.room_code) LIKE LOWER(?) OR i.room_code LIKE ?))`);
     values.push(`%${opts.roomCode}%`, `%${normalizeCode(opts.roomCode)}%`);
   }
   if (opts.shelfCode) {
-    where.push('(LOWER(b.shelf_code) LIKE LOWER(?) OR b.shelf_code LIKE ?)');
+    where.push(`EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
+                         AND (LOWER(i.shelf_code) LIKE LOWER(?) OR i.shelf_code LIKE ?))`);
     values.push(`%${opts.shelfCode}%`, `%${normalizeCode(opts.shelfCode)}%`);
   }
   // EXACT "same as this book" criteria, used by the criteria-based selection
@@ -643,15 +852,20 @@ export async function queryBooksWithFilters(
     values.push(foldDiacritics(opts.publisherExact), opts.publisherExact.trim());
   }
   if (opts.shelfExact !== undefined) {
+    // Over COPIES, so "select everything on this shelf" reaches the back-shelf
+    // duplicates as well as the primary copies.
+    //
     // Two bound forms, because Greek has two upper-case spellings in play:
     // `normalizeCode` produces the correct accent-less "ΠΙΣΩ", while rows
     // written before that fix hold "ΠΊΣΩ" from a plain .toUpperCase(). Matching
-    // both means "select every book on this shelf" keeps working during the
-    // window before POST /api/admin/normalize-books has healed the catalogue.
-    // For every non-Greek code the two forms are identical and this degenerates
-    // to the original single comparison.
+    // both keeps this working during the window before
+    // POST /api/admin/normalize-books has healed the catalogue. For every
+    // non-Greek code the two forms are identical and this degenerates to the
+    // original single comparison.
     const shelfTrimmed = opts.shelfExact.trim();
-    where.push("(UPPER(TRIM(COALESCE(b.shelf_code, ''))) = ? OR TRIM(COALESCE(b.shelf_code, '')) = ?)");
+    where.push(`EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
+                         AND (UPPER(TRIM(COALESCE(i.shelf_code, ''))) = ?
+                              OR TRIM(COALESCE(i.shelf_code, '')) = ?))`);
     values.push(shelfTrimmed.toUpperCase(), normalizeCode(shelfTrimmed));
   }
   for (const filter of opts.customFilters) {

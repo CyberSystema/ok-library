@@ -697,6 +697,79 @@ check("an unknown facet field is rejected", st == 400, f"{st} {r}")
 st, r = call("GET", "/api/facets?field=" + urllib.parse.quote("custom:bad key"))
 check("a malformed custom key is rejected", st == 400, f"{st} {r}")
 
+print("=== 30. REGRESSION: holdings — one record, copies in several places ===")
+# The librarian catalogued 29 volumes twice because each also sits on the back
+# shelf. With a holdings layer that is one record with two copies, and the
+# record has to be findable at BOTH locations — which is the whole point.
+hb, _ = mkbook(shelfCode="19-000")
+got = get(hb)
+check("a new record is given a copy automatically",
+      len(got.get("items", [])) == 1, got.get("items"))
+check("that copy inherits the record's location",
+      (got.get("items") or [{}])[0].get("shelfCode") == "19-000", got.get("items"))
+
+st, r = call("POST", "/api/items/add-copies",
+             {"bookIds": [hb], "copies": 1, "shelfCode": "19-000 πίσω"})
+check("add-copies succeeds", st == 200 and (r or {}).get("created") == 1, f"{st} {r}")
+got = get(hb)
+shelves = sorted((i.get("shelfCode") or "") for i in got.get("items", []))
+check("the record now has two copies", len(got.get("items", [])) == 2, got.get("items"))
+check("the second copy is on the back shelf, Greek-cased correctly",
+      shelves == ["19-000", "19-000 ΠΙΣΩ"], shelves)
+check("copy numbers continue rather than restart",
+      sorted(i["copyNumber"] for i in got["items"]) == [1, 2],
+      [i["copyNumber"] for i in got["items"]])
+# A duplicate exemplar is not a new position in a set — carrying volume_num over
+# would make a 29-volume set look complete twice to the gap report.
+check("a copy does not inherit the volume designation by default",
+      all(not i.get("volumeNum") for i in got["items"]), got["items"])
+
+for probe in ["19-000", "19-000 ΠΙΣΩ", "19-000 πίσω"]:
+    st, r = call("GET", "/api/books/ids?shelfExact=" + urllib.parse.quote(probe))
+    check(f"the record is found on shelf {probe!r}", hb in ((r or {}).get("ids") or []), probe)
+# The record's own shelf stays the PRIMARY copy's, because the CSV export, the
+# label printer and sorting all still read it.
+check("the record reports its primary copy's location", get(hb)["shelfCode"] == "19-000", get(hb)["shelfCode"])
+
+# The list payload has to carry holdings, or the UI cannot show where a book is.
+st, r = call("GET", "/api/books?pageSize=100&facetField=shelfCode&facetValue=" + urllib.parse.quote("19-000 ΠΙΣΩ"))
+row = next((x for x in (r or {}).get("items", []) if x["id"] == hb), None)
+check("the list payload carries each record's copies", row is not None and len(row.get("items", [])) == 2, row)
+
+# A book with one shelved and one unplaced copy is NOT unshelved.
+st, r = call("PUT", f"/api/books/{hb}/items", {"items": [
+    {"shelfCode": "19-000", "itemType": "book", "id": got["items"][0]["id"]},
+    {"shelfCode": None, "itemType": "book"}
+]})
+check("copies can be replaced as a list", st == 200, f"{st} {r}")
+check("replacing drops the copies left out of the list",
+      len((r or {}).get("items", [])) == 2, (r or {}).get("items"))
+check("replace renumbers copies by position",
+      sorted(i["copyNumber"] for i in (r or {}).get("items", [])) == [1, 2],
+      [i.get("copyNumber") for i in (r or {}).get("items", [])])
+st, r = call("GET", "/api/books?pageSize=1&missingShelf=true&emptyField=shelfCode")
+check("a partly-shelved record does not count as unshelved",
+      hb not in [x["id"] for x in (r or {}).get("items", [])], (r or {}).get("total"))
+
+# Deleting the record must take its copies off the shelf, and restoring must
+# put them back — otherwise a deleted book keeps inflating a shelf count.
+call("DELETE", f"/api/books/{hb}")
+st, r = call("GET", "/api/books/ids?shelfExact=19-000")
+check("a deleted record leaves the shelf", hb not in ((r or {}).get("ids") or []), "still listed")
+call("POST", f"/api/books/{hb}/restore")
+st, r = call("GET", "/api/books/ids?shelfExact=19-000")
+check("restoring puts it back on the shelf", hb in ((r or {}).get("ids") or []), "not restored")
+check("restoring brings back exactly what the deletion took",
+      len(get(hb).get("items", [])) == 2, get(hb).get("items"))
+check("restoring does NOT resurrect a copy removed earlier",
+      all((i.get("shelfCode") or "") != "19-000 ΠΙΣΩ" for i in get(hb).get("items", [])),
+      get(hb).get("items"))
+
+# Optimistic locking on the holdings list — losing hand-entered copies to a
+# concurrent save is the loss §3/§14 guard against elsewhere.
+st, r = call("PUT", f"/api/books/{hb}/items", {"expectedVersion": 0, "items": []})
+check("a stale expectedVersion is rejected", st == 409, f"{st} {r}")
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

@@ -1,8 +1,10 @@
 import {
+	AddCopiesSchema,
 	BookFilterQuerySchema,
 	BorrowBookSchema,
 	CreateBookSchema,
 	GenerateCodeSchema,
+	ReplaceItemsSchema,
 	ImportBooksSchema,
 	ImportCatalogSchema,
 	ReturnBookSchema,
@@ -45,6 +47,14 @@ import {
 	replaceBookAttributeValues,
 	recordSyncMutation,
 	resolveEmptyFieldExpr,
+	ensurePrimaryItem,
+	setItemsDeleted,
+	restoreItemsDeletedAt,
+	ITEM_BACKED_FACETS,
+	loadBookItems,
+	loadItemsForBooks,
+	parseItem,
+	syncBookFromItems,
 	runAtomic,
 	semanticSearchBookIds,
 	semanticSearchEnabled,
@@ -55,7 +65,7 @@ import {
 	withTxn
 } from './db';
 import type { AuthClaims, Env } from './types';
-import { deterministicUuid, generateCodeValue, normalizeBookData, nowIso, safeJsonParse, toCsv } from './utils';
+import { deterministicUuid, generateCodeValue, newId, normalizeBookData, normalizeCode, nowIso, safeJsonParse, toCsv } from './utils';
 
 type App = Hono<{ Bindings: Env; Variables: { user: AuthClaims } }>;
 type AppContext = Context<{ Bindings: Env; Variables: { user: AuthClaims } }>;
@@ -72,6 +82,11 @@ type ExistingCustomFieldRef = {
 };
 
 const app: App = new Hono();
+
+// D1 caps a batch at 50 statements; add-copies can generate 500 books x 10
+// copies, so it chunks. Kept below the batch limit rather than at it, since
+// each chunk is a subrequest and the per-invocation budget is unconfirmed.
+const D1_ADD_COPIES_BATCH = 40;
 
 const DEFAULT_BOOK_STRUCTURE: DefaultBookStructureColumn[] = [
 	{ label: 'ID', coreKey: 'id' },
@@ -852,11 +867,21 @@ app.get('/api/books', async (c) => {
 
 	const total = cachedTotal !== undefined ? cachedTotal : result.total;
 
+	// Attach each record's copies in ONE extra query for the page, not one per
+	// row. The list has to show where a book actually is, and a record held on
+	// two shelves must say so rather than showing only its primary location.
+	const pageIds = result.rows.map((r) => String((r as { id: unknown }).id));
+	const itemsByBook = await loadItemsForBooks(c.env, pageIds);
+	const rowsWithItems = result.rows.map((r) => ({
+		...r,
+		items: itemsByBook.get(String((r as { id: unknown }).id)) ?? []
+	}));
+
 	const response = {
 		page: query.page,
 		pageSize: query.pageSize,
 		total,
-		items: result.rows
+		items: rowsWithItems
 	};
 
 	if (c.env.CACHE) {
@@ -1437,7 +1462,8 @@ app.get('/api/books/:id', async (c) => {
 	return c.json({
 		...parseBook(row as Record<string, unknown>),
 		attributeValues: attributes,
-		codes: codes.results
+		codes: codes.results,
+		items: await loadBookItems(c.env, id)
 	});
 });
 
@@ -1509,6 +1535,9 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 		.run();
 
 	await replaceBookAttributeValues(c.env, id, customFields);
+	// Every record needs a copy from the moment it exists, or it is invisible to
+	// every location filter and facet — those read holdings now, not the record.
+	await ensurePrimaryItem(c.env, id, payload);
 	// The book is already committed. A failure to invalidate the cache is a
 	// staleness problem, not a reason to report failure — reporting failure
 	// makes the client retry a write that already succeeded.
@@ -1767,6 +1796,9 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	}
 
 	await replaceBookAttributeValues(c.env, id, merged.customFields as Record<string, unknown>);
+	// The single-book form edits the record's own shelf; carry it to the primary
+	// copy so location filters agree with what the librarian just saved.
+	await ensurePrimaryItem(c.env, id, merged as { shelfCode?: string | null; roomCode?: string | null });
 	await bumpBooksCacheVersion(c.env);
 
 	// Re-embed if any field the embedding text consumes might have changed.
@@ -1827,6 +1859,13 @@ app.delete('/api/books/:id', requirePermission('books.delete'), async (c) => {
 		throw new HTTPException(404, { message: 'Book not found' });
 	}
 
+	// A record's copies go with it, so a deleted book stops appearing in shelf
+	// facets and location filters — those read holdings now.
+	//
+	// Stamped with the SAME `now` the book row got, not a fresh one: restore
+	// matches on that timestamp to bring back exactly these copies and not ones
+	// the librarian had removed earlier.
+	if (id) await setItemsDeleted(c.env, id, now);
 	await bumpBooksCacheVersion(c.env);
 	// Soft-deleted books should not surface from semantic search either.
 	// We remove the embedding now; if the book is restored later, restore
@@ -1845,6 +1884,13 @@ app.post('/api/books/:id/restore', requirePermission('books.delete'), async (c) 
 		throw new HTTPException(400, { message: 'Missing book id' });
 	}
 	const now = nowIso();
+	// Read the deletion stamp BEFORE clearing it: it identifies exactly which
+	// copies went down with the record, as opposed to ones the librarian had
+	// already removed. Restoring all of them would put books back on shelves
+	// they are not on.
+	const trashed = await c.env.DB.prepare(
+		'SELECT deleted_at FROM books WHERE id = ? AND deleted_at IS NOT NULL'
+	).bind(id).first<{ deleted_at: string }>();
 	const result = await c.env.DB.prepare(
 		`UPDATE books SET deleted_at = NULL, updated_at = ?, version = version + 1
 		 WHERE id = ? AND deleted_at IS NOT NULL`
@@ -1880,6 +1926,9 @@ app.post('/api/books/:id/restore', requirePermission('books.delete'), async (c) 
 			});
 		});
 	}
+	// Bring the copies back with the record — restore must return it to the
+	// shelf it was on, not leave it holdings-less.
+	await restoreItemsDeletedAt(c.env, id, trashed?.deleted_at ?? null);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.restore', 'book', id, {});
 	return c.json({ id, restored: true });
 });
@@ -1908,6 +1957,9 @@ app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) 
 		c.env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(id),
 		c.env.DB.prepare('DELETE FROM code_assignments WHERE book_id = ?').bind(id),
 		c.env.DB.prepare('DELETE FROM borrow_transactions WHERE book_id = ?').bind(id),
+		// Before the book row: items hold an FK to it, and purge is a hard delete.
+		c.env.DB.prepare('DELETE FROM bound_with_items WHERE book_id = ?').bind(id),
+		c.env.DB.prepare('DELETE FROM items WHERE book_id = ?').bind(id),
 		c.env.DB.prepare('DELETE FROM books WHERE id = ?').bind(id)
 	]);
 
@@ -2157,6 +2209,174 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 			updatedAt: (row as Record<string, unknown>).updated_at
 		}))
 	});
+});
+
+// ─── Holdings: the physical copies of a record ────────────────────────────
+
+app.get('/api/books/:id/items', async (c) => {
+	const id = c.req.param('id') ?? '';
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
+	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+	return c.json({ bookId: id, items: await loadBookItems(c.env, id) });
+});
+
+// Whole-array replace, mirroring PUT /api/books/:id/attributes — the form edits
+// a record's copies as one list, and replace keeps the offline queue trivial.
+//
+// Unlike /attributes this takes an `expectedVersion` and 409s on a mismatch:
+// losing a hand-entered set of holdings to a concurrent save is exactly the
+// data loss §3 and §14 of the regression gate exist to prevent.
+app.put('/api/books/:id/items', requirePermission('books.write', { librarian: true }), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const book = await c.env.DB.prepare(
+		'SELECT id, version FROM books WHERE id = ? AND deleted_at IS NULL'
+	).bind(id).first<{ id: string; version: number }>();
+	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+
+	const payload = ReplaceItemsSchema.parse(await c.req.json());
+	if (payload.expectedVersion !== undefined && payload.expectedVersion !== book.version) {
+		throw new HTTPException(409, { message: 'Book was modified by someone else' });
+	}
+
+	const existing = await loadBookItems(c.env, id);
+	const existingById = new Map(existing.map((i) => [String(i.id), i]));
+	const keptIds = new Set(payload.items.map((i) => i.id).filter(Boolean) as string[]);
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [];
+
+	// A copy that is on loan cannot be removed — that would strand the loan and
+	// lose the record of who has the book.
+	for (const prior of existing) {
+		if (keptIds.has(String(prior.id))) continue;
+		if (prior.status === 'borrowed') {
+			throw new HTTPException(409, { message: 'Cannot remove a copy that is on loan. Return it first.' });
+		}
+		statements.push(
+			c.env.DB.prepare('UPDATE items SET deleted_at = ?, updated_at = ? WHERE id = ?')
+				.bind(now, now, prior.id)
+		);
+	}
+
+	payload.items.forEach((item, index) => {
+		// Renumbered by position, always. This is a whole-array replace, so the
+		// order the librarian arranged IS the numbering — honouring a client-sent
+		// copyNumber instead let a kept copy and a new one both claim "copy 2".
+		const copyNumber = index + 1;
+		const shelfCode = item.shelfCode ? normalizeCode(item.shelfCode) || null : null;
+		const roomCode = item.roomCode ? normalizeCode(item.roomCode) || null : null;
+		const barcode = item.barcode?.trim() || null;
+		if (item.id && existingById.has(item.id)) {
+			statements.push(
+				c.env.DB.prepare(
+					`UPDATE items SET copy_number = ?, volume_num = ?, volume_label = ?, room_code = ?,
+					        shelf_code = ?, call_number = ?, item_type = ?, condition = ?,
+					        acquisition_date = ?, notes = ?, barcode = ?, updated_at = ?, version = version + 1
+					  WHERE id = ?`
+				).bind(
+					copyNumber, item.volumeNum ?? null, item.volumeLabel ?? null, roomCode,
+					shelfCode, item.callNumber ?? null, item.itemType, item.condition ?? null,
+					item.acquisitionDate ?? null, item.notes ?? null, barcode, now, item.id
+				)
+			);
+		} else {
+			statements.push(
+				c.env.DB.prepare(
+					`INSERT INTO items (id, book_id, barcode, copy_number, volume_num, volume_label,
+					                    room_code, shelf_code, call_number, item_type, status, condition,
+					                    acquisition_date, notes, created_at, updated_at, version)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, ?, ?, ?, 0)`
+				).bind(
+					newId('itm'), id, barcode, copyNumber, item.volumeNum ?? null, item.volumeLabel ?? null,
+					roomCode, shelfCode, item.callNumber ?? null, item.itemType,
+					item.condition ?? null, item.acquisitionDate ?? null, item.notes ?? null, now, now
+				)
+			);
+		}
+	});
+
+	statements.push(
+		c.env.DB.prepare('UPDATE books SET updated_at = ?, version = version + 1 WHERE id = ?').bind(now, id)
+	);
+	await runAtomic(c.env, statements);
+	// The record's own shelf/room/status are derived from its copies.
+	await syncBookFromItems(c.env, id);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.items.replace', 'book', id, {
+		count: payload.items.length
+	});
+
+	return c.json({ bookId: id, items: await loadBookItems(c.env, id) });
+});
+
+// Add copies to many records at once.
+//
+// This is request #7: the librarian catalogued 29 "Φιλοσοφία" volumes twice
+// because each also sits on "19-000 ΠΙΣΩ". With holdings, that is one action —
+// 29 records with two copies each, instead of 58 records.
+app.post('/api/items/add-copies', requirePermission('books.write', { librarian: true }), async (c) => {
+	const payload = AddCopiesSchema.parse(await c.req.json());
+	const ids = payload.bookIds.filter((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id));
+	if (ids.length === 0) throw new HTTPException(400, { message: 'No valid book ids' });
+
+	const placeholders = ids.map(() => '?').join(',');
+	const books = await c.env.DB.prepare(
+		`SELECT id FROM books WHERE deleted_at IS NULL AND id IN (${placeholders})`
+	).bind(...ids).all<{ id: string }>();
+	const found = (books.results ?? []).map((b) => b.id);
+	if (found.length === 0) throw new HTTPException(404, { message: 'No matching books' });
+
+	const existingItems = await loadItemsForBooks(c.env, found);
+	const now = nowIso();
+	const shelfCode = payload.shelfCode ? normalizeCode(payload.shelfCode) || null : null;
+	const roomCode = payload.roomCode ? normalizeCode(payload.roomCode) || null : null;
+
+	const statements: D1PreparedStatement[] = [];
+	let created = 0;
+	for (const bookId of found) {
+		const copies = existingItems.get(bookId) ?? [];
+		// Continue the record's own numbering rather than restarting at 1.
+		const highest = copies.reduce((max, i) => Math.max(max, Number(i.copyNumber ?? 0)), 0);
+		// A new copy inherits its location from the first existing one unless the
+		// operator said otherwise — that is what makes "same shelf, one more
+		// copy" a single click.
+		const template = copies[0];
+		for (let n = 1; n <= payload.copies; n += 1) {
+			statements.push(
+				c.env.DB.prepare(
+					`INSERT INTO items (id, book_id, copy_number, volume_num, volume_label,
+					                    room_code, shelf_code, item_type, status,
+					                    created_at, updated_at, version)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, 0)`
+				).bind(
+					newId('itm'), bookId, highest + n,
+					// A second exemplar of the same volume is not a new position in a
+					// set. Carrying volume_num across would make a 29-volume set look
+					// complete twice over to the gap report.
+					payload.copyVolume ? (template?.volumeNum ?? null) : null,
+					payload.copyVolume ? (template?.volumeLabel ?? null) : null,
+					roomCode ?? (template?.roomCode ?? null),
+					shelfCode ?? (template?.shelfCode ?? null),
+					String(template?.itemType ?? 'book'),
+					now, now
+				)
+			);
+			created += 1;
+		}
+	}
+
+	for (let i = 0; i < statements.length; i += D1_ADD_COPIES_BATCH) {
+		await runAtomic(c.env, statements.slice(i, i + D1_ADD_COPIES_BATCH));
+	}
+	// Only the record's derived status/location can have moved, and only for
+	// books that had no copies at all — but sync them anyway so the invariant
+	// holds without depending on that reasoning.
+	for (const bookId of found) await syncBookFromItems(c.env, bookId);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'items.addCopies', 'book', null, {
+		books: found.length, copiesEach: payload.copies, created, shelfCode
+	});
+
+	return c.json({ books: found.length, created, shelfCode, roomCode });
 });
 
 app.get('/api/books/:id/attributes', async (c) => {
@@ -3318,6 +3538,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					)
 					.run();
 				await replaceBookAttributeValues(c.env, id, customFields);
+				await ensurePrimaryItem(c.env, id, row);
 				resultData = { id };
 			} else if (mutation.operation === 'delete_book') {
 				// Deletion needs its OWN permission. The route is gated only on the
@@ -3347,6 +3568,9 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					if (openLoan) {
 						throw new HTTPException(409, { message: 'Cannot delete: the book is on loan. Return it first.' });
 					}
+				} else {
+					// Mirror the direct DELETE: the copies go with the record.
+					await setItemsDeleted(c.env, row.id, now);
 				}
 				resultData = { id: row.id };
 			} else if (mutation.operation === 'update_book') {
@@ -3483,6 +3707,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				}
 
 				await replaceBookAttributeValues(c.env, row.id, merged.customFields as Record<string, unknown>);
+				await ensurePrimaryItem(c.env, row.id, merged as { shelfCode?: string | null; roomCode?: string | null });
 				resultData = { id: row.id, version: merged.version };
 			} else if (mutation.operation === 'borrow_book') {
 				// Lending is a 'circulation' action — enforce it here too, otherwise
@@ -3999,18 +4224,58 @@ app.get('/api/facets', async (c) => {
 	// with 629 distinct category labels against a 600 limit, sorting it last
 	// truncated it away entirely — the rail silently lost the single row the
 	// librarian most needs, and the counts stopped summing to the catalogue.
-	const emptyExpr = `CASE WHEN TRIM(COALESCE(CAST(${resolved.expr} AS TEXT), '')) = '' THEN 1 ELSE 0 END`;
-	const valueExpr = `CASE WHEN TRIM(COALESCE(CAST(${resolved.expr} AS TEXT), '')) = '' THEN '' ELSE CAST(${resolved.expr} AS TEXT) END`;
-	const rows = await c.env.DB.prepare(
-		`SELECT ${emptyExpr} AS is_empty, ${valueExpr} AS value, COUNT(*) AS count
-		   FROM books
-		  WHERE deleted_at IS NULL
-		  GROUP BY is_empty, value
-		  ORDER BY is_empty DESC, count DESC, value ASC
-		  LIMIT ?`
-	).bind(...resolved.bind, ...resolved.bind, ...resolved.bind, limit).all<{
-		is_empty: number; value: string | null; count: number;
-	}>();
+	const itemColumn = ITEM_BACKED_FACETS[field];
+	let rows: { results?: Array<{ is_empty: number; value: string | null; count: number }> };
+
+	if (itemColumn) {
+		// Location facets count BOOKS PER PLACE, over the copies.
+		//
+		// Two queries rather than one GROUP BY, because the buckets ask different
+		// questions and a single grouping cannot express both: a populated bucket
+		// is "records with a copy HERE", while the empty bucket is "records with
+		// no copy anywhere" — a book with one shelved and one unplaced copy
+		// belongs in the first, not the second. Both match the list filter exactly.
+		//
+		// Note the counts can sum to MORE than the catalogue: a record held on two
+		// shelves genuinely appears at both. That is the answer the librarian is
+		// after when reconciling a shelf, so the response reports it rather than
+		// pretending the numbers partition.
+		const valued = await c.env.DB.prepare(
+			`SELECT 0 AS is_empty, TRIM(i.${itemColumn}) AS value, COUNT(DISTINCT i.book_id) AS count
+			   FROM items i JOIN books b ON b.id = i.book_id
+			  WHERE i.deleted_at IS NULL AND b.deleted_at IS NULL
+			    AND TRIM(COALESCE(i.${itemColumn}, '')) <> ''
+			  GROUP BY value
+			  ORDER BY count DESC, value ASC
+			  LIMIT ?`
+		).bind(limit).all<{ is_empty: number; value: string | null; count: number }>();
+		const none = await c.env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM books b
+			  WHERE b.deleted_at IS NULL
+			    AND NOT EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
+			                     AND TRIM(COALESCE(i.${itemColumn}, '')) <> '')`
+		).first<{ n: number }>();
+		const emptyCount = Number(none?.n ?? 0);
+		rows = {
+			results: [
+				...(emptyCount > 0 ? [{ is_empty: 1, value: '', count: emptyCount }] : []),
+				...(valued.results ?? [])
+			]
+		};
+	} else {
+		const emptyExpr = `CASE WHEN TRIM(COALESCE(CAST(${resolved.expr} AS TEXT), '')) = '' THEN 1 ELSE 0 END`;
+		const valueExpr = `CASE WHEN TRIM(COALESCE(CAST(${resolved.expr} AS TEXT), '')) = '' THEN '' ELSE CAST(${resolved.expr} AS TEXT) END`;
+		rows = await c.env.DB.prepare(
+			`SELECT ${emptyExpr} AS is_empty, ${valueExpr} AS value, COUNT(*) AS count
+			   FROM books
+			  WHERE deleted_at IS NULL
+			  GROUP BY is_empty, value
+			  ORDER BY is_empty DESC, count DESC, value ASC
+			  LIMIT ?`
+		).bind(...resolved.bind, ...resolved.bind, ...resolved.bind, limit).all<{
+			is_empty: number; value: string | null; count: number;
+		}>();
+	}
 
 	// The library total comes from the key the list handler already memoizes, so
 	// the rail's "All" row can never disagree with the unfiltered list.
@@ -4043,6 +4308,10 @@ app.get('/api/facets', async (c) => {
 		totalBooks,
 		truncated: items.length >= limit,
 		shownCount: items.reduce((sum, i) => sum + i.count, 0),
+		// A location facet counts records per place, and a record held in two
+		// places is genuinely in both buckets — so these counts overlap and do
+		// NOT partition the catalogue. Flagged so the UI never claims they add up.
+		overlapping: Boolean(itemColumn),
 		items
 	};
 	if (c.env.CACHE) {
