@@ -90,6 +90,7 @@ const SMART_LISTS: Array<SmartList & { labelKey: string }> = [
   { key: 'missing-shelf',    icon: '📍', labelKey: 'library.smart.missingShelf',   label: 'Missing shelf',    params: { missingShelf: '1' } },
   { key: 'untitled',         icon: '⊘',  labelKey: 'library.smart.untitled',       label: 'Untitled',         params: { untitled: '1' } },
   { key: 'unknown-author',   icon: '?',  labelKey: 'library.smart.unknownAuthor',  label: 'Unknown author',   params: { unknownAuthor: '1' } },
+  { key: 'bad-isbn',         icon: '⚠',  labelKey: 'library.smart.badIsbn',        label: 'Bad ISBN',         params: { invalidIsbn: '1' } },
   { key: 'pre-1900',         icon: '🏛', labelKey: 'library.smart.pre1900',        label: 'Before 1900',      params: { yearMax: '1899' } },
   { key: 'post-2000',        icon: '🆕', labelKey: 'library.smart.post2000',       label: 'From 2000+',       params: { yearMin: '2000' } },
   { key: 'borrowed',         icon: '🔁', labelKey: 'library.smart.borrowed',       label: 'Currently borrowed', params: { status: 'borrowed' } },
@@ -191,6 +192,7 @@ const CORE_TABLE_COLUMNS: Array<Omit<BookColumn, 'get'> & { get: (b: Book) => st
   { key: 'isbn', labelKey: 'library.add.isbn', get: (b) => b.isbn ?? '', width: 130 },
   { key: 'shelfCode', labelKey: 'library.add.shelf', get: (b) => b.shelfCode ?? '', width: 100 },
   { key: 'roomCode', labelKey: 'library.bulk.field.roomCode', get: (b) => b.roomCode ?? '', width: 90 },
+  { key: 'ddc', labelKey: 'library.add.ddc', get: (b) => b.ddc ?? '', width: 90 },
   { key: 'legacyId', labelKey: 'ctx.copyLegacy', get: (b) => b.legacyId ?? '', width: 100 },
   { key: 'description', labelKey: 'library.add.description', get: (b) => b.description ?? '', width: 220 }
 ];
@@ -963,6 +965,7 @@ function App() {
     publisherRomanized: '',
     publisher: '',
     language: '',
+    ddc: '',
     description: ''
   });
   const [createAttrValues, setCreateAttrValues] = useState<Record<string, unknown>>({});
@@ -991,6 +994,7 @@ function App() {
     version: 0,
     publisher: '',
     language: '',
+    ddc: '',
     description: ''
   });
   // Missing-required field keys flagged on the last edit-save attempt (mirrors
@@ -2806,6 +2810,7 @@ function App() {
           titleRomanized: createForm.titleRomanized.trim() || null,
           authorRomanized: createForm.authorRomanized.trim() || null,
           publisherRomanized: createForm.publisherRomanized.trim() || null,
+          ddc: createForm.ddc.trim() || null,
           dateEdtf,
           tags: [],
           customFields: customFieldsValue,
@@ -2827,6 +2832,7 @@ function App() {
     publisherRomanized: '',
         publisher: '',
         language: '',
+        ddc: '',
         description: ''
       });
       setCreateFieldErrors(new Set());
@@ -3047,6 +3053,7 @@ function App() {
       version: book.version,
       publisher: book.publisher ?? '',
       language: book.language ?? '',
+      ddc: book.ddc ?? '',
       description: book.description ?? ''
     });
     setCurrentSection('books');
@@ -3129,6 +3136,7 @@ function App() {
           titleRomanized: editForm.titleRomanized.trim() || null,
           authorRomanized: editForm.authorRomanized.trim() || null,
           publisherRomanized: editForm.publisherRomanized.trim() || null,
+          ddc: editForm.ddc.trim() || null,
           dateEdtf,
           customFields: customFieldsValue,
           status: editForm.status,
@@ -5086,6 +5094,7 @@ function App() {
       version: b.version,
       publisher: b.publisher ?? '',
       language: b.language ?? '',
+      ddc: b.ddc ?? '',
       description: b.description ?? ''
     });
     setAttributeEditorValues(b.customFields ?? {});
@@ -5711,7 +5720,26 @@ function App() {
                       {detailBook.isbn && (
                         <div className="detail-item">
                           <span className="di-label">{t('detail.isbn')}</span>
-                          <span className="di-value">{detailBook.isbn}</span>
+                          <span className="di-value">
+                            {detailBook.isbn}
+                            {/* The server has computed this on every read since
+                                Phase B and nothing has ever shown it, so a
+                                mistyped ISBN stayed silently wrong. A warning,
+                                never an error: small publishers really do
+                                misprint check digits, and refusing the value
+                                would make the book uncatalogueable. */}
+                            {detailBook.isbnValid === false && (
+                              <span className="badge warn" title={t('detail.isbnBadTitle')}>
+                                {t('detail.isbnBad')}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      )}
+                      {detailBook.ddc && (
+                        <div className="detail-item">
+                          <span className="di-label">{t('library.add.ddc')}</span>
+                          <span className="di-value">{detailBook.ddc}</span>
                         </div>
                       )}
                       {displayBookDate(detailBook) && (
@@ -6004,6 +6032,15 @@ function App() {
                     <div>
                       <label htmlFor="fld-detail-language">{t('detail.language')}</label>
                       <input id="fld-detail-language" list="suggest-language" value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder={t('detail.languagePh')} />
+                    </div>
+                    <div>
+                      <label htmlFor="fld-detail-ddc">{t('library.add.ddc')}</label>
+                      <input
+                        id="fld-detail-ddc"
+                        value={editForm.ddc}
+                        onChange={(e) => setEditForm({ ...editForm, ddc: e.target.value })}
+                        placeholder={t('library.add.ddcPh')}
+                      />
                     </div>
                   </div>
                   <div className="form-field">
@@ -6833,6 +6870,19 @@ function App() {
                           <label htmlFor="fld-library-add-language">{t('library.add.language')}</label>
                           <input id="fld-library-add-language" list="suggest-language" value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder={t('library.add.languagePh')} />
                         </div>
+                        <div>
+                          {/* Dewey sits ALONGSIDE the shelf mark, never replacing
+                              it — nobody is re-labelling 12,675 spines. It has been
+                              accepted by the API and written by the ISBN lookup and
+                              MARC import since Phase B with no field to show it. */}
+                          <label htmlFor="fld-library-add-ddc">{t('library.add.ddc')}</label>
+                          <input
+                            id="fld-library-add-ddc"
+                            value={createForm.ddc}
+                            onChange={(e) => setCreateForm({ ...createForm, ddc: e.target.value })}
+                            placeholder={t('library.add.ddcPh')}
+                          />
+                        </div>
                       </div>
                       <div className="form-field">
                         <label htmlFor="fld-library-add-description-2">{t('library.add.description')}</label>
@@ -7485,7 +7535,11 @@ function App() {
                                 <div className="book-card-meta">
                                   {displayBookDate(book) && <span className="meta-chip">{displayBookDate(book)}</span>}
                                   {book.language && <span className="meta-chip">{book.language}</span>}
-                                  {book.isbn && <span className="meta-chip">ISBN</span>}
+                                  {book.isbn && (
+                                    book.isbnValid === false
+                                      ? <span className="meta-chip is-warn" title={t('detail.isbnBadTitle')}>ISBN ⚠</span>
+                                      : <span className="meta-chip">ISBN</span>
+                                  )}
                                   {book.legacyId && <span className="meta-chip mono">{book.legacyId}</span>}
                                 </div>
                               </div>

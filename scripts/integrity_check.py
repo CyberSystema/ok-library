@@ -1679,6 +1679,53 @@ try:
 except (FileNotFoundError, ValueError, IndexError) as exc:
     check("the worker source is readable from the gate", False, str(exc))
 
+print("=== 45. REGRESSION: Dewey, and finding a bad ISBN ===")
+uniq = uuid.uuid4().hex[:8]
+# `ddc` was accepted by the API and written by the ISBN lookup and MARC import
+# since Phase B with no field to show it — the same silent-discard shape as the
+# original ddc bug, one layer up.
+db, _ = mkbook(title=f"ZZITEST Dewey {uniq}", author="ZZ Dewey", ddc="270.1")
+check("ddc round-trips through the API", get(db).get("ddc") == "270.1", get(db).get("ddc"))
+cur = get(db)
+call("PUT", f"/api/books/{db}", {"version": cur["version"], "ddc": "281.9"})
+check("ddc survives an edit", get(db).get("ddc") == "281.9", get(db).get("ddc"))
+
+# isbn_valid is a GENERATED column (migration 0031): recomputed from `isbn` on
+# every read, so no write path can forget it and there is nothing to backfill.
+# That is the whole reason it is generated rather than stored — the romanized
+# folds are what happens otherwise.
+good, _ = mkbook(title=f"ZZITEST GoodIsbn {uniq}", author="ZZ G", isbn="9780306406157")
+bad, _  = mkbook(title=f"ZZITEST BadIsbn {uniq}",  author="ZZ B", isbn="9780306406158")
+ten, _  = mkbook(title=f"ZZITEST TenIsbn {uniq}",  author="ZZ T", isbn="043942089X")
+none, _ = mkbook(title=f"ZZITEST NoIsbn {uniq}",   author="ZZ N", isbn=None)
+check("a correct ISBN-13 check digit reads valid", get(good).get("isbnValid") is True, get(good).get("isbnValid"))
+check("a wrong ISBN-13 check digit reads invalid", get(bad).get("isbnValid") is False, get(bad).get("isbnValid"))
+check("an ISBN-10 ending in X reads valid", get(ten).get("isbnValid") is True, get(ten).get("isbnValid"))
+check("no ISBN is neither valid nor invalid", get(none).get("isbnValid") is None, get(none).get("isbnValid"))
+# A bad check digit must never block a save — small publishers misprint them,
+# and refusing would make the book uncatalogueable.
+check("a bad check digit did not block the save", get(bad) is not None)
+
+st, hits = call("GET", "/api/books?invalidIsbn=1&pageSize=100")
+ids = {b["id"] for b in (hits or {}).get("items", [])}
+check("the smart list finds the bad one", bad in ids, len(ids))
+check("and excludes the good ones", good not in ids and ten not in ids and none not in ids)
+# The memoized-total trap: a filter absent from `isFullyUnfiltered` serves the
+# whole-catalogue count while showing a filtered page. Caught here, not by eye.
+st, idsres = call("GET", "/api/books/ids?invalidIsbn=1")
+check("the filtered total is not the memoized catalogue total",
+      (hits or {}).get("total") == (idsres or {}).get("total"),
+      f'list={(hits or {}).get("total")} ids={(idsres or {}).get("total")}')
+
+# Editing the ISBN must move the record in and out of the list with no sweep.
+cur = get(bad)
+call("PUT", f"/api/books/{bad}", {"version": cur["version"], "isbn": "9780306406157"})
+check("correcting the ISBN reads valid immediately (generated, not stored)",
+      get(bad).get("isbnValid") is True, get(bad).get("isbnValid"))
+st, after = call("GET", "/api/books?invalidIsbn=1&pageSize=100")
+check("and it leaves the smart list with no backfill",
+      bad not in {b["id"] for b in (after or {}).get("items", [])})
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

@@ -821,6 +821,10 @@ export const BookFilterQuerySchema = z.object({
   missingShelf: ZodQueryBoolean.optional(),
   untitled: ZodQueryBoolean.optional(),
   unknownAuthor: ZodQueryBoolean.optional(),
+  // Books whose ISBN check digit does not compute. Reads the generated column
+  // added in migration 0031 — the value has been available on every record
+  // since Phase B but was unreachable from a query until it became a column.
+  invalidIsbn: ZodQueryBoolean.optional(),
   // Facet-rail selection. `facetField` + `facetValue` matches ONE exact value of
   // a whitelisted field; `emptyField` matches "nothing recorded here" — the
   // rail's `(empty)` bucket.

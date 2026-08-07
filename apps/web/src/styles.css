@@ -2645,3 +2645,12 @@ mark.hl {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+
+/* A chip flagging a value the system believes is wrong — today only an ISBN
+   whose check digit does not compute. Warning, not error: the record is valid
+   and saveable, the identifier merely looks mistyped. */
+.meta-chip.is-warn {
+  color: var(--warning);
+  background: var(--warning-bg);
+  border-color: var(--warning);
+}

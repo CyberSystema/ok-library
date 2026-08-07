@@ -902,7 +902,8 @@ app.get('/api/books', async (c) => {
 		&& !query.status && !query.language && !query.year
 		&& query.yearMin === undefined && query.yearMax === undefined
 		&& !query.roomCode && !query.shelfCode && !query.missingIsbn && !query.missingShelf
-		&& !query.untitled && !query.unknownAuthor && !query.emptyField && !query.facetField
+		&& !query.untitled && !query.unknownAuthor && !query.invalidIsbn
+		&& !query.emptyField && !query.facetField
 		&& customFilters.length === 0 && !includeDeleted;
 	const totalKey = `books:total:${cacheVersion}`;
 	let cachedTotal: number | undefined;
@@ -921,6 +922,7 @@ app.get('/api/books', async (c) => {
 		missingIsbn: query.missingIsbn,
 		missingShelf: query.missingShelf,
 		untitled: query.untitled,
+		invalidIsbn: query.invalidIsbn,
 		unknownAuthor: query.unknownAuthor,
 		facetField: query.facetField,
 		facetValue: query.facetValue,
@@ -1022,6 +1024,7 @@ app.get('/api/books/ids', async (c) => {
 		missingIsbn: query.missingIsbn,
 		missingShelf: query.missingShelf,
 		untitled: query.untitled,
+		invalidIsbn: query.invalidIsbn,
 		unknownAuthor: query.unknownAuthor,
 		facetField: query.facetField,
 		facetValue: query.facetValue,

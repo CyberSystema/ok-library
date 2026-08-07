@@ -18,6 +18,12 @@ export type Book = {
   roomCode?: string | null;
   shelfCode?: string | null;
   isbn?: string | null;
+  /**
+   * Whether the ISBN's check digit is arithmetically correct. COMPUTED by the
+   * server on every read, never stored — and until now never displayed, so a
+   * mistyped ISBN stayed silently wrong forever. `null` means no ISBN.
+   */
+  isbnValid?: boolean | null;
   publicationYear?: number | null;
   /** Latest year the date can denote; equals publicationYear for a single date. */
   publicationYearEnd?: number | null;
@@ -27,6 +33,11 @@ export type Book = {
   titleRomanized?: string | null;
   authorRomanized?: string | null;
   publisherRomanized?: string | null;
+  /**
+   * Dewey Decimal, alongside the local shelf mark rather than replacing it —
+   * no re-shelving, but imported records keep their classification. MARC 082.
+   */
+  ddc?: string | null;
   customFields?: Record<string, string | number | boolean | null>;
   version: number;
   publisher?: string | null;

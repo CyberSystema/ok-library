@@ -1025,6 +1025,7 @@ export async function queryBooksWithFilters(
     missingIsbn?: boolean;
     missingShelf?: boolean;
     untitled?: boolean;
+    invalidIsbn?: boolean;
     unknownAuthor?: boolean;
     /** Facet-rail selection: one exact value of a whitelisted field. */
     facetField?: string;
@@ -1120,6 +1121,11 @@ export async function queryBooksWithFilters(
     // shelf and one still unplaced is not lost, so it must not appear here.
     where.push(`NOT EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.deleted_at IS NULL
                              AND TRIM(COALESCE(i.shelf_code, '')) <> '')`);
+  }
+  if (opts.invalidIsbn) {
+    // The generated column, so this is a plain indexed predicate rather than a
+    // scan — idx_books_isbn_invalid is partial on exactly this value.
+    where.push('b.isbn_valid = 0');
   }
   if (opts.untitled) {
     where.push("(b.title = '(Untitled)' OR b.title IS NULL OR TRIM(b.title) = '')");
