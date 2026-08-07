@@ -837,6 +837,120 @@ const CatalogDatalists = React.memo(function CatalogDatalists({ facets }: { face
   );
 });
 
+/**
+ * A text input with a keyboard-navigable suggestion list.
+ *
+ * Extracted from the borrower picker, which was the only real typeahead in the
+ * app, so the title-duplicate warning can reuse the same interaction rather
+ * than growing a second, subtly different one. Behaviour is preserved exactly —
+ * in particular the three details that are easy to get wrong:
+ *
+ *  • `onMouseDown` + `preventDefault`, not `onClick`. The input's blur fires
+ *    first on click and would tear the list down before the pick registers.
+ *  • Enter only picks when something is highlighted, so pressing Enter with the
+ *    list merely open still submits the surrounding form.
+ *  • Arrow keys wrap around, and the highlight resets whenever a new result set
+ *    arrives — otherwise index 3 of the old list silently becomes index 3 of
+ *    the new one.
+ *
+ * `onPick` is shared by the keyboard and pointer paths so the two cannot drift.
+ */
+function Combobox<T>(props: {
+  idPrefix: string;
+  label?: React.ReactNode;
+  value: string;
+  onChange: (value: string) => void;
+  onFocus?: () => void;
+  onPick: (item: T) => void;
+  items: T[];
+  getKey: (item: T) => string;
+  renderItem: (item: T) => React.ReactNode;
+  /** Hide the list without clearing it — e.g. once a choice is locked in. */
+  suppressed?: boolean;
+  placeholder?: string;
+  required?: boolean;
+  inputRef?: React.Ref<HTMLInputElement>;
+  /** Rendered above the list; used for "N books already have this title". */
+  listHeader?: React.ReactNode;
+  /** Rendered inside the positioned wrapper, below the input. */
+  footer?: React.ReactNode;
+  className?: string;
+}) {
+  const { items, suppressed, onPick, getKey } = props;
+  const [highlight, setHighlight] = useState(-1);
+  const [dismissed, setDismissed] = useState(false);
+
+  // A new result set invalidates any position in the old one.
+  useEffect(() => { setHighlight(-1); setDismissed(false); }, [items]);
+
+  const open = items.length > 0 && !suppressed && !dismissed;
+  const listId = `${props.idPrefix}-suggestion-list`;
+
+  return (
+    <div className={props.className ?? 'combobox'}>
+      {props.label !== undefined && <label htmlFor={`${props.idPrefix}-input`}>{props.label}</label>}
+      <input
+        id={`${props.idPrefix}-input`}
+        ref={props.inputRef}
+        value={props.value}
+        onChange={(e) => props.onChange(e.target.value)}
+        onFocus={props.onFocus}
+        onKeyDown={(e) => {
+          if (!open) return;
+          if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setHighlight((i) => (i + 1) % items.length);
+          } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setHighlight((i) => (i <= 0 ? items.length - 1 : i - 1));
+          } else if (e.key === 'Enter' && highlight >= 0) {
+            e.preventDefault();
+            const picked = items[highlight];
+            if (picked !== undefined) onPick(picked);
+          } else if (e.key === 'Escape') {
+            e.preventDefault();
+            setDismissed(true);
+            setHighlight(-1);
+          }
+        }}
+        placeholder={props.placeholder}
+        required={props.required}
+        autoComplete="off"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-activedescendant={
+          open && highlight >= 0 && items[highlight]
+            ? `${props.idPrefix}-opt-${getKey(items[highlight] as T)}`
+            : undefined
+        }
+      />
+      {open && (
+        <>
+          {props.listHeader}
+          <ul className="combobox-list" role="listbox" id={listId}>
+            {items.map((item, i) => (
+              <li
+                key={getKey(item)}
+                id={`${props.idPrefix}-opt-${getKey(item)}`}
+                role="option"
+                aria-selected={highlight === i}
+                className={highlight === i ? 'is-active' : undefined}
+                onMouseEnter={() => setHighlight(i)}
+                onMouseDown={(e) => { e.preventDefault(); onPick(item); }}
+              >
+                {props.renderItem(item)}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {props.footer}
+    </div>
+  );
+}
+
 type ValueVariantGroup = { canonical: string; total: number; variants: Array<{ value: string; count: number }> };
 
 // One row of the "value consistency" tool: shows the fold-equivalent spellings
@@ -1115,7 +1229,6 @@ function App() {
   // Keyboard-navigation cursor inside the suggestion dropdown. -1 means
   // "no selection yet" — Enter on -1 doesn't pick anything (preserves the
   // existing "submit the typed value" behavior).
-  const [borrowerHighlight, setBorrowerHighlight] = useState(-1);
   const bookHistorySeqRef = useRef(0);
   // Drops results from an earlier loadBooks() call that resolves after a newer
   // one (fast typing / rapid filter changes) so a slow response can't clobber
@@ -1981,11 +2094,9 @@ function App() {
       const response = await apiRequest<{ items: Borrower[] }>(`/api/borrowers?${params.toString()}`);
       if (seq !== borrowerSearchSeqRef.current) return;
       setBorrowerSuggestions(response.items ?? []);
-      setBorrowerHighlight(-1);
     } catch {
       if (seq !== borrowerSearchSeqRef.current) return;
       setBorrowerSuggestions([]);
-      setBorrowerHighlight(-1);
     }
   }
 
@@ -2012,7 +2123,6 @@ function App() {
     setBorrowerContact(b.contact ?? '');
     setBorrowerQuery('');
     setBorrowerSuggestions([]);
-    setBorrowerHighlight(-1);
   }
 
   async function uploadBookCover(book: Book, file: File): Promise<void> {
@@ -6693,75 +6803,37 @@ function App() {
                         <p className="muted small">{displayAuthor(selectedBook, t('common.unknownAuthor'))}</p>
                       </div>
                       <div className="form-row">
-                        <div className="combobox">
-                          <label>{t('loans.borrower')} *</label>
-                          <input
-                            value={borrowerQuery || borrowerName}
-                            onChange={(e) => {
-                              const v = e.target.value;
-                              setBorrowerQuery(v);
-                              setBorrowerName(v);
-                              setSelectedBorrowerId('');
-                              if (v.trim().length >= 2) scheduleBorrowerSearch(v);
-                              else { setBorrowerSuggestions([]); setBorrowerHighlight(-1); }
-                            }}
-                            onFocus={() => { if (!borrowerSuggestions.length) void searchBorrowers(borrowerQuery); }}
-                            onKeyDown={(e) => {
-                              // Arrow keys move through the suggestion list, Enter
-                              // picks the highlighted row (or submits the form when
-                              // nothing is highlighted), Escape closes the dropdown.
-                              if (borrowerSuggestions.length === 0 || selectedBorrowerId) return;
-                              if (e.key === 'ArrowDown') {
-                                e.preventDefault();
-                                setBorrowerHighlight((i) => (i + 1) % borrowerSuggestions.length);
-                              } else if (e.key === 'ArrowUp') {
-                                e.preventDefault();
-                                setBorrowerHighlight((i) => (i <= 0 ? borrowerSuggestions.length - 1 : i - 1));
-                              } else if (e.key === 'Enter' && borrowerHighlight >= 0) {
-                                e.preventDefault();
-                                const picked = borrowerSuggestions[borrowerHighlight];
-                                if (picked) applyBorrowerSuggestion(picked);
-                              } else if (e.key === 'Escape') {
-                                e.preventDefault();
-                                setBorrowerSuggestions([]);
-                                setBorrowerHighlight(-1);
-                              }
-                            }}
-                            placeholder={t('loans.borrowerPh')}
-                            required
-                            autoComplete="off"
-                            role="combobox"
-                            aria-autocomplete="list"
-                            aria-expanded={borrowerSuggestions.length > 0}
-                            aria-controls="borrower-suggestion-list"
-                            aria-activedescendant={borrowerHighlight >= 0 ? `borrower-opt-${borrowerSuggestions[borrowerHighlight]?.id}` : undefined}
-                          />
-                          {borrowerSuggestions.length > 0 && !selectedBorrowerId && (
-                            <ul className="combobox-list" role="listbox" id="borrower-suggestion-list">
-                              {borrowerSuggestions.map((b, i) => (
-                                <li
-                                  key={b.id}
-                                  id={`borrower-opt-${b.id}`}
-                                  role="option"
-                                  aria-selected={borrowerHighlight === i}
-                                  className={borrowerHighlight === i ? 'is-active' : undefined}
-                                  onMouseEnter={() => setBorrowerHighlight(i)}
-                                  onMouseDown={(e) => {
-                                    e.preventDefault();
-                                    applyBorrowerSuggestion(b);
-                                  }}
-                                >
-                                  <span className="combo-name">{b.name}</span>
-                                  {b.contact && <span className="combo-contact muted small">{b.contact}</span>}
-                                  <span className="combo-stats muted small">
-                                    {t(b.totalLoans === 1 ? 'loans.suggestionLoanCount' : 'loans.suggestionLoanCountPlural', { n: fmt(b.totalLoans) })}
-                                    {b.overdueLoans > 0 && <span className="overdue-tag"> · {t('loans.suggestionOverdue', { n: fmt(b.overdueLoans) })}</span>}
-                                  </span>
-                                </li>
-                              ))}
-                            </ul>
+                        <Combobox<Borrower>
+                          idPrefix="borrower"
+                          label={<>{t('loans.borrower')} *</>}
+                          value={borrowerQuery || borrowerName}
+                          onChange={(v) => {
+                            setBorrowerQuery(v);
+                            setBorrowerName(v);
+                            setSelectedBorrowerId('');
+                            if (v.trim().length >= 2) scheduleBorrowerSearch(v);
+                            else setBorrowerSuggestions([]);
+                          }}
+                          onFocus={() => { if (!borrowerSuggestions.length) void searchBorrowers(borrowerQuery); }}
+                          onPick={applyBorrowerSuggestion}
+                          items={borrowerSuggestions}
+                          // Once a borrower is locked in, the list stays hidden
+                          // until the operator edits the name again.
+                          suppressed={Boolean(selectedBorrowerId)}
+                          getKey={(b) => b.id}
+                          renderItem={(b) => (
+                            <>
+                              <span className="combo-name">{b.name}</span>
+                              {b.contact && <span className="combo-contact muted small">{b.contact}</span>}
+                              <span className="combo-stats muted small">
+                                {t(b.totalLoans === 1 ? 'loans.suggestionLoanCount' : 'loans.suggestionLoanCountPlural', { n: fmt(b.totalLoans) })}
+                                {b.overdueLoans > 0 && <span className="overdue-tag"> · {t('loans.suggestionOverdue', { n: fmt(b.overdueLoans) })}</span>}
+                              </span>
+                            </>
                           )}
-                          {selectedBorrowerId && (
+                          placeholder={t('loans.borrowerPh')}
+                          required
+                          footer={selectedBorrowerId ? (
                             <p className="muted small">
                               {t('loans.borrowerProfile')}{' '}
                               <button
@@ -6771,8 +6843,8 @@ function App() {
                                 onClick={() => { setSelectedBorrowerId(''); setBorrowerName(''); setBorrowerContact(''); }}
                               >{t('loans.change')}</button>
                             </p>
-                          )}
-                        </div>
+                          ) : null}
+                        />
                         <div>
                           <label>{t('loans.contact', { optional: t('common.optional') })}</label>
                           <input
