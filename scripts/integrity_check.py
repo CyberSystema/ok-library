@@ -1599,6 +1599,86 @@ for bid in (lb,):
         if call("POST", f"/api/books/{bid}/return", {})[0] != 200:
             break
 
+print("=== 44. REGRESSION: the healing passes repair EVERY fold ===")
+# Migration 0023 added three parallel-script fold columns and neither healing
+# pass learned about them, so a stale romanized fold could never be repaired.
+#
+# This section is deliberately part BEHAVIOURAL and part STATIC, because the
+# behavioural half CANNOT catch this bug: the buggy code never corrupted the
+# romanized folds, it simply left them alone, and no HTTP path can make a fold
+# stale (every write path updates text and fold together). Verified by reverting
+# the fix and watching the behavioural assertions all pass. The static check
+# below is the one that fails.
+uniq = uuid.uuid4().hex[:8]
+fb, _ = mkbook(
+    title=f"ZZITEST Klemes {uniq}", author="\u039a\u03bb\u03ae\u03bc\u03b7\u03c2 \u1fec\u03ce\u03bc\u03b7\u03c2",
+    titleRomanized="Klemes Romes", authorRomanized="Klemes Romes",
+    publisherRomanized="Apostoliki Diakonia")
+
+# The romanized reading must find the vernacular record. This is what the fold
+# is FOR, and it is the assertion that fails first if a write path drops it.
+st, hit = call("GET", "/api/books?pageSize=5&partialWords=true&fuzzyTypos=false&q="
+               + urllib.parse.quote("Klemes Romes"))
+check("a romanized reading finds the vernacular record",
+      any(b["id"] == fb for b in (hit or {}).get("items", [])), (hit or {}).get("total"))
+
+before = get(fb)
+call("PUT", f"/api/books/{fb}", {"version": before["version"], "titleRomanized": "Klemes Romes Revised"})
+st, hit2 = call("GET", "/api/books?pageSize=5&partialWords=true&fuzzyTypos=false&q="
+                + urllib.parse.quote("Revised"))
+check("editing a romanized form keeps it searchable",
+      any(b["id"] == fb for b in (hit2 or {}).get("items", [])), (hit2 or {}).get("total"))
+
+# Open Library returns ALA-LC DECOMPOSED ("e" + U+0304), which never compares or
+# indexes equal to its composed twin.
+decomposed = unicodedata.normalize("NFD", "Kl\u0113m\u0113s R\u014dm\u0113s")
+composed = unicodedata.normalize("NFC", "Kl\u0113m\u0113s R\u014dm\u0113s")
+check("the fixture really is decomposed", decomposed != composed and len(decomposed) > len(composed))
+cur = get(fb)
+call("PUT", f"/api/books/{fb}", {"version": cur["version"], "titleRomanized": decomposed})
+check("a write NFC-normalizes the romanized form", get(fb).get("titleRomanized") == composed,
+      repr(get(fb).get("titleRomanized")))
+
+# One page, no `force`: enough to prove the pass runs and is idempotent without
+# rewriting 12.5K rows against the daily D1 write budget on every gate run.
+st, sweep = call("POST", "/api/admin/rebuild-search-index?limit=500&offset=0")
+check("rebuild-search-index answers", st == 200 and "rebuilt" in (sweep or {}), st)
+st, sweep2 = call("POST", "/api/admin/rebuild-search-index?limit=500&offset=0")
+check("a second pass over the same page rebuilds nothing",
+      sweep2.get("rebuilt") == 0, sweep2.get("rebuilt"))
+
+# THE check. A healing pass is the only thing that can repair a fold after the
+# fact, so a column it does not name is a column that stays wrong forever. Both
+# handlers must cover every fold column computeBookFolds produces — including
+# whichever one a future migration adds.
+try:
+    _api = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "apps", "api-worker", "src")
+    with open(os.path.join(_api, "db.ts"), encoding="utf-8") as fh:
+        db_src = fh.read()
+    with open(os.path.join(_api, "index.ts"), encoding="utf-8") as fh:
+        idx_src = fh.read()
+
+    # The fold columns are whatever computeBookFolds returns — derived, never
+    # a hand-maintained list that can drift from the thing it describes.
+    ret = db_src.split("export function computeBookFolds(", 1)[1].split("): {", 1)[1].split("} {", 1)[0]
+    fold_columns = re.findall(r"(\w+_fold):", ret)
+    check("computeBookFolds declares every fold column", len(fold_columns) >= 10, fold_columns)
+
+    for route in ("/api/admin/normalize-books", "/api/admin/rebuild-search-index"):
+        i = idx_src.index(f"app.post('{route}'")
+        body = idx_src[i:idx_src.index("\napp.", i + 10)]
+        missing = [c for c in fold_columns if c not in body]
+        check(f"{route} heals every fold column", not missing, f"missing: {missing}")
+
+    # normalize-books is also the only pass that can NFC-normalize existing text,
+    # so it has to READ the romanized columns, not just their folds.
+    i = idx_src.index("app.post('/api/admin/normalize-books'")
+    nb = idx_src[i:idx_src.index("\napp.", i + 10)]
+    absent = [c for c in ("title_romanized", "author_romanized", "publisher_romanized") if c not in nb]
+    check("normalize-books reads the romanized text so NFC reaches old rows", not absent, absent)
+except (FileNotFoundError, ValueError, IndexError) as exc:
+    check("the worker source is readable from the gate", False, str(exc))
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

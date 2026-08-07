@@ -6306,11 +6306,18 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 	const limit = Math.min(500, Math.max(1, Number(c.req.query('limit') ?? 500)));
 	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
 
+	// The romanized columns are selected for TWO reasons, and both were missing:
+	// `normalizeBookData` NFC-normalizes them (Open Library returns ALA-LC
+	// DECOMPOSED — "ē" as e + U+0304 — which never compares equal to its
+	// composed twin), and their folds have to be rebuilt in lock-step like every
+	// other pair.
 	const rows = await c.env.DB.prepare(
 		`SELECT id, title, author, isbn, publisher, language, description,
 		        room_code, shelf_code, acquisition_date, tags, custom_fields,
+		        title_romanized, author_romanized, publisher_romanized,
 		        title_fold, author_fold, isbn_fold, publisher_fold,
-		        description_fold, tags_fold, custom_fields_fold
+		        description_fold, tags_fold, custom_fields_fold,
+		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold
 		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
 	).bind(limit, offset).all<Record<string, unknown>>();
 
@@ -6332,7 +6339,10 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 			shelfCode: row.shelf_code as string | null,
 			acquisitionDate: row.acquisition_date as string | null,
 			tags: safeJsonParse<string[]>((row.tags as string) ?? '[]', []),
-			customFields: safeJsonParse<Record<string, unknown>>((row.custom_fields as string) ?? '{}', {})
+			customFields: safeJsonParse<Record<string, unknown>>((row.custom_fields as string) ?? '{}', {}),
+			titleRomanized: row.title_romanized as string | null,
+			authorRomanized: row.author_romanized as string | null,
+			publisherRomanized: row.publisher_romanized as string | null
 		};
 
 		const n = normalizeBookData(original);
@@ -6348,7 +6358,12 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 			n.shelfCode !== original.shelfCode ||
 			n.acquisitionDate !== original.acquisitionDate ||
 			JSON.stringify(n.tags) !== JSON.stringify(original.tags) ||
-			JSON.stringify(n.customFields) !== JSON.stringify(original.customFields);
+			JSON.stringify(n.customFields) !== JSON.stringify(original.customFields) ||
+			// A decomposed romanized form differs from its composed twin byte-wise
+			// but not visually, so this is the only thing that can detect it.
+			n.titleRomanized !== original.titleRomanized ||
+			n.authorRomanized !== original.authorRomanized ||
+			n.publisherRomanized !== original.publisherRomanized;
 
 		// Migration 0012 added the *_fold columns but deliberately skipped the
 		// backfill, relying on the books_fts triggers' COALESCE(fold, raw). That
@@ -6365,7 +6380,10 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 			(row.publisher_fold == null && (n.publisher ?? '') !== '') ||
 			(row.description_fold == null && (n.description ?? '') !== '') ||
 			(row.tags_fold == null && (n.tags ?? []).length > 0) ||
-			(row.custom_fields_fold == null && Object.keys(n.customFields ?? {}).length > 0);
+			(row.custom_fields_fold == null && Object.keys(n.customFields ?? {}).length > 0) ||
+			(row.title_romanized_fold == null && (n.titleRomanized ?? '') !== '') ||
+			(row.author_romanized_fold == null && (n.authorRomanized ?? '') !== '') ||
+			(row.publisher_romanized_fold == null && (n.publisherRomanized ?? '') !== '');
 
 		if (!textChanged && !needsFoldBackfill) continue;
 		if (needsFoldBackfill) foldsBackfilled++;
@@ -6381,7 +6399,10 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 			publisher: n.publisher ?? null,
 			description: n.description ?? null,
 			tagsJson,
-			customFieldsJson
+			customFieldsJson,
+			titleRomanized: n.titleRomanized ?? null,
+			authorRomanized: n.authorRomanized ?? null,
+			publisherRomanized: n.publisherRomanized ?? null
 		});
 
 		updates.push(
@@ -6389,16 +6410,21 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 				`UPDATE books SET
 				   title=?, author=?, isbn=?, publisher=?, language=?, description=?,
 				   room_code=?, shelf_code=?, acquisition_date=?, tags=?, custom_fields=?,
+				   title_romanized=?, author_romanized=?, publisher_romanized=?,
 				   updated_at=?, version=version+1,
 				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
-				   description_fold=?, tags_fold=?, custom_fields_fold=?
+				   description_fold=?, tags_fold=?, custom_fields_fold=?,
+				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?
 				 WHERE id=?`
 			).bind(
 				n.title, n.author, n.isbn ?? null, n.publisher ?? null, n.language ?? null, n.description ?? null,
 				n.roomCode ?? null, n.shelfCode ?? null, n.acquisitionDate ?? null,
-				tagsJson, customFieldsJson, now,
+				tagsJson, customFieldsJson,
+				n.titleRomanized ?? null, n.authorRomanized ?? null, n.publisherRomanized ?? null,
+				now,
 				folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
 				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
+				folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
 				row.id as string
 			)
 		);
@@ -6493,9 +6519,15 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
 	const force = c.req.query('force') === '1' || c.req.query('force') === 'true';
 
+	// ALL TEN fold columns, not the seven that existed before migration 0023.
+	// This pass is the only thing that can repair a fold after the fact, so a
+	// column it does not know about is a column that stays wrong forever — and
+	// `title_romanized_fold` is what makes "Klemes Romes" find Κλήμης Ῥώμης.
 	const rows = await c.env.DB.prepare(
 		`SELECT id, title, author, isbn, publisher, description, tags, custom_fields,
-		        title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
+		        title_romanized, author_romanized, publisher_romanized,
+		        title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
+		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold
 		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
 	).bind(limit, offset).all<Record<string, unknown>>();
 
@@ -6511,17 +6543,17 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 			publisher: (row.publisher as string) ?? null,
 			description: (row.description as string) ?? null,
 			tagsJson: (row.tags as string) ?? null,
-			customFieldsJson: (row.custom_fields as string) ?? null
+			customFieldsJson: (row.custom_fields as string) ?? null,
+			titleRomanized: (row.title_romanized as string) ?? null,
+			authorRomanized: (row.author_romanized as string) ?? null,
+			publisherRomanized: (row.publisher_romanized as string) ?? null
 		});
 
-		const changed =
-			folds.title_fold !== ((row.title_fold as string | null) ?? null) ||
-			folds.author_fold !== ((row.author_fold as string | null) ?? null) ||
-			folds.isbn_fold !== ((row.isbn_fold as string | null) ?? null) ||
-			folds.publisher_fold !== ((row.publisher_fold as string | null) ?? null) ||
-			folds.description_fold !== ((row.description_fold as string | null) ?? null) ||
-			folds.tags_fold !== ((row.tags_fold as string | null) ?? null) ||
-			folds.custom_fields_fold !== ((row.custom_fields_fold as string | null) ?? null);
+		// Compared by walking the computed object rather than a hand-written list
+		// of seven: the previous form silently ignored any column added later,
+		// which is exactly how the romanized three went unnoticed.
+		const changed = (Object.keys(folds) as Array<keyof typeof folds>)
+			.some((k) => folds[k] !== ((row[k] as string | null) ?? null));
 
 		if (!force && !changed) continue;
 
@@ -6529,11 +6561,13 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 			c.env.DB.prepare(
 				`UPDATE books SET
 				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
-				   description_fold=?, tags_fold=?, custom_fields_fold=?
+				   description_fold=?, tags_fold=?, custom_fields_fold=?,
+				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?
 				 WHERE id=?`
 			).bind(
 				folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
 				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
+				folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
 				row.id as string
 			)
 		);
