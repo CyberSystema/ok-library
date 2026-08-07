@@ -355,6 +355,158 @@ export function bookRowToMarcInput(
   };
 }
 
+// ─── Reading MARCXML ───────────────────────────────────────────────────────
+
+export type ParsedMarcRecord = {
+  leader: string | null;
+  controlFields: Record<string, string>;
+  /** tag -> occurrences -> subfield code -> values. */
+  dataFields: Array<{ tag: string; ind1: string; ind2: string; subfields: MarcSubfield[] }>;
+};
+
+/**
+ * Parse MARCXML with HTMLRewriter.
+ *
+ * workerd has no DOMParser and no XML parser, and a regex over MARCXML is a
+ * trap: it silently mangles entity-encoded text, which is precisely how Koha
+ * serves Greek (`&#x394;&#x3B9;…`). HTMLRewriter decodes for us.
+ *
+ * MARCXML element names are lowercase, so HTMLRewriter's HTML-mode lowercasing
+ * is harmless here.
+ */
+export async function parseMarcXml(xml: string): Promise<ParsedMarcRecord[]> {
+  const records: ParsedMarcRecord[] = [];
+  let current: ParsedMarcRecord | null = null;
+  let field: { tag: string; ind1: string; ind2: string; subfields: MarcSubfield[] } | null = null;
+  let subCode: string | null = null;
+  let buffer = '';
+  let controlTag: string | null = null;
+
+  const rewriter = new HTMLRewriter()
+    .on('record', {
+      element(el) {
+        current = { leader: null, controlFields: {}, dataFields: [] };
+        records.push(current);
+        el.onEndTag(() => { current = null; });
+      }
+    })
+    .on('leader', {
+      element(el) { buffer = ''; el.onEndTag(() => { if (current) current.leader = buffer; buffer = ''; }); },
+      text(t) { buffer += t.text; }
+    })
+    .on('controlfield', {
+      element(el) {
+        controlTag = el.getAttribute('tag');
+        buffer = '';
+        el.onEndTag(() => {
+          if (current && controlTag) current.controlFields[controlTag] = buffer.trim();
+          controlTag = null; buffer = '';
+        });
+      },
+      text(t) { buffer += t.text; }
+    })
+    .on('datafield', {
+      element(el) {
+        field = {
+          tag: el.getAttribute('tag') ?? '',
+          ind1: el.getAttribute('ind1') ?? ' ',
+          ind2: el.getAttribute('ind2') ?? ' ',
+          subfields: []
+        };
+        el.onEndTag(() => {
+          if (current && field && field.tag) current.dataFields.push(field);
+          field = null;
+        });
+      }
+    })
+    .on('subfield', {
+      element(el) {
+        subCode = el.getAttribute('code');
+        buffer = '';
+        el.onEndTag(() => {
+          if (field && subCode !== null) field.subfields.push({ code: subCode, value: buffer.trim() });
+          subCode = null; buffer = '';
+        });
+      },
+      // Koha splits long values across text chunks, so accumulate rather than
+      // assigning — assigning keeps only the last fragment of a long title.
+      text(t) { buffer += t.text; }
+    });
+
+  await rewriter.transform(new Response(xml)).arrayBuffer();
+  return records;
+}
+
+/** Strip the ISBD punctuation a source added, so it is not stored twice. */
+function unIsbd(value: string | undefined): string | null {
+  if (!value) return null;
+  const cleaned = value.replace(/\s*[/:;,]\s*$/, '').trim();
+  return cleaned || null;
+}
+
+/** Read one parsed MARC record into the shape the catalogue stores. */
+export function marcToBookFields(rec: ParsedMarcRecord): Partial<MarcRecordInput> & {
+  subjectTerms?: Array<{ term: string; source: string }>;
+} {
+  const first = (tag: string, code: string): string | undefined =>
+    rec.dataFields.find((f) => f.tag === tag)?.subfields.find((s) => s.code === code)?.value;
+  const all = (tag: string, code: string): string[] =>
+    rec.dataFields.filter((f) => f.tag === tag)
+      .flatMap((f) => f.subfields.filter((s) => s.code === code).map((s) => s.value));
+
+  // 880s carry the parallel script forms, linked by $6 "<tag>-<occurrence>".
+  const linkedFor = (tag: string): string | undefined =>
+    rec.dataFields
+      .filter((f) => f.tag === '880' && (f.subfields.find((s) => s.code === '6')?.value ?? '').startsWith(tag))
+      .flatMap((f) => f.subfields.filter((s) => s.code !== '6').map((s) => s.value))[0];
+
+  const title = unIsbd(first('245', 'a'));
+  const subtitle = unIsbd(first('245', 'b'));
+  // 264 is the RDA form and wins when present; 260 is the fallback.
+  const place = unIsbd(first('264', 'a') ?? first('260', 'a'));
+  const publisher = unIsbd(first('264', 'b') ?? first('260', 'b'));
+  const dateRaw = unIsbd(first('264', 'c') ?? first('260', 'c'));
+  const yearMatch = (dateRaw ?? '').match(/\b(\d{4})\b/);
+
+  const subjectTerms: Array<{ term: string; source: string }> = [];
+  for (const f of rec.dataFields.filter((x) => x.tag === '650')) {
+    const term = f.subfields.find((s) => s.code === 'a')?.value;
+    if (!term) continue;
+    // ind2 = 0 means LCSH; anything else names its own thesaurus in $2.
+    subjectTerms.push({ term: unIsbd(term) ?? term, source: f.ind2 === '0' ? 'lcsh' : 'imported' });
+  }
+
+  return {
+    title: title ?? undefined,
+    subtitle: subtitle ?? undefined,
+    titleRomanized: linkedFor('245'),
+    author: unIsbd(first('100', 'a') ?? first('700', 'a')) ?? undefined,
+    authorRomanized: linkedFor('100'),
+    // Passed through as transcribed. Stripping to [0-9X] here REWROTE the
+    // identifier rather than tidying it — anything unexpected in the field came
+    // out as a different, plausible-looking ISBN. normalizeBookData removes the
+    // formatting (spaces, hyphens) and nothing else, which is the correct scope.
+    isbn: first('020', 'a') ?? undefined,
+    issn: first('022', 'a') ?? undefined,
+    publisher: publisher ?? undefined,
+    publisherRomanized: linkedFor('264'),
+    placeOfPublication: place ?? undefined,
+    // The imprint date is transcribed as printed, which is already close to
+    // EDTF; the caller normalizes it through parseEdtf.
+    dateEdtf: dateRaw ?? undefined,
+    publicationYear: yearMatch ? Number(yearMatch[1]) : undefined,
+    // 300$a is the extent, free text — exactly what the `pages` field now holds.
+    extent: unIsbd(first('300', 'a')) ?? undefined,
+    language: all('041', 'a')[0] ?? undefined,
+    description: first('520', 'a') ?? undefined,
+    ddc: first('082', 'a') ?? undefined,
+    edition: unIsbd(first('250', 'a')) ?? undefined,
+    seriesTitle: unIsbd(first('490', 'a')) ?? undefined,
+    volumeDesignation: first('490', 'v') ?? undefined,
+    subjectTerms: subjectTerms.length ? subjectTerms : undefined
+  };
+}
+
 export const MARCXML_COLLECTION_OPEN =
   '<?xml version="1.0" encoding="UTF-8"?>\n' +
   '<collection xmlns="http://www.loc.gov/MARC21/slim"\n' +

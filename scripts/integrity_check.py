@@ -1031,6 +1031,70 @@ check("an unknown key is ignored rather than stored",
       "notAKey" not in (r or {}).get("settings", {}), r)
 call("PUT", "/api/library-settings", {"isil": None})
 
+print("=== 36. REGRESSION: MARC round-trip loses nothing ===")
+# Export and ingest share one field table so they cannot drift — a tag written
+# as 260$b but read as 264$b would silently drop the publisher every time.
+call("PUT", "/api/library-settings", {"isil": "GR-ZZTEST"})
+uniq = uuid.uuid4().hex[:6]
+mb, _ = mkbook(
+    title=f"ZZITEST Κλήμης Ῥώμης {uniq}", author="Κλήμης Ῥώμης",
+    titleRomanized="Klemes Romes", publisher="Αποστολική Διακονία",
+    isbn="978" + uuid.uuid4().hex[:10], publicationYear=None, dateEdtf="1955/1957",
+    language="gre", ddc="270",
+    customFields={"pages": "156,[3]σ.", "place_of_publication": "ΑΘΗΝΑ",
+                  "series": "ΒΙΒΛΙΟΘΗΚΗ ΕΛΛΗΝΩΝ ΠΑΤΕΡΩΝ", "edition": "2η έκδ."})
+before = get(mb)
+st, xml = call_text("GET", f"/api/books/{mb}/marc")
+check("a record renders as MARCXML", st == 200 and "<record>" in xml, st)
+for probe in ["<subfield code=\"a\">156,[3]σ.", "1955/1957", "tag=\"082\"", "tag=\"880\"", "tag=\"852\""]:
+    check(f"MARCXML carries {probe[:28]!r}", probe in xml, xml[:200])
+
+# Rebuild the record from its own MARCXML and compare field by field.
+call("DELETE", f"/api/books/{mb}")
+call("DELETE", f"/api/books/{mb}/purge")
+st, r = call("POST", "/api/import/marcxml", raw=xml.encode(), ctype="application/xml")
+check("MARCXML import accepted", st == 200 and (r or {}).get("created") == 1, f"{st} {r}")
+st, found = call("GET", "/api/books?pageSize=5&partialWords=true&fuzzyTypos=false&q="
+                 + urllib.parse.quote(f"ZZITEST Κλήμης {uniq}"))
+rebuilt = ((found or {}).get("items") or [{}])[0]
+if rebuilt.get("id"):
+    CREATED.append(rebuilt["id"])
+    after = get(rebuilt["id"])
+    for field in ["title", "author", "titleRomanized", "publisher", "isbn",
+                  "dateEdtf", "publicationYear", "publicationYearEnd", "language", "ddc"]:
+        check(f"round trip preserves {field}", after.get(field) == before.get(field),
+              f"{before.get(field)!r} -> {after.get(field)!r}")
+    for field in ["pages", "place_of_publication", "series", "edition"]:
+        check(f"round trip preserves {field}",
+              (after.get("customFields") or {}).get(field) == (before.get("customFields") or {}).get(field),
+              f"{(before.get('customFields') or {}).get(field)!r} -> {(after.get('customFields') or {}).get(field)!r}")
+    check("an imported record gets a copy", len(after.get("items") or []) == 1, after.get("items"))
+
+    # Re-importing the same file must UPDATE, not duplicate — same contract the
+    # XLSX import has — and must not blank holdings the librarian assigned.
+    call("PUT", f"/api/books/{rebuilt['id']}/items", {"items": [
+        {"shelfCode": "ZZ-MARC", "itemType": "book"}
+    ]})
+    st, xml2 = call_text("GET", f"/api/books/{rebuilt['id']}/marc")
+    st, r2 = call("POST", "/api/import/marcxml", raw=xml2.encode(), ctype="application/xml")
+    check("re-import updates rather than duplicating",
+          (r2 or {}).get("updated") == 1 and (r2 or {}).get("created") == 0, r2)
+    st, again = call("GET", "/api/books?pageSize=5&partialWords=true&fuzzyTypos=false&q="
+                     + urllib.parse.quote(f"ZZITEST Κλήμης {uniq}"))
+    check("re-import created no second record", (again or {}).get("total") == 1, (again or {}).get("total"))
+    check("re-import did not blank the shelf",
+          ((get(rebuilt['id']).get("items") or [{}])[0].get("shelfCode")) == "ZZ-MARC",
+          get(rebuilt['id']).get("items"))
+else:
+    check("the rebuilt record was found", False, found)
+
+# A record with no title cannot be stored; it must be reported, not swallowed.
+bad = '<?xml version="1.0"?><collection xmlns="http://www.loc.gov/MARC21/slim"><record><leader>00000nam a2200000 i 4500</leader></record></collection>'
+st, r = call("POST", "/api/import/marcxml", raw=bad.encode(), ctype="application/xml")
+check("a record with no 245$a is skipped and reported",
+      st == 200 and (r or {}).get("skipped") == 1 and (r or {}).get("problems"), r)
+call("PUT", "/api/library-settings", {"isil": None})
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

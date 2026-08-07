@@ -1,5 +1,6 @@
 import {
 	AddCopiesSchema,
+	parseEdtf,
 	BookFilterQuerySchema,
 	BorrowBookSchema,
 	CreateBookSchema,
@@ -73,10 +74,13 @@ import {
 	bookRowToMarcInput,
 	MARCXML_COLLECTION_CLOSE,
 	MARCXML_COLLECTION_OPEN,
+	marcToBookFields,
+	parseMarcXml,
 	toDublinCoreXml,
 	toMarcJson,
 	toMarcXml
 } from './marc';
+import type { ParsedMarcRecord } from './marc';
 import type { AuthClaims, Env } from './types';
 import { deterministicUuid, generateCodeValue, newId, normalizeBookData, normalizeCode, nowIso, safeJsonParse, toCsv } from './utils';
 
@@ -3498,6 +3502,169 @@ app.delete('/api/custom-fields/:id', requirePermission('customFields.manage', { 
 	return c.body(null, 204);
 });
 
+/**
+ * Load a MARCXML file.
+ *
+ * How a donated collection's records normally arrive, and the lossless
+ * counterpart to the MARCXML export. Everything Phase B added has somewhere to
+ * land: 880s become the parallel script fields, 300$a the extent, 082 the
+ * Dewey, 490 the series, 260/264$c an EDTF date.
+ *
+ * Matched on ISBN so re-loading the same file UPDATES rather than duplicating —
+ * the same contract the XLSX import has via `legacy_id`. A record with no ISBN
+ * always inserts, because there is nothing to match it on.
+ */
+app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
+	const dryRun = c.req.query('dryRun') === '1';
+	const xml = await c.req.text();
+	if (!xml.trim()) throw new HTTPException(400, { message: 'Empty request body' });
+	// 4 MB of MARCXML is roughly 4,000 records; past that the parse alone will
+	// outrun the invocation, so the file has to be split.
+	if (xml.length > 4_000_000) {
+		throw new HTTPException(413, { message: 'MARCXML file too large — split it into chunks of a few thousand records.' });
+	}
+
+	let records: ParsedMarcRecord[];
+	try {
+		records = await parseMarcXml(xml);
+	} catch (error) {
+		throw new HTTPException(400, { message: `Could not parse MARCXML: ${(error as Error).message}` });
+	}
+	if (records.length === 0) throw new HTTPException(400, { message: 'No <record> elements found' });
+
+	const now = nowIso();
+	const actor = c.get('user').sub;
+	let created = 0, updated = 0, skipped = 0;
+	const problems: string[] = [];
+
+	for (const rec of records) {
+		const f = marcToBookFields(rec);
+		if (!f.title) { skipped += 1; problems.push('a record has no 245$a title'); continue; }
+
+		// An imprint date is transcribed as printed. Keep it only if it is EDTF
+		// we understand; otherwise fall back to the bare year the regex found, so
+		// a date like "[1955?]" still sorts instead of being dropped.
+		const edtf = f.dateEdtf && parseEdtf(f.dateEdtf) ? f.dateEdtf
+			: (f.publicationYear ? String(f.publicationYear) : null);
+
+		const payload = normalizeBookData({
+			title: f.title,
+			author: f.author ?? '',
+			titleRomanized: f.titleRomanized ?? null,
+			authorRomanized: f.authorRomanized ?? null,
+			publisherRomanized: f.publisherRomanized ?? null,
+			isbn: f.isbn ?? null,
+			publisher: f.publisher ?? null,
+			language: f.language ?? null,
+			description: f.description ?? null,
+			ddc: f.ddc ?? null,
+			dateEdtf: edtf,
+			// Derived from dateEdtf by normalizeBookData; declared so the shape
+			// carries them.
+			publicationYear: null as number | null,
+			publicationYearEnd: null as number | null,
+			customFields: {
+				...(f.extent ? { pages: f.extent } : {}),
+				...(f.placeOfPublication ? { place_of_publication: f.placeOfPublication } : {}),
+				...(f.edition ? { edition: f.edition } : {}),
+				...(f.seriesTitle ? { series: f.seriesTitle } : {}),
+				...(f.volumeDesignation ? { volume_num: f.volumeDesignation } : {}),
+				...(f.issn ? { issn: f.issn } : {}),
+				...(f.subtitle ? { subTitle: f.subtitle } : {})
+			}
+		});
+
+		if (dryRun) { created += 1; continue; }
+
+		const existing = payload.isbn
+			? await c.env.DB.prepare('SELECT id, version FROM books WHERE isbn = ? AND deleted_at IS NULL LIMIT 1')
+				.bind(payload.isbn).first<{ id: string; version: number }>()
+			: null;
+
+		try {
+			if (existing) {
+				// Re-import updates in place. Only fields the record actually
+				// carries are written — a MARC record that omits a field must not
+				// blank what the librarian already catalogued by hand.
+				const cf = await validateCustomFields(c.env, payload.customFields as Record<string, unknown>);
+				await c.env.DB.prepare(
+					`UPDATE books SET title = ?, author = ?, publisher = ?, language = ?, description = ?,
+					        ddc = COALESCE(?, ddc), date_edtf = COALESCE(?, date_edtf),
+					        publication_year = COALESCE(?, publication_year),
+					        publication_year_end = COALESCE(?, publication_year_end),
+					        title_romanized = COALESCE(?, title_romanized),
+					        author_romanized = COALESCE(?, author_romanized),
+					        publisher_romanized = COALESCE(?, publisher_romanized),
+					        custom_fields = json_patch(custom_fields, ?),
+					        updated_at = ?, version = version + 1
+					  WHERE id = ?`
+				).bind(
+					payload.title, payload.author, payload.publisher ?? null, payload.language ?? null,
+					payload.description ?? null, payload.ddc ?? null, payload.dateEdtf ?? null,
+					payload.publicationYear ?? null, payload.publicationYearEnd ?? null,
+					payload.titleRomanized ?? null, payload.authorRomanized ?? null, payload.publisherRomanized ?? null,
+					JSON.stringify(cf), now, existing.id
+				).run();
+				// Deliberately NOT ensurePrimaryItem here: it writes the passed
+				// location onto the primary copy, and this payload carries none —
+				// re-importing would blank the shelf the librarian assigned. MARC
+				// 852 holdings import is its own job.
+				updated += 1;
+			} else {
+				const id = crypto.randomUUID();
+				const cf = await validateCustomFields(c.env, payload.customFields as Record<string, unknown>);
+				const cfJson = JSON.stringify(cf);
+				const folds = computeBookFolds({
+					title: payload.title, author: payload.author, isbn: payload.isbn ?? null,
+					publisher: payload.publisher ?? null, description: payload.description ?? null,
+					tagsJson: '[]', customFieldsJson: cfJson,
+					titleRomanized: payload.titleRomanized ?? null,
+					authorRomanized: payload.authorRomanized ?? null,
+					publisherRomanized: payload.publisherRomanized ?? null
+				});
+				await c.env.DB.prepare(
+					`INSERT INTO books (id, title, author, isbn, publication_year, publication_year_end, date_edtf,
+					                    publisher, language, description, ddc,
+					                    title_romanized, author_romanized, publisher_romanized,
+					                    tags, custom_fields, status, version, created_at, updated_at,
+					                    title_fold, author_fold, isbn_fold, publisher_fold, description_fold,
+					                    tags_fold, custom_fields_fold,
+					                    title_romanized_fold, author_romanized_fold, publisher_romanized_fold)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 'available', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+				).bind(
+					id, payload.title, payload.author, payload.isbn ?? null,
+					payload.publicationYear ?? null, payload.publicationYearEnd ?? null, payload.dateEdtf ?? null,
+					payload.publisher ?? null, payload.language ?? null, payload.description ?? null, payload.ddc ?? null,
+					payload.titleRomanized ?? null, payload.authorRomanized ?? null, payload.publisherRomanized ?? null,
+					cfJson, now, now,
+					folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
+					folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
+					folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold
+				).run();
+				// A new record needs a copy to exist at all, or it is invisible to
+				// every location filter. Unshelved until someone places it.
+				await ensurePrimaryItem(c.env, id, {});
+				created += 1;
+			}
+		} catch (error) {
+			skipped += 1;
+			problems.push(`${f.title.slice(0, 50)}: ${(error as Error).message}`);
+		}
+	}
+
+	if (!dryRun && (created > 0 || updated > 0)) await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, actor, 'import.marcxml', 'book', null, {
+		records: records.length, created, updated, skipped, dryRun
+	});
+
+	return c.json({
+		records: records.length, created, updated, skipped, dryRun,
+		// Capped: a bad file can produce one problem per record and the operator
+		// only needs enough to see the pattern.
+		problems: problems.slice(0, 20)
+	});
+});
+
 app.post('/api/import/books', requirePermission('import'), async (c) => {
 	let rawPayload: unknown;
 	try {
@@ -6288,8 +6455,14 @@ type EnrichedBookFields = {
 	language?: string | null;
 	description?: string | null;
 	pages?: number | null;
+	/** ISBD area 5 as transcribed by the source — MARC 300$a, free text. */
+	extent?: string | null;
+	ddc?: string | null;
+	titleRomanized?: string | null;
+	authorRomanized?: string | null;
+	publisherRomanized?: string | null;
 	coverUrl?: string | null;
-	source: 'openlibrary' | 'googlebooks' | 'both' | 'none';
+	source: 'openlibrary' | 'googlebooks' | 'nlg' | 'both' | 'none';
 };
 
 function sanitizeIsbn(raw: string): string {
@@ -6377,37 +6550,210 @@ async function fetchGoogleBooks(isbn: string): Promise<Partial<EnrichedBookField
 	}
 }
 
-function mergeEnrichment(
-	primary: Partial<EnrichedBookFields> | null,
-	fallback: Partial<EnrichedBookFields> | null
-): Partial<EnrichedBookFields> {
-	const out: Partial<EnrichedBookFields> = {};
-	for (const key of [
-		'title', 'subTitle', 'author', 'publisher', 'publicationYear',
-		'language', 'description', 'pages', 'coverUrl'
-	] as Array<keyof EnrichedBookFields>) {
-		const p = primary?.[key];
-		const f = fallback?.[key];
-		// Pick the non-empty/non-null value; primary wins ties.
-		const chosen = (p !== null && p !== undefined && p !== '') ? p : f;
-		if (chosen !== undefined && chosen !== null && chosen !== '') {
-			(out as Record<string, unknown>)[key] = chosen;
+// ─── Which reading of a field to trust ────────────────────────────────────
+//
+// The old merge hard-wired Open Library as primary, so its ALA-LC romanization
+// beat Google Books' native-script title whenever it existed — which is what
+// filled the librarian's form with "Epiphanios Salaminos Kyprou". Choosing per
+// field, by script, is the fix.
+
+// ISBN registration groups that say "published in Greece". 960 and 618 are the
+// Greek group identifiers; 978/979 are the EAN prefixes in front of them.
+const GREEK_ISBN_GROUPS = [/^97[89]960/, /^97[89]618/, /^960/, /^618/];
+const NON_LATIN_SCRIPT_RE = /[Ͱ-Ͽἀ-῿Ѐ-ӿ가-힯぀-ヿ一-鿿]/;
+const LATIN_LETTER_RE = /[A-Za-z]/;
+
+function isGreekIsbn(isbn: string): boolean {
+	return GREEK_ISBN_GROUPS.some((re) => re.test(isbn));
+}
+
+/**
+ * Score one candidate value for a field.
+ *
+ * +2 the value is in the script the work is expected to be in
+ * -2 the work is expected to be non-Latin and this is pure Latin — i.e. a
+ *    romanization, which belongs in the parallel field, not this one
+ * +1 tie-break toward the source that is native for this work
+ */
+function scoreCandidate(value: string, expectNonLatin: boolean, nativeSource: boolean): number {
+	let score = 0;
+	const hasNonLatin = NON_LATIN_SCRIPT_RE.test(value);
+	if (expectNonLatin) {
+		if (hasNonLatin) score += 2;
+		else if (LATIN_LETTER_RE.test(value)) score -= 2;
+	} else if (!hasNonLatin) score += 2;
+	if (nativeSource) score += 1;
+	return score;
+}
+
+type Candidate = { source: string; fields: Partial<EnrichedBookFields>; nativeFor: 'greek' | null };
+
+/**
+ * Merge by choosing the best-scoring reading of each field, and keep the
+ * romanized alternative rather than discarding it.
+ */
+function mergeByScript(
+	candidates: Candidate[],
+	isbn: string
+): { merged: Partial<EnrichedBookFields>; alternates: Record<string, Array<{ value: string; source: string }>> } {
+	const expectNonLatin = isGreekIsbn(isbn);
+	const merged: Partial<EnrichedBookFields> = {};
+	const alternates: Record<string, Array<{ value: string; source: string }>> = {};
+
+	const textKeys = ['title', 'subTitle', 'author', 'publisher'] as const;
+	for (const key of textKeys) {
+		const options = candidates
+			.map((cand) => ({ source: cand.source, value: cand.fields[key], native: cand.nativeFor === 'greek' && expectNonLatin }))
+			.filter((o): o is { source: string; value: string; native: boolean } =>
+				typeof o.value === 'string' && o.value.trim() !== '');
+		if (options.length === 0) continue;
+		const ranked = options
+			.map((o) => ({ ...o, score: scoreCandidate(o.value, expectNonLatin, o.native) }))
+			.sort((a, b) => b.score - a.score);
+		const best = ranked[0] as { source: string; value: string; score: number };
+		const romanizedTarget = key === 'title' ? 'titleRomanized'
+			: key === 'author' ? 'authorRomanized'
+				: key === 'publisher' ? 'publisherRomanized' : null;
+
+		// The case that produced the original complaint: for a Greek-group ISBN
+		// the ONLY reading available is a Latin one, i.e. a romanization. Putting
+		// it in the vernacular field is exactly what filled the form with
+		// "Epiphanios Salaminos Kyprou". It belongs in the parallel field, and the
+		// vernacular is left empty for the librarian to type from the book — which
+		// is the only place the Greek actually exists.
+		if (best.score < 0 && romanizedTarget) {
+			(merged as Record<string, unknown>)[romanizedTarget] = best.value;
+			const rest = ranked.slice(1).filter((o) => o.value !== best.value);
+			if (rest.length) alternates[key] = rest.map((o) => ({ value: o.value, source: o.source }));
+			continue;
+		}
+
+		(merged as Record<string, unknown>)[key] = best.value;
+		// Everything not chosen is offered to the librarian rather than dropped —
+		// a romanization is useful in the parallel field, and a second opinion on
+		// a title is worth seeing.
+		const rest = ranked.slice(1).filter((o) => o.value !== best.value);
+		if (rest.length) alternates[key] = rest.map((o) => ({ value: o.value, source: o.source }));
+		// When the winner is native script and a Latin reading also exists, that
+		// Latin reading IS the romanization — hand it over pre-labelled.
+		if (expectNonLatin && romanizedTarget && NON_LATIN_SCRIPT_RE.test(best.value)) {
+			const roman = ranked.find((o) => !NON_LATIN_SCRIPT_RE.test(o.value) && LATIN_LETTER_RE.test(o.value));
+			if (roman) (merged as Record<string, unknown>)[romanizedTarget] = roman.value;
 		}
 	}
-	return out;
+
+	// Non-textual fields have no script question; first non-empty wins.
+	for (const key of ['publicationYear', 'language', 'description', 'pages', 'coverUrl', 'extent', 'ddc'] as const) {
+		for (const cand of candidates) {
+			const v = (cand.fields as Record<string, unknown>)[key];
+			if (v !== undefined && v !== null && v !== '') { (merged as Record<string, unknown>)[key] = v; break; }
+		}
+	}
+	return { merged, alternates };
+}
+
+/**
+ * The National Library of Greece, via its Koha OPAC.
+ *
+ * Added because Open Library serves ALA-LC romanization for Greek books while
+ * NLG serves the vernacular. Measured on 25 random Greek-titled ISBNs from this
+ * catalogue: NLG resolved 15 (60%), Open Library ~28% and always romanized.
+ *
+ * Two subrequests — search by ISBN for the biblionumber, then export the record
+ * as MARCXML — so it is gated to Greek ISBN groups. A non-Greek lookup stays at
+ * the previous two subrequests total.
+ */
+async function fetchNlg(isbn: string, signal: AbortSignal): Promise<Partial<EnrichedBookFields> | null> {
+	const base = 'https://catalogue.nlg.gr/cgi-bin/koha';
+	const searchUrl = `${base}/opac-search.pl?idx=nb&q=${encodeURIComponent(isbn)}&format=rss2`;
+	const res = await fetch(searchUrl, {
+		signal,
+		headers: { 'User-Agent': NLG_USER_AGENT },
+		cf: { cacheEverything: true, cacheTtl: 86400 }
+	} as RequestInit);
+	if (!res.ok) throw new Error(`NLG search HTTP ${res.status}`);
+	const rss = await res.text();
+	// The OPAC sits behind a proof-of-work bot challenge (Anubis) that answers
+	// 200 with an HTML interstitial. Verified: it fires for requests from
+	// Cloudflare's egress but not from an ordinary desktop, so this is about
+	// where the request comes from, not what it claims to be. Reported as an
+	// error rather than silently looking like "no such book" — and NOT worked
+	// around: the library has decided automated access goes through a gate, and
+	// the right response is to ask them for machine access, not to defeat it.
+	// Their OAI-PMH endpoint (oai.pl) IS reachable, which suggests they would.
+	if (rss.includes('not to be a robot') || rss.includes('within.website')) {
+		throw new Error('NLG OPAC is behind a bot challenge for automated clients — machine access must be arranged with the library');
+	}
+	const bib = rss.match(/biblionumber=(\d+)/)?.[1];
+	if (!bib) return null;
+
+	const xmlRes = await fetch(`${base}/opac-export.pl?op=export&bib=${bib}&format=marcxml`, {
+		signal,
+		headers: { 'User-Agent': NLG_USER_AGENT },
+		cf: { cacheEverything: true, cacheTtl: 86400 }
+	} as RequestInit);
+	if (!xmlRes.ok) throw new Error(`NLG export HTTP ${xmlRes.status}`);
+	const records = await parseMarcXml(await xmlRes.text());
+	if (records.length === 0) return null;
+	const f = marcToBookFields(records[0] as ParsedMarcRecord);
+	return {
+		title: f.title ?? null,
+		subTitle: f.subtitle ?? null,
+		author: f.author ?? null,
+		publisher: f.publisher ?? null,
+		publicationYear: f.publicationYear ?? null,
+		language: f.language ?? null,
+		// 300$a — free text, which is exactly the shape the extent field wants.
+		extent: f.extent ?? null,
+		ddc: f.ddc ?? null
+	} as Partial<EnrichedBookFields>;
+}
+
+// Both Open Library and a small self-hosted Koha ask to be told who is calling.
+const NLG_USER_AGENT = 'OK-Library/1.0 (library catalogue; +https://github.com/CyberSystema/ok-library)';
+
+/**
+ * Run a provider with a deadline and turn a failure into a REPORTED status.
+ *
+ * The old code swallowed every error into `null`, which is how Google Books
+ * quietly returning HTTP 429 "quota exceeded" went unnoticed — leaving Open
+ * Library as the only source and every lookup romanized. Workers' fetch has no
+ * default timeout either, so one slow provider hung the whole request.
+ */
+async function runProvider<T>(
+	name: string,
+	fn: (signal: AbortSignal) => Promise<T | null>
+): Promise<{ name: string; ok: boolean; value: T | null; error?: string; ms: number }> {
+	const started = Date.now();
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), 5000);
+	try {
+		const value = await fn(controller.signal);
+		return { name, ok: true, value, ms: Date.now() - started };
+	} catch (error) {
+		return {
+			name, ok: false, value: null,
+			error: error instanceof Error ? error.message : String(error),
+			ms: Date.now() - started
+		};
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 app.get('/api/lookup/isbn/:isbn', async (c) => {
 	const sourceParam = (c.req.query('source') ?? 'both').toLowerCase();
-	if (!['openlibrary', 'googlebooks', 'both'].includes(sourceParam)) {
-		throw new HTTPException(400, { message: 'source must be openlibrary, googlebooks, or both' });
+	if (!['openlibrary', 'googlebooks', 'nlg', 'both'].includes(sourceParam)) {
+		throw new HTTPException(400, { message: 'source must be openlibrary, googlebooks, nlg, or both' });
 	}
 	const isbn = sanitizeIsbn(c.req.param('isbn') ?? '');
 	if (!isValidIsbn(isbn)) {
 		throw new HTTPException(400, { message: 'Invalid ISBN (need 10 or 13 digits).' });
 	}
 
-	const cacheKey = `enrich:isbn:${sourceParam}:${isbn}`;
+	// v2: the v1 entries hold the old romanization-wins merge, and they live for
+	// a week — without a new prefix the fix would be invisible until they aged out.
+	const cacheKey = `enrich:isbn:v2:${sourceParam}:${isbn}`;
 	if (c.env.CACHE) {
 		try {
 			const cached = await c.env.CACHE.get(cacheKey, 'json');
@@ -6417,32 +6763,47 @@ app.get('/api/lookup/isbn/:isbn', async (c) => {
 		}
 	}
 
-	let merged: Partial<EnrichedBookFields> = {};
-	let source: EnrichedBookFields['source'] = 'none';
-	if (sourceParam === 'openlibrary') {
-		const ol = await fetchOpenLibrary(isbn);
-		merged = ol ?? {};
-		source = ol ? 'openlibrary' : 'none';
-	} else if (sourceParam === 'googlebooks') {
-		const gb = await fetchGoogleBooks(isbn);
-		merged = gb ?? {};
-		source = gb ? 'googlebooks' : 'none';
-	} else {
-		const [ol, gb] = await Promise.all([fetchOpenLibrary(isbn), fetchGoogleBooks(isbn)]);
-		merged = mergeEnrichment(ol, gb);
-		if (ol && gb) source = 'both';
-		else if (ol) source = 'openlibrary';
-		else if (gb) source = 'googlebooks';
-		else source = 'none';
-	}
+	// NLG is deliberately NOT in the default set. Its OPAC is bot-challenged for
+	// automated clients (see fetchNlg), so including it would spend two
+	// subrequests per Greek lookup to always fail. Left addressable via
+	// ?source=nlg so it starts working the moment access is arranged.
+	const wanted = sourceParam === 'both' ? ['googlebooks', 'openlibrary'] : [sourceParam];
 
-	const response: EnrichedBookFields = { isbn, source, ...merged };
+	const results = await Promise.all(wanted.map((name) => {
+		if (name === 'nlg') return runProvider('nlg', (signal) => fetchNlg(isbn, signal));
+		if (name === 'googlebooks') return runProvider('googlebooks', () => fetchGoogleBooks(isbn));
+		return runProvider('openlibrary', () => fetchOpenLibrary(isbn));
+	}));
+
+	const candidates: Candidate[] = results
+		.filter((r) => r.ok && r.value)
+		.map((r) => ({
+			source: r.name,
+			fields: r.value as Partial<EnrichedBookFields>,
+			nativeFor: r.name === 'nlg' ? 'greek' as const : null
+		}));
+
+	const { merged, alternates } = mergeByScript(candidates, isbn);
+	const hits = candidates.map((cand) => cand.source);
+	const source: EnrichedBookFields['source'] =
+		hits.length === 0 ? 'none' : hits.length > 1 ? 'both' : (hits[0] as EnrichedBookFields['source']);
+
+	const response = {
+		isbn,
+		source,
+		...merged,
+		// Everything not chosen, so the librarian can take a different reading
+		// per field instead of accepting or discarding the whole lookup.
+		alternates,
+		// Reported rather than swallowed: a quota-exceeded provider is something
+		// the operator needs to see, not a silently emptier result.
+		providers: results.map((r) => ({ name: r.name, ok: r.ok, found: Boolean(r.value), error: r.error, ms: r.ms }))
+	};
 
 	if (c.env.CACHE && source !== 'none') {
 		try {
-			// 7 days. We cache positive hits aggressively because they're
-			// effectively static; negative hits are NOT cached so a typo'd
-			// ISBN can self-correct as soon as the user fixes it.
+			// 7 days. Positive hits are effectively static; negative hits are NOT
+			// cached so a typo'd ISBN self-corrects as soon as it is fixed.
 			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 7 * 24 * 60 * 60 });
 		} catch (error) {
 			console.warn('ISBN enrichment cache write failed', error);
