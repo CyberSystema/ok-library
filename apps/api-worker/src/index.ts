@@ -15,6 +15,8 @@ import {
 	UpsertAuthoritySchema,
 	ImportBooksSchema,
 	ITEM_TYPES,
+	code128Svg,
+	formatItemBarcode,
 	ImportCatalogSchema,
 	ReturnBookSchema,
 	SyncPushSchema,
@@ -985,7 +987,17 @@ app.get('/api/books/by-ids', async (c) => {
 	)
 		.bind(...ids)
 		.all<Record<string, unknown>>();
-	return c.json({ items: (res.results ?? []).map(parseBook) });
+	// Copies, like the list route and GET /api/books/:id already do. This route
+	// is the ONLY source for a bulk label print, and a label is now per copy —
+	// without them the whole-shelf reprint would silently emit QR-only tiles
+	// while the single-book paths worked fine.
+	const itemsByBook = await loadItemsForBooks(c.env, ids);
+	return c.json({
+		items: (res.results ?? []).map((row) => {
+			const book = parseBook(row);
+			return { ...book, items: itemsByBook.get(String(book.id)) ?? [] };
+		})
+	});
 });
 
 // Criteria-based selection: return every id matching a filter set, unpaginated.
@@ -3070,6 +3082,108 @@ app.post('/api/books/:id/return', requirePermission('circulation', { librarian: 
 	});
 });
 
+// ─── Item barcodes ─────────────────────────────────────────────────────────
+//
+// `items.barcode` has been in the schema since migration 0021, documented as
+// the "Code 128 payload once labels are reprinted", and has been NULL on every
+// one of the 12,528 copies ever since — nothing minted a value and no screen
+// could enter one.
+//
+// The payload is an 8-digit zero-padded sequence, chosen so Code 128 subset C
+// applies: 8 digits pack into 4 symbols, 79 modules, about 26mm at a scannable
+// module width. The label tile has roughly 35mm free beside the QR. The
+// alphanumeric values `generateCodeValue` mints are ~24 characters and would
+// need ~75mm, which is why they are not reused here.
+
+/** The next free number in the sequence. One indexed read; not a stored counter. */
+async function nextBarcodeSequence(env: Env): Promise<number> {
+	const row = await env.DB.prepare(
+		// GLOB rather than a CAST over everything: a barcode a librarian typed by
+		// hand ('REF-12') must not be read as a number and collapse the sequence.
+		`SELECT MAX(CAST(barcode AS INTEGER)) AS n FROM items
+		  WHERE barcode IS NOT NULL AND barcode GLOB '[0-9]*'`
+	).first<{ n: number | null }>();
+	return Number(row?.n ?? 0) + 1;
+}
+
+app.post('/api/items/assign-barcodes', requirePermission('books.write', { librarian: true }), async (c) => {
+	const body = z.object({
+		bookIds: z.array(z.string().min(1)).max(500).optional(),
+		// Paged like every other catalogue-wide sweep in this codebase: 12.5K
+		// writes do not fit in one Workers invocation, and the caller loops on
+		// `remaining` the way the attribute retype and normalize passes are driven.
+		limit: z.number().int().min(1).max(500).default(200)
+	}).parse(await c.req.json().catch(() => ({})));
+
+	const scope = body.bookIds?.length
+		? `AND book_id IN (${body.bookIds.map(() => '?').join(',')})`
+		: '';
+	const args: unknown[] = body.bookIds?.length ? [...body.bookIds] : [];
+	const rows = await c.env.DB.prepare(
+		`SELECT id FROM items
+		  WHERE deleted_at IS NULL AND (barcode IS NULL OR TRIM(barcode) = '') ${scope}
+		  ORDER BY created_at ASC, id ASC LIMIT ?`
+	).bind(...args, body.limit).all<{ id: string }>();
+
+	const todo = rows.results ?? [];
+	let seq = await nextBarcodeSequence(c.env);
+	const now = nowIso();
+	const statements = todo.map((r) => {
+		const value = formatItemBarcode(seq++);
+		return c.env.DB.prepare(
+			// The guard makes a retried page a no-op instead of burning numbers on
+			// copies a previous attempt already labelled.
+			`UPDATE items SET barcode = ?, updated_at = ? WHERE id = ? AND (barcode IS NULL OR TRIM(barcode) = '')`
+		).bind(value, now, r.id);
+	});
+	for (let i = 0; i < statements.length; i += 40) {
+		await runAtomic(c.env, statements.slice(i, i + 40));
+	}
+
+	const left = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM items
+		  WHERE deleted_at IS NULL AND (barcode IS NULL OR TRIM(barcode) = '') ${scope}`
+	).bind(...args).first<{ n: number }>();
+
+	if (todo.length > 0) {
+		await bumpBooksCacheVersion(c.env);
+		await insertAuditLog(c.env, c.get('user').sub, 'items.assignBarcodes', 'system', null, {
+			assigned: todo.length, remaining: Number(left?.n ?? 0)
+		});
+	}
+	return c.json({
+		assigned: todo.length,
+		remaining: Number(left?.n ?? 0),
+		// The caller keeps POSTing while this is false, exactly like the attribute
+		// retype sweep.
+		complete: Number(left?.n ?? 0) === 0
+	});
+});
+
+// The symbol itself. Served rather than only rendered client-side so the
+// encoder has one implementation and the regression gate can assert its module
+// pattern against known vectors — an encoder nobody tests prints unscannable
+// labels.
+app.get('/api/items/:id/barcode.svg', async (c) => {
+	const id = c.req.param('id') ?? '';
+	const row = await c.env.DB.prepare(
+		'SELECT barcode FROM items WHERE id = ? AND deleted_at IS NULL'
+	).bind(id).first<{ barcode: string | null }>();
+	if (!row) throw new HTTPException(404, { message: 'Copy not found' });
+	if (!row.barcode) throw new HTTPException(409, { message: 'This copy has no barcode yet' });
+
+	const svg = code128Svg(row.barcode, {
+		moduleWidth: Number(c.req.query('mw') ?? 1),
+		height: Number(c.req.query('h') ?? 40),
+		showText: c.req.query('text') !== 'false'
+	});
+	c.header('Content-Type', 'image/svg+xml; charset=utf-8');
+	// Immutable for a given copy: the payload only changes if the copy is
+	// relabelled, which changes the barcode and therefore the meaning anyway.
+	c.header('Cache-Control', 'private, max-age=86400');
+	return c.body(svg);
+});
+
 // ─── Holds: a queue on the title, filled by whichever copy returns first ───
 //
 // How many days a collected-but-uncollected copy stays behind the desk. Not a
@@ -3097,7 +3211,7 @@ async function fillNextHold(
 	const next = await c.env.DB.prepare(
 		`SELECT id, borrower_name FROM holds
 		  WHERE book_id = ? AND status = 'waiting'
-		  ORDER BY placed_at ASC, id ASC LIMIT 1`
+		  ORDER BY placed_at ASC, rowid ASC LIMIT 1`
 	).bind(bookId).first<{ id: string; borrower_name: string }>();
 	if (!next) return null;
 
@@ -3120,7 +3234,11 @@ app.get('/api/books/:id/holds', requirePermission('circulation', { librarian: tr
 		`SELECT h.*, i.copy_number, i.shelf_code FROM holds h
 		   LEFT JOIN items i ON i.id = h.item_id
 		  WHERE h.book_id = ? AND h.status IN ('waiting', 'ready')
-		  ORDER BY h.placed_at ASC, h.id ASC`
+		  -- rowid, not id, as the tiebreak. Hold ids are random UUIDs, so two
+		  -- holds placed in the same millisecond would queue in an order decided
+		  -- by a coin flip. SQLite's rowid is insertion order, which is exactly
+		  -- what first-come-first-served means.
+		  ORDER BY h.placed_at ASC, h.rowid ASC`
 	).bind(bookId).all<Record<string, unknown>>();
 	return c.json({
 		bookId,
@@ -3192,10 +3310,15 @@ app.post('/api/books/:id/holds', requirePermission('circulation', { librarian: t
 	const free = await pickLendableItem(c.env, bookId, null, borrowerId);
 	const ready = free ? await fillNextHold(c, bookId, free.id, now) : null;
 
+	// Rank, not a count of everything before "now": placed_at has millisecond
+	// resolution and two holds taken in the same click land on the same value.
+	// The tiebreak must match the queue's own ORDER BY or the number shown to
+	// the reader is not the position they will actually be served in.
 	const position = await c.env.DB.prepare(
-		`SELECT COUNT(*) AS n FROM holds
-		  WHERE book_id = ? AND status IN ('waiting','ready') AND placed_at <= ? AND id <= ?`
-	).bind(bookId, now, id).first<{ n: number }>();
+		`SELECT COUNT(*) + 1 AS n FROM holds
+		  WHERE book_id = ? AND status IN ('waiting','ready')
+		    AND (placed_at < ? OR (placed_at = ? AND rowid < (SELECT rowid FROM holds WHERE id = ?)))`
+	).bind(bookId, now, now, id).first<{ n: number }>();
 
 	await insertAuditLog(c.env, c.get('user').sub, 'hold.place', 'book', bookId, {
 		holdId: id, borrowerId, ready: Boolean(ready)
@@ -3242,7 +3365,7 @@ app.get('/api/holds', requirePermission('circulation', { librarian: true }), asy
 		   JOIN books b ON b.id = h.book_id AND b.deleted_at IS NULL
 		   LEFT JOIN items i ON i.id = h.item_id
 		  WHERE h.status IN ('waiting', 'ready')
-		  ORDER BY (h.status = 'ready') DESC, h.placed_at ASC
+		  ORDER BY (h.status = 'ready') DESC, h.placed_at ASC, h.rowid ASC
 		  LIMIT 500`
 	).all<Record<string, unknown>>();
 	const items = (rows.results ?? []).map((r) => ({
@@ -3626,6 +3749,11 @@ app.post('/api/items/add-copies', requirePermission('books.write', { librarian: 
 
 	const statements: D1PreparedStatement[] = [];
 	let created = 0;
+	// A new copy is born labelled. The alternative is a shelf where some copies
+	// scan and some do not, which is worse than none scanning: the operator
+	// cannot tell which case they are in without trying.
+	let barcodeSeq = await nextBarcodeSequence(c.env);
+
 	for (const bookId of found) {
 		const copies = existingItems.get(bookId) ?? [];
 		// Continue the record's own numbering rather than restarting at 1.
@@ -3638,9 +3766,9 @@ app.post('/api/items/add-copies', requirePermission('books.write', { librarian: 
 			statements.push(
 				c.env.DB.prepare(
 					`INSERT INTO items (id, book_id, copy_number, volume_num, volume_label,
-					                    room_code, shelf_code, item_type, status,
+					                    room_code, shelf_code, item_type, status, barcode,
 					                    created_at, updated_at, version)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, 0)`
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, ?, 0)`
 				).bind(
 					newId('itm'), bookId, highest + n,
 					// A second exemplar of the same volume is not a new position in a
@@ -3651,6 +3779,7 @@ app.post('/api/items/add-copies', requirePermission('books.write', { librarian: 
 					roomCode ?? (template?.roomCode ?? null),
 					shelfCode ?? (template?.shelfCode ?? null),
 					String(template?.itemType ?? 'book'),
+					formatItemBarcode(barcodeSeq++),
 					now, now
 				)
 			);
@@ -3828,15 +3957,31 @@ app.post('/api/books/:id/codes', requirePermission('books.write', { librarian: t
 
 app.get('/api/scan/:value', async (c) => {
 	const codeValue = c.req.param('value');
-	let row = await c.env.DB.prepare(
-		`SELECT b.*, ca.code_type, ca.code_value
-		 FROM code_assignments ca
-		 JOIN books b ON b.id = ca.book_id
-		 WHERE ca.code_value = ? AND ca.active = 1 AND b.deleted_at IS NULL
-		 LIMIT 1`
-	)
-		.bind(codeValue)
-		.first();
+
+	// An ITEM barcode comes first, because it is the only one of the four that
+	// answers the question a scan is actually asking: not "which book is this?"
+	// but "which of the copies on 19-000 ΠΙΣΩ am I holding?". Returning the
+	// record alone was fine while a record had one copy.
+	const itemRow = await c.env.DB.prepare(
+		`SELECT i.* FROM items i
+		  WHERE i.barcode = ? AND i.deleted_at IS NULL LIMIT 1`
+	).bind(codeValue).first<Record<string, unknown>>();
+
+	let row: Record<string, unknown> | null = null;
+	if (itemRow) {
+		row = await c.env.DB.prepare('SELECT * FROM books WHERE id = ? AND deleted_at IS NULL')
+			.bind(String(itemRow.book_id)).first<Record<string, unknown>>();
+	}
+
+	if (!row) {
+		row = await c.env.DB.prepare(
+			`SELECT b.*, ca.code_type, ca.code_value
+			 FROM code_assignments ca
+			 JOIN books b ON b.id = ca.book_id
+			 WHERE ca.code_value = ? AND ca.active = 1 AND b.deleted_at IS NULL
+			 LIMIT 1`
+		).bind(codeValue).first<Record<string, unknown>>();
+	}
 
 	// Fallback: printed labels (labels.ts) encode /api/scan/<legacy_id | book id>,
 	// NOT a generated code_value, so scanning a printed label would otherwise
@@ -3847,16 +3992,31 @@ app.get('/api/scan/:value', async (c) => {
 			`SELECT b.* FROM books b
 			 WHERE (b.legacy_id = ? OR b.id = ?) AND b.deleted_at IS NULL
 			 LIMIT 1`
-		)
-			.bind(codeValue, codeValue)
-			.first();
+		).bind(codeValue, codeValue).first<Record<string, unknown>>();
 	}
 
 	if (!row) {
 		throw new HTTPException(404, { message: 'No book found for this code' });
 	}
 
-	return c.json({ book: parseBook(row as Record<string, unknown>) });
+	const book = parseBook(row);
+	const bookId = String(book.id);
+	return c.json({
+		book,
+		// Which copy was scanned, when the value identified one. Null for the
+		// three book-level fallbacks — the caller then has to ask.
+		item: itemRow ? parseItem(itemRow) : null,
+		// Every copy, so a scan of a book-level label can still offer a choice
+		// rather than guessing.
+		items: await loadBookItems(c.env, bookId),
+		// What a scan is usually a prelude to. Saves the desk a second request.
+		openLoan: await c.env.DB.prepare(
+			`SELECT t.id, t.borrower_name, t.due_at, t.item_id, t.renewal_count
+			   FROM borrow_transactions t
+			  WHERE t.returned_at IS NULL AND ${itemRow ? 't.item_id = ?' : 't.book_id = ?'}
+			  ORDER BY t.borrowed_at ASC LIMIT 1`
+		).bind(itemRow ? String(itemRow.id) : bookId).first()
+	});
 });
 
 app.get('/api/rooms', async (c) => {

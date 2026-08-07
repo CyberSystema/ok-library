@@ -132,6 +132,13 @@ type ActiveBorrow = {
   renewalCount?: number;
 };
 
+type ScanHit = {
+  book: Book;
+  item: Item | null;
+  items: Item[];
+  openLoan: { id: string; borrower_name: string; due_at: string; item_id: string | null; renewal_count: number } | null;
+};
+
 // ── Loan policies, holds and renewals ───────────────────────────────────────
 type LoanPolicy = {
   id?: string;
@@ -1838,6 +1845,10 @@ function App() {
   const [policyItemTypes, setPolicyItemTypes] = useState<string[]>([]);
   const [policiesLoaded, setPoliciesLoaded] = useState(false);
   const [detailHolds, setDetailHolds] = useState<Hold[]>([]);
+  // Barcode scanning: a handheld scanner is a keyboard that types a whole code
+  // then Enter, so the surface it needs is just a focused text input.
+  const [scanHit, setScanHit] = useState<ScanHit | null>(null);
+  const [barcodeBusy, setBarcodeBusy] = useState(false);
   const [mergeLoading, setMergeLoading] = useState(false);
   const [mergeScanned, setMergeScanned] = useState(false);
   const [variantsScanned, setVariantsScanned] = useState(false);
@@ -2756,9 +2767,15 @@ function App() {
         popupBlocked: t('labels.popupBlocked'),
         untitled: t('common.untitled'),
         unknown: t('common.unknown'),
+        copyOf: t('labels.copyOf'),
+        noBarcode: t('labels.noBarcode'),
         htmlLang: lang
       });
-      setMessage(t('toast.printOpened', { n: targets.length, s: targets.length === 1 ? '' : 's' }));
+      // Count TILES, not records: one label per copy, so a selection of 20
+      // records on two shelves each prints 40 stickers and the operator needs
+      // to know that before they load the sheet.
+      const tiles = targets.reduce((n, b) => n + Math.max(1, b.items?.length ?? 1), 0);
+      setMessage(t('toast.printOpened', { n: tiles, s: tiles === 1 ? '' : 's' }));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -4713,6 +4730,7 @@ function App() {
     event.preventDefault();
     clearStatus();
     setScanResult('');
+    setScanHit(null);
 
     try {
       const value = scanCode.trim();
@@ -4720,14 +4738,45 @@ function App() {
         throw new Error(t('toast.scanRequired'));
       }
 
-      const response = await runAction(() => apiRequest<{ book: Book }>(`/api/scan/${encodeURIComponent(value)}`));
+      const response = await runAction(() => apiRequest<ScanHit>(`/api/scan/${encodeURIComponent(value)}`));
       // Localized, blank-safe: show the title and append the author only when
       // there is a real one (no hardcoded English "by", no dangling separator).
       const scanTitle = displayTitle(response.book, t('common.untitled'));
       const scanAuthor = displayAuthor(response.book, '');
       setScanResult(scanAuthor ? `${scanTitle} — ${scanAuthor}` : scanTitle);
+      setScanHit(response);
+      // A scanner fires a whole string then Enter, so the operator's hands never
+      // leave it — clearing the box is what makes scanning a second copy work
+      // without reaching for the mouse.
+      setScanCode('');
+    } catch (e) {
+      setError(String((e as Error).message).includes('404') ? t('scan.notFound') : (e as Error).message);
+    }
+  }
+
+  // Assign a Code 128 barcode to every copy that lacks one. Paged like the
+  // other catalogue-wide sweeps: 12.5K writes do not fit in one Workers
+  // invocation, so the endpoint reports what is left and this loops.
+  async function assignBarcodes() {
+    clearStatus();
+    setBarcodeBusy(true);
+    let total = 0;
+    try {
+      for (let page = 0; page < 200; page += 1) {
+        const res = await apiRequest<{ assigned: number; remaining: number; complete: boolean }>(
+          '/api/items/assign-barcodes',
+          { method: 'POST', body: JSON.stringify({ limit: 200 }) }
+        );
+        total += res.assigned;
+        if (res.complete || res.assigned === 0) break;
+        setMessage(t('barcodes.progress', { n: total, left: res.remaining }));
+      }
+      setMessage(t('barcodes.done', { n: total }));
+      await loadBooks();
     } catch (e) {
       setError((e as Error).message);
+    } finally {
+      setBarcodeBusy(false);
     }
   }
 
@@ -8013,6 +8062,66 @@ function App() {
                   </div>
                 </div>
 
+                {/* Scan — the desk's fastest path to a copy. A handheld scanner
+                    types the code and presses Enter, so this is the whole UI. */}
+                <div className="card">
+                  <h3>{t('scan.heading')}</h3>
+                  <p className="muted small" style={{ marginBottom: '0.75rem' }}>{t('scan.intro')}</p>
+                  <form onSubmit={(e) => void resolveScanCode(e)} className="search-bar" style={{ alignItems: 'flex-end' }}>
+                    <div className="filter-field" style={{ flex: '1 1 18rem' }}>
+                      <label htmlFor="scan-input">{t('scan.heading')}</label>
+                      <input
+                        id="scan-input"
+                        value={scanCode}
+                        onChange={(e) => setScanCode(e.target.value)}
+                        placeholder={t('scan.placeholder')}
+                        autoComplete="off"
+                        // A scanner emits the whole string in milliseconds; the
+                        // browser's autocorrect and spellcheck only get in the way.
+                        spellCheck={false}
+                      />
+                    </div>
+                    <div className="search-actions">
+                      <span aria-hidden="true" className="field-spacer" />
+                      <button type="submit" className="primary">{t('scan.go')}</button>
+                    </div>
+                  </form>
+                  {scanHit && (
+                    <div className="merge-preview" style={{ marginTop: '0.75rem' }}>
+                      <p style={{ margin: 0, fontWeight: 600 }}>{scanResult}</p>
+                      <p className="muted small" style={{ margin: '0.25rem 0 0' }}>
+                        {scanHit.item
+                          ? <>{t('scan.copyN', { n: scanHit.item.copyNumber ?? 1 })}{scanHit.item.shelfCode ? ` · ${scanHit.item.shelfCode}` : ''}</>
+                          : t('scan.copiesN', { n: scanHit.items.length })}
+                      </p>
+                      {scanHit.openLoan && (
+                        <p className="small" style={{ margin: '0.25rem 0 0', color: 'var(--warning)' }}>
+                          {t('scan.onLoanTo', {
+                            name: scanHit.openLoan.borrower_name,
+                            date: new Date(scanHit.openLoan.due_at).toLocaleDateString()
+                          })}
+                        </p>
+                      )}
+                      <div className="button-group" style={{ marginTop: '0.5rem' }}>
+                        <button className="secondary small" onClick={() => { void openBookDetailById(scanHit.book.id); }}>
+                          {t('scan.openBook')}
+                        </button>
+                        {scanHit.openLoan ? (
+                          <button className="primary small" onClick={() => void quickReturnByBookId(
+                            scanHit.book.id,
+                            displayTitle(scanHit.book, t('common.untitled')),
+                            scanHit.openLoan!.id
+                          )}>{t('loans.return')}</button>
+                        ) : (
+                          <button className="primary small" onClick={() => { setSelectedBook(scanHit.book); setScanHit(null); }}>
+                            {t('detail.borrowBtn')}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 {/* Loan stats */}
                 <div className="stats-row" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
                   <div className="stat-box accent">
@@ -8705,6 +8814,12 @@ function App() {
                       {t('settings.searchIndexIntro')}
                     </p>
                     <button className="secondary" onClick={() => void rebuildSearchIndex()}>{t('settings.searchIndexRun')}</button>
+                    <p className="muted small" style={{ margin: '1.25rem 0 1rem' }}>
+                      {t('barcodes.intro')}
+                    </p>
+                    <button className="secondary" disabled={barcodeBusy} onClick={() => void assignBarcodes()}>
+                      {barcodeBusy ? t('barcodes.working') : t('barcodes.assign')}
+                    </button>
                   </div>
                 )}
 

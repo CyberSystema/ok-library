@@ -888,3 +888,8 @@ export type CodeAssignment = z.infer<typeof CodeAssignmentSchema>;
 export type CatalogImportRow = z.infer<typeof CatalogImportRowSchema>;
 export type Borrower = z.infer<typeof BorrowerSchema>;
 export type UpsertBorrowerInput = z.infer<typeof UpsertBorrowerSchema>;
+
+// Code 128, in its own module because it is a lookup table and a checksum
+// rather than a schema. Re-exported here so callers keep one import path.
+export { code128Values, code128Pattern, code128Svg, formatItemBarcode } from './code128';
+export type { Code128SvgOptions } from './code128';

@@ -2462,3 +2462,12 @@ mark.hl {
   background: var(--accent);
 }
 .copies-list .badge.ready { margin-left: 0.4rem; }
+
+/* A spacer that keeps a button aligned with the labelled fields beside it.
+   Replaces the `<label>.</label>` trick, which put a label element with no
+   control into the accessibility tree purely to occupy vertical space. */
+.search-actions .field-spacer {
+  display: block;
+  height: 1.2em;
+  margin-bottom: 0.35rem;
+}

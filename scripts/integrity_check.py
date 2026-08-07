@@ -1454,6 +1454,75 @@ for bid in (cb, pb, hb):
         if st != 200:
             break
 
+print("=== 41. REGRESSION: Code 128 copy barcodes ===")
+# items.barcode has been in the schema since 0021, documented as the Code 128
+# payload, and NULL on all 12,528 copies because nothing minted one and no
+# screen could enter one.
+uniq = uuid.uuid4().hex[:8]
+bcb, _ = mkbook(title=f"ZZITEST Barcode {uniq}", author="ZZ Barcode", shelfCode="ZZ-BC1")
+st, asg = call("POST", "/api/items/assign-barcodes", {"bookIds": [bcb], "limit": 10})
+check("barcodes are assigned to copies that lack one",
+      st == 200 and asg.get("assigned") == 1 and asg.get("complete") is True, f"{st} {asg}")
+item = (get(bcb).get("items") or [{}])[0]
+bc = item.get("barcode")
+check("the payload is 8 numeric digits (so Code 128 subset C applies)",
+      isinstance(bc, str) and len(bc) == 8 and bc.isdigit(), bc)
+
+# Re-running must not burn numbers on copies that already have one.
+st, again = call("POST", "/api/items/assign-barcodes", {"bookIds": [bcb], "limit": 10})
+check("re-running assigns nothing", st == 200 and again.get("assigned") == 0, again)
+check("the barcode did not change", (get(bcb).get("items") or [{}])[0].get("barcode") == bc)
+
+# A new copy is born labelled — a shelf where some copies scan and some do not
+# is worse than none scanning, because the operator cannot tell which they have.
+st, _ = call("POST", "/api/items/add-copies", {"bookIds": [bcb], "count": 1, "shelfCode": "ZZ-BC2"})
+codes = [i.get("barcode") for i in (get(bcb).get("items") or [])]
+check("a copy added later is born with a barcode", all(codes) and len(codes) == 2, codes)
+check("the two copies have DIFFERENT barcodes", len(set(codes)) == 2, codes)
+
+# Scanning must answer "which copy", not merely "which book" — the whole point
+# of a barcode on the copy rather than on the record.
+st, scan = call("GET", f"/api/scan/{bc}")
+check("scanning a copy barcode resolves the record", st == 200 and scan.get("book", {}).get("id") == bcb, st)
+check("scanning names the COPY", (scan.get("item") or {}).get("id") == item.get("id"), scan.get("item"))
+check("scanning carries every copy so a book-level label can still choose",
+      len(scan.get("items") or []) == 2, scan.get("items"))
+check("a scan of an unknown code is a clean 404", call("GET", "/api/scan/zznope00")[0] == 404)
+
+# A printed label that predates barcodes still scans: the legacy_id fallback.
+st, legacy = call("GET", f"/api/scan/{bcb}")
+check("scanning a book id still resolves (old printed labels)",
+      st == 200 and legacy.get("book", {}).get("id") == bcb and legacy.get("item") is None, st)
+
+# The encoder. An encoder nobody tests prints unscannable labels, so the module
+# pattern is asserted against a known vector rather than merely rendering.
+st, svg = call_text("GET", f"/api/items/{item['id']}/barcode.svg")
+check("the barcode renders as SVG", st == 200 and "<svg" in svg and 'aria-label="Barcode' in svg, svg[:120])
+bars = re.findall(r'<rect x="([\d.]+)" y="0" width="([\d.]+)"', svg)
+# Six 11-module symbols (start C, four data pairs, checksum) contribute 3 bars
+# each; the stop is the one 13-module symbol and its 7 runs give 4 bars. 22.
+check("the symbol has the right number of bars", len(bars) == 22, len(bars))
+# Total modules for an 8-digit subset-C payload: start + 4 data + check + stop
+# = 11*6 + 13 = 79, plus a 10-module quiet zone at each end = 99.
+width = re.search(r'viewBox="0 0 ([\d.]+)', svg)
+check("the symbol is 79 modules plus two 10-module quiet zones",
+      width is not None and abs(float(width.group(1)) - 99) < 0.01, width and width.group(1))
+
+# A copy with no barcode must say so rather than render an empty symbol.
+nb, _ = mkbook(title=f"ZZITEST NoBarcode {uniq}", author="ZZ NoBC")
+call("PUT", f"/api/books/{nb}/items", {"items": [{"shelfCode": "ZZ-NOBC"}]})
+nbi = (get(nb).get("items") or [{}])[0]
+st, _ = call("GET", f"/api/items/{nbi.get('id')}/barcode.svg")
+check("a copy with no barcode is a clear conflict, not a blank symbol", st == 409, st)
+
+# The bulk label path is the one that matters for reprinting a whole shelf, and
+# it reads /api/books/by-ids — which did not carry copies, so it would have
+# emitted QR-only tiles while the single-book paths worked.
+st, byids = call("GET", f"/api/books/by-ids?ids={bcb}")
+check("by-ids carries the copies the label printer needs",
+      len(((byids or {}).get("items") or [{}])[0].get("items") or []) == 2,
+      ((byids or {}).get("items") or [{}])[0].get("items"))
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")
