@@ -1504,7 +1504,17 @@ app.get('/api/books/sets', async (c) => {
 		// the series name cannot disqualify a genuine set.
 		if (!row.set_id && foldDiacritics(series) === foldDiacritics(row.title ?? '')) continue;
 
-		const key = row.set_id ?? `series:${foldDiacritics(series)}`;
+		// Grouped on the EXACT series string, not its fold.
+		//
+		// Folding would merge accent/case variants, but measured against this
+		// catalogue it merges exactly ONE pair out of ~930 sets (an ellipsis
+		// character), and it would break the rule that a count in the rail opens
+		// a list of the same size — clicking a set filters on the exact spelling.
+		// Two spellings showing as two sets is also the more useful answer: it
+		// surfaces an inconsistency the existing value-consistency merge tool can
+		// fix, instead of hiding it. (The series-equals-title test below still
+		// folds; that is a different comparison.)
+		const key = row.set_id ?? `series:${series}`;
 		let cluster = clusters.get(key);
 		if (!cluster) {
 			cluster = {

@@ -175,6 +175,20 @@ type FacetItem = {
   count: number;
 };
 
+type SetSummary = {
+  key: string;
+  setId: string | null;
+  title: string;
+  sampleAuthor: string;
+  bookCount: number;
+  minVol: number | null;
+  maxVol: number | null;
+  unnumbered: number;
+  gapsAvailable: boolean;
+  missing: number[];
+  missingCount: number;
+};
+
 type FacetResponse = {
   field: string;
   totalBooks: number;
@@ -186,6 +200,10 @@ type FacetResponse = {
 // Fields the rail can group by. Core fields first, then every custom attribute
 // (appended at runtime from the live definitions, everyday ones first). Must
 // stay a subset of the server's whitelist in db.ts `resolveEmptyFieldExpr`.
+// Sentinel rail mode. Not a facet field — it groups by multi-part work and
+// reports absent volumes, which is a different shape from value/count rows.
+const RAIL_SETS = 'sets';
+
 const CORE_FACET_CHOICES: Array<{ key: string; labelKey: string }> = [
   { key: 'shelfCode', labelKey: 'library.add.shelf' },
   { key: 'publisher', labelKey: 'library.add.publisher' },
@@ -301,7 +319,10 @@ function buildBookFilterParams(f: {
   // holds exactly the number the rail showed. See the schema comment.
   if (f.facetEmpty) query.set('emptyField', f.facetField);
   else if (f.facetValue) {
-    query.set('facetField', f.facetField);
+    // The Sets rail is a display mode, not a server field: a set IS the books
+    // sharing a `series` value, so that is what gets filtered on. Grouping is
+    // by exact spelling server-side, which keeps the count and this list equal.
+    query.set('facetField', f.facetField === 'sets' ? 'custom:series' : f.facetField);
     query.set('facetValue', f.facetValue);
   }
   if (f.needsReviewFilter) query.set('custom_needs_review', '1');
@@ -1413,6 +1434,12 @@ function App() {
   const [facetItems, setFacetItems] = useState<FacetItem[]>([]);
   const [facetTotalBooks, setFacetTotalBooks] = useState<number | null>(null);
   const [facetTruncated, setFacetTruncated] = useState(false);
+  // 'Sets' is a rail mode rather than a facet field: it groups by multi-part
+  // work and reports which volumes are absent, which is a different shape
+  // from a value/count list.
+  const [bookSets, setBookSets] = useState<SetSummary[]>([]);
+  const [setsGapsOnly, setSetsGapsOnly] = useState(false);
+  const [setsLoading, setSetsLoading] = useState(false);
   const [needsReviewFilter, setNeedsReviewFilter] = useState(false);
   const [smartListKey, setSmartListKey] = useState<string>('');
   const [borrowerSuggestions, setBorrowerSuggestions] = useState<Borrower[]>([]);
@@ -2531,6 +2558,21 @@ function App() {
       setFacetTruncated(Boolean(response.truncated));
     } catch {
       if (!cached) { setFacetItems([]); setFacetTruncated(false); }
+    }
+  }, []);
+
+  const loadBookSets = useCallback(async (gapsOnly: boolean) => {
+    const path = `/api/books/sets?minBooks=2&withGapsOnly=${gapsOnly}&limit=300`;
+    setSetsLoading(true);
+    const cached = await cacheGet<{ items: SetSummary[] }>(`GET ${path}`);
+    if (cached) setBookSets(cached.value.items ?? []);
+    try {
+      const response = await apiRequest<{ items: SetSummary[] }>(path);
+      setBookSets(response.items ?? []);
+    } catch {
+      if (!cached) setBookSets([]);
+    } finally {
+      setSetsLoading(false);
     }
   }, []);
 
@@ -4990,6 +5032,7 @@ function App() {
   // already arrive in that order).
   const facetChoices = useMemo(
     () => [
+      { key: RAIL_SETS, label: t('library.sets.mode') },
       ...CORE_FACET_CHOICES.map((f) => ({ key: f.key, label: t(f.labelKey) })),
       ...customFields.map((f) => ({ key: `custom:${f.key}`, label: f.label }))
     ],
@@ -5000,8 +5043,9 @@ function App() {
   // at each mutation site, the way the category rail already did.
   useEffect(() => {
     if (!loggedIn) return;
-    void loadFacet(facetField);
-  }, [loggedIn, facetField, loadFacet]);
+    if (facetField === RAIL_SETS) void loadBookSets(setsGapsOnly);
+    else void loadFacet(facetField);
+  }, [loggedIn, facetField, setsGapsOnly, loadFacet, loadBookSets]);
 
   // Add a copy of each selected record.
   //
@@ -6584,6 +6628,54 @@ function App() {
                         value={categoryRailQuery}
                         onChange={(e) => setCategoryRailQuery(e.target.value)}
                       />
+                      {facetField === RAIL_SETS ? (
+                        /* Multi-part works, with the volumes that are absent.
+                           Clicking a set filters the list to its members, so
+                           the librarian can go from "volume 7 is missing" to
+                           the shelf it belongs on. */
+                        <>
+                          <label className="rail-toggle">
+                            <input
+                              type="checkbox"
+                              checked={setsGapsOnly}
+                              onChange={(e) => setSetsGapsOnly(e.target.checked)}
+                            />
+                            {t('library.sets.gapsOnly')}
+                          </label>
+                          <ul className="category-rail-list">
+                            {setsLoading && bookSets.length === 0 && (
+                              <li><span className="muted small">{t('app.working')}</span></li>
+                            )}
+                            {bookSets
+                              .filter((set) => {
+                                const needle = categoryRailQuery.trim().toLowerCase();
+                                return !needle || set.title.toLowerCase().includes(needle);
+                              })
+                              .map((set) => (
+                                <li key={set.key}>
+                                  <button
+                                    type="button"
+                                    className={`category-rail-item set-row${facetValue === set.title ? ' is-active' : ''}`}
+                                    aria-pressed={facetValue === set.title}
+                                    onClick={() => selectFacet({ value: set.title, isEmpty: false, count: set.bookCount })}
+                                    title={set.title}
+                                  >
+                                    <span className="cat-label"><span className="cat-text">{set.title}</span></span>
+                                    <span className="cat-count">{fmt(set.bookCount)}</span>
+                                    {set.gapsAvailable && set.missingCount > 0 && (
+                                      <span className="set-gap" title={t('library.sets.missingTitle', { list: set.missing.slice(0, 20).join(', ') })}>
+                                        {t('library.sets.missingN', { n: fmt(set.missingCount) })}
+                                      </span>
+                                    )}
+                                    {!set.gapsAvailable && set.unnumbered > 0 && (
+                                      <span className="set-unnumbered">{t('library.sets.unnumbered')}</span>
+                                    )}
+                                  </button>
+                                </li>
+                              ))}
+                          </ul>
+                        </>
+                      ) : (
                       <ul className="category-rail-list">
                         <li>
                           <button
@@ -6629,6 +6721,7 @@ function App() {
                             );
                           })}
                       </ul>
+                      )}
                     </aside>
                   )}
                   <div className="library-main">

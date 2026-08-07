@@ -2389,3 +2389,20 @@ mark.hl {
   padding-left: 0.75rem;
   margin: 0.25rem 0 0.5rem;
 }
+
+/* Multi-part sets in the rail. The missing-volume badge is the point of the
+   mode, so it is the loudest thing in the row. */
+.rail-toggle {
+  display: flex; align-items: center; gap: 0.4rem;
+  font-size: 0.75rem; font-weight: 400; text-transform: none;
+  letter-spacing: normal; margin: 0 0 0.4rem;
+}
+.rail-toggle input[type="checkbox"] { width: auto; margin: 0; padding: 0; flex: 0 0 auto; }
+.category-rail-item.set-row { flex-wrap: wrap; row-gap: 0.15rem; }
+.set-gap {
+  flex-basis: 100%;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  color: var(--warning);
+}
+.set-unnumbered { flex-basis: 100%; font-size: 0.6875rem; color: var(--text-muted); font-style: italic; }
