@@ -39,6 +39,8 @@ type Book = {
   description?: string | null;
   legacyId?: string | null;
   coverUrl?: string | null;
+  /** The physical copies. A record can be held in more than one place. */
+  items?: Item[];
 };
 
 type Borrower = {
@@ -1027,6 +1029,25 @@ function Combobox<T>(props: {
   );
 }
 
+// One physical copy of a record — the object on the shelf, as distinct from the
+// edition it is a copy of.
+type Item = {
+  id: string;
+  bookId: string;
+  copyNumber: number;
+  barcode?: string | null;
+  volumeNum?: string | null;
+  volumeLabel?: string | null;
+  roomCode?: string | null;
+  shelfCode?: string | null;
+  callNumber?: string | null;
+  itemType: string;
+  status: BookStatus;
+  condition?: string | null;
+  notes?: string | null;
+  version: number;
+};
+
 type TitleSuggestion = {
   id: string;
   title: string;
@@ -1302,6 +1323,10 @@ function App() {
   const [tableColumns, setTableColumns] = useState<string[] | null>(null);
   const [tableHighlightGaps, setTableHighlightGaps] = useState(true);
   const [showColumnPicker, setShowColumnPicker] = useState(false);
+  const [addCopiesOpen, setAddCopiesOpen] = useState(false);
+  const [addCopiesCount, setAddCopiesCount] = useState('1');
+  const [addCopiesShelf, setAddCopiesShelf] = useState('');
+  const [addCopiesBusy, setAddCopiesBusy] = useState(false);
   // Guards the prefs writer against clobbering stored values on first mount.
   const prefsHydratedRef = useRef(false);
   const [jumpPage, setJumpPage] = useState('');
@@ -4863,6 +4888,51 @@ function App() {
     void loadFacet(facetField);
   }, [loggedIn, facetField, loadFacet]);
 
+  // Add a copy of each selected record.
+  //
+  // Request #7: 29 volumes were catalogued twice because each also sits on
+  // "19-000 πίσω". This adds a second copy instead — the record stays one
+  // record, and both shelves find it.
+  async function addCopiesToSelection() {
+    const copies = Math.max(1, Math.min(10, Number(addCopiesCount) || 1));
+    const ok = await confirm({
+      title: t('confirm.addCopiesTitle', { n: fmt(selectedBookIds.length * copies) }),
+      body: addCopiesShelf.trim()
+        ? t('confirm.addCopiesBodyShelf', { shelf: addCopiesShelf.trim() })
+        : t('confirm.addCopiesBody'),
+      confirmLabel: t('library.bulk.addCopies')
+    });
+    if (!ok) return;
+    clearStatus();
+    setAddCopiesBusy(true);
+    try {
+      // Chunked because the endpoint caps a request at 500 books, and each copy
+      // is a D1 write.
+      const CHUNK = 200;
+      let created = 0;
+      for (let i = 0; i < selectedBookIds.length; i += CHUNK) {
+        const res = await runAction(() => apiRequest<{ created: number }>('/api/items/add-copies', {
+          method: 'POST',
+          body: JSON.stringify({
+            bookIds: selectedBookIds.slice(i, i + CHUNK),
+            copies,
+            shelfCode: addCopiesShelf.trim() || null
+          })
+        }));
+        created += res?.created ?? 0;
+      }
+      setAddCopiesOpen(false);
+      setAddCopiesShelf('');
+      setAddCopiesCount('1');
+      await Promise.all([loadBooks(), loadFacet(facetField)]);
+      setMessage(t('toast.copiesAdded', { n: fmt(created) }));
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setAddCopiesBusy(false);
+    }
+  }
+
   // ─── table view ──────────────────────────────────────────────────────────
   // Every column the table COULD show: the core book fields plus one per custom
   // attribute, generated from the definitions so the list stays in the same
@@ -5283,6 +5353,49 @@ function App() {
           built around: a control the librarian did not touch writes NOTHING.
           An empty box means "leave it alone" — blanking a field across a
           selection is a separate, explicit "Clear" toggle. */}
+      {addCopiesOpen && canWrite && (
+        <div className="modal-overlay" onClick={() => setAddCopiesOpen(false)} role="dialog" aria-modal="true">
+          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '32rem' }}>
+            <div className="modal-header">
+              <div className="modal-title-block">
+                <h2>{t('library.bulk.addCopies')}</h2>
+                <p className="muted small">{t('library.copies.subtitle', { n: fmt(selectedBookIds.length) })}</p>
+              </div>
+            </div>
+            <div style={{ padding: '1rem 1.5rem 1.5rem' }}>
+              <p className="muted small" style={{ marginBottom: '1rem' }}>{t('library.copies.hint')}</p>
+              <div className="form-row">
+                <div>
+                  <label>{t('library.copies.count')}</label>
+                  <input
+                    type="number" min={1} max={10}
+                    value={addCopiesCount}
+                    onChange={(e) => setAddCopiesCount(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label>{t('library.copies.shelf')}</label>
+                  <input
+                    value={addCopiesShelf}
+                    onChange={(e) => setAddCopiesShelf(e.target.value)}
+                    placeholder={t('library.copies.shelfPh')}
+                    list="suggest-shelf"
+                  />
+                </div>
+              </div>
+              <div className="modal-actions" style={{ marginTop: '1rem' }}>
+                <button className="secondary" onClick={() => setAddCopiesOpen(false)}>{t('common.cancel')}</button>
+                <button
+                  className="primary"
+                  disabled={addCopiesBusy || selectedBookIds.length === 0}
+                  onClick={() => void addCopiesToSelection()}
+                >{addCopiesBusy ? t('app.working') : t('library.bulk.addCopies')}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {bulkEditOpen && canWrite && (
         <div className="modal-overlay" onClick={closeBulkEditor} role="dialog" aria-modal="true">
           <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '46rem' }}>
@@ -5670,6 +5783,32 @@ function App() {
                       </p>
                     )}
                   </div>
+
+                  {/* Holdings: where the physical copies actually are. Shown
+                      whenever a record is held more than once — for a single
+                      copy the location is already in the header badge, and
+                      repeating it would be noise. */}
+                  {(detailBook.items?.length ?? 0) > 1 && (
+                    <div className="detail-section">
+                      <div className="detail-section-title">
+                        {t('library.copies.heading', { n: fmt(detailBook.items?.length ?? 0) })}
+                      </div>
+                      <ul className="copies-list">
+                        {(detailBook.items ?? []).map((item) => (
+                          <li key={item.id}>
+                            <span className="copy-number">{t('library.copies.nth', { n: item.copyNumber })}</span>
+                            <span className={`shelf-badge${item.shelfCode ? '' : ' shelf-missing'}`}>
+                              <span className="shelf-icon" aria-hidden="true">📍</span>
+                              <span className="shelf-value">{item.shelfCode || t('library.book.noShelf')}</span>
+                            </span>
+                            {item.volumeNum && <span className="meta-chip">{item.volumeNum}</span>}
+                            {item.barcode && <span className="meta-chip mono">{item.barcode}</span>}
+                            <span className={`status-badge status-${item.status}`}>{t(`status.${item.status}`)}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
 
                   {/* Custom field attributes, driven by the DEFINITIONS rather
                       than by whatever keys happen to be on the book. That gives
@@ -6874,6 +7013,13 @@ function App() {
                         className="secondary small"
                         onClick={() => setBulkEditOpen(true)}
                       >{t('library.bulk.moreFields')}</button>
+                      {/* Add a copy of each selected record, optionally on a
+                          different shelf. This is what replaces re-cataloguing
+                          a book because a second exemplar sits elsewhere. */}
+                      <button
+                        className="secondary small"
+                        onClick={() => setAddCopiesOpen(true)}
+                      >{t('library.bulk.addCopies')}</button>
                       {canPrintLabels && (
                         <button
                           className="secondary small"

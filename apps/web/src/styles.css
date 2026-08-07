@@ -1031,6 +1031,21 @@ label {
 }
 .category-rail-item.is-empty-bucket .cat-count { color: var(--warning); font-weight: 700; }
 
+/* Holdings list in the detail view — one row per physical copy. */
+.copies-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.copies-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.45rem 0.6rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.copy-number { font-size: 0.75rem; font-weight: 700; color: var(--text-muted); min-width: 4.5rem; }
+.copies-list .status-badge { margin-left: auto; }
+
 /* Borrow history */
 .history-list { display: flex; flex-direction: column; gap: 0.5rem; }
 .history-item {
