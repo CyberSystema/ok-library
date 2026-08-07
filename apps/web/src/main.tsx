@@ -279,7 +279,44 @@ const SELECTION_STORAGE_KEY = 'ok-library-selection-v1';
 
 type SortBy = 'updatedAt' | 'title' | 'author' | 'publicationYear' | 'status';
 type SortDir = 'asc' | 'desc';
-type Density = 'comfortable' | 'compact';
+// 'table' is the spreadsheet view: one row per book, one column per field, so
+// the librarian can see at a glance which records are missing something.
+type Density = 'comfortable' | 'compact' | 'table';
+const DENSITIES: Density[] = ['comfortable', 'compact', 'table'];
+
+// Core columns available in the table view. Custom attributes are appended from
+// the live definitions, so this only has to name the things that live on the
+// book row itself. `get` returns the display string; '' means "missing", which
+// is what the gap highlighting keys on.
+type BookColumn = {
+  key: string;
+  /** i18n key for the header, or `label` when the header is authored data. */
+  labelKey?: string;
+  label?: string;
+  get: (book: Book) => string;
+  width?: number;
+};
+
+const CORE_TABLE_COLUMNS: Array<Omit<BookColumn, 'get'> & { get: (b: Book) => string }> = [
+  { key: 'title', labelKey: 'library.add.bookTitle', get: (b) => b.title ?? '', width: 280 },
+  { key: 'author', labelKey: 'library.add.author', get: (b) => b.author ?? '', width: 180 },
+  { key: 'publisher', labelKey: 'library.add.publisher', get: (b) => b.publisher ?? '', width: 160 },
+  { key: 'publicationYear', labelKey: 'library.add.year', get: (b) => (b.publicationYear ? String(b.publicationYear) : ''), width: 80 },
+  { key: 'language', labelKey: 'library.add.language', get: (b) => b.language ?? '', width: 90 },
+  { key: 'isbn', labelKey: 'library.add.isbn', get: (b) => b.isbn ?? '', width: 130 },
+  { key: 'shelfCode', labelKey: 'library.add.shelf', get: (b) => b.shelfCode ?? '', width: 100 },
+  { key: 'roomCode', labelKey: 'library.bulk.field.roomCode', get: (b) => b.roomCode ?? '', width: 90 },
+  { key: 'legacyId', labelKey: 'ctx.copyLegacy', get: (b) => b.legacyId ?? '', width: 100 },
+  { key: 'description', labelKey: 'library.add.description', get: (b) => b.description ?? '', width: 220 }
+];
+
+// What the table opens with: the fields a librarian checks on every record,
+// plus every everyday (pinned) attribute, which is what "μια εποπτική εικόνα
+// των καταχωρήσεων" actually asks for. `status` is always rendered as a badge
+// in its own leading column, so it is not listed here.
+const DEFAULT_TABLE_COLUMNS = [
+  'title', 'author', 'publisher', 'publicationYear', 'language', 'isbn', 'shelfCode'
+];
 
 // Kept in sync with CATALOG_CUSTOM_FIELDS in apps/api-worker/src/index.ts.
 const CATALOG_FIELD_COUNT = 25;
@@ -1226,6 +1263,15 @@ function App() {
   const [sortBy, setSortBy] = useState<SortBy>('updatedAt');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [density, setDensity] = useState<Density>('comfortable');
+  // Which columns the table view shows, and whether to flag empty cells.
+  // `null` means "not chosen yet" → fall back to the defaults plus whatever the
+  // everyday attributes currently are, so pinning a new attribute surfaces it
+  // without the librarian having to re-open the picker.
+  const [tableColumns, setTableColumns] = useState<string[] | null>(null);
+  const [tableHighlightGaps, setTableHighlightGaps] = useState(true);
+  const [showColumnPicker, setShowColumnPicker] = useState(false);
+  // Guards the prefs writer against clobbering stored values on first mount.
+  const prefsHydratedRef = useRef(false);
   const [jumpPage, setJumpPage] = useState('');
   const [categories, setCategories] = useState<CategoryItem[]>([]);
   const [categoryFilter, setCategoryFilter] = useState<string>('');
@@ -1539,10 +1585,17 @@ function App() {
     try {
       const raw = localStorage.getItem(PREFS_STORAGE_KEY);
       if (!raw) return;
-      const prefs = JSON.parse(raw) as { sortBy?: SortBy; sortDir?: SortDir; density?: Density; theme?: Theme };
+      const prefs = JSON.parse(raw) as {
+        sortBy?: SortBy; sortDir?: SortDir; density?: Density; theme?: Theme;
+        tableColumns?: string[]; tableHighlightGaps?: boolean;
+      };
       if (prefs.sortBy) setSortBy(prefs.sortBy);
       if (prefs.sortDir) setSortDir(prefs.sortDir);
-      if (prefs.density) setDensity(prefs.density);
+      // Validate rather than trust: the blob is user-editable, and an unknown
+      // density would render neither grid nor table.
+      if (prefs.density && DENSITIES.includes(prefs.density)) setDensity(prefs.density);
+      if (Array.isArray(prefs.tableColumns)) setTableColumns(prefs.tableColumns.filter((k) => typeof k === 'string'));
+      if (typeof prefs.tableHighlightGaps === 'boolean') setTableHighlightGaps(prefs.tableHighlightGaps);
       if (prefs.theme) setTheme(prefs.theme);
       else if (window.matchMedia?.('(prefers-color-scheme: dark)').matches) setTheme('dark');
     } catch {
@@ -1551,12 +1604,23 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Skip the very first run. Both this and the restore effect fire in the
+    // same mount commit, and this one would otherwise write the INITIAL state
+    // (density 'comfortable', no columns) straight over what was just read back
+    // — the restored values only reach state on the following render. Observed
+    // in practice: the chosen columns survived a reload but the layout did not.
+    if (!prefsHydratedRef.current) {
+      prefsHydratedRef.current = true;
+      return;
+    }
     try {
-      localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify({ sortBy, sortDir, density, theme }));
+      localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify({
+        sortBy, sortDir, density, theme, tableColumns, tableHighlightGaps
+      }));
     } catch {
       // Storage may be disabled (private mode); ignore.
     }
-  }, [sortBy, sortDir, density, theme]);
+  }, [sortBy, sortDir, density, theme, tableColumns, tableHighlightGaps]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -4714,6 +4778,65 @@ function App() {
     void loadBookHistory(book.id);
   }
 
+  // ─── table view ──────────────────────────────────────────────────────────
+  // Every column the table COULD show: the core book fields plus one per custom
+  // attribute, generated from the definitions so the list stays in the same
+  // everyday-first order as the forms. Built as data rather than JSX because
+  // the next columns to arrive (holdings, volumes, subjects) then cost one
+  // entry each instead of another pass over the markup.
+  const allTableColumns = useMemo<BookColumn[]>(() => {
+    const yes = t('common.yes');
+    const no = t('common.no');
+    const core = CORE_TABLE_COLUMNS.map((c) => ({ ...c, label: t(c.labelKey as string) }));
+    const custom = customFields.map((f) => ({
+      key: `cf:${f.key}`,
+      label: f.label,
+      width: 150,
+      get: (b: Book) => formatCustomValue(f, (b.customFields ?? {})[f.key], yes, no)
+    }));
+    return [...core, ...custom];
+  }, [customFields, t]);
+
+  // The columns actually rendered, in the order the model defines them (never
+  // the order they were ticked, which would drift from the forms).
+  const visibleTableColumns = useMemo<BookColumn[]>(() => {
+    const chosen = tableColumns
+      ?? [...DEFAULT_TABLE_COLUMNS, ...pinnedCustomFields.map((f) => `cf:${f.key}`)];
+    const want = new Set(chosen);
+    return allTableColumns.filter((c) => want.has(c.key));
+  }, [allTableColumns, tableColumns, pinnedCustomFields]);
+
+  function toggleTableColumn(key: string) {
+    setTableColumns((prev) => {
+      const base = prev ?? [...DEFAULT_TABLE_COLUMNS, ...pinnedCustomFields.map((f) => `cf:${f.key}`)];
+      return base.includes(key) ? base.filter((k) => k !== key) : [...base, key];
+    });
+  }
+
+  // Selection, context menu and row activation are identical in every layout,
+  // so they are produced once and spread into both the card and the table row.
+  // Branching them per layout is how the two silently drift apart.
+  function bookRowHandlers(book: Book) {
+    const activate = () => {
+      // In selection mode the whole row acts as the checkbox so users don't
+      // have to aim for a tiny target.
+      if (selectionMode && canWrite) toggleBookSelection(book.id);
+      else openBookDetail(book);
+    };
+    return {
+      role: 'button' as const,
+      tabIndex: 0,
+      onClick: activate,
+      onContextMenu: (e: React.MouseEvent) =>
+        openContextMenu(e, buildBookMenu(book), displayTitle(book, t('common.untitled'))),
+      onKeyDown: (e: React.KeyboardEvent) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        activate();
+      }
+    };
+  }
+
   // Open a book we only hold an id for — the title-duplicate warning carries a
   // trimmed row, not a full record, and the detail modal needs the whole thing
   // (version included, or the first edit would 409).
@@ -6432,13 +6555,29 @@ function App() {
                       <button className="secondary" onClick={() => { setShowAdvancedSearch((v) => !v); }}>
                         {showAdvancedSearch ? t('library.search.hideAdvanced') : t('library.search.advanced')}
                       </button>
+                      {/* Cards → List → Table → Cards. The button shows where
+                          the next click goes, matching the previous two-way
+                          toggle's behaviour. */}
                       <button
                         className="secondary"
-                        onClick={() => setDensity((d) => (d === 'compact' ? 'comfortable' : 'compact'))}
+                        onClick={() => setDensity((d) => DENSITIES[(DENSITIES.indexOf(d) + 1) % DENSITIES.length] as Density)}
                         title={t('library.search.densityTitle')}
                       >
-                        {density === 'compact' ? t('library.search.densityCards') : t('library.search.densityList')}
+                        {density === 'comfortable'
+                          ? t('library.search.densityList')
+                          : density === 'compact'
+                            ? t('library.search.densityTable')
+                            : t('library.search.densityCards')}
                       </button>
+                      {density === 'table' && (
+                        <button
+                          className={`secondary${showColumnPicker ? ' is-active' : ''}`}
+                          onClick={() => setShowColumnPicker((v) => !v)}
+                          title={t('library.table.columnsTitle')}
+                        >
+                          {t('library.table.columns', { n: fmt(visibleTableColumns.length) })}
+                        </button>
+                      )}
                       <button className="secondary" onClick={() => {
                         setQ('');
                         setQExclude('');
@@ -6703,6 +6842,104 @@ function App() {
                     </div>
                   ) : (
                     <>
+                      {density === 'table' && showColumnPicker && (
+                        <div className="column-picker card">
+                          <div className="column-picker-head">
+                            <strong>{t('library.table.columnsTitle')}</strong>
+                            <label className="column-picker-toggle">
+                              <input
+                                type="checkbox"
+                                checked={tableHighlightGaps}
+                                onChange={(e) => setTableHighlightGaps(e.target.checked)}
+                              />
+                              {t('library.table.highlightGaps')}
+                            </label>
+                            <button className="secondary small" onClick={() => setTableColumns(null)}>
+                              {t('library.table.resetColumns')}
+                            </button>
+                          </div>
+                          <div className="column-picker-grid">
+                            {allTableColumns.map((col) => {
+                              const on = visibleTableColumns.some((c) => c.key === col.key);
+                              return (
+                                <label key={col.key} className={on ? 'is-on' : undefined}>
+                                  <input type="checkbox" checked={on} onChange={() => toggleTableColumn(col.key)} />
+                                  {col.label}
+                                </label>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                      {density === 'table' ? (
+                        /* Spreadsheet view. The whole point is spotting gaps —
+                           "να βλέπω π.χ. αν έχω παραλείψει να καταχωρήσω κάποιο
+                           πεδίο" — so empty cells are marked rather than left
+                           blank. The wrapper scrolls sideways, never the page. */
+                        <div className="book-table-wrap">
+                          <table className={`book-table${tableHighlightGaps ? ' show-gaps' : ''}`}>
+                            <thead>
+                              <tr>
+                                {canWrite && selectionMode && <th className="col-select" scope="col"><span className="sr-only">{t('library.select.start')}</span></th>}
+                                <th className="col-status" scope="col">{t('detail.statusRow')}</th>
+                                {visibleTableColumns.map((col) => (
+                                  <th key={col.key} scope="col" style={col.width ? { minWidth: col.width } : undefined}>
+                                    {col.label}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {books.map((book) => {
+                                const isSelected = selectedBookIds.includes(book.id);
+                                return (
+                                  <tr
+                                    key={book.id}
+                                    className={`${isSelected ? 'is-selected' : ''}${selectionMode ? ' is-selecting' : ''}`}
+                                    {...bookRowHandlers(book)}
+                                  >
+                                    {canWrite && selectionMode && (
+                                      <td className="col-select">
+                                        <input
+                                          type="checkbox"
+                                          className="book-select"
+                                          checked={isSelected}
+                                          onChange={(e) => { e.stopPropagation(); toggleBookSelection(book.id); }}
+                                          onClick={(e) => e.stopPropagation()}
+                                          aria-label={t('library.book.selectAria', { title: displayTitle(book, t('common.untitled')) })}
+                                        />
+                                      </td>
+                                    )}
+                                    <td className="col-status">
+                                      <span className={`status-badge status-${book.status}`}>{t(`status.${book.status}`)}</span>
+                                    </td>
+                                    {visibleTableColumns.map((col) => {
+                                      const value = col.get(book);
+                                      // Title and author render their localized
+                                      // placeholder rather than looking merely blank.
+                                      const display = col.key === 'title'
+                                        ? displayTitle(book, t('common.untitled'))
+                                        : col.key === 'author'
+                                          ? displayAuthor(book, t('common.unknownAuthor'))
+                                          : value;
+                                      const empty = value.trim() === '';
+                                      return (
+                                        <td
+                                          key={col.key}
+                                          className={empty ? 'cell-empty' : undefined}
+                                          title={empty ? undefined : display}
+                                        >
+                                          {empty ? <span aria-label={t('library.table.missing')}>—</span> : display}
+                                        </td>
+                                      );
+                                    })}
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      ) : (
                       <div className={density === 'compact' ? 'book-list' : 'book-grid'}>
                         {books.map((book) => {
                           const isSelected = selectedBookIds.includes(book.id);
@@ -6710,27 +6947,7 @@ function App() {
                             <div
                               key={book.id}
                               className={`${density === 'compact' ? 'book-row' : 'book-card'}${isSelected ? ' is-selected' : ''}${selectionMode ? ' is-selecting' : ''}`}
-                              onClick={() => {
-                                // In selection mode the whole row acts as the
-                                // checkbox so users don't have to aim for a tiny target.
-                                if (selectionMode && canWrite) {
-                                  toggleBookSelection(book.id);
-                                } else {
-                                  openBookDetail(book);
-                                }
-                              }}
-                              role="button"
-                              tabIndex={0}
-                              onContextMenu={(e) => openContextMenu(e, buildBookMenu(book), displayTitle(book, t('common.untitled')))}
-                              onKeyDown={(e) => {
-                                if (e.key !== 'Enter' && e.key !== ' ') return;
-                                e.preventDefault();
-                                if (selectionMode && canWrite) {
-                                  toggleBookSelection(book.id);
-                                } else {
-                                  openBookDetail(book);
-                                }
-                              }}
+                              {...bookRowHandlers(book)}
                             >
                               <input
                                 type="checkbox"
@@ -6784,6 +7001,7 @@ function App() {
                           );
                         })}
                       </div>
+                      )}
                       <div className="pagination">
                         <button
                           className="secondary small"

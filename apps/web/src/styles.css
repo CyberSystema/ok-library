@@ -368,7 +368,9 @@ label {
 }
 .search-bar .search-field { flex: 2; min-width: 220px; }
 .search-bar .filter-field { flex: 1; min-width: 140px; }
-.search-bar .search-actions { display: flex; gap: 0.5rem; padding-bottom: 0; }
+/* Wraps because the table view adds a fourth button (the column picker), which
+   pushed this row past a phone's width. */
+.search-bar .search-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; padding-bottom: 0; }
 .search-bar .search-actions label { visibility: hidden; }
 .sort-row { display: flex; gap: 0.4rem; align-items: stretch; }
 .sort-row select { flex: 1; }
@@ -881,6 +883,131 @@ label {
    real — but visually set apart so it reads as "needs attention", not as a
    normal field. */
 .attr-tile.is-orphan { border-style: dashed; opacity: 0.85; }
+
+/* ── Table (spreadsheet) layout ───────────────────────────────────────────
+   A third density beside cards and list. Its job is comparison across records:
+   seeing at a glance which books are missing a field. At 50 rows per page and
+   ~18 columns this is under 2,000 cells, so no virtualization — which would
+   also break the sticky header and the keyboard/context-menu flow. */
+.book-table-wrap {
+  /* The WRAPPER scrolls, never the page body.
+     Both axes, deliberately. `overflow-y: visible` beside `overflow-x: auto`
+     computes to `auto` anyway (CSS spec), which silently makes this element the
+     sticky containing block — and with no height limit the header then pins to
+     a box that is itself scrolling away, so it never appears to stick at all.
+     Verified: the header was 1166px above the viewport after scrolling.
+     Bounding the height makes this a real scroll container and the sticky
+     header behave. Mirrors `.category-rail`, which already scrolls itself. */
+  overflow: auto;
+  max-height: calc(100vh - 170px);
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+.book-table {
+  /* `separate`, not `collapse`: collapsed borders are painted on the table
+     itself and vanish under position: sticky, so the header would lose its
+     rules the moment it detached. Rules are drawn with box-shadow instead. */
+  border-collapse: separate;
+  border-spacing: 0;
+  width: 100%;
+  font-size: 0.8125rem;
+}
+.book-table th,
+.book-table td {
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: inset 0 -1px 0 var(--border);
+}
+.book-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-2);
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  box-shadow: inset 0 -1px 0 var(--border);
+}
+.book-table tbody tr { cursor: pointer; }
+.book-table tbody tr:hover td { background: var(--surface-2); }
+.book-table tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.book-table tbody tr.is-selected td { background: var(--accent-light); }
+.book-table tbody tr.is-selecting { cursor: copy; }
+.book-table .col-select, .book-table .col-status { width: 1%; }
+.book-table .col-select { padding-right: 0; }
+
+/* Empty cells read as a deliberate gap rather than as blank space — this is the
+   whole reason the view exists. Off by default only if the librarian says so. */
+.book-table.show-gaps td.cell-empty {
+  /* A tint of the warning colour rather than --warning-bg: that token is a
+     solid pale cream in light and a solid dark brown in dark, and a whole
+     column of solid blocks overwhelms the data. Mixing to ~14% alpha reads as
+     the same gentle wash on either surface. */
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  color: var(--warning);
+  text-align: center;
+}
+.book-table td.cell-empty { color: var(--text-muted); text-align: center; }
+
+/* Column picker */
+.column-picker { margin-bottom: 0.75rem; padding: 0.85rem 1rem; }
+.column-picker-head {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.6rem;
+}
+/* The global `label` rule is display:block + uppercase + bold, meant for form
+   field captions. These labels wrap a checkbox and show an attribute's authored
+   name, so they have to opt out of all three. */
+.column-picker-toggle,
+.column-picker-grid label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  margin: 0;
+}
+.column-picker-toggle { white-space: nowrap; }
+/* The global input rule is width:100% (for text fields), which in a flex row
+   stretches the checkbox across the whole label. Pin it back to its own size. */
+.column-picker-toggle input[type="checkbox"],
+.column-picker-grid input[type="checkbox"] {
+  width: auto;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+}
+.column-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.3rem 0.9rem;
+}
+.column-picker-grid label { color: var(--text-muted); cursor: pointer; }
+.column-picker-grid label.is-on { color: var(--text); font-weight: 600; }
+
+/* Screen-reader-only text (the selection column's header). */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* Borrow history */
 .history-list { display: flex; flex-direction: column; gap: 0.5rem; }
