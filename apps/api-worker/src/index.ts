@@ -1500,11 +1500,12 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 
 	await c.env.DB.prepare(
 		`INSERT OR IGNORE INTO books (
-			id, title, author, isbn, publication_year, publisher, language, description,
+			id, title, author, isbn, publication_year, publication_year_end, date_edtf,
+			publisher, language, description,
 			room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 			legacy_id, created_at, updated_at, deleted_at,
 			title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
 	)
 		.bind(
 			id,
@@ -1512,6 +1513,8 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			payload.author,
 			payload.isbn ?? null,
 			payload.publicationYear ?? null,
+			payload.publicationYearEnd ?? payload.publicationYear ?? null,
+			payload.dateEdtf ?? null,
 			payload.publisher ?? null,
 			payload.language ?? null,
 			payload.description ?? null,
@@ -1737,7 +1740,8 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 
 	const updateBookStmt = c.env.DB.prepare(
 		`UPDATE books SET
-			title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?, description = ?,
+			title = ?, author = ?, isbn = ?, publication_year = ?, publication_year_end = ?, date_edtf = ?,
+			publisher = ?, language = ?, description = ?,
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 			legacy_id = ?, version = ?, updated_at = ?,
 			title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
@@ -1748,6 +1752,8 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			merged.author,
 			merged.isbn ?? null,
 			merged.publicationYear ?? null,
+			merged.publicationYearEnd ?? merged.publicationYear ?? null,
+			merged.dateEdtf ?? null,
 			merged.publisher ?? null,
 			merged.language ?? null,
 			merged.description ?? null,
@@ -3505,11 +3511,12 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				});
 				await c.env.DB.prepare(
 					`INSERT OR IGNORE INTO books (
-						id, title, author, isbn, publication_year, publisher, language, description,
+						id, title, author, isbn, publication_year, publication_year_end, date_edtf,
+						publisher, language, description,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 						created_at, updated_at, deleted_at,
 						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						id,
@@ -3517,6 +3524,8 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						row.author,
 						row.isbn ?? null,
 						row.publicationYear ?? null,
+						row.publicationYearEnd ?? row.publicationYear ?? null,
+						row.dateEdtf ?? null,
 						row.publisher ?? null,
 						row.language ?? null,
 						row.description ?? null,
@@ -3667,7 +3676,8 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 
 				const syncUpd = await c.env.DB.prepare(
 					`UPDATE books SET
-						 title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?, description = ?,
+						 title = ?, author = ?, isbn = ?, publication_year = ?, publication_year_end = ?, date_edtf = ?,
+						 publisher = ?, language = ?, description = ?,
 						 room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 						 version = ?, updated_at = ?,
 						 title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?
@@ -3678,6 +3688,8 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						merged.author,
 						merged.isbn ?? null,
 						merged.publicationYear ?? null,
+						merged.publicationYearEnd ?? merged.publicationYear ?? null,
+						merged.dateEdtf ?? null,
 						merged.publisher ?? null,
 						merged.language ?? null,
 						merged.description ?? null,

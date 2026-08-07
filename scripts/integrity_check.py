@@ -770,6 +770,49 @@ check("restoring does NOT resurrect a copy removed earlier",
 st, r = call("PUT", f"/api/books/{hb}/items", {"expectedVersion": 0, "items": []})
 check("a stale expectedVersion is rejected", st == 409, f"{st} {r}")
 
+print("=== 31. REGRESSION: EDTF publication dates ===")
+# A plain integer year cannot describe a volume bound from two parts with two
+# imprints — the case the librarian actually hit — nor "circa", nor an undated
+# one. EDTF (ISO 8601-2) is the standard for it; we support a documented subset
+# and derive the sortable years so every existing year query keeps working.
+for edtf, want in [("1955", (1955, 1955)), ("1955/1957", (1955, 1957)), ("1955?", (1955, 1955)),
+                   ("~1850", (1850, 1850)), ("19XX", (1900, 1999)), ("[1955,1957]", (1955, 1957)),
+                   ("../1960", (1000, 1960)), ("1960/..", (1960, 3000))]:
+    eid, _ = mkbook(dateEdtf=edtf, publicationYear=None)
+    g = get(eid)
+    check(f"EDTF {edtf!r} derives {want}",
+          (g.get("publicationYear"), g.get("publicationYearEnd")) == want,
+          (g.get("publicationYear"), g.get("publicationYearEnd")))
+    check(f"EDTF {edtf!r} is stored as authored", g.get("dateEdtf") == edtf, g.get("dateEdtf"))
+
+# The point of the whole exercise: a two-part volume dated 1955/1957 IS a 1956
+# book as far as browsing goes, and neither endpoint is 1956.
+bw, _ = mkbook(dateEdtf="1955/1957", publicationYear=None, title="ZZITEST boundwith " + uuid.uuid4().hex[:6])
+st, r = call("GET", "/api/books?pageSize=100&year=1956&q=ZZITEST+boundwith&partialWords=true&fuzzyTypos=false")
+check("a 1955/1957 span answers a 1956 query",
+      bw in [x["id"] for x in (r or {}).get("items", [])], (r or {}).get("total"))
+st, r = call("GET", "/api/books?pageSize=100&yearMin=1956&yearMax=1956&q=ZZITEST+boundwith&partialWords=true&fuzzyTypos=false")
+check("...and a 1956-1956 range query", bw in [x["id"] for x in (r or {}).get("items", [])], (r or {}).get("total"))
+# A single-year book must NOT start matching neighbouring years.
+sy, _ = mkbook(dateEdtf="1955", publicationYear=None, title="ZZITEST singleyear " + uuid.uuid4().hex[:6])
+st, r = call("GET", "/api/books?pageSize=100&year=1956&q=ZZITEST+singleyear&partialWords=true&fuzzyTypos=false")
+check("a single-year book is not matched by a neighbouring year",
+      sy not in [x["id"] for x in (r or {}).get("items", [])], (r or {}).get("total"))
+
+# Unparseable dates are KEPT, never rejected — the librarian is transcribing
+# what the book says, and refusing would lose the only note of it.
+ud, _ = mkbook(dateEdtf="χωρίς χρονολογία", publicationYear=None)
+g = get(ud)
+check("an unparseable date is still saved", g.get("dateEdtf") == "χωρίς χρονολογία", g.get("dateEdtf"))
+check("an unparseable date derives no year", g.get("publicationYear") is None, g.get("publicationYear"))
+
+# A plain year still round-trips both directions, so an older client and the
+# offline queue stay consistent with the new column.
+py, _ = mkbook(publicationYear=1999)
+g = get(py)
+check("a plain year mirrors into dateEdtf", g.get("dateEdtf") == "1999", g.get("dateEdtf"))
+check("a plain year gets a matching span end", g.get("publicationYearEnd") == 1999, g.get("publicationYearEnd"))
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

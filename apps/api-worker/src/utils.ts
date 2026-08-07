@@ -1,3 +1,5 @@
+import { parseEdtf } from '@ok-library/shared';
+
 export function nowIso(): string {
   return new Date().toISOString();
 }
@@ -57,6 +59,9 @@ export type NormalizableBook = {
   roomCode?: string | null;
   shelfCode?: string | null;
   acquisitionDate?: string | null;
+  publicationYear?: number | null;
+  publicationYearEnd?: number | null;
+  dateEdtf?: string | null;
   tags?: string[];
   customFields?: Record<string, unknown>;
 };
@@ -92,7 +97,56 @@ export function normalizeCode(value: string): string {
 }
 
 /**
+ * Reconcile a book's date fields.
+ *
+ * `dateEdtf` is authoritative when it parses: `publicationYear` becomes the
+ * earliest year it can denote and `publicationYearEnd` the latest, so the two
+ * representations can never drift apart and every existing year query keeps
+ * working untouched.
+ *
+ * An unparseable expression is KEPT — the librarian is transcribing what is
+ * printed in the book, and refusing to store it would lose the only record of
+ * it. The derived years are simply left alone in that case, and the UI warns.
+ *
+ * With no `dateEdtf` at all, a plain `publicationYear` still round-trips and is
+ * mirrored into `dateEdtf`, which is how rows written by an older client (or
+ * the offline queue) stay consistent.
+ */
+export function reconcileBookDates<T extends {
+  publicationYear?: number | null;
+  publicationYearEnd?: number | null;
+  dateEdtf?: string | null;
+}>(input: T): T {
+  const out = { ...input } as Record<string, unknown>;
+  const raw = typeof out.dateEdtf === 'string' ? out.dateEdtf.trim() : '';
+
+  if (raw) {
+    out.dateEdtf = raw;
+    const parsed = parseEdtf(raw);
+    if (parsed) {
+      out.publicationYear = parsed.start;
+      out.publicationYearEnd = parsed.end;
+    } else {
+      // Unparseable: keep the transcription, but never let a client-supplied
+      // span stand in for one we did not derive.
+      out.publicationYearEnd = out.publicationYear ?? null;
+    }
+    return out as T;
+  }
+
+  out.dateEdtf = null;
+  if (typeof out.publicationYear === 'number') {
+    out.dateEdtf = String(out.publicationYear);
+    out.publicationYearEnd = out.publicationYear;
+  } else if (out.publicationYear === null) {
+    out.publicationYearEnd = null;
+  }
+  return out as T;
+}
+
+/**
  * Normalizes book fields before persistence:
+ * - Reconciles dateEdtf with the derived publicationYear / publicationYearEnd
  * - Collapses multiple spaces and trims text fields (title, author, publisher, …)
  * - Strips hyphens/spaces from ISBN and upper-cases it
  * - Trims language, description, acquisitionDate
@@ -101,7 +155,9 @@ export function normalizeCode(value: string): string {
  * - Trims string-typed custom field values
  */
 export function normalizeBookData<T extends NormalizableBook>(input: T): T {
-  const out = { ...input } as Record<string, unknown>;
+  // Dates are reconciled here so EVERY write path — direct, sync, import —
+  // gets it without having to remember to call it.
+  const out = { ...reconcileBookDates(input as Record<string, unknown>) } as Record<string, unknown>;
 
   // Converge the two historical representations of "no value" into one canonical
   // form: the empty string. Legacy catalog imports minted the English sentinels

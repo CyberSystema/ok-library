@@ -57,6 +57,16 @@ export const BookCoreSchema = z.object({
   author: z.string().max(200).default(''),
   isbn: z.string().max(32).optional().nullable(),
   publicationYear: z.number().int().min(1000).max(3000).optional().nullable(),
+  // The authored date, in the EDTF subset above. When present it is
+  // AUTHORITATIVE and `publicationYear` is derived from it, so the two can
+  // never disagree. Free-form up to 64 chars: an unparseable value is warned
+  // about, never rejected — a librarian must always be able to record what is
+  // printed in the book.
+  dateEdtf: z.string().max(64).optional().nullable(),
+  // DERIVED, never trusted from a client: the latest year `dateEdtf` can denote.
+  // Accepted in the schema only so the type flows through the write paths;
+  // `reconcileBookDates` overwrites it on every write.
+  publicationYearEnd: z.number().int().min(1000).max(3000).optional().nullable(),
   publisher: z.string().max(200).optional().nullable(),
   // Catalogues frequently use multi-language tags like "EL,EN,FR" so we keep
   // the field free-form text rather than enumerated.
@@ -119,6 +129,110 @@ export const BookSchema = CreateBookSchema.extend({
   deletedAt: ISODateTimeSchema.nullable(),
   version: z.number().int().min(0)
 });
+
+// ─── Publication dates (EDTF) ──────────────────────────────────────────────
+//
+// A plain integer year cannot say what an old theological collection actually
+// holds. The librarian hit this on a volume bound from two parts: "έχουν 2
+// διαφορετικές ημερομηνίες έκδοσης. Δεν μου επιτρέπει το σύστημα να καταχωρήσω
+// 2 ημερομηνίες έκδοσης σε μια καταχώρηση βιβλίου." Undated, circa- and
+// decade-only imprints are just as common.
+//
+// EDTF (Extended Date/Time Format, ISO 8601-2) is the standard libraries use
+// for exactly this. We implement a documented SUBSET — the shapes that occur in
+// this catalogue and that MARC 260$c / 008 map onto — and treat anything else
+// as unparseable rather than pretending to understand it.
+//
+//   1955          exact
+//   1955/1957     an interval — the two-volume bound-with
+//   1955?         uncertain
+//   ~1850         approximate ("circa", "χ. 1850")
+//   1955~         approximate, EDTF's trailing form
+//   19XX          unspecified digits — MARC's "[19--]"
+//   [1955,1957]   one of these
+//   ../1960       open start ("before 1960")
+//   1960/..       open end
+export type ParsedEdtf = {
+  /** Earliest year the expression can denote; drives sorting and filtering. */
+  start: number;
+  /** Latest year it can denote. Equals `start` for a single date. */
+  end: number;
+  /** true when the value is a range/one-of rather than a single year. */
+  isRange: boolean;
+  qualifier: 'exact' | 'uncertain' | 'approximate';
+};
+
+const EDTF_MIN_YEAR = 1000;
+const EDTF_MAX_YEAR = 3000;
+
+function edtfYear(token: string): number | null {
+  if (!/^\d{4}$/.test(token)) return null;
+  const n = Number(token);
+  return n >= EDTF_MIN_YEAR && n <= EDTF_MAX_YEAR ? n : null;
+}
+
+/**
+ * Parse the supported EDTF subset. Returns null for anything outside it, which
+ * the callers surface as a warning — never as a refusal to save. A librarian
+ * transcribing what is printed in a book must always be able to record it.
+ */
+export function parseEdtf(raw: string): ParsedEdtf | null {
+  let text = raw.trim();
+  if (!text) return null;
+
+  let qualifier: ParsedEdtf['qualifier'] = 'exact';
+  // Approximation can be written either side; uncertainty trails.
+  if (text.startsWith('~')) { qualifier = 'approximate'; text = text.slice(1).trim(); }
+  if (text.endsWith('~')) { qualifier = 'approximate'; text = text.slice(0, -1).trim(); }
+  if (text.endsWith('?')) { qualifier = 'uncertain'; text = text.slice(0, -1).trim(); }
+
+  // One-of: [1955,1957] — the span between the extremes is what can be filtered.
+  if (text.startsWith('[') && text.endsWith(']')) {
+    const parts = text.slice(1, -1).split(',').map((p) => p.trim()).filter(Boolean);
+    const years = parts.map(edtfYear);
+    if (years.length === 0 || years.some((y) => y === null)) return null;
+    const nums = years as number[];
+    return { start: Math.min(...nums), end: Math.max(...nums), isRange: true, qualifier };
+  }
+
+  // Interval, including the open-ended forms.
+  if (text.includes('/')) {
+    const [lo, hi] = text.split('/', 2).map((p) => p.trim());
+    const openStart = lo === '..' || lo === '';
+    const openEnd = hi === '..' || hi === '';
+    const loYear = openStart ? null : edtfYear(lo);
+    const hiYear = openEnd ? null : edtfYear(hi);
+    if (!openStart && loYear === null) return null;
+    if (!openEnd && hiYear === null) return null;
+    if (openStart && openEnd) return null;
+    const start = loYear ?? EDTF_MIN_YEAR;
+    const end = hiYear ?? EDTF_MAX_YEAR;
+    if (start > end) return null;
+    return { start, end, isRange: true, qualifier };
+  }
+
+  // Unspecified trailing digits: 19XX, 195X.
+  if (/^\d{1,3}X+$/i.test(text) && text.length === 4) {
+    const known = text.replace(/X+$/i, '');
+    const pad = 4 - known.length;
+    const start = Number(known + '0'.repeat(pad));
+    const end = Number(known + '9'.repeat(pad));
+    if (start < EDTF_MIN_YEAR || end > EDTF_MAX_YEAR) return null;
+    return { start, end, isRange: true, qualifier };
+  }
+
+  const single = edtfYear(text);
+  if (single === null) return null;
+  return { start: single, end: single, isRange: false, qualifier };
+}
+
+/** Render a parsed date for display: "1955", "1955–1957", "c. 1850", "1955?". */
+export function formatEdtfRange(parsed: ParsedEdtf): string {
+  const span = parsed.start === parsed.end ? String(parsed.start) : `${parsed.start}–${parsed.end}`;
+  if (parsed.qualifier === 'approximate') return `c. ${span}`;
+  if (parsed.qualifier === 'uncertain') return `${span}?`;
+  return span;
+}
 
 // ─── Holdings ──────────────────────────────────────────────────────────────
 // An Item is one physical copy of a bibliographic record — the shelf-level

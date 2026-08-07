@@ -115,6 +115,8 @@ export async function ensureBootstrapAdmin(env: Env): Promise<void> {
 const SNAKE_TO_CAMEL_BOOK_FIELDS: Record<string, string> = {
   custom_fields: 'customFields',
   publication_year: 'publicationYear',
+  publication_year_end: 'publicationYearEnd',
+  date_edtf: 'dateEdtf',
   shelf_code: 'shelfCode',
   room_code: 'roomCode',
   acquisition_date: 'acquisitionDate',
@@ -152,6 +154,11 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
   out.customFields = safeJsonParse((row.custom_fields as string) ?? '{}', {});
   out.tags = Array.isArray(row.tags) ? row.tags : safeJsonParse((row.tags as string) ?? '[]', []);
   out.publicationYear = row.publication_year ?? null;
+  // Derived on read when absent, so the import paths — which never carry an
+  // authored EDTF value — still present a consistent date. A stored NULL simply
+  // means "the same as the year".
+  out.publicationYearEnd = row.publication_year_end ?? row.publication_year ?? null;
+  out.dateEdtf = row.date_edtf ?? (row.publication_year != null ? String(row.publication_year) : null);
   out.shelfCode = row.shelf_code ?? null;
   out.roomCode = row.room_code ?? null;
   out.acquisitionDate = row.acquisition_date ?? null;
@@ -738,12 +745,17 @@ export async function queryBooksWithFilters(
       values.push(`%${term}%`);
     }
   }
+  // Year filters test OVERLAP with the book's date span, not equality with a
+  // single year. A volume bound from two parts and dated 1955/1957 is genuinely
+  // a 1956 book as far as browsing goes, and "before 1960" has to include it.
+  // COALESCE because the span end is only stored when it differs — for the
+  // ~12.5K single-year rows this reduces to exactly the old comparison.
   if (opts.year) {
-    where.push('b.publication_year = ?');
-    values.push(opts.year);
+    where.push('(b.publication_year <= ? AND COALESCE(b.publication_year_end, b.publication_year) >= ?)');
+    values.push(opts.year, opts.year);
   }
   if (opts.yearMin !== undefined) {
-    where.push('b.publication_year >= ?');
+    where.push('COALESCE(b.publication_year_end, b.publication_year) >= ?');
     values.push(opts.yearMin);
   }
   if (opts.yearMax !== undefined) {

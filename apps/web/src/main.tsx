@@ -12,6 +12,7 @@ import {
   useToast
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
+import { formatEdtfRange, parseEdtf } from '@ok-library/shared';
 import { cacheGet, cacheSet, cacheBustPrefixes, cacheClear } from './cache';
 import { OnboardingCourse } from './onboarding';
 import './styles.css';
@@ -32,6 +33,10 @@ type Book = {
   shelfCode?: string | null;
   isbn?: string | null;
   publicationYear?: number | null;
+  /** Latest year the date can denote; equals publicationYear for a single date. */
+  publicationYearEnd?: number | null;
+  /** The authored date in the EDTF subset — "1955/1957", "~1850", "19XX". */
+  dateEdtf?: string | null;
   customFields?: Record<string, string | number | boolean | null>;
   version: number;
   publisher?: string | null;
@@ -334,7 +339,7 @@ const CORE_TABLE_COLUMNS: Array<Omit<BookColumn, 'get'> & { get: (b: Book) => st
   { key: 'title', labelKey: 'library.add.bookTitle', get: (b) => b.title ?? '', width: 280 },
   { key: 'author', labelKey: 'library.add.author', get: (b) => b.author ?? '', width: 180 },
   { key: 'publisher', labelKey: 'library.add.publisher', get: (b) => b.publisher ?? '', width: 160 },
-  { key: 'publicationYear', labelKey: 'library.add.year', get: (b) => (b.publicationYear ? String(b.publicationYear) : ''), width: 80 },
+  { key: 'publicationYear', labelKey: 'library.add.year', get: (b) => displayBookDate(b), width: 96 },
   { key: 'language', labelKey: 'library.add.language', get: (b) => b.language ?? '', width: 90 },
   { key: 'isbn', labelKey: 'library.add.isbn', get: (b) => b.isbn ?? '', width: 130 },
   { key: 'shelfCode', labelKey: 'library.add.shelf', get: (b) => b.shelfCode ?? '', width: 100 },
@@ -907,6 +912,44 @@ const CatalogDatalists = React.memo(function CatalogDatalists({ facets }: { face
     </>
   );
 });
+
+/**
+ * Live feedback under the publication-date field.
+ *
+ * The field takes EDTF, so it accepts things a year box cannot: "1955/1957" for
+ * a volume bound from two parts, "~1850" for circa, "19XX" for an undated
+ * imprint. Showing the interpreted span as it is typed is what makes that
+ * discoverable — otherwise the syntax is invisible.
+ *
+ * An unrecognised value is flagged but never blocks the save: a librarian
+ * transcribing what is printed in the book must always be able to record it,
+ * and refusing would lose the only note of it. It simply won't sort or filter
+ * by year, which the hint says.
+ */
+/**
+ * How a book's date reads: "1955", "1955–1957", "c. 1850", "1955?".
+ *
+ * Prefers the authored EDTF expression so a range or a qualifier survives to
+ * the screen; falls back to the derived year for rows that predate the column.
+ */
+function displayBookDate(book: { dateEdtf?: string | null; publicationYear?: number | null }): string {
+  const raw = (book.dateEdtf ?? '').trim();
+  if (raw) {
+    const parsed = parseEdtf(raw);
+    // Unparseable is shown verbatim — it is what the librarian transcribed.
+    return parsed ? formatEdtfRange(parsed) : raw;
+  }
+  return book.publicationYear ? String(book.publicationYear) : '';
+}
+
+function EdtfHint({ value, t }: { value: string; t: (k: string, v?: Record<string, string | number>) => string }) {
+  const raw = value.trim();
+  if (!raw) return <span className="edtf-hint muted small">{t('library.add.dateHint')}</span>;
+  const parsed = parseEdtf(raw);
+  if (!parsed) return <span className="edtf-hint is-warn">{t('library.add.dateUnparsed')}</span>;
+  if (!parsed.isRange && parsed.qualifier === 'exact') return null;
+  return <span className="edtf-hint muted small">{t('library.add.dateReads', { span: formatEdtfRange(parsed) })}</span>;
+}
 
 /**
  * A text input with a keyboard-navigable suggestion list.
@@ -3150,7 +3193,9 @@ function App() {
 
     try {
       const customFieldsValue = buildCustomFieldsPayload(createAttrValues);
-      const publicationYear = parsePublicationYear(createForm.publicationYear);
+      // The date field accepts EDTF ("1955/1957", "~1850", "19XX"), so it is sent
+      // as-authored and the server derives the sortable years from it.
+      const dateEdtf = createForm.publicationYear.trim() || null;
       const result = await runAction(() => apiRequest<{ id: string; duplicateOf?: DuplicateEntry[] }>('/api/books', {
         method: 'POST',
         body: JSON.stringify({
@@ -3161,7 +3206,7 @@ function App() {
           publisher: createForm.publisher.trim() || null,
           language: createForm.language.trim() || null,
           description: createForm.description.trim() || null,
-          publicationYear,
+          dateEdtf,
           tags: [],
           customFields: customFieldsValue,
           status: 'available'
@@ -3336,7 +3381,7 @@ function App() {
       author: book.author,
       isbn: book.isbn ?? '',
       shelfCode: book.shelfCode ?? '',
-      publicationYear: book.publicationYear?.toString() ?? '',
+      publicationYear: book.dateEdtf ?? book.publicationYear?.toString() ?? '',
       status: book.status,
       version: book.version,
       publisher: book.publisher ?? '',
@@ -3409,7 +3454,7 @@ function App() {
 
     try {
       const customFieldsValue = buildCustomFieldsPayload(attributeEditorValues);
-      const publicationYear = parsePublicationYear(editForm.publicationYear);
+      const dateEdtf = editForm.publicationYear.trim() || null;
       const result = await runAction(() => apiRequest<{ id: string; version: number }>(`/api/books/${editForm.id}`, {
         method: 'PUT',
         body: JSON.stringify({
@@ -3420,7 +3465,7 @@ function App() {
           publisher: editForm.publisher.trim() || null,
           language: editForm.language.trim() || null,
           description: editForm.description.trim() || null,
-          publicationYear,
+          dateEdtf,
           customFields: customFieldsValue,
           status: editForm.status,
           version: editForm.version
@@ -3441,7 +3486,12 @@ function App() {
               publisher: editForm.publisher.trim() || null,
               language: editForm.language.trim() || null,
               description: editForm.description.trim() || null,
-              publicationYear: publicationYear ?? null,
+              // The server derives the sortable years from the EDTF value, so
+              // mirror that here rather than guess — an unparseable expression
+              // leaves the previous years alone, exactly as the server does.
+              dateEdtf,
+              publicationYear: dateEdtf ? (parseEdtf(dateEdtf)?.start ?? prev.publicationYear ?? null) : null,
+              publicationYearEnd: dateEdtf ? (parseEdtf(dateEdtf)?.end ?? prev.publicationYearEnd ?? null) : null,
               customFields: customFieldsValue as Record<string, string | number | boolean | null>,
               status: editForm.status,
               version: result.version,
@@ -5129,7 +5179,7 @@ function App() {
       author: b.author,
       isbn: b.isbn ?? '',
       shelfCode: b.shelfCode ?? '',
-      publicationYear: b.publicationYear?.toString() ?? '',
+      publicationYear: b.dateEdtf ?? b.publicationYear?.toString() ?? '',
       status: b.status,
       version: b.version,
       publisher: b.publisher ?? '',
@@ -5740,10 +5790,10 @@ function App() {
                           <span className="di-value">{detailBook.isbn}</span>
                         </div>
                       )}
-                      {detailBook.publicationYear && (
+                      {displayBookDate(detailBook) && (
                         <div className="detail-item">
                           <span className="di-label">{t('detail.yearPublished')}</span>
-                          <span className="di-value">{detailBook.publicationYear}</span>
+                          <span className="di-value">{displayBookDate(detailBook)}</span>
                         </div>
                       )}
                       {detailBook.publisher && (
@@ -5936,7 +5986,12 @@ function App() {
                     </div>
                     <div>
                       <label>{t('detail.yearPublished')}</label>
-                      <input type="number" min={1000} max={3000} value={editForm.publicationYear} onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })} placeholder={t('detail.yearPh')} />
+                      <input
+                        value={editForm.publicationYear}
+                        onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })}
+                        placeholder={t('detail.yearPh')}
+                      />
+                      <EdtfHint value={editForm.publicationYear} t={t} />
                     </div>
                   </div>
                   <div className="form-row">
@@ -6597,7 +6652,12 @@ function App() {
                       <div className="form-row">
                         <div>
                           <label>{t('library.add.year')}</label>
-                          <input type="number" min={1000} max={3000} value={createForm.publicationYear} onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })} placeholder={t('library.add.yearPh')} />
+                          <input
+                            value={createForm.publicationYear}
+                            onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })}
+                            placeholder={t('library.add.yearPh')}
+                          />
+                          <EdtfHint value={createForm.publicationYear} t={t} />
                         </div>
                         <div>
                           <label>{t('library.add.shelf')}</label>
@@ -7243,7 +7303,7 @@ function App() {
                                   {q ? highlight(displayAuthor(book, t('common.unknownAuthor')), q) : displayAuthor(book, t('common.unknownAuthor'))}
                                 </p>
                                 <div className="book-card-meta">
-                                  {book.publicationYear && <span className="meta-chip">{book.publicationYear}</span>}
+                                  {displayBookDate(book) && <span className="meta-chip">{displayBookDate(book)}</span>}
                                   {book.language && <span className="meta-chip">{book.language}</span>}
                                   {book.isbn && <span className="meta-chip">ISBN</span>}
                                   {book.legacyId && <span className="meta-chip mono">{book.legacyId}</span>}

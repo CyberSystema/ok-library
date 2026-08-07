@@ -2375,3 +2375,8 @@ mark.hl {
 
 [data-theme="dark"] .bulk-field input:disabled,
 [data-theme="dark"] .bulk-field select:disabled { background: rgba(220,38,38,0.16); }
+
+/* Live feedback under the publication-date field: the EDTF syntax is only
+   discoverable if the interpretation shows as you type. */
+.edtf-hint { display: block; margin-top: 0.25rem; font-size: 0.75rem; }
+.edtf-hint.is-warn { color: var(--warning); font-weight: 600; }
