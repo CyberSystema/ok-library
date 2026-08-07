@@ -4473,7 +4473,47 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 		await c.env.DB.batch(updates.slice(i, i + BATCH_SIZE));
 	}
 
-	if (updated > 0) {
+	// Heal the location codes on the COPIES too.
+	//
+	// The loop above only rewrites `books`, but location filters and the shelf
+	// facet read `items` — so without this a healed record said "19-000 ΠΙΣΩ"
+	// while the shelf browser still listed "19-000 ΠΊΣΩ", and the two disagreed
+	// permanently. Introduced by the holdings layer; the healing pass had to
+	// learn about it.
+	//
+	// Done by DISTINCT VALUE, not per row: there are ~249 shelf codes against
+	// 12.5K copies, only a handful of them Greek, so this is a few reads and at
+	// most a few writes instead of a second full sweep. Runs on the first page
+	// only — it is set-based and repeating it 26 times would be pure waste.
+	let itemCodesHealed = 0;
+	if (offset === 0) {
+		const codes = await c.env.DB.prepare(
+			`SELECT DISTINCT shelf_code AS code, 'shelf_code' AS col FROM items
+			  WHERE shelf_code IS NOT NULL AND TRIM(shelf_code) <> ''
+			 UNION
+			 SELECT DISTINCT room_code, 'room_code' FROM items
+			  WHERE room_code IS NOT NULL AND TRIM(room_code) <> ''`
+		).all<{ code: string; col: string }>();
+
+		const codeFixes: D1PreparedStatement[] = [];
+		for (const row of codes.results ?? []) {
+			const normalized = normalizeCode(row.code);
+			if (normalized === row.code) continue;
+			// Column name comes from this query's own literals, never user input.
+			const column = row.col === 'room_code' ? 'room_code' : 'shelf_code';
+			codeFixes.push(
+				c.env.DB.prepare(
+					`UPDATE items SET ${column} = ?, updated_at = ? WHERE ${column} = ?`
+				).bind(normalized, now, row.code)
+			);
+			itemCodesHealed += 1;
+		}
+		for (let i = 0; i < codeFixes.length; i += BATCH_SIZE) {
+			await c.env.DB.batch(codeFixes.slice(i, i + BATCH_SIZE));
+		}
+	}
+
+	if (updated > 0 || itemCodesHealed > 0) {
 		await bumpBooksCacheVersion(c.env);
 	}
 
@@ -4481,11 +4521,11 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 	const totalBooks = countResult?.n ?? 0;
 
 	await insertAuditLog(c.env, c.get('user').sub, 'admin.normalizeBooks', 'book', null, {
-		processed, updated, foldsBackfilled, offset, limit
+		processed, updated, foldsBackfilled, itemCodesHealed, offset, limit
 	});
 
 	return c.json({
-		processed, updated, foldsBackfilled,
+		processed, updated, foldsBackfilled, itemCodesHealed,
 		unchanged: processed - updated, offset, nextOffset: offset + processed, totalBooks
 	});
 });

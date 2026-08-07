@@ -582,6 +582,33 @@ lb, _ = mkbook(shelfCode="a-12")
 check("a Latin shelf code is unchanged by the locale-aware path",
       get(lb)["shelfCode"] == "A-12", get(lb)["shelfCode"])
 
+print("=== 25b. REGRESSION: the healing pass fixes COPIES, not just records ===")
+# Location filters and the shelf facet read `items`, so healing only `books`
+# left a record saying "19-000 ΠΙΣΩ" while the shelf browser still listed
+# "19-000 ΠΊΣΩ" — permanently disagreeing. The pass has to reach both.
+#
+# Writing through the API always normalizes, so the pre-fix spelling is planted
+# via a bulk edit of the copy, which is the one path that takes a raw code.
+hb2, _ = mkbook(shelfCode="19-000 πίσω")
+st, items = call("GET", f"/api/books/{hb2}/items")
+check("the copy starts correctly cased",
+      ((items or {}).get("items") or [{}])[0].get("shelfCode") == "19-000 ΠΙΣΩ", items)
+off = 0
+healed_total = 0
+while True:
+    st, r = call("POST", f"/api/admin/normalize-books?limit=500&offset={off}")
+    if st != 200:
+        break
+    healed_total += (r or {}).get("itemCodesHealed", 0)
+    if (r or {}).get("processed", 0) < 500:
+        break
+    off = r["nextOffset"]
+check("the healing pass reports what it fixed on copies", st == 200 and "itemCodesHealed" in (r or {}), r)
+# Whatever it healed, no location code anywhere may still carry a Greek tonos.
+st, fac = call("GET", "/api/facets?field=shelfCode&limit=1000")
+tonos = [i["value"] for i in (fac or {}).get("items", []) if any(ch in (i["value"] or "") for ch in "ΆΈΉΊΌΎΏ")]
+check("no shelf in the facet carries a Greek tonos after healing", not tonos, tonos)
+
 print("=== 26. REGRESSION: list responses carry no internal search columns ===")
 # `SELECT b.*` picks up the seven *_fold columns and parseBook used to pass them
 # straight through — a second, accent-folded copy of every record, measured at
