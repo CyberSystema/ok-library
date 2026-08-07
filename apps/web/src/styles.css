@@ -2446,3 +2446,19 @@ mark.hl {
   color: var(--warning);
 }
 .set-unnumbered { flex-basis: 100%; font-size: 0.6875rem; color: var(--text-muted); font-style: italic; }
+
+/* ===== Hold shelf ===== */
+/* A ready hold is the one row the librarian must act on — a copy is physically
+   behind the desk with somebody's name on it — so it gets the accent edge the
+   overdue rows use for the same reason. */
+.loan-item.is-ready { border-left: 3px solid var(--accent); }
+.badge.ready {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 100px;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  color: #fff;
+  background: var(--accent);
+}
+.copies-list .badge.ready { margin-left: 0.4rem; }

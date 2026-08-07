@@ -613,7 +613,27 @@ export async function restoreItemsDeletedAt(
  *
  * Location *filtering* does not use these — it queries items directly, so a
  * book held in two places is found under both.
+ *
+ * An OPEN LOAN pins a copy, whatever items.status happens to say. Circulation
+ * writes items.status itself, so the two normally agree; the loan check is what
+ * makes this safe to call from anywhere. Before migration 0028 nothing wrote
+ * items.status at all, and this function would quietly free a borrowed record
+ * whenever add-copies or a merge ran over it.
  */
+/**
+ * When a copy may leave the building.
+ *
+ * Three things must be true: the copy is physically available, nobody has it
+ * out, and it is not set aside for someone in the hold queue. A ready hold is
+ * a reservation, not a property of the copy — which is why it lives in `holds`
+ * rather than as a fifth value of the CHECK-constrained items.status.
+ */
+const ITEM_IS_FREE = `i.status = 'available'
+       AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+                        WHERE t.item_id = i.id AND t.returned_at IS NULL)
+       AND NOT EXISTS (SELECT 1 FROM holds h
+                        WHERE h.item_id = i.id AND h.status = 'ready')`;
+
 export async function syncBookFromItems(env: Env, bookId: string): Promise<void> {
   await env.DB.prepare(
     `UPDATE books SET
@@ -625,13 +645,157 @@ export async function syncBookFromItems(env: Env, bookId: string): Promise<void>
                       ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1),
        status = CASE
          WHEN EXISTS (SELECT 1 FROM items i WHERE i.book_id = books.id AND i.deleted_at IS NULL
-                                              AND i.status = 'available') THEN 'available'
+                                              AND ${ITEM_IS_FREE}) THEN 'available'
+         WHEN EXISTS (SELECT 1 FROM borrow_transactions t
+                       WHERE t.book_id = books.id AND t.returned_at IS NULL) THEN 'borrowed'
          ELSE COALESCE((SELECT i.status FROM items i
                          WHERE i.book_id = books.id AND i.deleted_at IS NULL
                          ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1), books.status)
        END
      WHERE id = ?`
   ).bind(bookId).run();
+}
+
+/**
+ * The copy a borrow should take when the operator did not name one.
+ *
+ * Lowest copy number first, so "copy 1" leaves before "copy 2" and the shelf
+ * empties predictably. Returns null when every copy is out, lost or in
+ * maintenance — the caller turns that into a 409 rather than lending a copy
+ * that is not there.
+ */
+export async function pickLendableItem(
+  env: Env,
+  bookId: string,
+  itemId?: string | null,
+  /**
+   * The borrower this loan is for. Their OWN ready hold does not block them —
+   * collecting a hold is the one case where a copy set aside is handed over.
+   */
+  forHoldBorrowerId?: string | null
+): Promise<{ id: string; shelfCode: string | null; copyNumber: number; itemType: string } | null> {
+  const where = itemId
+    ? 'i.book_id = ? AND i.id = ? AND i.deleted_at IS NULL'
+    : 'i.book_id = ? AND i.deleted_at IS NULL';
+  const args: unknown[] = itemId ? [bookId, itemId] : [bookId];
+  const free = forHoldBorrowerId
+    ? ITEM_IS_FREE.replace(
+      "h.item_id = i.id AND h.status = 'ready'",
+      "h.item_id = i.id AND h.status = 'ready' AND (h.borrower_id IS NULL OR h.borrower_id <> ?)"
+    )
+    : ITEM_IS_FREE;
+  if (forHoldBorrowerId) args.push(forHoldBorrowerId);
+  const row = await env.DB.prepare(
+    `SELECT i.id, i.shelf_code, i.copy_number, i.item_type FROM items i
+      WHERE ${where} AND ${free}
+      ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1`
+  ).bind(...args).first<{ id: string; shelf_code: string | null; copy_number: number; item_type: string }>();
+  return row
+    ? { id: row.id, shelfCode: row.shelf_code, copyNumber: Number(row.copy_number), itemType: row.item_type }
+    : null;
+}
+
+/** A resolved loan rule. Every field the borrow and renew paths need. */
+export interface LoanPolicy {
+  id: string;
+  borrowerCategory: string;
+  itemType: string;
+  loanDays: number;
+  renewalLimit: number;
+  renewalDays: number;
+  maxConcurrentLoans: number | null;
+  lendable: boolean;
+}
+
+/**
+ * The rule that applies to this borrower and this kind of copy.
+ *
+ * Most specific wins: an exact (category, type) match beats a category-wide
+ * rule, which beats a type-wide rule, which beats the default. Ordering by the
+ * two wildcard tests rather than fetching all four candidates keeps it to one
+ * indexed read.
+ *
+ * There is always an answer — migration 0029 seeds ('*','*') — but the fallback
+ * below means a library that deletes it still lends rather than 500s.
+ */
+export async function resolveLoanPolicy(
+  env: Env,
+  borrowerCategory: string,
+  itemType: string
+): Promise<LoanPolicy> {
+  const row = await env.DB.prepare(
+    `SELECT * FROM loan_policies
+      WHERE (borrower_category = ? OR borrower_category = '*')
+        AND (item_type = ? OR item_type = '*')
+      ORDER BY (borrower_category <> '*') DESC, (item_type <> '*') DESC
+      LIMIT 1`
+  ).bind(borrowerCategory || 'standard', itemType || 'book').first<Record<string, unknown>>();
+
+  if (!row) {
+    return {
+      id: 'pol_fallback', borrowerCategory: '*', itemType: '*',
+      loanDays: 14, renewalLimit: 2, renewalDays: 14, maxConcurrentLoans: null, lendable: true
+    };
+  }
+  const loanDays = Number(row.loan_days ?? 14);
+  return {
+    id: String(row.id),
+    borrowerCategory: String(row.borrower_category),
+    itemType: String(row.item_type),
+    loanDays,
+    renewalLimit: Number(row.renewal_limit ?? 0),
+    // NULL renewal_days means "another full loan period".
+    renewalDays: row.renewal_days == null ? loanDays : Number(row.renewal_days),
+    maxConcurrentLoans: row.max_concurrent_loans == null ? null : Number(row.max_concurrent_loans),
+    lendable: Number(row.lendable ?? 1) === 1
+  };
+}
+
+/**
+ * A due date `days` from now, at the end of that day in UTC.
+ *
+ * Anchored to 23:59:59.999 for the same reason the web client already does it:
+ * "due in 14 days" is a date the reader reads off a slip, not an hour of the
+ * afternoon that silently makes the book overdue at lunchtime.
+ */
+export function dueDateFromPolicy(days: number, from: Date = new Date()): string {
+  const due = new Date(from.getTime() + days * 86400000);
+  due.setUTCHours(23, 59, 59, 999);
+  return due.toISOString();
+}
+
+/** Open loans this borrower already has. Advisory — the real check is in the borrow batch. */
+export async function countOpenLoansFor(env: Env, borrowerId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    'SELECT COUNT(*) AS n FROM borrow_transactions WHERE borrower_id = ? AND returned_at IS NULL'
+  ).bind(borrowerId).first<{ n: number }>();
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * Close out ready holds nobody collected.
+ *
+ * This worker has no scheduled() handler, so nothing can run on a timer.
+ * Expiry is therefore swept whenever the queue is looked at or a copy comes
+ * back — cheap (one indexed UPDATE), and it means the librarian never sees a
+ * copy held for someone who stopped coming three weeks ago. A hold that has
+ * expired stops holding its copy immediately; the next return re-offers it.
+ */
+export async function expireStaleHolds(env: Env, now: string): Promise<number> {
+  const res = await env.DB.prepare(
+    `UPDATE holds SET status = 'expired', closed_at = ?, updated_at = ?
+      WHERE status = 'ready' AND expires_at IS NOT NULL AND expires_at < ?`
+  ).bind(now, now, now).run();
+  return res.meta?.changes ?? 0;
+}
+
+/** How many copies of a record could be lent right now. Drives the UI's "2 of 3 available". */
+export async function countLendableItems(env: Env, bookId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM items i
+      WHERE i.book_id = ? AND i.deleted_at IS NULL AND ${ITEM_IS_FREE}`
+  ).bind(bookId).first<{ n: number }>();
+  return Number(row?.n ?? 0);
 }
 
 // Fields the facet rail can group by, and that the `(empty)` bucket can filter

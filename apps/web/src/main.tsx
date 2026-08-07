@@ -123,6 +123,43 @@ type ActiveBorrow = {
   borrowedAt: string;
   dueAt: string;
   isOverdue: boolean;
+  // WHICH copy is out. A record can have several on loan at once since the
+  // holdings layer, so a loan row that named only the title was ambiguous.
+  itemId?: string | null;
+  copyNumber?: number | null;
+  shelfCode?: string | null;
+  barcode?: string | null;
+  renewalCount?: number;
+};
+
+// ── Loan policies, holds and renewals ───────────────────────────────────────
+type LoanPolicy = {
+  id?: string;
+  borrowerCategory: string;
+  itemType: string;
+  loanDays: number;
+  renewalLimit: number;
+  renewalDays: number | null;
+  maxConcurrentLoans: number | null;
+  lendable: boolean;
+  notes?: string | null;
+};
+type Hold = {
+  id: string;
+  bookId?: string;
+  title?: string;
+  author?: string;
+  position?: number;
+  borrowerId?: string | null;
+  borrowerName: string;
+  borrowerContact?: string | null;
+  status: 'waiting' | 'ready' | 'fulfilled' | 'cancelled' | 'expired';
+  itemId?: string | null;
+  copyNumber?: number | null;
+  shelfCode?: string | null;
+  placedAt: string;
+  readyAt?: string | null;
+  expiresAt?: string | null;
 };
 
 type AuditLogItem = {
@@ -147,6 +184,7 @@ type StaffUser = {
 
 type BorrowHistoryItem = {
   id: string;
+  itemId?: string | null;
   borrowerName: string;
   borrowerContact?: string | null;
   borrowedAt: string;
@@ -1793,6 +1831,13 @@ function App() {
   const [mergeTotal, setMergeTotal] = useState(0);
   const [mergeStrict, setMergeStrict] = useState(true);
   const [mergeQuery, setMergeQuery] = useState('');
+  // Circulation: the hold shelf, and the rules that decide loan periods.
+  const [holds, setHolds] = useState<Hold[]>([]);
+  const [loanPolicies, setLoanPolicies] = useState<LoanPolicy[]>([]);
+  const [policyCategories, setPolicyCategories] = useState<string[]>([]);
+  const [policyItemTypes, setPolicyItemTypes] = useState<string[]>([]);
+  const [policiesLoaded, setPoliciesLoaded] = useState(false);
+  const [detailHolds, setDetailHolds] = useState<Hold[]>([]);
   const [mergeLoading, setMergeLoading] = useState(false);
   const [mergeScanned, setMergeScanned] = useState(false);
   const [variantsScanned, setVariantsScanned] = useState(false);
@@ -2517,6 +2562,7 @@ function App() {
       loadCustomFields(),
       loadFacets(),
       loadActiveBorrows(),
+      loadHolds(),
       // audit logs + staff users are admin-only endpoints — loading them for a
       // librarian/viewer is a guaranteed 403 + a wasted Workers request each.
       ...(isAdminUser ? [loadAuditLogs(), loadStaffUsers()] : []),
@@ -3930,32 +3976,147 @@ function App() {
     // Trim so a whitespace-only name can't create an anonymous loan (the server
     // schema's min(1) would otherwise accept "   ").
     const trimmedBorrowerName = borrowerName.trim();
-    if ((!selectedBorrowerId && !trimmedBorrowerName) || !dueAt) {
+    if (!selectedBorrowerId && !trimmedBorrowerName) {
       setError(t('toast.borrowerRequired'));
       return;
     }
 
     try {
-      const body: Record<string, unknown> = { dueAt, notes: null };
+      // An empty due date is not an omission: it means "apply the library's
+      // rule", which the server resolves from the borrower's category and the
+      // copy's type. A typed date is an override the librarian is entitled to.
+      const body: Record<string, unknown> = { dueAt: dueAt || null, notes: null };
       if (selectedBorrowerId) {
         body.borrowerId = selectedBorrowerId;
       } else {
         body.borrowerName = trimmedBorrowerName;
         body.borrowerContact = borrowerContact.trim() || null;
       }
-      await runAction(() => apiRequest(`/api/books/${book.id}/borrow`, {
-        method: 'POST',
-        body: JSON.stringify(body)
-      }));
+      const res = await runAction(() => apiRequest<{ dueAt: string; copyNumber: number; shelfCode: string | null; copiesAvailable: number; holdFulfilled?: boolean }>(
+        `/api/books/${book.id}/borrow`,
+        { method: 'POST', body: JSON.stringify(body) }
+      ));
 
-      setMessage(t('toast.bookBorrowed', { title: book.title }));
+      // Say which copy went and when it is due — with several copies on the
+      // shelf, "borrowed" alone no longer tells the operator what happened.
+      setMessage(t('toast.bookBorrowedCopy', {
+        title: book.title,
+        copy: res.copyNumber,
+        date: new Date(res.dueAt).toLocaleDateString()
+      }));
       // Reset borrower form so the next borrow starts fresh.
       setBorrowerName('');
       setBorrowerContact('');
       setSelectedBorrowerId('');
       setBorrowerQuery('');
       setBorrowerSuggestions([]);
-      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
+      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary(), loadHolds()]);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  // ── Renewals, holds and loan policies ─────────────────────────────────────
+
+  async function renewLoan(loan: ActiveBorrow) {
+    clearStatus();
+    try {
+      const res = await runAction(() => apiRequest<{ dueAt: string; renewalCount: number; renewalsLeft: number }>(
+        `/api/loans/${loan.id}/renew`,
+        {
+          method: 'POST',
+          // The renewal count is the precondition that makes a retried request
+          // safe: it strictly increases, so a replay cannot match. The due date
+          // alone cannot do it — renewing a fresh loan lands on the same date.
+          body: JSON.stringify({ expectedRenewalCount: loan.renewalCount ?? 0, expectedDueAt: loan.dueAt })
+        }
+      ));
+      setMessage(t('toast.loanRenewed', {
+        date: new Date(res.dueAt).toLocaleDateString(),
+        n: res.renewalsLeft
+      }));
+      await Promise.all([loadActiveBorrows(), loadBooks()]);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function loadHolds() {
+    if (!canSeeCirculation) return;
+    try {
+      const res = await apiRequest<{ items: Hold[] }>('/api/holds');
+      setHolds(res.items ?? []);
+    } catch {
+      // A failed hold-shelf read must not blank the loans screen.
+    }
+  }
+
+  async function placeHold(book: Book) {
+    clearStatus();
+    const name = window.prompt(t('holds.promptBorrower'));
+    if (!name || !name.trim()) return;
+    try {
+      const res = await runAction(() => apiRequest<{ position: number; status: string }>(
+        `/api/books/${book.id}/holds`,
+        { method: 'POST', body: JSON.stringify({ borrowerName: name.trim() }) }
+      ));
+      setMessage(res.status === 'ready'
+        ? t('toast.holdReady', { name: name.trim() })
+        : t('toast.holdPlaced', { name: name.trim(), n: res.position }));
+      await Promise.all([loadHolds(), loadBookHolds(book.id)]);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function cancelHold(hold: Hold) {
+    clearStatus();
+    try {
+      const res = await runAction(() => apiRequest<{ passedOnTo: string | null }>(
+        `/api/holds/${hold.id}`, { method: 'DELETE' }
+      ));
+      setMessage(res.passedOnTo
+        ? t('toast.holdCancelledPassed', { name: res.passedOnTo })
+        : t('toast.holdCancelled'));
+      await Promise.all([loadHolds(), hold.bookId ? loadBookHolds(hold.bookId) : Promise.resolve()]);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function loadBookHolds(bookId: string) {
+    if (!canSeeCirculation) { setDetailHolds([]); return; }
+    try {
+      const res = await apiRequest<{ holds: Hold[] }>(`/api/books/${bookId}/holds`);
+      setDetailHolds(res.holds ?? []);
+    } catch {
+      setDetailHolds([]);
+    }
+  }
+
+  async function loadLoanPolicies() {
+    try {
+      const res = await apiRequest<{ policies: LoanPolicy[]; borrowerCategories: Array<{ category: string }>; itemTypes: string[] }>(
+        '/api/loan-policies'
+      );
+      setLoanPolicies(res.policies ?? []);
+      setPolicyCategories((res.borrowerCategories ?? []).map((r) => r.category));
+      setPolicyItemTypes(res.itemTypes ?? []);
+      setPoliciesLoaded(true);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
+  async function saveLoanPolicies() {
+    clearStatus();
+    try {
+      await runAction(() => apiRequest('/api/loan-policies', {
+        method: 'PUT',
+        body: JSON.stringify({ policies: loanPolicies.map(({ id: _id, ...p }) => p) })
+      }));
+      setMessage(t('toast.policiesSaved', { n: loanPolicies.length }));
+      await loadLoanPolicies();
     } catch (e) {
       setError((e as Error).message);
     }
@@ -3971,7 +4132,7 @@ function App() {
       }));
 
       setMessage(t('toast.bookReturned', { title: book.title }));
-      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
+      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary(), loadHolds()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -3989,7 +4150,7 @@ function App() {
         body: JSON.stringify({ notes: 'Returned from active loans list', transactionId: transactionId ?? null })
       }));
       setMessage(t('toast.bookReturned', { title }));
-      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
+      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary(), loadHolds()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -4024,7 +4185,7 @@ function App() {
         setMessage(t('toast.returnedOverdueAll', { n: success }));
       }
 
-      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary()]);
+      await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary(), loadHolds()]);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -5270,7 +5431,9 @@ function App() {
     setDetailBook(book);
     setDetailMode('view');
     setBookHistory([]);
+    setDetailHolds([]);
     void loadBookHistory(book.id);
+    void loadBookHolds(book.id);
   }
 
   // Core fields plus every custom attribute, everyday-first (the definitions
@@ -6081,6 +6244,14 @@ function App() {
                       {t('detail.returnBtn')}
                     </button>
                   )}
+                  {/* Queue for a book whose copies are all out. Placing a hold on
+                      an available book is allowed too — it puts the copy aside
+                      straight away — but the button belongs where the need is. */}
+                  {canSeeCirculation && detailBook.status !== 'available' && (
+                    <button className="secondary small" onClick={() => void placeHold(detailBook)}>
+                      {t('holds.place')}
+                    </button>
+                  )}
                   {canPrintLabels && (
                     <button className="secondary small" onClick={() => void printLabels([detailBook])}>{t('detail.labelBtn')}</button>
                   )}
@@ -6286,7 +6457,24 @@ function App() {
                   {/* Borrow History */}
                   {canSeeCirculation && (
                   <div className="detail-section">
-                    <div className="detail-section-title">{t('detail.history')}</div>
+                    {detailHolds.length > 0 && (
+                  <>
+                    <div className="detail-section-title">{t('holds.queueHeading', { n: detailHolds.length })}</div>
+                    <ul className="copies-list">
+                      {detailHolds.map((h) => (
+                        <li key={h.id}>
+                          <span className="copy-number">{h.position}</span>
+                          <span>{h.borrowerName}</span>
+                          {h.status === 'ready'
+                            ? <span className="badge ready">{t('holds.ready')}</span>
+                            : <span className="muted small">{t('holds.waitingSince', { date: new Date(h.placedAt).toLocaleDateString() })}</span>}
+                          <button type="button" className="secondary small" onClick={() => void cancelHold(h)}>{t('holds.cancel')}</button>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                <div className="detail-section-title">{t('detail.history')}</div>
                     {bookHistory.length === 0 ? (
                       <p style={{ fontSize: '0.875rem', color: 'var(--text-muted)' }}>{t('detail.noHistory')}</p>
                     ) : (
@@ -7863,16 +8051,59 @@ function App() {
                             <p className="meta">
                               {t('loans.due', { date: new Date(loan.dueAt).toLocaleDateString() })}
                               {loan.isOverdue && <span className="overdue-tag"> · {t('loans.overdueTag')}</span>}
+                              {/* WHICH copy. With several out at once, the row has
+                                  to say which one is coming back. */}
+                              {loan.copyNumber != null && (
+                                <span className="muted"> · {t('loans.copyN', { n: loan.copyNumber })}{loan.shelfCode ? ` · ${loan.shelfCode}` : ''}</span>
+                              )}
+                              {(loan.renewalCount ?? 0) > 0 && (
+                                <span className="muted"> · {t('loans.renewedN', { n: loan.renewalCount ?? 0 })}</span>
+                              )}
                             </p>
                           </div>
-                          <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, displayTitle({ title: loan.title }, t('common.untitled')), loan.id)}>
-                            {t('loans.return')}
-                          </button>
+                          <div className="button-group">
+                            <button className="secondary small" onClick={() => void renewLoan(loan)}>
+                              {t('loans.renew')}
+                            </button>
+                            <button className="secondary small" onClick={() => void quickReturnByBookId(loan.bookId, displayTitle({ title: loan.title }, t('common.untitled')), loan.id)}>
+                              {t('loans.return')}
+                            </button>
+                          </div>
                         </div>
                       ))}
                     </div>
                   )}
                 </div>
+
+                {/* The hold shelf — copies waiting behind the desk, and the queue */}
+                {holds.length > 0 && (
+                  <div className="card">
+                    <h3>{t('holds.heading', { n: holds.length })}</h3>
+                    <p className="muted small" style={{ marginBottom: '0.75rem' }}>{t('holds.intro')}</p>
+                    <div className="loan-list">
+                      {holds.map((h) => (
+                        <div key={h.id} className={`loan-item${h.status === 'ready' ? ' is-ready' : ''}`}>
+                          <div className="loan-item-info">
+                            <strong>{displayTitle({ title: h.title ?? '' }, t('common.untitled'))}</strong>
+                            <p className="meta">{t('holds.forReader', { name: h.borrowerName })}</p>
+                            <p className="meta">
+                              {h.status === 'ready'
+                                ? <>
+                                    <span className="badge ready">{t('holds.ready')}</span>
+                                    {h.shelfCode ? ` · ${h.shelfCode}` : ''}
+                                    {h.expiresAt ? ` · ${t('holds.until', { date: new Date(h.expiresAt).toLocaleDateString() })}` : ''}
+                                  </>
+                                : t('holds.waitingSince', { date: new Date(h.placedAt).toLocaleDateString() })}
+                            </p>
+                          </div>
+                          <button className="secondary small" onClick={() => void cancelHold(h)}>
+                            {t('holds.cancel')}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Borrow Form */}
                 <div className="card">
@@ -7937,17 +8168,27 @@ function App() {
                         </div>
                       </div>
                       <div className="form-field">
-                        <label>{t('loans.dueDate')} *</label>
+                        <label htmlFor="loan-due-date">{t('loans.dueDate')}</label>
                         <input
+                          id="loan-due-date"
                           type="date"
                           value={isoToLocalDateInput(dueAt)}
-                          onChange={(e) => setDueAt(endOfLocalDayIso(e.target.value))}
-                          required
+                          onChange={(e) => setDueAt(e.target.value ? endOfLocalDayIso(e.target.value) : '')}
+                          aria-describedby="loan-due-hint"
                         />
+                        {/* No longer required. Blank means "apply the library's
+                            rule", which is now the normal case; typing a date is
+                            an override the librarian is entitled to make. */}
+                        <p id="loan-due-hint" className="muted small" style={{ marginTop: '0.35rem' }}>
+                          {dueAt ? t('loans.dueOverride') : t('loans.duePolicy')}
+                        </p>
                         <div className="button-group" style={{ marginTop: '0.5rem' }}>
                           <button type="button" className="secondary small" onClick={() => setDueInDays(7)}>{t('loans.in7')}</button>
                           <button type="button" className="secondary small" onClick={() => setDueInDays(14)}>{t('loans.in14')}</button>
                           <button type="button" className="secondary small" onClick={() => setDueInDays(30)}>{t('loans.in30')}</button>
+                          {dueAt && (
+                            <button type="button" className="secondary small" onClick={() => setDueAt('')}>{t('loans.useRule')}</button>
+                          )}
                         </div>
                       </div>
                       <div className="button-group">
@@ -8464,6 +8705,105 @@ function App() {
                       {t('settings.searchIndexIntro')}
                     </p>
                     <button className="secondary" onClick={() => void rebuildSearchIndex()}>{t('settings.searchIndexRun')}</button>
+                  </div>
+                )}
+
+                {/* Loan rules: how long, how many, how often — decided once */}
+                {isAdmin && (
+                  <div className="card">
+                    <h3>{t('policies.heading')}</h3>
+                    <p className="muted small" style={{ marginBottom: '1rem' }}>{t('policies.intro')}</p>
+                    {!policiesLoaded ? (
+                      <button className="secondary" onClick={() => void loadLoanPolicies()}>{t('policies.load')}</button>
+                    ) : (
+                      <>
+                        <div style={{ overflowX: 'auto' }}>
+                          <table className="merge-table">
+                            <thead>
+                              <tr>
+                                <th scope="col">{t('policies.category')}</th>
+                                <th scope="col">{t('policies.itemType')}</th>
+                                <th scope="col">{t('policies.loanDays')}</th>
+                                <th scope="col">{t('policies.renewalLimit')}</th>
+                                <th scope="col">{t('policies.maxLoans')}</th>
+                                <th scope="col">{t('policies.lendable')}</th>
+                                <th scope="col"><span className="sr-only">{t('common.remove')}</span></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {loanPolicies.map((p, i) => {
+                                const isDefault = p.borrowerCategory === '*' && p.itemType === '*';
+                                const upd = (patch: Partial<LoanPolicy>) =>
+                                  setLoanPolicies((prev) => prev.map((q, j) => (j === i ? { ...q, ...patch } : q)));
+                                return (
+                                  <tr key={i}>
+                                    <td>
+                                      <input
+                                        value={p.borrowerCategory}
+                                        list="policy-categories"
+                                        aria-label={t('policies.categoryFor', { n: i + 1 })}
+                                        disabled={isDefault}
+                                        onChange={(e) => upd({ borrowerCategory: e.target.value })}
+                                      />
+                                    </td>
+                                    <td>
+                                      <select
+                                        value={p.itemType}
+                                        aria-label={t('policies.itemTypeFor', { n: i + 1 })}
+                                        disabled={isDefault}
+                                        onChange={(e) => upd({ itemType: e.target.value })}
+                                      >
+                                        <option value="*">{t('policies.anyType')}</option>
+                                        {policyItemTypes.map((it) => <option key={it} value={it}>{t(`itemType.${it}`)}</option>)}
+                                      </select>
+                                    </td>
+                                    <td>
+                                      <input type="number" min={1} max={365} value={p.loanDays}
+                                        aria-label={t('policies.loanDaysFor', { n: i + 1 })}
+                                        onChange={(e) => upd({ loanDays: Number(e.target.value) || 1 })} />
+                                    </td>
+                                    <td>
+                                      <input type="number" min={0} max={20} value={p.renewalLimit}
+                                        aria-label={t('policies.renewalLimitFor', { n: i + 1 })}
+                                        onChange={(e) => upd({ renewalLimit: Number(e.target.value) || 0 })} />
+                                    </td>
+                                    <td>
+                                      <input type="number" min={1} max={1000} value={p.maxConcurrentLoans ?? ''}
+                                        placeholder={t('policies.unlimited')}
+                                        aria-label={t('policies.maxLoansFor', { n: i + 1 })}
+                                        onChange={(e) => upd({ maxConcurrentLoans: e.target.value ? Number(e.target.value) : null })} />
+                                    </td>
+                                    <td>
+                                      <input type="checkbox" checked={p.lendable}
+                                        aria-label={t('policies.lendableFor', { n: i + 1 })}
+                                        onChange={(e) => upd({ lendable: e.target.checked })} />
+                                    </td>
+                                    <td>
+                                      {!isDefault && (
+                                        <button type="button" className="secondary small"
+                                          onClick={() => setLoanPolicies((prev) => prev.filter((_, j) => j !== i))}
+                                        >{t('common.remove')}</button>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                          <datalist id="policy-categories">
+                            {policyCategories.map((cat) => <option key={cat} value={cat} />)}
+                          </datalist>
+                        </div>
+                        <div className="button-group" style={{ marginTop: '0.75rem' }}>
+                          <button className="secondary small" onClick={() => setLoanPolicies((prev) => [...prev, {
+                            borrowerCategory: 'standard', itemType: 'book', loanDays: 14,
+                            renewalLimit: 2, renewalDays: null, maxConcurrentLoans: null, lendable: true
+                          }])}>{t('policies.addRule')}</button>
+                          <button className="primary small" onClick={() => void saveLoanPolicies()}>{t('policies.save')}</button>
+                        </div>
+                        <p className="muted small" style={{ marginTop: '0.6rem' }}>{t('policies.note')}</p>
+                      </>
+                    )}
                   </div>
                 )}
 

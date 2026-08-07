@@ -9,8 +9,12 @@ import {
 	computeSetGaps,
 	LinkAuthoritiesSchema,
 	MergeBooksSchema,
+	PlaceHoldSchema,
+	RenewLoanSchema,
+	ReplaceLoanPoliciesSchema,
 	UpsertAuthoritySchema,
 	ImportBooksSchema,
+	ITEM_TYPES,
 	ImportCatalogSchema,
 	ReturnBookSchema,
 	SyncPushSchema,
@@ -62,6 +66,12 @@ import {
 	loadBookItems,
 	loadItemsForBooks,
 	loadMergeCandidateGroups,
+	pickLendableItem,
+	countLendableItems,
+	resolveLoanPolicy,
+	dueDateFromPolicy,
+	countOpenLoansFor,
+	expireStaleHolds,
 	parseItem,
 	syncBookFromItems,
 	runAtomic,
@@ -1950,9 +1960,14 @@ app.post('/api/books/merge', requirePermission('books.write', { librarian: true 
 
 	// A record on loan cannot be merged away: the loan points at the book, and
 	// moving it would rewrite the borrower's history under them.
+	//
+	// The KEEPER is checked too. It is not being moved, but the merge ends by
+	// re-deriving its status from its copies and renumbering them, and a
+	// borrower is holding one of those copies. Before 0028 this hole silently
+	// freed a record whose loan was still open.
 	const loans = await c.env.DB.prepare(
-		`SELECT book_id FROM borrow_transactions WHERE returned_at IS NULL AND book_id IN (${mergeIds.map(() => '?').join(',')})`
-	).bind(...mergeIds).all<{ book_id: string }>();
+		`SELECT book_id FROM borrow_transactions WHERE returned_at IS NULL AND book_id IN (${ids.map(() => '?').join(',')})`
+	).bind(...ids).all<{ book_id: string }>();
 	if ((loans.results ?? []).length > 0) {
 		throw new HTTPException(409, {
 			message: 'Cannot merge a record that is on loan. Return it first.'
@@ -2491,8 +2506,16 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 
 	if (closeOpenLoanOnWrite) {
 		// Atomically close the open loan when a borrowed book is marked lost/
-		// maintenance, so no phantom active loan is left behind.
+		// maintenance, so no phantom active loan is left behind. Since 0028 the
+		// copies carry the status too, and they must move with the record or
+		// syncBookFromItems will put the record straight back to 'borrowed'.
 		await runAtomic(c.env, [
+			c.env.DB.prepare(
+				`UPDATE items SET status = ?, version = version + 1, updated_at = ?
+				  WHERE deleted_at IS NULL AND status = 'borrowed'
+				    AND id IN (SELECT item_id FROM borrow_transactions
+				                WHERE book_id = ? AND returned_at IS NULL AND item_id IS NOT NULL)`
+			).bind(merged.status, now, id),
 			c.env.DB.prepare(
 				`UPDATE borrow_transactions
 				    SET returned_at = ?, notes = TRIM(COALESCE(notes, '') || ' [auto-closed: marked ' || ? || ']')
@@ -2766,111 +2789,250 @@ app.post('/api/books/:id/borrow', requirePermission('circulation', { librarian: 
 
 	// Reject due dates that are not strictly in the future. Catches calendar
 	// typos (last year) and timezone-crossed clocks before they create
-	// already-overdue loans.
-	if (Date.parse(payload.dueAt) <= Date.now()) {
+	// already-overdue loans. An absent dueAt is not a typo — it means "use the
+	// policy", which is the normal case since 0029.
+	if (payload.dueAt && Date.parse(payload.dueAt) <= Date.now()) {
 		throw new HTTPException(400, { message: 'dueAt must be in the future.' });
 	}
 
 	const { borrowerId, borrowerName, borrowerContact } = await resolveBorrower(c.env, payload);
 
+	// Which physical copy leaves the building. The operator may name one — that
+	// is what scanning a copy's barcode does — otherwise the lowest-numbered
+	// free copy goes. Before migration 0028 a loan named only the record, so a
+	// two-copy book could be lent exactly once.
+	//
+	// A copy set aside for THIS borrower's own hold is fair game: handing over a
+	// hold is exactly what collecting one means.
+	const item = await pickLendableItem(c.env, bookId ?? '', payload.itemId ?? null, borrowerId);
+	if (!item) {
+		const exists = await c.env.DB.prepare('SELECT status FROM books WHERE id = ? AND deleted_at IS NULL')
+			.bind(bookId).first<{ status: string }>();
+		if (!exists) throw new HTTPException(404, { message: 'Book not found' });
+		// A copy held for somebody else is a different situation from no copy at
+		// all, and the operator needs to know which.
+		const heldFor = await c.env.DB.prepare(
+			`SELECT h.borrower_name FROM holds h JOIN items i ON i.id = h.item_id
+			  WHERE i.book_id = ? AND h.status = 'ready' LIMIT 1`
+		).bind(bookId).first<{ borrower_name: string }>();
+		if (heldFor) {
+			throw new HTTPException(409, {
+				message: `The available copy is being held for ${heldFor.borrower_name}.`
+			});
+		}
+		throw new HTTPException(409, {
+			message: payload.itemId ? 'That copy is not available' : 'No copy of this book is available'
+		});
+	}
+
+	// The rule for this reader and this kind of copy. It decides how long the
+	// loan runs, whether the copy may leave at all, and how many the reader may
+	// hold at once — replacing three hard-coded buttons in the web app and a
+	// hard-coded 14 in the mobile one.
+	const category = borrowerId
+		? (await c.env.DB.prepare('SELECT category FROM borrowers WHERE id = ?').bind(borrowerId)
+			.first<{ category: string }>())?.category ?? 'standard'
+		: 'standard';
+	const policy = await resolveLoanPolicy(c.env, category, item.itemType);
+	if (!policy.lendable) {
+		throw new HTTPException(409, {
+			message: 'This is a consultation-only copy and cannot be lent.'
+		});
+	}
+	// An explicit dueAt is an override the librarian is entitled to make; the
+	// policy is the default, not a cage. The audit log records both so an
+	// override is visible afterwards.
+	const dueAt = payload.dueAt ?? dueDateFromPolicy(policy.loanDays);
+	const policyDueAt = dueDateFromPolicy(policy.loanDays);
+
 	const now = nowIso();
 	const txId = crypto.randomUUID();
 
-	// A loan is two facts that must be true together: the ledger row exists and
-	// the book reads as 'borrowed'. Writing them as two independent statements
-	// meant a crash (or an evicted isolate) between them left the book flagged
+	// A loan is three facts that must be true together: the ledger row exists,
+	// the copy reads as 'borrowed', and the record agrees. Writing them as
+	// independent statements meant a crash between them left a copy flagged
 	// borrowed with nobody on the hook for it, and the compensating revert that
 	// tried to paper over that could itself fail. One batch = one D1
-	// transaction, so both land or neither does.
+	// transaction, so all three land or none do.
 	//
-	// Both statements carry the SAME `status = 'available'` guard, so a
+	// The INSERT and the copy UPDATE carry the SAME availability guard, so a
 	// concurrent borrow that wins the race makes both no-ops rather than
 	// inserting an orphan ledger row. The INSERT runs first for exactly that
-	// reason — after the UPDATE the book is no longer 'available' and its own
-	// guard would never match.
+	// reason — after the UPDATE the copy is no longer 'available' and its own
+	// guard would never match. `idx_borrow_active_item` is the backstop.
+	// The cap lives INSIDE the insert's guard, not in a read before it. Checking
+	// "does this borrower already have N out?" and then inserting is
+	// check-then-act: two borrows arriving together both pass a read of N-1.
+	// Folded into the WHERE, the second one simply inserts nothing.
+	const capClause = policy.maxConcurrentLoans != null && borrowerId
+		? ` AND (SELECT COUNT(*) FROM borrow_transactions t2
+		          WHERE t2.borrower_id = ? AND t2.returned_at IS NULL) < ?`
+		: '';
+	const guard = `(SELECT 1 FROM items i
+			 WHERE i.id = ? AND i.deleted_at IS NULL AND i.status = 'available'
+			   AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+			                    WHERE t.item_id = i.id AND t.returned_at IS NULL)
+			   AND NOT EXISTS (SELECT 1 FROM holds h
+			                    WHERE h.item_id = i.id AND h.status = 'ready'
+			                      AND (h.borrower_id IS NULL OR h.borrower_id <> ?))${capClause})`;
 	const borrowResults = await runAtomic(c.env, [
 		c.env.DB.prepare(
 			`INSERT INTO borrow_transactions (
-				id, book_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
+				id, book_id, item_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
 			)
-			 SELECT ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
-			 WHERE EXISTS (SELECT 1 FROM books WHERE id = ? AND deleted_at IS NULL AND status = 'available')`
+			 SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
+			 WHERE EXISTS ${guard}`
 		).bind(
 			txId,
 			bookId,
+			item.id,
 			borrowerId,
 			borrowerName,
 			borrowerContact,
 			now,
-			payload.dueAt,
+			dueAt,
 			payload.notes ?? null,
 			c.get('user').sub,
 			now,
-			bookId
+			item.id,
+			borrowerId,
+			...(capClause ? [borrowerId, policy.maxConcurrentLoans] : [])
 		),
 		c.env.DB.prepare(
-			`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ?
+			`UPDATE items SET status = 'borrowed', version = version + 1, updated_at = ?
 			 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
+		).bind(now, item.id),
+		// The record is available while ANY copy still is, so a three-copy book
+		// stays lendable after the first goes out. Same derivation as
+		// syncBookFromItems, inlined so it lands inside this transaction.
+		c.env.DB.prepare(
+			`UPDATE books SET status = CASE
+			   WHEN EXISTS (SELECT 1 FROM items i WHERE i.book_id = books.id AND i.deleted_at IS NULL
+			                  AND i.status = 'available'
+			                  AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+			                                   WHERE t.item_id = i.id AND t.returned_at IS NULL))
+			     THEN 'available' ELSE 'borrowed' END,
+			     version = version + 1, updated_at = ?
+			 WHERE id = ? AND deleted_at IS NULL`
 		).bind(now, bookId)
 	]);
 
 	if ((borrowResults[1]?.meta?.changes ?? 0) === 0) {
-		const exists = await c.env.DB.prepare('SELECT status FROM books WHERE id = ? AND deleted_at IS NULL')
-			.bind(bookId).first<{ status: string }>();
-		if (!exists) {
-			throw new HTTPException(404, { message: 'Book not found' });
+		// The guard covers three refusals at once. Distinguish the cap, because
+		// "this reader already has 5 out" is the operator's problem to solve and
+		// "the copy went" is not.
+		if (policy.maxConcurrentLoans != null && borrowerId) {
+			const open = await countOpenLoansFor(c.env, borrowerId);
+			if (open >= policy.maxConcurrentLoans) {
+				throw new HTTPException(409, {
+					message: `${borrowerName} already has ${open} item(s) on loan (limit ${policy.maxConcurrentLoans}).`
+				});
+			}
 		}
-		throw new HTTPException(409, { message: 'Book is not available' });
+		throw new HTTPException(409, { message: 'That copy is not available' });
+	}
+
+	// Collecting a hold closes it. Done after the loan so a failed borrow never
+	// consumes the reader's place in the queue.
+	let holdFulfilled: string | null = null;
+	if (borrowerId) {
+		const fulfil = await c.env.DB.prepare(
+			`UPDATE holds SET status = 'fulfilled', fulfilled_at = ?, closed_at = ?, updated_at = ?
+			  WHERE book_id = ? AND borrower_id = ? AND status IN ('waiting', 'ready')`
+		).bind(now, now, now, bookId, borrowerId).run();
+		if ((fulfil.meta?.changes ?? 0) > 0) holdFulfilled = borrowerId;
 	}
 
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.borrow', 'book', bookId ?? null, {
 		transactionId: txId,
-		dueAt: payload.dueAt
+		itemId: item.id,
+		copyNumber: item.copyNumber,
+		dueAt,
+		policyId: policy.id,
+		// Recorded only when the operator overrode the rule, so an override is
+		// visible in the log rather than indistinguishable from the default.
+		...(dueAt !== policyDueAt ? { policyDueAt, overridden: true } : {})
 	});
 
-	return c.json({ transactionId: txId, borrowerId }, 201);
+	return c.json({
+		transactionId: txId,
+		borrowerId,
+		itemId: item.id,
+		copyNumber: item.copyNumber,
+		shelfCode: item.shelfCode,
+		dueAt,
+		policy: { id: policy.id, loanDays: policy.loanDays, renewalLimit: policy.renewalLimit },
+		holdFulfilled: Boolean(holdFulfilled),
+		// How many copies are still lendable — the operator's next question.
+		copiesAvailable: await countLendableItems(c.env, bookId ?? '')
+	}, 201);
 });
 
 app.post('/api/books/:id/return', requirePermission('circulation', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = ReturnBookSchema.parse(await c.req.json());
 
-	const tx = await c.env.DB.prepare(
-		`SELECT id, borrower_name FROM borrow_transactions WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at DESC LIMIT 1`
-	)
-		.bind(bookId)
-		.first<{ id: string; borrower_name: string | null }>();
+	// A record can now have several copies out at once, so "return this book"
+	// is ambiguous unless the operator says which loan. transactionId picks one
+	// exactly; otherwise the oldest open loan comes back first, which is the one
+	// most likely to be overdue and the one a person handing back a book means.
+	const tx = payload.transactionId
+		? await c.env.DB.prepare(
+			`SELECT id, borrower_name, item_id FROM borrow_transactions
+			  WHERE id = ? AND book_id = ? AND returned_at IS NULL`
+		).bind(payload.transactionId, bookId).first<{ id: string; borrower_name: string | null; item_id: string | null }>()
+		: await c.env.DB.prepare(
+			`SELECT id, borrower_name, item_id FROM borrow_transactions
+			  WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at ASC LIMIT 1`
+		).bind(bookId).first<{ id: string; borrower_name: string | null; item_id: string | null }>();
 
 	if (!tx) {
+		// Distinguish "nothing is out" from "the loan you named is not the open
+		// one" — the operator's screen being stale is a different problem from
+		// the book already being back.
+		const anyOpen = await c.env.DB.prepare(
+			`SELECT borrower_name FROM borrow_transactions
+			  WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at ASC LIMIT 1`
+		).bind(bookId).first<{ borrower_name: string | null }>();
+		if (payload.transactionId && anyOpen) {
+			throw new HTTPException(409, {
+				message: `This copy has since been lent to ${anyOpen.borrower_name || 'someone else'}. Refresh and check before returning.`
+			});
+		}
 		throw new HTTPException(409, { message: 'No active borrow transaction found' });
 	}
 
-	// The client tells us which loan it thinks it is closing. If the open loan
-	// is a different one, the operator's screen is stale — the book was already
-	// returned and lent to somebody else — and closing it would file the new
-	// borrower's loan as returned while they still hold the book.
-	if (payload.transactionId && payload.transactionId !== tx.id) {
-		throw new HTTPException(409, {
-			message: `This book has since been lent to ${tx.borrower_name || 'someone else'}. Refresh and check before returning.`
-		});
-	}
-
 	const now = nowIso();
-	// Atomic: borrow row is closed AND the book becomes available, or neither.
-	// The `returned_at IS NULL` guard makes the close idempotent under a
-	// double-click or a retried request.
+	// Atomic: the borrow row is closed AND the copy comes back AND the record
+	// agrees, or none of it happens. The `returned_at IS NULL` guard makes the
+	// close idempotent under a double-click or a retried request.
 	const returnResults = await runAtomic(c.env, [
 		c.env.DB.prepare(
 			`UPDATE borrow_transactions SET returned_at = ?, return_notes = COALESCE(?, return_notes), updated_at = ?
 			 WHERE id = ? AND returned_at IS NULL`
 		).bind(now, payload.notes ?? null, now, tx.id),
-		// Only free the book if the statement above is the one that closed the
+		// Only free the copy if the statement above is the one that closed the
 		// loan — matching on OUR timestamp, not merely "returned_at is set".
-		// Had the loan already been closed and the book lent to someone else,
-		// this would otherwise mark an active loan's book as available.
+		// Had the loan already been closed and the copy lent to someone else,
+		// this would otherwise mark an active loan's copy as available.
+		//
+		// `status = 'borrowed'` also means a copy marked lost or in maintenance
+		// while it was out stays that way: the book is back in the building but
+		// not back on the shelf, and only a person can decide that.
 		c.env.DB.prepare(
-			`UPDATE books SET status = 'available', version = version + 1, updated_at = ?
+			`UPDATE items SET status = 'available', version = version + 1, updated_at = ?
+			 WHERE id = ? AND deleted_at IS NULL AND status = 'borrowed'
+			   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ? AND returned_at = ?)`
+		).bind(now, tx.item_id ?? '', tx.id, now),
+		c.env.DB.prepare(
+			`UPDATE books SET status = CASE
+			   WHEN EXISTS (SELECT 1 FROM items i WHERE i.book_id = books.id AND i.deleted_at IS NULL
+			                  AND i.status = 'available'
+			                  AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+			                                   WHERE t.item_id = i.id AND t.returned_at IS NULL))
+			     THEN 'available' ELSE books.status END,
+			     version = version + 1, updated_at = ?
 			 WHERE id = ? AND deleted_at IS NULL
 			   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ? AND returned_at = ?)`
 		).bind(now, bookId, tx.id, now)
@@ -2880,12 +3042,399 @@ app.post('/api/books/:id/return', requirePermission('circulation', { librarian: 
 		throw new HTTPException(409, { message: 'This loan was already closed. Refresh to see the current state.' });
 	}
 
+	// The returned copy goes to whoever is first in the queue. This is the whole
+	// point of holds being on the title rather than on a copy: the reader asked
+	// for the book, and this is the copy that came back.
+	//
+	// Deliberately AFTER the return batch rather than inside it. A hold that
+	// fails to attach must not roll back a return that physically happened —
+	// the book is on the desk either way — and the next return re-offers the
+	// copy because the queue is re-read every time.
+	const filledHold = await fillNextHold(c, bookId ?? '', tx.item_id, now);
+
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.return', 'book', bookId ?? null, {
-		transactionId: tx.id
+		transactionId: tx.id,
+		itemId: tx.item_id,
+		...(filledHold ? { holdFilledFor: filledHold.borrowerName, holdId: filledHold.id } : {})
 	});
 
-	return c.json({ transactionId: tx.id, returnedAt: now });
+	return c.json({
+		transactionId: tx.id,
+		returnedAt: now,
+		itemId: tx.item_id,
+		// Names the reader the copy must now be put aside for, so the operator
+		// shelves it behind the desk rather than back on 19-000.
+		heldFor: filledHold ? { id: filledHold.id, borrowerName: filledHold.borrowerName, expiresAt: filledHold.expiresAt } : null,
+		copiesAvailable: await countLendableItems(c.env, bookId ?? '')
+	});
+});
+
+// ─── Holds: a queue on the title, filled by whichever copy returns first ───
+//
+// How many days a collected-but-uncollected copy stays behind the desk. Not a
+// setting yet: a library needs to live with one number before it knows whether
+// it wants to change it, and every configurable value is one more thing that
+// can be set to something nonsensical.
+const HOLD_SHELF_DAYS = 7;
+
+/**
+ * Put a just-returned copy aside for the head of the queue, if anyone is in it.
+ *
+ * Returns the hold it filled, or null. Sweeps expired holds first so a copy is
+ * never handed to somebody who stopped coming — there is no cron in this
+ * worker, so "on read" is the only moment expiry can be evaluated.
+ */
+async function fillNextHold(
+	c: AppContext,
+	bookId: string,
+	itemId: string | null,
+	now: string
+): Promise<{ id: string; borrowerName: string; expiresAt: string } | null> {
+	if (!itemId) return null;
+	await expireStaleHolds(c.env, now);
+
+	const next = await c.env.DB.prepare(
+		`SELECT id, borrower_name FROM holds
+		  WHERE book_id = ? AND status = 'waiting'
+		  ORDER BY placed_at ASC, id ASC LIMIT 1`
+	).bind(bookId).first<{ id: string; borrower_name: string }>();
+	if (!next) return null;
+
+	const expiresAt = dueDateFromPolicy(HOLD_SHELF_DAYS, new Date(now));
+	// The `status = 'waiting'` guard makes two simultaneous returns of two
+	// copies fill two DIFFERENT holds rather than both claiming the head.
+	const res = await c.env.DB.prepare(
+		`UPDATE holds SET status = 'ready', item_id = ?, ready_at = ?, expires_at = ?, updated_at = ?
+		  WHERE id = ? AND status = 'waiting'`
+	).bind(itemId, now, expiresAt, now, next.id).run();
+	if ((res.meta?.changes ?? 0) === 0) return null;
+
+	return { id: next.id, borrowerName: next.borrower_name, expiresAt };
+}
+
+app.get('/api/books/:id/holds', requirePermission('circulation', { librarian: true }), async (c) => {
+	const bookId = c.req.param('id') ?? '';
+	await expireStaleHolds(c.env, nowIso());
+	const rows = await c.env.DB.prepare(
+		`SELECT h.*, i.copy_number, i.shelf_code FROM holds h
+		   LEFT JOIN items i ON i.id = h.item_id
+		  WHERE h.book_id = ? AND h.status IN ('waiting', 'ready')
+		  ORDER BY h.placed_at ASC, h.id ASC`
+	).bind(bookId).all<Record<string, unknown>>();
+	return c.json({
+		bookId,
+		holds: (rows.results ?? []).map((r, idx) => ({
+			id: r.id,
+			// Position in the queue, computed rather than stored: a stored
+			// position goes stale the moment anyone cancels.
+			position: idx + 1,
+			borrowerId: r.borrower_id,
+			borrowerName: r.borrower_name,
+			borrowerContact: r.borrower_contact,
+			status: r.status,
+			itemId: r.item_id,
+			copyNumber: r.copy_number ?? null,
+			shelfCode: r.shelf_code ?? null,
+			placedAt: r.placed_at,
+			readyAt: r.ready_at,
+			expiresAt: r.expires_at,
+			notes: r.notes
+		}))
+	});
+});
+
+app.post('/api/books/:id/holds', requirePermission('circulation', { librarian: true }), async (c) => {
+	const bookId = c.req.param('id') ?? '';
+	const payload = PlaceHoldSchema.parse(await c.req.json());
+
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL')
+		.bind(bookId).first();
+	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+
+	const { borrowerId, borrowerName, borrowerContact } = await resolveBorrower(c.env, payload);
+	const now = nowIso();
+	await expireStaleHolds(c.env, now);
+
+	// A reader already holding a copy does not need to queue for it.
+	const alreadyOut = borrowerId
+		? await c.env.DB.prepare(
+			`SELECT 1 FROM borrow_transactions WHERE book_id = ? AND borrower_id = ? AND returned_at IS NULL`
+		).bind(bookId, borrowerId).first()
+		: null;
+	if (alreadyOut) {
+		throw new HTTPException(409, { message: `${borrowerName} already has this book on loan.` });
+	}
+
+	const id = newId('hold');
+	try {
+		await c.env.DB.prepare(
+			`INSERT INTO holds (id, book_id, borrower_id, borrower_name, borrower_contact,
+			                    status, placed_at, notes, created_by, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, 'waiting', ?, ?, ?, ?, ?)`
+		).bind(id, bookId, borrowerId, borrowerName, borrowerContact, now,
+			payload.notes ?? null, c.get('user').sub, now, now).run();
+	} catch (error) {
+		// idx_holds_one_per_borrower. Placing the same hold twice is a
+		// double-click, not a request for two copies.
+		const existing = borrowerId
+			? await c.env.DB.prepare(
+				`SELECT id FROM holds WHERE book_id = ? AND borrower_id = ? AND status IN ('waiting','ready')`
+			).bind(bookId, borrowerId).first<{ id: string }>()
+			: null;
+		if (existing) throw new HTTPException(409, { message: `${borrowerName} is already in the queue for this book.` });
+		throw error;
+	}
+
+	// If a copy is sitting free right now there is nothing to wait for — put it
+	// aside immediately rather than making the reader come back for a return
+	// that will never happen.
+	const free = await pickLendableItem(c.env, bookId, null, borrowerId);
+	const ready = free ? await fillNextHold(c, bookId, free.id, now) : null;
+
+	const position = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM holds
+		  WHERE book_id = ? AND status IN ('waiting','ready') AND placed_at <= ? AND id <= ?`
+	).bind(bookId, now, id).first<{ n: number }>();
+
+	await insertAuditLog(c.env, c.get('user').sub, 'hold.place', 'book', bookId, {
+		holdId: id, borrowerId, ready: Boolean(ready)
+	});
+
+	return c.json({
+		id, bookId, borrowerId, borrowerName,
+		status: ready?.id === id ? 'ready' : 'waiting',
+		position: Number(position?.n ?? 1),
+		expiresAt: ready?.id === id ? ready.expiresAt : null
+	}, 201);
+});
+
+app.delete('/api/holds/:id', requirePermission('circulation', { librarian: true }), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const now = nowIso();
+	const hold = await c.env.DB.prepare(
+		`SELECT book_id, item_id, status FROM holds WHERE id = ? AND status IN ('waiting','ready')`
+	).bind(id).first<{ book_id: string; item_id: string | null; status: string }>();
+	if (!hold) throw new HTTPException(404, { message: 'Hold not found or already closed' });
+
+	await c.env.DB.prepare(
+		`UPDATE holds SET status = 'cancelled', closed_at = ?, updated_at = ? WHERE id = ? AND status IN ('waiting','ready')`
+	).bind(now, now, id).run();
+
+	// A cancelled READY hold frees the copy it was sitting on — pass it to the
+	// next reader in the queue rather than leaving it behind the desk.
+	const passedOn = hold.status === 'ready' ? await fillNextHold(c, hold.book_id, hold.item_id, now) : null;
+
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'hold.cancel', 'book', hold.book_id, { holdId: id });
+	return c.json({ id, cancelled: true, passedOnTo: passedOn?.borrowerName ?? null });
+});
+
+// Every copy waiting behind the desk, across the catalogue — the shelf the
+// librarian actually has to walk past.
+app.get('/api/holds', requirePermission('circulation', { librarian: true }), async (c) => {
+	await expireStaleHolds(c.env, nowIso());
+	const rows = await c.env.DB.prepare(
+		`SELECT h.id, h.book_id, h.borrower_name, h.borrower_contact, h.status,
+		        h.placed_at, h.ready_at, h.expires_at, h.item_id,
+		        b.title, b.author, i.copy_number, i.shelf_code
+		   FROM holds h
+		   JOIN books b ON b.id = h.book_id AND b.deleted_at IS NULL
+		   LEFT JOIN items i ON i.id = h.item_id
+		  WHERE h.status IN ('waiting', 'ready')
+		  ORDER BY (h.status = 'ready') DESC, h.placed_at ASC
+		  LIMIT 500`
+	).all<Record<string, unknown>>();
+	const items = (rows.results ?? []).map((r) => ({
+		id: r.id, bookId: r.book_id, title: r.title, author: r.author,
+		borrowerName: r.borrower_name, borrowerContact: r.borrower_contact,
+		status: r.status, placedAt: r.placed_at, readyAt: r.ready_at, expiresAt: r.expires_at,
+		itemId: r.item_id, copyNumber: r.copy_number ?? null, shelfCode: r.shelf_code ?? null
+	}));
+	return c.json({
+		total: items.length,
+		readyCount: items.filter((h) => h.status === 'ready').length,
+		items
+	});
+});
+
+// ─── Loan policies ─────────────────────────────────────────────────────────
+//
+// Readable by anyone who can circulate — the borrow form needs to show what the
+// rule will do — but writable only by an admin. A loan period is the kind of
+// thing that should be decided once, not adjusted by whoever is at the desk.
+
+app.get('/api/loan-policies', requirePermission('circulation', { librarian: true }), async (c) => {
+	const [rows, cats] = await Promise.all([
+		c.env.DB.prepare(
+			`SELECT * FROM loan_policies
+			  ORDER BY (borrower_category = '*'), borrower_category, (item_type = '*'), item_type`
+		).all<Record<string, unknown>>(),
+		// The categories actually in use, so the editor offers real values
+		// rather than asking the librarian to remember what they typed.
+		c.env.DB.prepare(
+			`SELECT category, COUNT(*) AS n FROM borrowers GROUP BY category ORDER BY n DESC`
+		).all<{ category: string; n: number }>()
+	]);
+	return c.json({
+		policies: (rows.results ?? []).map((r) => ({
+			id: r.id,
+			borrowerCategory: r.borrower_category,
+			itemType: r.item_type,
+			loanDays: Number(r.loan_days),
+			renewalLimit: Number(r.renewal_limit),
+			renewalDays: r.renewal_days == null ? null : Number(r.renewal_days),
+			maxConcurrentLoans: r.max_concurrent_loans == null ? null : Number(r.max_concurrent_loans),
+			lendable: Number(r.lendable) === 1,
+			notes: r.notes
+		})),
+		borrowerCategories: (cats.results ?? []).map((r) => ({ category: r.category, borrowers: Number(r.n) })),
+		itemTypes: ITEM_TYPES
+	});
+});
+
+app.put('/api/loan-policies', requirePermission('setup'), async (c) => {
+	const payload = ReplaceLoanPoliciesSchema.parse(await c.req.json());
+
+	// (category, type) is UNIQUE, and a whole-array replace that contained the
+	// same pair twice would fail halfway through the batch. Say so instead.
+	const seen = new Set<string>();
+	for (const p of payload.policies) {
+		const key = `${p.borrowerCategory}${p.itemType}`;
+		if (seen.has(key)) {
+			throw new HTTPException(400, {
+				message: `Two rules for the same pair: ${p.borrowerCategory} / ${p.itemType}`
+			});
+		}
+		seen.add(key);
+	}
+	// Without a fallback, a borrower category nobody wrote a rule for would fall
+	// through to the hard-coded default in resolveLoanPolicy — which is correct
+	// but invisible. Requiring the row keeps the table the whole truth.
+	if (!seen.has('**')) {
+		throw new HTTPException(400, { message: 'A default rule (* / *) is required.' });
+	}
+
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [
+		c.env.DB.prepare('DELETE FROM loan_policies'),
+		...payload.policies.map((p) =>
+			c.env.DB.prepare(
+				`INSERT INTO loan_policies (id, borrower_category, item_type, loan_days, renewal_limit,
+				                            renewal_days, max_concurrent_loans, lendable, notes, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(
+				// Deterministic id from the pair: re-saving the same table keeps
+				// the same ids, so an audit log diff reads as a change rather than
+				// as everything being replaced.
+				`pol_${normalizeCode(p.borrowerCategory)}_${normalizeCode(p.itemType)}`.replace(/[^A-Za-z0-9_*]/g, '_'),
+				p.borrowerCategory, p.itemType, p.loanDays, p.renewalLimit,
+				p.renewalDays ?? null, p.maxConcurrentLoans ?? null, p.lendable ? 1 : 0,
+				p.notes ?? null, now, now
+			)
+		)
+	];
+	for (let i = 0; i < statements.length; i += 40) {
+		await runAtomic(c.env, statements.slice(i, i + 40));
+	}
+	await insertAuditLog(c.env, c.get('user').sub, 'loanPolicies.replace', 'system', null, {
+		count: payload.policies.length
+	});
+	return c.json({ saved: payload.policies.length });
+});
+
+// ─── Renewals ──────────────────────────────────────────────────────────────
+
+app.post('/api/loans/:id/renew', requirePermission('circulation', { librarian: true }), async (c) => {
+	const loanId = c.req.param('id') ?? '';
+	const payload = RenewLoanSchema.parse(await c.req.json());
+
+	const loan = await c.env.DB.prepare(
+		`SELECT t.id, t.book_id, t.item_id, t.borrower_id, t.due_at, t.renewal_count, t.original_due_at,
+		        i.item_type, COALESCE(br.category, 'standard') AS category
+		   FROM borrow_transactions t
+		   LEFT JOIN items i ON i.id = t.item_id
+		   LEFT JOIN borrowers br ON br.id = t.borrower_id
+		  WHERE t.id = ? AND t.returned_at IS NULL`
+	).bind(loanId).first<{
+		id: string; book_id: string; item_id: string | null; borrower_id: string | null;
+		due_at: string; renewal_count: number; original_due_at: string | null;
+		item_type: string | null; category: string;
+	}>();
+	if (!loan) throw new HTTPException(404, { message: 'No open loan with that id' });
+
+	// The renewal count is the precondition that actually works. It strictly
+	// increases, so the web client's automatic retry of a request whose response
+	// was lost cannot match and cannot double-extend the loan. The due date
+	// alone is not enough: renewing a fresh 14-day loan for another 14 days
+	// lands on the same calendar date, and a replay then still matches.
+	if (payload.expectedRenewalCount != null && payload.expectedRenewalCount !== loan.renewal_count) {
+		throw new HTTPException(409, {
+			message: 'This loan has already been renewed. Refresh to see the current due date.'
+		});
+	}
+	if (payload.expectedDueAt && payload.expectedDueAt !== loan.due_at) {
+		throw new HTTPException(409, {
+			message: 'This loan has already been renewed. Refresh to see the current due date.'
+		});
+	}
+
+	const policy = await resolveLoanPolicy(c.env, loan.category, loan.item_type ?? 'book');
+	if (loan.renewal_count >= policy.renewalLimit) {
+		throw new HTTPException(409, {
+			message: policy.renewalLimit === 0
+				? 'This kind of loan cannot be renewed.'
+				: `Renewal limit reached (${policy.renewalLimit}).`
+		});
+	}
+
+	// Somebody is waiting. Renewing past a queue is how a hold never gets
+	// filled, so the answer is no and the operator can see who is waiting.
+	const waiting = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM holds WHERE book_id = ? AND status IN ('waiting','ready')`
+	).bind(loan.book_id).first<{ n: number }>();
+	if (Number(waiting?.n ?? 0) > 0) {
+		throw new HTTPException(409, {
+			message: `Cannot renew: ${waiting?.n} reader(s) are waiting for this book.`
+		});
+	}
+
+	const now = nowIso();
+	// Renew from TODAY, not from the old due date: an overdue loan renewed from
+	// its own due date would still be overdue, which is not what anyone means.
+	// Never shorter than it already is, though — a renewal cannot take time away.
+	const fromToday = dueDateFromPolicy(policy.renewalDays);
+	const newDueAt = fromToday > loan.due_at ? fromToday : loan.due_at;
+	// Renewing a loan taken this morning buys nothing and would spend one of the
+	// reader's renewals for no extra time. Say so rather than charging them.
+	if (newDueAt === loan.due_at) {
+		throw new HTTPException(409, {
+			message: 'This loan already runs to the maximum the rule allows; renewing would not extend it.'
+		});
+	}
+	const res = await c.env.DB.prepare(
+		`UPDATE borrow_transactions
+		    SET due_at = ?, renewal_count = renewal_count + 1,
+		        original_due_at = COALESCE(original_due_at, due_at),
+		        return_notes = return_notes, updated_at = ?
+		  WHERE id = ? AND returned_at IS NULL AND due_at = ? AND renewal_count = ?`
+	).bind(newDueAt, now, loanId, loan.due_at, loan.renewal_count).run();
+	if ((res.meta?.changes ?? 0) === 0) {
+		throw new HTTPException(409, { message: 'This loan changed while you were looking at it. Refresh and retry.' });
+	}
+
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'loan.renew', 'book', loan.book_id, {
+		transactionId: loanId, from: loan.due_at, to: newDueAt, renewalCount: loan.renewal_count + 1
+	});
+
+	return c.json({
+		transactionId: loanId,
+		dueAt: newDueAt,
+		originalDueAt: loan.original_due_at ?? loan.due_at,
+		renewalCount: loan.renewal_count + 1,
+		renewalsLeft: policy.renewalLimit - (loan.renewal_count + 1)
+	});
 });
 
 app.get('/api/books/:id/history', requirePermission('circulation', { librarian: true }), async (c) => {
@@ -2909,6 +3458,7 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 		`SELECT
 			id,
 			book_id,
+			item_id,
 			borrower_name,
 			borrower_contact,
 			borrowed_at,
@@ -2938,6 +3488,9 @@ app.get('/api/books/:id/history', requirePermission('circulation', { librarian: 
 		items: allRows.slice(0, limit).map((row) => ({
 			id: (row as Record<string, unknown>).id,
 			bookId: (row as Record<string, unknown>).book_id,
+			// Which copy this loan was of — a two-copy record's history is
+			// meaningless without it.
+			itemId: (row as Record<string, unknown>).item_id ?? null,
 			borrowerName: (row as Record<string, unknown>).borrower_name,
 			borrowerContact: (row as Record<string, unknown>).borrower_contact,
 			borrowedAt: (row as Record<string, unknown>).borrowed_at,
@@ -3179,9 +3732,14 @@ app.get('/api/borrow/active', requirePermission('circulation', { librarian: true
 				bt.borrower_contact,
 				bt.borrowed_at,
 				bt.due_at,
+				bt.item_id,
+				i.copy_number,
+				i.shelf_code,
+				i.barcode,
 				CASE WHEN bt.due_at < ? THEN 1 ELSE 0 END AS is_overdue
 			 FROM borrow_transactions bt
 			 JOIN books b ON b.id = bt.book_id
+			 LEFT JOIN items i ON i.id = bt.item_id
 			 WHERE bt.returned_at IS NULL
 				AND b.deleted_at IS NULL
 				AND (? = 0 OR bt.due_at < ?)
@@ -3202,6 +3760,12 @@ app.get('/api/borrow/active', requirePermission('circulation', { librarian: true
 				borrowerContact: r.borrower_contact ?? null,
 				borrowedAt: r.borrowed_at ?? '',
 				dueAt: r.due_at ?? '',
+				// WHICH copy is out. A record can now have several on loan at
+				// once, so the row has to say which one to hand back.
+				itemId: r.item_id ?? null,
+				copyNumber: r.copy_number ?? null,
+				shelfCode: r.shelf_code ?? null,
+				barcode: r.barcode ?? null,
 				isOverdue: r.is_overdue === 1
 			};
 		});
@@ -5053,84 +5617,124 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					throw new HTTPException(403, { message: 'Permission denied: circulation' });
 				}
 				const row = z.object({ id: z.string().min(1), data: BorrowBookSchema }).parse(mutation.payload);
-				if (Date.parse(row.data.dueAt) <= Date.now()) {
+				if (row.data.dueAt && Date.parse(row.data.dueAt) <= Date.now()) {
 					throw new HTTPException(400, { message: 'dueAt must be in the future.' });
 				}
 				const { borrowerId, borrowerName, borrowerContact } = await resolveBorrower(c.env, row.data);
 				const txId = crypto.randomUUID();
 				const now = nowIso();
-				// Same atomic flip as the direct endpoint — prevents two queued
-				// offline borrows on the same book from both succeeding.
-				const flip = await c.env.DB.prepare(
-					`UPDATE books SET status = 'borrowed', version = version + 1, updated_at = ?
-					 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
-				).bind(now, row.id).run();
-				if ((flip.meta?.changes ?? 0) === 0) {
-					throw new HTTPException(409, { message: 'Book is not available' });
+				const syncItem = await pickLendableItem(c.env, row.id, row.data.itemId ?? null, borrowerId);
+				if (!syncItem) {
+					throw new HTTPException(409, { message: 'No copy of this book is available' });
 				}
-				try {
-					await c.env.DB.prepare(
+				// Same rule as the direct endpoint. A mutation queued offline may
+				// arrive days later, so the policy is applied when it LANDS — which
+				// is also when the due date starts being meaningful to the reader.
+				const syncCategory = borrowerId
+					? (await c.env.DB.prepare('SELECT category FROM borrowers WHERE id = ?').bind(borrowerId)
+						.first<{ category: string }>())?.category ?? 'standard'
+					: 'standard';
+				const syncPolicy = await resolveLoanPolicy(c.env, syncCategory, syncItem.itemType);
+				if (!syncPolicy.lendable) {
+					throw new HTTPException(409, { message: 'This is a consultation-only copy and cannot be lent.' });
+				}
+				const syncDueAt = row.data.dueAt ?? dueDateFromPolicy(syncPolicy.loanDays);
+				// One atomic batch, exactly like the direct endpoint. This branch
+				// used to flip the book first and INSERT afterwards inside a
+				// try/catch with a compensating revert — a crash between the two
+				// left a book borrowed with no ledger row, and the revert could
+				// itself fail. A queued offline borrow may arrive hours late, which
+				// is precisely when that window matters.
+				const syncGuard = `(SELECT 1 FROM items i
+					 WHERE i.id = ? AND i.deleted_at IS NULL AND i.status = 'available'
+					   AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+					                    WHERE t.item_id = i.id AND t.returned_at IS NULL))`;
+				const syncBorrow = await runAtomic(c.env, [
+					c.env.DB.prepare(
 						`INSERT INTO borrow_transactions (
-							 id, book_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
-						 ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
-					)
-						.bind(
-							txId,
-							row.id,
-							borrowerId,
-							borrowerName,
-							borrowerContact,
-							now,
-							row.data.dueAt,
-							row.data.notes ?? null,
-							actor.sub,
-							now
-						)
-						.run();
-				} catch (err) {
-					await c.env.DB.prepare(
-						`UPDATE books SET status = 'available', updated_at = ? WHERE id = ? AND status = 'borrowed'`
-					).bind(nowIso(), row.id).run();
-					throw err;
+							 id, book_id, item_id, borrower_id, borrower_name, borrower_contact, borrowed_at, due_at, returned_at, notes, created_by, updated_at
+						 )
+						 SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?
+						 WHERE EXISTS ${syncGuard}`
+					).bind(
+						txId, row.id, syncItem.id, borrowerId, borrowerName, borrowerContact,
+						now, syncDueAt, row.data.notes ?? null, actor.sub, now, syncItem.id
+					),
+					c.env.DB.prepare(
+						`UPDATE items SET status = 'borrowed', version = version + 1, updated_at = ?
+						 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
+					).bind(now, syncItem.id),
+					c.env.DB.prepare(
+						`UPDATE books SET status = CASE
+						   WHEN EXISTS (SELECT 1 FROM items i WHERE i.book_id = books.id AND i.deleted_at IS NULL
+						                  AND i.status = 'available'
+						                  AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+						                                   WHERE t.item_id = i.id AND t.returned_at IS NULL))
+						     THEN 'available' ELSE 'borrowed' END,
+						     version = version + 1, updated_at = ?
+						 WHERE id = ? AND deleted_at IS NULL`
+					).bind(now, row.id)
+				]);
+				if ((syncBorrow[1]?.meta?.changes ?? 0) === 0) {
+					throw new HTTPException(409, { message: 'That copy is not available' });
 				}
 
-				resultData = { transactionId: txId, borrowerId };
+				resultData = { transactionId: txId, borrowerId, itemId: syncItem.id };
 			} else if (mutation.operation === 'return_book') {
 				if (!(await userHasPermission(c, 'circulation', { librarian: true }))) {
 					throw new HTTPException(403, { message: 'Permission denied: circulation' });
 				}
 				const row = z.object({ id: z.string().min(1), data: ReturnBookSchema }).parse(mutation.payload);
-				const tx = await c.env.DB.prepare(
-					`SELECT id, borrower_name FROM borrow_transactions WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at DESC LIMIT 1`
-				)
-					.bind(row.id)
-					.first<{ id: string; borrower_name: string | null }>();
-
-				if (!tx) {
-					throw new HTTPException(409, { message: 'No active borrow transaction found' });
-				}
-
 				// A queued offline return names the loan it saw. Replaying it against
 				// a different open loan would close the wrong borrower's record —
 				// exactly the risk offline queues create, since the mutation may be
-				// hours old by the time it reaches us.
-				if (row.data.transactionId && row.data.transactionId !== tx.id) {
-					throw new HTTPException(409, {
-						message: `This book has since been lent to ${tx.borrower_name || 'someone else'}. Refresh and check before returning.`
-					});
+				// hours old by the time it reaches us. Without a named loan the
+				// oldest open one comes back, matching the direct endpoint.
+				const tx = row.data.transactionId
+					? await c.env.DB.prepare(
+						`SELECT id, borrower_name, item_id FROM borrow_transactions
+						  WHERE id = ? AND book_id = ? AND returned_at IS NULL`
+					).bind(row.data.transactionId, row.id).first<{ id: string; borrower_name: string | null; item_id: string | null }>()
+					: await c.env.DB.prepare(
+						`SELECT id, borrower_name, item_id FROM borrow_transactions
+						  WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at ASC LIMIT 1`
+					).bind(row.id).first<{ id: string; borrower_name: string | null; item_id: string | null }>();
+
+				if (!tx) {
+					const stillOut = await c.env.DB.prepare(
+						`SELECT borrower_name FROM borrow_transactions
+						  WHERE book_id = ? AND returned_at IS NULL ORDER BY borrowed_at ASC LIMIT 1`
+					).bind(row.id).first<{ borrower_name: string | null }>();
+					if (row.data.transactionId && stillOut) {
+						throw new HTTPException(409, {
+							message: `This copy has since been lent to ${stillOut.borrower_name || 'someone else'}. Refresh and check before returning.`
+						});
+					}
+					throw new HTTPException(409, { message: 'No active borrow transaction found' });
 				}
 
 				const now = nowIso();
-				// Atomic: close the loan AND flip the book to available together, so a
-				// mid-request failure can't leave the book stuck 'borrowed' with no
-				// open loan (mirrors the direct /return endpoint, guards included).
+				// Atomic: close the loan AND bring the copy back AND re-derive the
+				// record together, so a mid-request failure can't leave a copy stuck
+				// 'borrowed' with no open loan (mirrors /return, guards included).
 				const syncReturn = await runAtomic(c.env, [
 					c.env.DB.prepare(
 						`UPDATE borrow_transactions SET returned_at = ?, return_notes = COALESCE(?, return_notes), updated_at = ?
 						 WHERE id = ? AND returned_at IS NULL`
 					).bind(now, row.data.notes ?? null, now, tx.id),
 					c.env.DB.prepare(
-						`UPDATE books SET status = 'available', version = version + 1, updated_at = ?
+						`UPDATE items SET status = 'available', version = version + 1, updated_at = ?
+						 WHERE id = ? AND deleted_at IS NULL AND status = 'borrowed'
+						   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ? AND returned_at = ?)`
+					).bind(now, tx.item_id ?? '', tx.id, now),
+					c.env.DB.prepare(
+						`UPDATE books SET status = CASE
+						   WHEN EXISTS (SELECT 1 FROM items i WHERE i.book_id = books.id AND i.deleted_at IS NULL
+						                  AND i.status = 'available'
+						                  AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+						                                   WHERE t.item_id = i.id AND t.returned_at IS NULL))
+						     THEN 'available' ELSE books.status END,
+						     version = version + 1, updated_at = ?
 						 WHERE id = ? AND deleted_at IS NULL
 						   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ? AND returned_at = ?)`
 					).bind(now, row.id, tx.id, now)
@@ -5139,7 +5743,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					throw new HTTPException(409, { message: 'This loan was already closed.' });
 				}
 
-				resultData = { transactionId: tx.id };
+				resultData = { transactionId: tx.id, itemId: tx.item_id };
 			}
 		} catch (error) {
 			status = 'error';
@@ -6642,7 +7246,7 @@ app.get('/api/borrowers', requirePermission('circulation', { librarian: true }),
 	}
 
 	const rows = await c.env.DB.prepare(
-		`SELECT b.id, b.name, b.contact, b.notes, b.created_at, b.updated_at,
+		`SELECT b.id, b.name, b.contact, b.notes, b.category, b.created_at, b.updated_at,
 		        COALESCE(c.total_loans, 0) AS total_loans,
 		        COALESCE(c.open_loans, 0) AS open_loans,
 		        COALESCE(c.overdue_loans, 0) AS overdue_loans
@@ -6660,7 +7264,7 @@ app.get('/api/borrowers', requirePermission('circulation', { librarian: true }),
 		 ORDER BY total_loans DESC, LOWER(b.name) ASC
 		 LIMIT ?`
 	).bind(nowIso(), ...params, limit).all<{
-		id: string; name: string; contact: string | null; notes: string | null;
+		id: string; name: string; contact: string | null; notes: string | null; category: string | null;
 		created_at: string; updated_at: string;
 		total_loans: number; open_loans: number; overdue_loans: number;
 	}>();
@@ -6671,6 +7275,7 @@ app.get('/api/borrowers', requirePermission('circulation', { librarian: true }),
 			name: r.name,
 			contact: r.contact,
 			notes: r.notes,
+			category: r.category ?? 'standard',
 			createdAt: r.created_at,
 			updatedAt: r.updated_at,
 			totalLoans: Number(r.total_loans ?? 0),
@@ -6721,9 +7326,10 @@ app.post('/api/borrowers', requirePermission('circulation', { librarian: true })
 	const id = crypto.randomUUID();
 	const now = nowIso();
 	await c.env.DB.prepare(
-		`INSERT INTO borrowers (id, name, contact, notes, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`
-	).bind(id, payload.name, payload.contact ?? null, payload.notes ?? null, now, now).run();
+		`INSERT INTO borrowers (id, name, contact, notes, category, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`
+	).bind(id, payload.name, payload.contact ?? null, payload.notes ?? null,
+		payload.category ?? 'standard', now, now).run();
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.create', 'borrower', id, { name: payload.name });
 	return c.json({ id }, 201);
 });
@@ -6731,9 +7337,14 @@ app.post('/api/borrowers', requirePermission('circulation', { librarian: true })
 app.put('/api/borrowers/:id', requirePermission('circulation', { librarian: true }), async (c) => {
 	const id = c.req.param('id') ?? '';
 	const payload = UpsertBorrowerSchema.parse(await c.req.json());
+	// COALESCE, not a plain assignment: this is a full replace and an older
+	// client that has never heard of a category must not blank one. Same
+	// preserve-when-absent rule the book schemas document for title and tags.
 	const result = await c.env.DB.prepare(
-		`UPDATE borrowers SET name = ?, contact = ?, notes = ?, updated_at = ? WHERE id = ?`
-	).bind(payload.name, payload.contact ?? null, payload.notes ?? null, nowIso(), id).run();
+		`UPDATE borrowers SET name = ?, contact = ?, notes = ?, category = COALESCE(?, category), updated_at = ?
+		  WHERE id = ?`
+	).bind(payload.name, payload.contact ?? null, payload.notes ?? null,
+		payload.category ?? null, nowIso(), id).run();
 	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
 	}
@@ -6843,7 +7454,7 @@ app.post('/api/borrowers/:id/erase', requirePermission('setup'), async (c) => {
 
 app.get('/api/borrowers/export.csv', requirePermission('circulation', { librarian: true }), async (c) => {
 	const rows = await c.env.DB.prepare(
-		`SELECT b.id, b.name, b.contact, b.notes, b.created_at, b.updated_at,
+		`SELECT b.id, b.name, b.contact, b.notes, b.category, b.created_at, b.updated_at,
 		        COUNT(bt.id) AS total_loans,
 		        SUM(CASE WHEN bt.returned_at IS NULL THEN 1 ELSE 0 END) AS open_loans,
 		        SUM(CASE WHEN bt.returned_at IS NULL AND bt.due_at < ? THEN 1 ELSE 0 END) AS overdue_loans
@@ -6852,7 +7463,7 @@ app.get('/api/borrowers/export.csv', requirePermission('circulation', { libraria
 		  GROUP BY b.id
 		  ORDER BY total_loans DESC, LOWER(b.name) ASC`
 	).bind(nowIso()).all<{
-		id: string; name: string; contact: string | null; notes: string | null;
+		id: string; name: string; contact: string | null; notes: string | null; category: string | null;
 		created_at: string; updated_at: string;
 		total_loans: number; open_loans: number; overdue_loans: number;
 	}>();
@@ -6863,13 +7474,14 @@ app.get('/api/borrowers/export.csv', requirePermission('circulation', { libraria
 			Name: r.name,
 			Contact: r.contact ?? '',
 			Notes: r.notes ?? '',
+			Category: r.category ?? 'standard',
 			'Total loans': Number(r.total_loans ?? 0),
 			'Open loans': Number(r.open_loans ?? 0),
 			'Overdue loans': Number(r.overdue_loans ?? 0),
 			'Created at': r.created_at,
 			'Updated at': r.updated_at
 		})),
-		['ID', 'Name', 'Contact', 'Notes', 'Total loans', 'Open loans', 'Overdue loans', 'Created at', 'Updated at']
+		['ID', 'Name', 'Contact', 'Notes', 'Category', 'Total loans', 'Open loans', 'Overdue loans', 'Created at', 'Updated at']
 	);
 
 	c.header('Content-Type', 'text/csv; charset=utf-8');

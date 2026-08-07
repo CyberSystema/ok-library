@@ -564,8 +564,18 @@ export const BorrowBookSchema = z.object({
   // …or create one inline by passing a name (kept for friction-free workflows).
   borrowerName: z.string().min(1).max(200).optional(),
   borrowerContact: z.string().max(200).optional().nullable(),
-  dueAt: ISODateTimeSchema,
-  notes: z.string().max(2000).optional().nullable()
+  /**
+   * OPTIONAL since the loan policies of 0029: absent means "apply the rule for
+   * this reader and this kind of copy", which is now the normal case. A value
+   * is still honoured — a librarian must be able to say "back on Friday" — and
+   * the audit log records that the rule was overridden.
+   */
+  dueAt: ISODateTimeSchema.optional().nullable(),
+  notes: z.string().max(2000).optional().nullable(),
+  // WHICH COPY leaves the building. Optional: the older clients (and the mobile
+  // app) send only a book id, and the server then takes the lowest-numbered
+  // free copy. Naming one is what scanning a copy's barcode does.
+  itemId: z.string().min(1).max(64).optional().nullable()
 }).refine((v) => Boolean(v.borrowerId) || Boolean(v.borrowerName), {
   // Don't pin the error to a specific path: the form may be picking from the
   // borrowerId combobox or typing borrowerName freely. A form-level error is
@@ -578,6 +588,10 @@ export const BorrowerSchema = z.object({
   name: z.string().min(1).max(200),
   contact: z.string().max(200).optional().nullable(),
   notes: z.string().max(2000).optional().nullable(),
+  // One axis of the loan-policy matrix. Free text rather than an enum: a
+  // library's reader classes are its own business, and the policy table is
+  // what gives a category meaning.
+  category: z.string().min(1).max(40).default('standard'),
   createdAt: ISODateTimeSchema,
   updatedAt: ISODateTimeSchema
 });
@@ -586,6 +600,90 @@ export const UpsertBorrowerSchema = BorrowerSchema.pick({
   name: true,
   contact: true,
   notes: true
+}).extend({
+  // Optional so an existing three-field client cannot blank a category it does
+  // not know about — PUT /api/borrowers/:id is a full replace. Same
+  // preserve-when-absent rule UpdateBookSchema documents for title/tags.
+  category: z.string().min(1).max(40).optional()
+});
+
+/**
+ * What kind of physical thing a copy is.
+ *
+ * Two jobs at once: the second axis of the loan-policy matrix, and the
+ * "collection by document category" breakdown ISO 2789 asks for. Kept short and
+ * aligned to that standard's categories rather than exhaustive — a list nobody
+ * can choose from correctly is worse than a coarse one, and 'other' is an
+ * honest answer.
+ *
+ * NOT enforced as a DB CHECK: migration 0021 shipped item_type as free text and
+ * constraining it now would mean rebuilding the table. The UI offers these; a
+ * value from outside the list still stores and still resolves a policy.
+ */
+export const ITEM_TYPES = [
+  'book',
+  'serial',
+  'manuscript',
+  'audiovisual',
+  'cartographic',
+  'microform',
+  'electronic',
+  'other'
+] as const;
+export type ItemType = (typeof ITEM_TYPES)[number];
+
+// ─── Loan policies, renewals and holds ──────────────────────────────────────
+
+export const LoanPolicySchema = z.object({
+  /** '*' matches any borrower category. */
+  borrowerCategory: z.string().min(1).max(40).default('*'),
+  /** '*' matches any item type. */
+  itemType: z.string().min(1).max(40).default('*'),
+  // A year is the outer bound of anything a library would call a loan; beyond
+  // that is a typo, and a typo here is applied to every future borrow.
+  loanDays: z.number().int().min(1).max(365).default(14),
+  renewalLimit: z.number().int().min(0).max(20).default(2),
+  /** Null = a renewal runs for another full loan period. */
+  renewalDays: z.number().int().min(1).max(365).optional().nullable(),
+  /** Null = unlimited. */
+  maxConcurrentLoans: z.number().int().min(1).max(1000).optional().nullable(),
+  /** false = consultation only; this copy never leaves the building. */
+  lendable: z.boolean().default(true),
+  notes: z.string().max(500).optional().nullable()
+});
+
+export const ReplaceLoanPoliciesSchema = z.object({
+  // Whole-array replace, mirroring the items and attributes editors: the rules
+  // are read as a table and edited as one.
+  policies: z.array(LoanPolicySchema).max(200)
+});
+
+export const PlaceHoldSchema = z.object({
+  borrowerId: z.string().min(1).optional().nullable(),
+  borrowerName: z.string().min(1).max(200).optional(),
+  borrowerContact: z.string().max(200).optional().nullable(),
+  notes: z.string().max(2000).optional().nullable()
+}).refine((v) => Boolean(v.borrowerId) || Boolean(v.borrowerName), {
+  message: 'Either borrowerId or borrowerName must be provided.'
+});
+
+export const RenewLoanSchema = z.object({
+  /**
+   * How many times the operator believes this loan has already been renewed.
+   *
+   * A renewal is not idempotent and the web client retries a write four times
+   * on a 5xx, so without a precondition a lost response silently extends the
+   * loan twice. This is the RELIABLE precondition: the count strictly
+   * increases, so a replay can never match.
+   *
+   * `expectedDueAt` cannot do this job on its own — renewing a fresh loan for
+   * the same period lands on the same calendar date, and a replay would then
+   * still match. Measured, not assumed: it consumed a second renewal.
+   */
+  expectedRenewalCount: z.number().int().min(0).max(100).optional().nullable(),
+  /** The due date on the operator's screen. A secondary staleness check. */
+  expectedDueAt: ISODateTimeSchema.optional().nullable(),
+  notes: z.string().max(2000).optional().nullable()
 });
 
 export const ReturnBookSchema = z.object({

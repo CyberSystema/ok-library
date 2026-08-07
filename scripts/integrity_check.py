@@ -12,7 +12,7 @@ Usage:
 
 Exit code 0 = everything held. Non-zero = at least one assertion failed.
 """
-import csv, io, json, os, re, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
+import csv, datetime, io, json, os, re, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
 
 BASE = os.environ.get("API", "http://127.0.0.1:8787").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -1318,6 +1318,141 @@ orphan = next((b for b in (trash2 or {}).get("items", []) if b["id"] == pl), Non
 check("its tombstone loses the dangling forwarding address",
       orphan is not None and not orphan.get("mergedInto"), orphan and orphan.get("mergedInto"))
 call("DELETE", f"/api/books/{pl}/purge")
+
+print("=== 39. REGRESSION: a loan names a COPY ===")
+# Before migration 0028 the unique index was on (book_id), so a record with two
+# copies could be lent exactly once and the second copy was unlendable. This is
+# the change every other part of circulation depends on.
+uniq = uuid.uuid4().hex[:8]
+cb, _ = mkbook(title=f"ZZITEST Copies {uniq}", author="ZZ Copies", shelfCode="ZZ-FRONT")
+st, _ = call("POST", "/api/items/add-copies", {"bookIds": [cb], "count": 1, "shelfCode": "ZZ-BACK"})
+check("a second copy was added", len(get(cb).get("items") or []) == 2, get(cb).get("items"))
+
+st, b1 = call("POST", f"/api/books/{cb}/borrow", {"borrowerName": "ZZ Reader A", "dueAt": "2030-01-01T00:00:00.000Z"})
+check("the first copy is lent", st in (200, 201) and b1.get("copyNumber") == 1, f"{st} {b1}")
+st, b2 = call("POST", f"/api/books/{cb}/borrow", {"borrowerName": "ZZ Reader B", "dueAt": "2030-01-01T00:00:00.000Z"})
+check("the SECOND copy is lendable at the same time", st in (200, 201) and b2.get("copyNumber") == 2, f"{st} {b2}")
+check("the borrow says which copy went", b2.get("shelfCode") == "ZZ-BACK", b2.get("shelfCode"))
+st, b3 = call("POST", f"/api/books/{cb}/borrow", {"borrowerName": "ZZ Reader C", "dueAt": "2030-01-01T00:00:00.000Z"})
+check("a third borrow is refused — no copy left", st == 409, f"{st} {b3}")
+check("both copies read as borrowed",
+      sorted(i["status"] for i in (get(cb).get("items") or [])) == ["borrowed", "borrowed"],
+      [i["status"] for i in (get(cb).get("items") or [])])
+
+# The live bug 0028 closes: syncBookFromItems derived books.status from copies
+# that circulation never marked, so adding a copy freed a borrowed record and
+# orphaned its loans.
+st, _ = call("POST", "/api/items/add-copies", {"bookIds": [cb], "count": 1, "shelfCode": "ZZ-THIRD"})
+st, act = call("GET", "/api/borrow/active")
+mine = [l for l in (act or {}).get("items", []) if l["bookId"] == cb]
+check("adding a copy does not orphan the open loans", len(mine) == 2, len(mine))
+check("active loans name the copy", all(l.get("copyNumber") for l in mine), mine)
+
+# Returning without naming a loan closes the OLDEST, and frees only that copy.
+st, r = call("POST", f"/api/books/{cb}/return", {})
+check("return frees exactly one copy", st == 200 and r.get("copiesAvailable") == 2, f"{st} {r}")
+statuses = sorted(i["status"] for i in (get(cb).get("items") or []))
+check("the other copy is still out", statuses == ["available", "available", "borrowed"], statuses)
+
+print("=== 40. REGRESSION: loan policies, renewals and holds ===")
+# The rule replaces a hand-typed date. A borrow with no dueAt must still work.
+st, pol = call("GET", "/api/loan-policies")
+default = next((p for p in (pol or {}).get("policies", [])
+                if p["borrowerCategory"] == "*" and p["itemType"] == "*"), None)
+check("a default loan rule exists", default is not None and default["loanDays"] >= 1, default)
+
+pb, _ = mkbook(title=f"ZZITEST Policy {uniq}", author="ZZ Policy")
+st, br = call("POST", f"/api/books/{pb}/borrow", {"borrowerName": "ZZ Policy Reader"})
+check("a borrow with no dueAt applies the rule", st in (200, 201) and br.get("dueAt"), f"{st} {br}")
+expected_days = default["loanDays"] if default else 14
+due = datetime.datetime.fromisoformat(br["dueAt"].replace("Z", "+00:00"))
+gap = (due - datetime.datetime.now(datetime.timezone.utc)).days
+check("the due date matches the rule", abs(gap - expected_days) <= 1, f"{gap} vs {expected_days}")
+
+# Renewing a loan that already runs the full period buys nothing, and spending
+# one of the reader's renewals for no extra time would be wrong.
+st, hist = call("GET", f"/api/books/{pb}/history")
+loan_id = ((hist or {}).get("items") or [{}])[0].get("id")
+st, noop = call("POST", f"/api/loans/{loan_id}/renew", {"expectedRenewalCount": 0})
+check("renewing a full-length loan is refused rather than wasted",
+      st == 409 and "not extend" in str(noop), f"{st} {noop}")
+call("POST", f"/api/books/{pb}/return", {})
+
+# Now a loan due SOON, where renewing genuinely extends it — which is what
+# exercises the retry guard. A renewal is not idempotent and the web client
+# retries a write four times on a 5xx, so the renewal COUNT is the precondition
+# that works. The due date alone does not: renewing a fresh loan for the same
+# period lands on the same calendar date, and a replay would still match.
+soon = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).isoformat().replace("+00:00", "Z")
+call("POST", f"/api/books/{pb}/borrow", {"borrowerName": "ZZ Policy Reader", "dueAt": soon})
+st, hist = call("GET", f"/api/books/{pb}/history")
+loan_id = ((hist or {}).get("items") or [{}])[0].get("id")
+st, rn = call("POST", f"/api/loans/{loan_id}/renew", {"expectedRenewalCount": 0})
+check("a short loan renews", st == 200 and rn.get("renewalCount") == 1, f"{st} {rn}")
+check("the renewal records what it was due before",
+      rn.get("originalDueAt") == soon, f'{soon} -> {rn.get("originalDueAt")}')
+st, replay = call("POST", f"/api/loans/{loan_id}/renew", {"expectedRenewalCount": 0})
+check("a replayed renewal is refused, not applied twice", st == 409, f"{st} {replay}")
+st, again = call("GET", f"/api/books/{pb}/history")
+check("the loan was extended exactly once",
+      ((again or {}).get("items") or [{}])[0].get("dueAt") == rn.get("dueAt"),
+      f'{rn.get("dueAt")} vs {((again or {}).get("items") or [{}])[0].get("dueAt")}')
+
+# Holds: a queue on the title, filled by whichever copy comes back first.
+hb, _ = mkbook(title=f"ZZITEST Holds {uniq}", author="ZZ Holds")
+call("POST", f"/api/books/{hb}/borrow", {"borrowerName": "ZZ Holder", "dueAt": "2030-01-01T00:00:00.000Z"})
+st, h1 = call("POST", f"/api/books/{hb}/holds", {"borrowerName": "ZZ Queue One"})
+st2, h2 = call("POST", f"/api/books/{hb}/holds", {"borrowerName": "ZZ Queue Two"})
+check("two readers queue in order",
+      h1.get("position") == 1 and h2.get("position") == 2, f"{h1} {h2}")
+st, dup = call("POST", f"/api/books/{hb}/holds", {"borrowerName": "ZZ Queue One"})
+check("the same reader cannot queue twice", st == 409, f"{st} {dup}")
+
+st, hist2 = call("GET", f"/api/books/{hb}/history")
+hloan = ((hist2 or {}).get("items") or [{}])[0].get("id")
+st, rn2 = call("POST", f"/api/loans/{hloan}/renew", {"expectedRenewalCount": 0})
+check("a loan cannot be renewed past a queue", st == 409 and "waiting" in str(rn2), f"{st} {rn2}")
+
+st, ret = call("POST", f"/api/books/{hb}/return", {})
+check("the returned copy is put aside for the head of the queue",
+      st == 200 and (ret.get("heldFor") or {}).get("borrowerName") == "ZZ Queue One", ret)
+st, blocked = call("POST", f"/api/books/{hb}/borrow", {"borrowerName": "ZZ Interloper", "dueAt": "2030-01-01T00:00:00.000Z"})
+check("a held copy cannot be lent to somebody else", st == 409, f"{st} {blocked}")
+st, collected = call("POST", f"/api/books/{hb}/borrow", {"borrowerName": "ZZ Queue One", "dueAt": "2030-01-01T00:00:00.000Z"})
+check("the reader it is held for CAN take it",
+      st in (200, 201) and collected.get("holdFulfilled") is True, f"{st} {collected}")
+st, q = call("GET", f"/api/books/{hb}/holds")
+check("collecting advances the queue",
+      len((q or {}).get("holds") or []) == 1
+      and (q["holds"][0]["borrowerName"] == "ZZ Queue Two"), q)
+
+# Consultation-only: expressed as a rule, not as a fifth copy status.
+st, saved = call("PUT", "/api/loan-policies", {"policies": [
+    {"borrowerCategory": "*", "itemType": "*", "loanDays": 14, "renewalLimit": 2, "lendable": True},
+    {"borrowerCategory": "*", "itemType": "manuscript", "loanDays": 1, "renewalLimit": 0, "lendable": False}
+]})
+check("loan rules save", st == 200, f"{st} {saved}")
+st, nodefault = call("PUT", "/api/loan-policies", {"policies": [
+    {"borrowerCategory": "zzstudent", "itemType": "book", "loanDays": 7, "renewalLimit": 1, "lendable": True}
+]})
+check("a rule set with no default is refused", st == 400, f"{st} {nodefault}")
+
+rb, _ = mkbook(title=f"ZZITEST Reference {uniq}", author="ZZ Ref")
+call("PUT", f"/api/books/{rb}/items", {"items": [{"shelfCode": "ZZ-REF", "itemType": "manuscript"}]})
+st, refused = call("POST", f"/api/books/{rb}/borrow", {"borrowerName": "ZZ Ref Reader"})
+check("a consultation-only copy cannot be lent", st == 409 and "consultation" in str(refused), f"{st} {refused}")
+# Put the default table back so later runs start clean.
+call("PUT", "/api/loan-policies", {"policies": [
+    {"borrowerCategory": "*", "itemType": "*", "loanDays": 14, "renewalLimit": 2,
+     "renewalDays": 14, "maxConcurrentLoans": None, "lendable": True}
+]})
+
+# Close every fixture loan so the books can be deleted in CLEANUP.
+for bid in (cb, pb, hb):
+    for _ in range(3):
+        st, _ = call("POST", f"/api/books/{bid}/return", {})
+        if st != 200:
+            break
 
 print("\n=== CLEANUP ===")
 for bid in CREATED:
