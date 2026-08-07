@@ -1599,6 +1599,120 @@ for bid in (lb,):
         if call("POST", f"/api/books/{bid}/return", {})[0] != 200:
             break
 
+print("=== 43. REGRESSION: accessibility guards (static) ===")
+# The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
+# do is stop the two classes of defect that regrow fastest — because both look
+# correct in review — by reading the source the same way the audit did.
+_WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "apps", "web", "src")
+
+
+def _read(name):
+    with open(os.path.join(_WEB, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+try:
+    css = _read("styles.css")
+    tsx = _read("main.tsx")
+    ui = _read("ui.tsx")
+    i18n = _read("i18n.tsx")
+
+    # `outline: none` without a measured replacement is how focus disappears.
+    # One global :focus-visible rule replaced six sites; if a new one appears,
+    # the ring is gone again for whatever it covers.
+    # `:focus:not(:focus-visible)` is the legitimate form — it suppresses the
+    # ring for a programmatic landing point while keeping it for a real
+    # keyboard focus. A bare `outline: none` is not.
+    outlines = [ln.strip() for ln in css.splitlines()
+                if "outline: none" in ln and not ln.strip().startswith(("*", "/*", "//"))
+                and ":not(:focus-visible)" not in ln]
+    check("no rule removes the focus outline", not outlines, outlines)
+    check("a global :focus-visible ring exists", ":focus-visible {" in css, "missing")
+
+    # Contrast is computable straight from the tokens, so it is checkable here.
+    def _lum(hexs):
+        h = hexs.lstrip("#")
+        parts = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        conv = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
+        return 0.2126 * conv[0] + 0.7152 * conv[1] + 0.0722 * conv[2]
+
+    def _ratio(a, b):
+        la, lb = _lum(a), _lum(b)
+        hi, lo = max(la, lb), min(la, lb)
+        return (hi + 0.05) / (lo + 0.05)
+
+    def _tokens(block):
+        m = re.search(block + r"\s*\{(.*?)\}", css, re.S)
+        return dict(re.findall(r"--([a-z-]+):\s*(#[0-9a-fA-F]{6})", m.group(1))) if m else {}
+
+    light = _tokens(r":root")
+    dark = _tokens(r'\[data-theme="dark"\]')
+    for name, toks in (("light", light), ("dark", dark)):
+        if not toks.get("text-light"):
+            continue
+        # --text-light is the worst offender historically: eight consumers, and
+        # it failed in every one because each looked fine on white.
+        worst = min(_ratio(toks["text-light"], toks[bg]) for bg in ("surface", "surface-2", "bg") if toks.get(bg))
+        check(f"{name}: --text-light reaches 4.5:1 on every surface",
+              worst >= 4.5, f'{toks["text-light"]} -> {worst:.2f}')
+        worst_muted = min(_ratio(toks["text-muted"], toks[bg]) for bg in ("surface", "surface-2", "bg") if toks.get(bg))
+        check(f"{name}: --text-muted reaches 4.5:1 on every surface",
+              worst_muted >= 4.5, f'{toks["text-muted"]} -> {worst_muted:.2f}')
+        # A field's border is the only thing that identifies it — SC 1.4.11.
+        check(f"{name}: --field-border reaches 3:1 against the field background",
+              _ratio(toks["field-border"], toks["surface"]) >= 3.0,
+              f'{toks.get("field-border")} -> {_ratio(toks["field-border"], toks["surface"]):.2f}')
+        # White on the dark theme's light-blue accent was 2.54:1.
+        check(f"{name}: --on-accent reaches 4.5:1 on --accent",
+              _ratio(toks["on-accent"], toks["accent"]) >= 4.5,
+              f'{toks.get("on-accent")} on {toks.get("accent")} -> {_ratio(toks["on-accent"], toks["accent"]):.2f}')
+
+    # aria-label is PROHIBITED on a roleless span/div and is silently dropped —
+    # the failure mode is code that looks right and does nothing.
+    prohibited = re.findall(r"<(?:span|div)(?![^>]*\brole=)[^>]*\saria-label=", tsx)
+    check("no aria-label on a roleless span or div", len(prohibited) == 0, len(prohibited))
+
+    # role="button" on a <tr> stops it being a row.
+    check("no role=button spread onto a table row",
+          "role: 'button' as const" not in tsx.split("function bookRowHandlers")[1].split("function bookCardHandlers")[0],
+          "bookRowHandlers still carries the role")
+
+    # Landmarks and the skip link — SC 1.3.1 / 2.4.1.
+    for needle, what in [("<main className=\"simple-content\"", "a <main> landmark"),
+                         ("<header className=\"simple-navbar\">", "a <header> landmark"),
+                         ("<nav className=\"simple-tabs\"", "a <nav> landmark"),
+                         ("className=\"skip-link\"", "a skip link")]:
+        check(f"the shell has {what}", needle in tsx, needle)
+
+    # The one dialog primitive. Six overlays each got this wrong differently.
+    check("a shared Dialog primitive exists", "function Dialog({" in tsx, "missing")
+    check("no overlay claims the dialog role on its backdrop",
+          'className="modal-overlay" onClick' not in tsx, "an overlay still does")
+    check("every Dialog is named", tsx.count("<Dialog onClose") == tsx.count("labelledBy="),
+          f'{tsx.count("<Dialog onClose")} dialogs, {tsx.count("labelledBy=")} named')
+
+    # Error toasts are the only channel for validation failures, so a timeout
+    # on them is a time limit on reading them — SC 2.2.1.
+    check("error toasts do not auto-dismiss", "if (kind === 'error') return;" in ui, "they still do")
+
+    # The three infinite animations can run well past five seconds.
+    rm = css.split("prefers-reduced-motion")[-1] if "prefers-reduced-motion" in css else ""
+    check("reduced motion stops the infinite animations",
+          all(sel in rm for sel in (".spinner", ".skeleton")), "not covered")
+
+    # Every string in all four locales, and no key referenced but undefined.
+    keys = re.findall(r"^  '([a-zA-Z0-9_.]+)':", i18n, re.M)
+    counts = {}
+    for k in keys:
+        counts[k] = counts.get(k, 0) + 1
+    drift = {k: v for k, v in counts.items() if v != 4}
+    check("every UI string exists in all four locales", not drift, list(drift.items())[:5])
+    referenced = set(re.findall(r"(?<![A-Za-z0-9_.])t\('([a-zA-Z0-9_.]+)'", tsx))
+    absent = sorted(k for k in referenced if k not in counts)
+    check("no UI string is referenced but undefined", not absent, absent[:5])
+except FileNotFoundError as exc:
+    check("the web source is readable from the gate", False, str(exc))
+
 print("\n=== CLEANUP ===")
 for bid in CREATED:
     call("DELETE", f"/api/books/{bid}")

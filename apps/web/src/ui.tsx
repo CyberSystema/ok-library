@@ -54,10 +54,16 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
     const id = ++idRef.current;
     setToasts((prev) => [...prev, { id, kind, message }]);
     // Errors stay longer so users have time to read; success/info auto-dismiss faster.
-    const ttl = kind === 'error' ? 7000 : 4000;
+    //
+    // SC 2.2.1 Timing Adjustable: toasts are this app's only channel for
+    // validation errors and import results, and a fixed timeout is a time
+    // limit on reading them. An ERROR now stays until dismissed — there is no
+    // other copy of it anywhere — while the transient confirmations keep their
+    // timer, since re-reading "Saved" is not something anyone needs to do.
+    if (kind === 'error') return;
     window.setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, ttl);
+    }, 4000);
   }, []);
 
   const value = useMemo(() => ({ toasts, push, dismiss }), [toasts, push, dismiss]);
@@ -65,14 +71,29 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      <div className="toast-stack" role="region" aria-label={t('common.notifications')}>
+      {/* The live region is PERSISTENT and the toasts render inside it.
+          Creating a role="status" element at the same moment as its content is
+          unreliably announced across screen readers — the region has to exist
+          first for the insertion to be seen as a change. role="alert" on the
+          error toast stays, because that one is announced on insertion. */}
+      <div
+        className="toast-stack"
+        role="region"
+        aria-label={t('common.notifications')}
+        aria-live="polite"
+        aria-atomic="false"
+      >
         {toasts.map((entry) => (
-          <div key={entry.id} className={`toast toast-${entry.kind}`} role={entry.kind === 'error' ? 'alert' : 'status'}>
-            <span className="toast-icon">
+          <div key={entry.id} className={`toast toast-${entry.kind}`} role={entry.kind === 'error' ? 'alert' : undefined}>
+            {/* Decorative: without aria-hidden every announcement was prefixed
+                with "check mark" or "warning". */}
+            <span className="toast-icon" aria-hidden="true">
               {entry.kind === 'success' ? '✓' : entry.kind === 'error' ? '⚠' : 'ℹ'}
             </span>
             <span className="toast-msg">{entry.message}</span>
-            <button className="toast-x" onClick={() => dismiss(entry.id)} aria-label={t('common.dismiss')}>✕</button>
+            <button className="toast-x" onClick={() => dismiss(entry.id)} aria-label={t('common.dismiss')}>
+              <span aria-hidden="true">✕</span>
+            </button>
           </div>
         ))}
       </div>

@@ -1271,7 +1271,11 @@ function VariantGroupCard({ group, mergeLabel, keepLabel, onMerge }: {
         ))}
       </div>
       <div className="variant-merge-row">
-        <input value={canonical} onChange={(e) => setCanonical(e.target.value)} />
+        <input
+          value={canonical}
+          aria-label={keepLabel}
+          onChange={(e) => setCanonical(e.target.value)}
+        />
         <button
           type="button"
           className="primary small"
@@ -1442,6 +1446,112 @@ function MergeGroupCard({ group, t, onPreview, onMerge }: {
     </div>
   );
 }
+
+/**
+ * The one dialog primitive.
+ *
+ * Six overlays each reimplemented this pattern and each implemented a different
+ * incomplete subset: `role="dialog" aria-modal="true"` was on the click-away
+ * BACKDROP rather than on the dialog box, none had an accessible name, none
+ * moved focus in, none trapped Tab, none restored focus on close, and Escape
+ * was wired for three of them in one place and one of them in another.
+ *
+ * `ContextMenuView` already had a correct focus-restore implementation; this
+ * lifts that approach so the next overlay inherits it instead of the gaps.
+ *
+ * WCAG 2.4.3 (focus order), 4.1.2 (name, role, value), 2.1.2 (no keyboard trap
+ * — Tab cycles WITHIN the dialog, which is what aria-modal already promises AT
+ * users and what Tab did not honour).
+ */
+function Dialog({ onClose, labelledBy, label, className, style, children, initialFocus }: {
+  onClose: () => void;
+  /** Id of the heading inside. Preferred over `label` — it names the dialog with its own title. */
+  labelledBy?: string;
+  label?: string;
+  className?: string;
+  style?: React.CSSProperties;
+  children: React.ReactNode;
+  initialFocus?: 'first' | 'container';
+}) {
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  // Captured on mount, before focus moves: this is what focus goes back to.
+  const returnToRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    returnToRef.current = document.activeElement as HTMLElement | null;
+    const box = boxRef.current;
+    if (box) {
+      const focusable = box.querySelectorAll<HTMLElement>(FOCUSABLE);
+      const target = initialFocus === 'container' ? box : (focusable[0] ?? box);
+      // The container itself needs a tabindex to be focusable at all; -1 keeps
+      // it out of the tab sequence while allowing programmatic focus.
+      if (target === box) box.setAttribute('tabindex', '-1');
+      target.focus();
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      // Only restore if focus is still inside the dialog being torn down —
+      // otherwise a dialog that opened another one would yank focus back.
+      returnToRef.current?.focus?.();
+    };
+  }, [initialFocus]);
+
+  function onKeyDown(e: React.KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      onClose();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const box = boxRef.current;
+    if (!box) return;
+    const items = [...box.querySelectorAll<HTMLElement>(FOCUSABLE)]
+      .filter((el) => el.offsetParent !== null || el === document.activeElement);
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
+  return (
+    // The backdrop is a backdrop: it is not the dialog and must not claim the
+    // role. Click-away stays, but only when the click started on the backdrop
+    // itself, so a drag that ends outside the box does not close it.
+    <div
+      className="modal-overlay"
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onKeyDown={onKeyDown}
+    >
+      <div
+        ref={boxRef}
+        className={className ?? 'modal'}
+        style={style}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={labelledBy}
+        aria-label={labelledBy ? undefined : label}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** Everything a keyboard can land on. Used by the focus trap and by initial focus. */
+const FOCUSABLE = [
+  'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])', 'textarea:not([disabled])', 'summary',
+  '[tabindex]:not([tabindex="-1"])'
+].join(',');
 
 // ── Custom right-click context menu ─────────────────────────────────────────
 // A single app-owned menu that replaces the browser's native one on the app's
@@ -2103,16 +2213,10 @@ function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [loggedIn, detailBook, coverZoom, contextMenu]);
 
-  // Lock the body scroll while any full-screen modal is open. Without this a
-  // long detail/profile modal lets the underlying list scroll on touch+wheel,
-  // which is jarring on mobile and noticeable on desktops with momentum.
-  useEffect(() => {
-    const anyOpen = Boolean(detailBook) || profileOpen;
-    if (!anyOpen) return;
-    const previous = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => { document.body.style.overflow = previous; };
-  }, [detailBook, profileOpen]);
+  // Body-scroll locking lives in <Dialog> now. It used to be duplicated here,
+  // and the two RACED: this effect set overflow:hidden first, Dialog then
+  // captured 'hidden' as the value to restore, and closing the modal left the
+  // page permanently unscrollable. Measured in the browser, not reasoned about.
 
   const availableBooksFromSummary =
     roomSummary.reduce((sum, room) => sum + Number(room.available_books ?? 0), 0) + Number(unassignedSummary.availableBooks ?? 0);
@@ -5683,6 +5787,17 @@ function App() {
   // Selection, context menu and row activation are identical in every layout,
   // so they are produced once and spread into both the card and the table row.
   // Branching them per layout is how the two silently drift apart.
+  /**
+   * Row BEHAVIOUR — click, right-click, Enter/Space — shared by the card layout
+   * and the table so the two cannot drift apart.
+   *
+   * Deliberately NOT the ARIA semantics. Spreading `role="button" tabIndex={0}`
+   * onto a `<tr>` stops it being a row: `<tbody>` then has children that are not
+   * rows, row/column navigation is gone, and the "button" name becomes the
+   * concatenation of all ~18 cells. The card `<div>` genuinely is a button and
+   * gets the role from `bookCardHandlers` below; the table row keeps its row
+   * semantics and puts the affordance on a cell instead.
+   */
   function bookRowHandlers(book: Book) {
     const activate = () => {
       // In selection mode the whole row acts as the checkbox so users don't
@@ -5691,8 +5806,6 @@ function App() {
       else openBookDetail(book);
     };
     return {
-      role: 'button' as const,
-      tabIndex: 0,
       onClick: activate,
       onContextMenu: (e: React.MouseEvent) =>
         openContextMenu(e, buildBookMenu(book), displayTitle(book, t('common.untitled'))),
@@ -5702,6 +5815,11 @@ function App() {
         activate();
       }
     };
+  }
+
+  /** The card layout: a div that really is a button, so it says so. */
+  function bookCardHandlers(book: Book) {
+    return { role: 'button' as const, tabIndex: 0, ...bookRowHandlers(book) };
   }
 
   // Open a book we only hold an id for — the title-duplicate warning carries a
@@ -6069,11 +6187,11 @@ function App() {
           An empty box means "leave it alone" — blanking a field across a
           selection is a separate, explicit "Clear" toggle. */}
       {addCopiesOpen && canWrite && (
-        <div className="modal-overlay" onClick={() => setAddCopiesOpen(false)} role="dialog" aria-modal="true">
-          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '32rem' }}>
+        <Dialog onClose={() => setAddCopiesOpen(false)} labelledBy="dlg-addcopies" style={{ maxWidth: '32rem' }}>
+          <div>
             <div className="modal-header">
               <div className="modal-title-block">
-                <h2>{t('library.bulk.addCopies')}</h2>
+                <h2 id="dlg-addcopies">{t('library.bulk.addCopies')}</h2>
                 <p className="muted small">{t('library.copies.subtitle', { n: fmt(selectedBookIds.length) })}</p>
               </div>
             </div>
@@ -6081,16 +6199,16 @@ function App() {
               <p className="muted small" style={{ marginBottom: '1rem' }}>{t('library.copies.hint')}</p>
               <div className="form-row">
                 <div>
-                  <label>{t('library.copies.count')}</label>
-                  <input
+                  <label htmlFor="fld-library-copies-count">{t('library.copies.count')}</label>
+                  <input id="fld-library-copies-count"
                     type="number" min={1} max={10}
                     value={addCopiesCount}
                     onChange={(e) => setAddCopiesCount(e.target.value)}
                   />
                 </div>
                 <div>
-                  <label>{t('library.copies.shelf')}</label>
-                  <input
+                  <label htmlFor="fld-library-copies-shelf">{t('library.copies.shelf')}</label>
+                  <input id="fld-library-copies-shelf"
                     value={addCopiesShelf}
                     onChange={(e) => setAddCopiesShelf(e.target.value)}
                     placeholder={t('library.copies.shelfPh')}
@@ -6108,15 +6226,15 @@ function App() {
               </div>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {bulkEditOpen && canWrite && (
-        <div className="modal-overlay" onClick={closeBulkEditor} role="dialog" aria-modal="true">
-          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '46rem' }}>
+        <Dialog onClose={closeBulkEditor} labelledBy="dlg-bulkedit" style={{ maxWidth: '46rem' }}>
+          <div>
             <div className="modal-header">
               <div className="modal-title-block">
-                <h2>{t('library.bulk.editTitle')}</h2>
+                <h2 id="dlg-bulkedit">{t('library.bulk.editTitle')}</h2>
                 <p className="muted small">
                   {t('library.bulk.editSubtitle', { n: selectedBookIds.length })}
                 </p>
@@ -6232,32 +6350,29 @@ function App() {
               </div>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {/* ═══ PROFILE MODAL ═══ */}
       {profileOpen && currentUser && (
-        <div className="modal-overlay" onClick={() => setProfileOpen(false)} role="dialog" aria-modal="true">
-          <div className="modal" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '32rem' }}>
+        <Dialog onClose={() => setProfileOpen(false)} labelledBy="dlg-profile" style={{ maxWidth: '32rem' }}>
+          <div>
             <div className="modal-header">
               <div className="modal-title-block">
-                <h2>{t('profile.title')}</h2>
+                <h2 id="dlg-profile">{t('profile.title')}</h2>
                 <p className="muted small">{t('profile.subtitle')}</p>
               </div>
             </div>
             <div style={{ padding: '1rem 1.5rem 1.5rem' }}>
               <div style={{ marginBottom: '1rem' }}>
-                <label className="muted small">{t('users.uuid')}</label>
-                <div
-                  style={{
-                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-                    background: 'rgba(127,127,127,0.1)',
-                    padding: '0.5rem 0.75rem',
-                    borderRadius: '6px',
-                    cursor: 'pointer',
-                    wordBreak: 'break-all',
-                    marginTop: '0.25rem'
-                  }}
+                <span className="muted small" id="profile-uuid-label">{t('users.uuid')}</span>
+                {/* A real <button>. It was a styled div with an onClick: not
+                    focusable, not announced as interactive, and unreachable by
+                    keyboard (SC 2.1.1 / 4.1.2). */}
+                <button
+                  type="button"
+                  className="uuid-copy"
+                  aria-describedby="profile-uuid-label"
                   title={t('users.uuidCopy')}
                   onClick={() => {
                     void navigator.clipboard?.writeText(currentUser.id);
@@ -6265,7 +6380,7 @@ function App() {
                   }}
                 >
                   {currentUser.id}
-                </div>
+                </button>
                 <p className="muted small" style={{ marginTop: '0.35rem' }}>{t('profile.uuidHint')}</p>
               </div>
               <div style={{ marginBottom: '1rem' }}>
@@ -6274,8 +6389,8 @@ function App() {
               </div>
               <form onSubmit={saveProfile} className="simple-form">
                 <div>
-                  <label>{t('users.username')}</label>
-                  <input
+                  <label htmlFor="fld-users-username">{t('users.username')}</label>
+                  <input id="fld-users-username"
                     value={profileUsername}
                     onChange={(e) => setProfileUsername(e.target.value)}
                     minLength={3}
@@ -6283,8 +6398,8 @@ function App() {
                   />
                 </div>
                 <div>
-                  <label>{t('profile.newPassword')}</label>
-                  <input
+                  <label htmlFor="fld-profile-newpassword">{t('profile.newPassword')}</label>
+                  <input id="fld-profile-newpassword"
                     type="password"
                     value={profileNewPassword}
                     onChange={(e) => setProfileNewPassword(e.target.value)}
@@ -6295,8 +6410,8 @@ function App() {
                   <p className="muted small">{t('users.passwordHint')}</p>
                 </div>
                 <div>
-                  <label>{t('profile.currentPassword')} *</label>
-                  <input
+                  <label htmlFor="fld-profile-currentpassword">{t('profile.currentPassword')} *</label>
+                  <input id="fld-profile-currentpassword"
                     type="password"
                     value={profileCurrentPassword}
                     onChange={(e) => setProfileCurrentPassword(e.target.value)}
@@ -6316,15 +6431,13 @@ function App() {
               </form>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {/* ═══ BOOK DETAIL MODAL ═══ */}
       {detailBook && (
-        <div className="modal-overlay" onClick={closeDetail} role="dialog" aria-modal="true">
+        <Dialog onClose={closeDetail} labelledBy="dlg-detail-title">
           <div
-            className="modal"
-            onClick={(e) => e.stopPropagation()}
             onContextMenu={(e) => {
               // Keep the native menu on the edit form's text fields.
               if ((e.target as HTMLElement).closest('input, textarea, select, [contenteditable="true"]')) return;
@@ -6334,9 +6447,9 @@ function App() {
 
             {/* Header */}
             <div className="modal-header">
-              <div className="modal-avatar">{(displayTitle(detailBook, t('common.untitled')).charAt(0) || '?').toUpperCase()}</div>
+              <div className="modal-avatar" aria-hidden="true">{(displayTitle(detailBook, t('common.untitled')).charAt(0) || '?').toUpperCase()}</div>
               <div className="modal-title-block">
-                <h2 className={isPlaceholder(detailBook.title, 'title') || !detailBook.title ? 'is-placeholder' : ''}>
+                <h2 id="dlg-detail-title" className={isPlaceholder(detailBook.title, 'title') || !detailBook.title ? 'is-placeholder' : ''}>
                   {displayTitle(detailBook, t('common.untitled'))}
                 </h2>
                 {/* The romanized reading sits UNDER the vernacular title, the
@@ -6352,19 +6465,26 @@ function App() {
                   <p className="romanized-line muted small" lang="und-Latn">{detailBook.authorRomanized}</p>
                 )}
                 <div className="modal-pills">
-                  <span className={`status-badge status-${detailBook.status}`}>{detailBook.status}</span>
+                  <span className={`status-badge status-${detailBook.status}`}>{t(`status.${detailBook.status}`)}</span>
                   {detailBook.legacyId ? (
                     <span className="legacy-id-pill" title={t('detail.legacyTitle')}>{detailBook.legacyId}</span>
                   ) : null}
                 </div>
               </div>
-              <div className="modal-shelf-block" aria-label={detailBook.shelfCode ? t('detail.shelfAria', { code: detailBook.shelfCode }) : t('detail.shelfNoneAria')}>
-                <span className="modal-shelf-label">{t('detail.shelf')}</span>
+              {/* Same prohibited-attribute problem as the card badge: a
+                  roleless div cannot carry an accessible name. */}
+              <div className="modal-shelf-block">
+                <span className="sr-only">
+                  {detailBook.shelfCode ? t('detail.shelfAria', { code: detailBook.shelfCode }) : t('detail.shelfNoneAria')}
+                </span>
+                <span className="modal-shelf-label" aria-hidden="true">{t('detail.shelf')}</span>
                 <span className={`modal-shelf-value${detailBook.shelfCode ? '' : ' is-empty'}`}>
                   {detailBook.shelfCode || '—'}
                 </span>
               </div>
-              <button className="modal-close" onClick={closeDetail} title={t('common.close')}>✕</button>
+              <button className="modal-close" onClick={closeDetail} aria-label={t('common.close')} title={t('common.close')}>
+                <span aria-hidden="true">✕</span>
+              </button>
             </div>
 
             {/* Action bar */}
@@ -6446,7 +6566,10 @@ function App() {
                           <input
                             type="file"
                             accept="image/png,image/jpeg,image/webp,image/gif"
-                            style={{ display: 'none' }}
+                            // NOT display:none — that removes the input from the tab order,
+                            // and a <label> is not focusable, so this control could
+                            // not be reached by keyboard at all (SC 2.1.1, Level A).
+                            className="sr-only"
                             onChange={(e) => {
                               const f = e.target.files?.[0];
                               e.target.value = '';
@@ -6695,8 +6818,8 @@ function App() {
                 <form onSubmit={saveBookEdit} className="simple-form">
                   <div className="form-row">
                     <div>
-                      <label>{t('detail.title')}<span className="required-mark"> *</span></label>
-                      <input
+                      <label htmlFor="fld-detail-title">{t('detail.title')}<span className="required-mark"> *</span></label>
+                      <input id="fld-detail-title"
                         ref={editTitleInputRef}
                         className={editFieldErrors.has('title') ? 'input-error' : undefined}
                         aria-required="true"
@@ -6715,18 +6838,18 @@ function App() {
                       />
                     </div>
                     <div>
-                      <label>{t('detail.author')}</label>
-                      <input list="suggest-author" value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} />
+                      <label htmlFor="fld-detail-author">{t('detail.author')}</label>
+                      <input id="fld-detail-author" list="suggest-author" value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} />
                     </div>
                   </div>
                   <div className="form-row">
                     <div>
-                      <label>{t('detail.isbn')}</label>
-                      <input className="isbn-input" value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder={t('detail.isbnPh')} inputMode="text" autoComplete="off" autoCapitalize="characters" spellCheck={false} />
+                      <label htmlFor="fld-detail-isbn">{t('detail.isbn')}</label>
+                      <input id="fld-detail-isbn" className="isbn-input" value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder={t('detail.isbnPh')} inputMode="text" autoComplete="off" autoCapitalize="characters" spellCheck={false} />
                     </div>
                     <div>
-                      <label>{t('detail.yearPublished')}</label>
-                      <input
+                      <label htmlFor="fld-detail-yearpublished">{t('detail.yearPublished')}</label>
+                      <input id="fld-detail-yearpublished"
                         value={editForm.publicationYear}
                         onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })}
                         placeholder={t('detail.yearPh')}
@@ -6736,12 +6859,12 @@ function App() {
                   </div>
                   <div className="form-row">
                     <div>
-                      <label>{t('detail.shelfRow')}</label>
-                      <input list="suggest-shelf" value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder={t('detail.shelfPh')} />
+                      <label htmlFor="fld-detail-shelfrow">{t('detail.shelfRow')}</label>
+                      <input id="fld-detail-shelfrow" list="suggest-shelf" value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder={t('detail.shelfPh')} />
                     </div>
                     <div>
-                      <label>{t('detail.statusRow')}</label>
-                      <select value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
+                      <label htmlFor="fld-detail-statusrow">{t('detail.statusRow')}</label>
+                      <select id="fld-detail-statusrow" value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
                         {/* 'borrowed' is owned by the borrow/return actions — the
                             server rejects setting it manually (or clearing it to
                             available). Offer only the transitions the edit path is
@@ -6756,17 +6879,17 @@ function App() {
                   </div>
                   <div className="form-row">
                     <div>
-                      <label>{t('detail.publisher')}</label>
-                      <input list="suggest-publisher" value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder={t('detail.publisherPh')} />
+                      <label htmlFor="fld-detail-publisher">{t('detail.publisher')}</label>
+                      <input id="fld-detail-publisher" list="suggest-publisher" value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder={t('detail.publisherPh')} />
                     </div>
                     <div>
-                      <label>{t('detail.language')}</label>
-                      <input list="suggest-language" value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder={t('detail.languagePh')} />
+                      <label htmlFor="fld-detail-language">{t('detail.language')}</label>
+                      <input id="fld-detail-language" list="suggest-language" value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder={t('detail.languagePh')} />
                     </div>
                   </div>
                   <div className="form-field">
-                    <label>{t('library.add.description')}</label>
-                    <textarea
+                    <label htmlFor="fld-library-add-description">{t('library.add.description')}</label>
+                    <textarea id="fld-library-add-description"
                       value={editForm.description}
                       onChange={(e) => setEditForm({ ...editForm, description: e.target.value })}
                       rows={3}
@@ -6800,7 +6923,7 @@ function App() {
               )}
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       {/* ═══ COVER ZOOM LIGHTBOX ═══ */}
@@ -6831,6 +6954,10 @@ function App() {
         ref={coverInputRef}
         type="file"
         accept="image/png,image/jpeg,image/webp,image/gif"
+        // Genuinely offscreen plumbing: opened programmatically by the context
+        // menu, never tabbed to, so display:none is correct here. Named anyway.
+        aria-label={t('detail.uploadCover')}
+        tabIndex={-1}
         style={{ display: 'none' }}
         onChange={(e) => {
           const f = e.target.files?.[0];
@@ -6858,12 +6985,12 @@ function App() {
             </div>
             <form onSubmit={login} className="simple-form">
               <div>
-                <label>{t('login.username')}</label>
-                <input value={username} onChange={(e) => setUsername(e.target.value)} autoFocus required />
+                <label htmlFor="fld-login-username">{t('login.username')}</label>
+                <input id="fld-login-username" value={username} onChange={(e) => setUsername(e.target.value)} autoFocus required />
               </div>
               <div>
-                <label>{t('login.password')}</label>
-                <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+                <label htmlFor="fld-login-password">{t('login.password')}</label>
+                <input id="fld-login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
               </div>
               <button type="submit" className="primary">{isWorking ? t('login.signingIn') : t('login.signIn')}</button>
             </form>
@@ -6876,7 +7003,11 @@ function App() {
       ) : (
         <>
           {/* ─── Navbar ─── */}
-          <div className="simple-navbar">
+          {/* Skip link: the facet rail can render hundreds of buttons before
+              the results, and a keyboard user had to tab through all of them.
+              SC 2.4.1 Bypass Blocks. */}
+          <a className="skip-link" href="#main-content">{t('a11y.skipToContent')}</a>
+          <header className="simple-navbar">
             <div className="navbar-brand">
               <div className="navbar-icon">📚</div>
               <h1>{t('app.brand')}</h1>
@@ -6898,30 +7029,37 @@ function App() {
                   className="secondary small"
                   onClick={openProfile}
                   title={t('profile.open')}
-                  aria-label={t('profile.open')}
+                  // SC 2.5.3: the accessible name must CONTAIN the visible
+                  // label, or a speech-input user saying the username cannot
+                  // activate the control.
+                  aria-label={`${currentUser.username} — ${t('profile.open')}`}
                 >
-                  👤 {currentUser.username}
+                  <span aria-hidden="true">👤 </span>{currentUser.username}
                 </button>
               )}
               <button className="secondary small" onClick={logout}>{t('app.signOut')}</button>
             </div>
-          </div>
+          </header>
 
           {/* ─── Tabs ─── */}
-          <div className="simple-tabs">
+          {/* The active tab was conveyed by a colour and a 2.5px underline and
+              nothing else — no role, no aria-selected, no aria-current — so a
+              screen-reader user could not tell which section they were in. */}
+          <nav className="simple-tabs" aria-label={t('app.brand')}>
             {sectionMeta.map((section) => (
               <button
                 key={section.key}
                 className={currentSection === section.key ? 'tab-btn active' : 'tab-btn'}
+                aria-current={currentSection === section.key ? 'page' : undefined}
                 onClick={() => setCurrentSection(section.key)}
               >
                 <span className="tab-icon" aria-hidden="true">{section.icon}</span>
                 <span className="tab-label">{section.label}</span>
               </button>
             ))}
-          </div>
+          </nav>
 
-          <div className="simple-content">
+          <main className="simple-content" id="main-content" tabIndex={-1}>
 
             {/* ═══ DASHBOARD TAB ═══ */}
             {currentSection === 'dashboard' && (
@@ -7322,6 +7460,10 @@ function App() {
                         className="category-rail-field"
                         value={facetField}
                         onChange={(e) => { setFacetField(e.target.value); clearFacetSelection(); }}
+                        // `title` is a tooltip, not an accessible name for a
+                        // select — it is used only when nothing better exists,
+                        // and inconsistently.
+                        aria-label={t('library.facets.fieldTitle')}
                         title={t('library.facets.fieldTitle')}
                       >
                         {facetChoices.map((f) => (
@@ -7330,6 +7472,9 @@ function App() {
                       </select>
                       <input
                         className="category-rail-search"
+                        // A placeholder is not an accessible name — it
+                        // disappears the moment the field has a value.
+                        aria-label={t('library.cats.filter')}
                         placeholder={t('library.cats.filter')}
                         value={categoryRailQuery}
                         onChange={(e) => setCategoryRailQuery(e.target.value)}
@@ -7484,8 +7629,8 @@ function App() {
                           placeholder={t('library.add.titlePh')}
                         />
                         <div>
-                          <label>{t('library.add.author')}</label>
-                          <input list="suggest-author" value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder={t('library.add.authorPh')} />
+                          <label htmlFor="fld-library-add-author">{t('library.add.author')}</label>
+                          <input id="fld-library-add-author" list="suggest-author" value={createForm.author} onChange={(e) => setCreateForm({ ...createForm, author: e.target.value })} placeholder={t('library.add.authorPh')} />
                         </div>
                       </div>
                       {/* Parallel (romanized) forms. Only shown once something is
@@ -7497,12 +7642,12 @@ function App() {
                           <p className="muted small">{t('library.add.romanizedNote')}</p>
                           <div className="form-row">
                             <div>
-                              <label>{t('library.add.titleRomanized')}</label>
-                              <input value={createForm.titleRomanized} onChange={(e) => setCreateForm({ ...createForm, titleRomanized: e.target.value })} />
+                              <label htmlFor="fld-library-add-titleromanized">{t('library.add.titleRomanized')}</label>
+                              <input id="fld-library-add-titleromanized" value={createForm.titleRomanized} onChange={(e) => setCreateForm({ ...createForm, titleRomanized: e.target.value })} />
                             </div>
                             <div>
-                              <label>{t('library.add.authorRomanized')}</label>
-                              <input value={createForm.authorRomanized} onChange={(e) => setCreateForm({ ...createForm, authorRomanized: e.target.value })} />
+                              <label htmlFor="fld-library-add-authorromanized">{t('library.add.authorRomanized')}</label>
+                              <input id="fld-library-add-authorromanized" value={createForm.authorRomanized} onChange={(e) => setCreateForm({ ...createForm, authorRomanized: e.target.value })} />
                             </div>
                           </div>
                         </div>
@@ -7511,9 +7656,10 @@ function App() {
                           visible while typing and the lookup button sits beside it
                           without squeezing the field into a few characters. */}
                       <div className="form-field">
-                        <label>{t('library.add.isbn')}</label>
+                        <label htmlFor="fld-add-isbn">{t('library.add.isbn')}</label>
                         <div className="isbn-row">
                           <input
+                            id="fld-add-isbn"
                             className="isbn-input"
                             value={createForm.isbn}
                             onChange={(e) => setCreateForm({ ...createForm, isbn: e.target.value })}
@@ -7546,8 +7692,8 @@ function App() {
                       </div>
                       <div className="form-row">
                         <div>
-                          <label>{t('library.add.year')}</label>
-                          <input
+                          <label htmlFor="fld-library-add-year">{t('library.add.year')}</label>
+                          <input id="fld-library-add-year"
                             value={createForm.publicationYear}
                             onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })}
                             placeholder={t('library.add.yearPh')}
@@ -7555,23 +7701,23 @@ function App() {
                           <EdtfHint value={createForm.publicationYear} t={t} />
                         </div>
                         <div>
-                          <label>{t('library.add.shelf')}</label>
-                          <input list="suggest-shelf" value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder={t('library.add.shelfPh')} />
+                          <label htmlFor="fld-library-add-shelf">{t('library.add.shelf')}</label>
+                          <input id="fld-library-add-shelf" list="suggest-shelf" value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder={t('library.add.shelfPh')} />
                         </div>
                       </div>
                       <div className="form-row">
                         <div>
-                          <label>{t('library.add.publisher')}</label>
-                          <input list="suggest-publisher" value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder={t('library.add.publisherPh')} />
+                          <label htmlFor="fld-library-add-publisher">{t('library.add.publisher')}</label>
+                          <input id="fld-library-add-publisher" list="suggest-publisher" value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder={t('library.add.publisherPh')} />
                         </div>
                         <div>
-                          <label>{t('library.add.language')}</label>
-                          <input list="suggest-language" value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder={t('library.add.languagePh')} />
+                          <label htmlFor="fld-library-add-language">{t('library.add.language')}</label>
+                          <input id="fld-library-add-language" list="suggest-language" value={createForm.language} onChange={(e) => setCreateForm({ ...createForm, language: e.target.value })} placeholder={t('library.add.languagePh')} />
                         </div>
                       </div>
                       <div className="form-field">
-                        <label>{t('library.add.description')}</label>
-                        <textarea
+                        <label htmlFor="fld-library-add-description-2">{t('library.add.description')}</label>
+                        <textarea id="fld-library-add-description-2"
                           value={createForm.description}
                           onChange={(e) => setCreateForm({ ...createForm, description: e.target.value })}
                           rows={2}
@@ -7582,7 +7728,9 @@ function App() {
                       {/* Cover image — staged here, uploaded right after the book row
                           is created (the cover endpoint keys on the book id). */}
                       <div className="form-field">
-                        <label>{t('library.add.cover')}</label>
+                        {/* This names a GROUP (preview + upload button), not a
+                            single control, so it is not a <label>. */}
+                        <span className="field-group-label">{t('library.add.cover')}</span>
                         <div className="cover-section">
                           {createCoverPreview ? (
                             <img className="detail-cover" src={createCoverPreview} alt={t('library.add.coverPreviewAlt')} />
@@ -7597,7 +7745,8 @@ function App() {
                               <input
                                 type="file"
                                 accept="image/png,image/jpeg,image/webp,image/gif"
-                                style={{ display: 'none' }}
+                                // See above: display:none would make this unreachable by keyboard.
+                                className="sr-only"
                                 onChange={(e) => {
                                   const f = e.target.files?.[0];
                                   e.target.value = '';
@@ -7680,13 +7829,14 @@ function App() {
                         ref={searchInputRef}
                         value={q}
                         onChange={(e) => setQ(e.target.value)}
+                        aria-label={t('library.search.label')}
                         placeholder={t('library.search.placeholder')}
                         list="suggest-author"
                       />
                     </div>
                     <div className="filter-field">
-                      <label>{t('library.search.status')}</label>
-                      <select value={status} onChange={(e) => setStatus(e.target.value)}>
+                      <label htmlFor="fld-library-search-status">{t('library.search.status')}</label>
+                      <select id="fld-library-search-status" value={status} onChange={(e) => setStatus(e.target.value)}>
                         <option value="">{t('status.allStatuses')}</option>
                         <option value="available">{t('status.available')}</option>
                         <option value="borrowed">{t('status.borrowed')}</option>
@@ -7695,8 +7845,8 @@ function App() {
                       </select>
                     </div>
                     <div className="filter-field">
-                      <label>{t('library.search.shelf')}</label>
-                      <input
+                      <label htmlFor="fld-library-search-shelf">{t('library.search.shelf')}</label>
+                      <input id="fld-library-search-shelf"
                         value={shelfFilter}
                         onChange={(e) => setShelfFilter(e.target.value)}
                         placeholder={t('library.search.shelfPh')}
@@ -7705,8 +7855,8 @@ function App() {
                       />
                     </div>
                     <div className="filter-field">
-                      <label>{t('library.search.language')}</label>
-                      <input
+                      <label htmlFor="fld-library-search-language">{t('library.search.language')}</label>
+                      <input id="fld-library-search-language"
                         value={filterLanguage}
                         onChange={(e) => setFilterLanguage(e.target.value)}
                         placeholder={t('library.search.languagePh')}
@@ -7737,13 +7887,13 @@ function App() {
                       </datalist>
                     </div>
                     <div className="filter-field">
-                      <label>{t('library.search.year')}</label>
-                      <input type="number" min={1000} max={3000} value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder={t('library.search.yearPh')} />
+                      <label htmlFor="fld-library-search-year">{t('library.search.year')}</label>
+                      <input id="fld-library-search-year" type="number" min={1000} max={3000} value={filterYear} onChange={(e) => setFilterYear(e.target.value)} placeholder={t('library.search.yearPh')} />
                     </div>
                     <div className="filter-field">
-                      <label>{t('library.search.sort')}</label>
+                      <label htmlFor="fld-search-sort">{t('library.search.sort')}</label>
                       <div className="sort-row">
-                        <select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)}>
+                        <select id="fld-search-sort" value={sortBy} onChange={(e) => setSortBy(e.target.value as SortBy)}>
                           <option value="updatedAt">{t('library.search.sortUpdated')}</option>
                           <option value="title">{t('library.search.sortTitle')}</option>
                           <option value="author">{t('library.search.sortAuthor')}</option>
@@ -7762,7 +7912,7 @@ function App() {
                       </div>
                     </div>
                     <div className="search-actions">
-                      <label>.</label>
+                      <span aria-hidden="true" className="field-spacer" />
                       <button className="secondary" onClick={() => { setShowAdvancedSearch((v) => !v); }}>
                         {showAdvancedSearch ? t('library.search.hideAdvanced') : t('library.search.advanced')}
                       </button>
@@ -7813,8 +7963,8 @@ function App() {
                     <div style={{ marginTop: '0.75rem', borderTop: '1px solid var(--border)', paddingTop: '0.75rem' }}>
                       <div className="form-row">
                         <div>
-                          <label>{t('library.adv.engine')}</label>
-                          <select
+                          <label htmlFor="fld-library-adv-engine">{t('library.adv.engine')}</label>
+                          <select id="fld-library-adv-engine"
                             value={searchEngine}
                             onChange={(e) => setSearchEngine(e.target.value as 'lexical' | 'semantic')}
                             disabled={semanticAvailable === false}
@@ -7833,8 +7983,8 @@ function App() {
                           )}
                         </div>
                         <div>
-                          <label>{t('library.adv.exclude')}</label>
-                          <input
+                          <label htmlFor="fld-library-adv-exclude">{t('library.adv.exclude')}</label>
+                          <input id="fld-library-adv-exclude"
                             value={qExclude}
                             onChange={(e) => setQExclude(e.target.value)}
                             placeholder={t('library.adv.excludePh')}
@@ -7842,8 +7992,8 @@ function App() {
                           />
                         </div>
                         <div>
-                          <label>{t('library.adv.matchMode')}</label>
-                          <select
+                          <label htmlFor="fld-library-adv-matchmode">{t('library.adv.matchMode')}</label>
+                          <select id="fld-library-adv-matchmode"
                             value={qMode}
                             onChange={(e) => setQMode(e.target.value as SearchMode)}
                             disabled={searchEngine === 'semantic'}
@@ -7854,8 +8004,8 @@ function App() {
                           </select>
                         </div>
                         <div>
-                          <label>{t('library.adv.partialWords')}</label>
-                          <select
+                          <label htmlFor="fld-library-adv-partialwords">{t('library.adv.partialWords')}</label>
+                          <select id="fld-library-adv-partialwords"
                             value={partialWords ? 'yes' : 'no'}
                             onChange={(e) => setPartialWords(e.target.value === 'yes')}
                             disabled={searchEngine === 'semantic'}
@@ -7865,8 +8015,8 @@ function App() {
                           </select>
                         </div>
                         <div>
-                          <label>{t('library.adv.fuzzy')}</label>
-                          <select
+                          <label htmlFor="fld-library-adv-fuzzy">{t('library.adv.fuzzy')}</label>
+                          <select id="fld-library-adv-fuzzy"
                             value={fuzzyTypos ? 'on' : 'off'}
                             onChange={(e) => setFuzzyTypos(e.target.value === 'on')}
                             disabled={searchEngine === 'semantic'}
@@ -8096,6 +8246,18 @@ function App() {
                            blank. The wrapper scrolls sideways, never the page. */
                         <div className="book-table-wrap">
                           <table className={`book-table${tableHighlightGaps ? ' show-gaps' : ''}`}>
+                            {/* A caption, not an aria-label: it names the table
+                                for AT and says what the rows are ordered by,
+                                which nothing else in the table conveys — sorting
+                                is driven by the toolbar, so no header carries
+                                aria-sort. */}
+                            <caption className="sr-only">
+                              {t('library.table.caption', {
+                                n: books.length,
+                                sort: t(`library.sortBy.${sortBy}`),
+                                dir: t(`library.sortDir.${sortDir}`)
+                              })}
+                            </caption>
                             <thead>
                               <tr>
                                 {canWrite && selectionMode && <th className="col-select" scope="col"><span className="sr-only">{t('library.select.start')}</span></th>}
@@ -8147,7 +8309,7 @@ function App() {
                                           className={empty ? 'cell-empty' : undefined}
                                           title={empty ? undefined : display}
                                         >
-                                          {empty ? <span aria-label={t('library.table.missing')}>—</span> : display}
+                                          {empty ? <><span className="sr-only">{t('library.table.missing')}</span><span aria-hidden="true">—</span></> : display}
                                         </td>
                                       );
                                     })}
@@ -8165,7 +8327,7 @@ function App() {
                             <div
                               key={book.id}
                               className={`${density === 'compact' ? 'book-row' : 'book-card'}${isSelected ? ' is-selected' : ''}${selectionMode ? ' is-selecting' : ''}`}
-                              {...bookRowHandlers(book)}
+                              {...bookCardHandlers(book)}
                             >
                               <input
                                 type="checkbox"
@@ -8180,7 +8342,11 @@ function App() {
                                 <img
                                   className="book-avatar book-cover"
                                   src={joinApiUrl(book.coverUrl)}
-                                  alt={`Cover of ${displayTitle(book, t('common.untitled'))}`}
+                                  /* Decorative here: the title is right beside it, so an alt
+                             would only repeat what the row already says. The
+                             detail modal, where the cover stands alone, keeps a
+                             real localized alt. */
+                          alt=""
                                   loading="lazy"
                                   decoding="async"
                                   onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
@@ -8205,13 +8371,19 @@ function App() {
                                 </div>
                               </div>
                               <div className="book-card-side">
+                                {/* Visually-hidden text, not aria-label: the
+                                    attribute is PROHIBITED on a roleless span and
+                                    is dropped, so the badge used to read as just
+                                    "📍 19-000" with no indication of what that is. */}
                                 <span
                                   className={`shelf-badge${book.shelfCode ? '' : ' shelf-missing'}`}
                                   title={book.shelfCode ? t('library.book.shelfTitle', { code: book.shelfCode }) : t('library.book.noShelfTitle')}
-                                  aria-label={book.shelfCode ? t('library.book.shelfTitle', { code: book.shelfCode }) : t('library.book.noShelfAria')}
                                 >
                                   <span className="shelf-icon" aria-hidden="true">📍</span>
-                                  <span className="shelf-value">{book.shelfCode || t('library.book.noShelf')}</span>
+                                  <span className="sr-only">
+                                    {book.shelfCode ? t('library.book.shelfTitle', { code: book.shelfCode }) : t('library.book.noShelfAria')}
+                                  </span>
+                                  <span className="shelf-value" aria-hidden="true">{book.shelfCode || t('library.book.noShelf')}</span>
                                 </span>
                                 <span className={`status-badge status-${book.status}`}>{t(`status.${book.status}`)}</span>
                               </div>
@@ -8491,8 +8663,8 @@ function App() {
                           ) : null}
                         />
                         <div>
-                          <label>{t('loans.contact', { optional: t('common.optional') })}</label>
-                          <input
+                          <label htmlFor="fld-loans-contact">{t('loans.contact', { optional: t('common.optional') })}</label>
+                          <input id="fld-loans-contact"
                             value={borrowerContact}
                             onChange={(e) => setBorrowerContact(e.target.value)}
                             placeholder={t('loans.contactPh')}
@@ -8665,8 +8837,11 @@ function App() {
                                     className={f.pinned ? 'secondary small cf-pin-on' : 'secondary small'}
                                     onClick={() => void toggleCustomFieldPin(f)}
                                     title={f.pinned ? t('settings.unpinTitle') : t('settings.pinTitle')}
+                                    // Content wins over `title` in the accessible-name
+                                    // computation, so the name was the star glyph.
+                                    aria-label={f.pinned ? t('settings.cf.unpin') : t('settings.cf.pin')}
                                     aria-pressed={f.pinned}
-                                  >{f.pinned ? '★' : '☆'}</button>
+                                  ><span aria-hidden="true">{f.pinned ? '★' : '☆'}</span></button>
                                   {f.pinned && (
                                     <>
                                       <button
@@ -8700,8 +8875,8 @@ function App() {
                       <form onSubmit={saveCustomField} className="simple-form" style={{ marginTop: '0.75rem' }}>
                         <div className="form-row">
                           <div>
-                            <label>{t('settings.attrKey')}</label>
-                            <input
+                            <label htmlFor="fld-settings-attrkey">{t('settings.attrKey')}</label>
+                            <input id="fld-settings-attrkey"
                               value={fieldForm.key}
                               onChange={(e) => setFieldForm({ ...fieldForm, key: e.target.value })}
                               placeholder={t('settings.attrKeyPh')}
@@ -8709,8 +8884,8 @@ function App() {
                             />
                           </div>
                           <div>
-                            <label>{t('settings.attrLabel')}</label>
-                            <input
+                            <label htmlFor="fld-settings-attrlabel">{t('settings.attrLabel')}</label>
+                            <input id="fld-settings-attrlabel"
                               value={fieldForm.label}
                               onChange={(e) => setFieldForm({ ...fieldForm, label: e.target.value })}
                               placeholder={t('settings.attrLabelPh')}
@@ -8720,8 +8895,8 @@ function App() {
                         </div>
                         <div className="form-row">
                           <div>
-                            <label>{t('settings.attrType')}</label>
-                            <select
+                            <label htmlFor="fld-settings-attrtype">{t('settings.attrType')}</label>
+                            <select id="fld-settings-attrtype"
                               value={fieldForm.type}
                               onChange={(e) => setFieldForm({ ...fieldForm, type: e.target.value as CustomField['type'] })}
                             >
@@ -8733,8 +8908,8 @@ function App() {
                             </select>
                           </div>
                           <div>
-                            <label>{t('settings.attrRequired')}</label>
-                            <select
+                            <label htmlFor="fld-settings-attrrequired">{t('settings.attrRequired')}</label>
+                            <select id="fld-settings-attrrequired"
                               value={fieldForm.required ? 'yes' : 'no'}
                               onChange={(e) => setFieldForm({ ...fieldForm, required: e.target.value === 'yes' })}
                             >
@@ -8745,8 +8920,8 @@ function App() {
                         </div>
                         {fieldForm.type === 'enum' && (
                           <div className="form-field">
-                            <label>{t('settings.attrEnumOptions')}</label>
-                            <input
+                            <label htmlFor="fld-settings-attrenumoptions">{t('settings.attrEnumOptions')}</label>
+                            <input id="fld-settings-attrenumoptions"
                               value={fieldForm.enumOptionsCsv}
                               onChange={(e) => setFieldForm({ ...fieldForm, enumOptionsCsv: e.target.value })}
                               placeholder={t('settings.attrEnumPh')}
@@ -8821,9 +8996,9 @@ function App() {
                                   {u.active === 1 ? t('users.active') : t('users.inactive')}
                                   {' · '}{new Date(u.created_at).toLocaleDateString()}
                                 </span>
-                                <span
-                                  className="muted small"
-                                  style={{ display: 'block', marginTop: '0.15rem', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', cursor: 'pointer' }}
+                                <button
+                                  type="button"
+                                  className="uuid-copy muted small"
                                   title={t('users.uuidCopy')}
                                   onClick={() => {
                                     void navigator.clipboard?.writeText(u.id);
@@ -8831,7 +9006,7 @@ function App() {
                                   }}
                                 >
                                   {t('users.uuid')}: {u.id}
-                                </span>
+                                </button>
                               </div>
                               <div className="cf-row-actions" style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap', alignItems: 'center' }}>
                                 <select
@@ -8894,8 +9069,8 @@ function App() {
                       <form onSubmit={createStaffUser} className="simple-form" style={{ marginTop: '0.75rem' }}>
                         <div className="form-row">
                           <div>
-                            <label>{t('users.username')} *</label>
-                            <input
+                            <label htmlFor="fld-users-username-2">{t('users.username')} *</label>
+                            <input id="fld-users-username-2"
                               value={newUserUsername}
                               onChange={(e) => setNewUserUsername(e.target.value)}
                               autoComplete="off"
@@ -8904,8 +9079,8 @@ function App() {
                             />
                           </div>
                           <div>
-                            <label>{t('users.password')} *</label>
-                            <input
+                            <label htmlFor="fld-users-password">{t('users.password')} *</label>
+                            <input id="fld-users-password"
                               type="password"
                               value={newUserPassword}
                               onChange={(e) => setNewUserPassword(e.target.value)}
@@ -8915,8 +9090,8 @@ function App() {
                             />
                           </div>
                           <div>
-                            <label>{t('users.role')} *</label>
-                            <select value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as StaffRole)}>
+                            <label htmlFor="fld-users-role">{t('users.role')} *</label>
+                            <select id="fld-users-role" value={newUserRole} onChange={(e) => setNewUserRole(e.target.value as StaffRole)}>
                               <option value="admin">{t('users.role.admin')}</option>
                               <option value="librarian">{t('users.role.librarian')}</option>
                               <option value="viewer">{t('users.role.viewer')}</option>
@@ -8949,25 +9124,29 @@ function App() {
                           <table className="perm-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.9rem' }}>
                             <thead>
                               <tr>
-                                <th style={{ textAlign: 'left', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('roles.permission')}</th>
-                                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.admin')}</th>
-                                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.librarian')}</th>
-                                <th style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.viewer')}</th>
+                                <th scope="col" style={{ textAlign: 'left', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('roles.permission')}</th>
+                                <th scope="col" style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.admin')}</th>
+                                <th scope="col" style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.librarian')}</th>
+                                <th scope="col" style={{ textAlign: 'center', padding: '0.4rem 0.5rem', borderBottom: '1px solid var(--border, rgba(127,127,127,0.3))' }}>{t('users.role.viewer')}</th>
                               </tr>
                             </thead>
                             <tbody>
                               {permissionMatrix.catalog.map((perm) => (
                                 <tr key={perm}>
-                                  <td style={{ padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }}>
+                                  {/* A row HEADER, not a cell: without it the
+                                      checkboxes have no header association at
+                                      all and announce as "checkbox, checked". */}
+                                  <th scope="row" style={{ textAlign: 'left', fontWeight: 400, padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }}>
                                     <strong>{t(`perm.${perm}` as never)}</strong>
                                     <div className="muted small">{t(`perm.${perm}.desc` as never)}</div>
-                                  </td>
+                                  </th>
                                   <td style={{ textAlign: 'center', padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }} title={t('roles.adminLocked')}>
-                                    <input type="checkbox" checked disabled />
+                                    <input type="checkbox" checked disabled aria-label={`${t(`perm.${perm}` as never)} — ${t('users.role.admin')}`} />
                                   </td>
                                   <td style={{ textAlign: 'center', padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }}>
                                     <input
                                       type="checkbox"
+                                      aria-label={`${t(`perm.${perm}` as never)} — ${t('users.role.librarian')}`}
                                       checked={Boolean(permissionMatrix.matrix.librarian[perm])}
                                       onChange={() => togglePermissionCell('librarian', perm)}
                                     />
@@ -8975,6 +9154,7 @@ function App() {
                                   <td style={{ textAlign: 'center', padding: '0.35rem 0.5rem', borderBottom: '1px solid rgba(127,127,127,0.15)' }}>
                                     <input
                                       type="checkbox"
+                                      aria-label={`${t(`perm.${perm}` as never)} — ${t('users.role.viewer')}`}
                                       checked={Boolean(permissionMatrix.matrix.viewer[perm])}
                                       onChange={() => togglePermissionCell('viewer', perm)}
                                     />
@@ -9153,8 +9333,8 @@ function App() {
                     <p className="muted small" style={{ marginBottom: '1rem' }}>{t('settings.vc.intro')}</p>
                     <div className="search-bar" style={{ alignItems: 'flex-end' }}>
                       <div className="filter-field">
-                        <label>{t('settings.vc.field')}</label>
-                        <select
+                        <label htmlFor="fld-settings-vc-field">{t('settings.vc.field')}</label>
+                        <select id="fld-settings-vc-field"
                           value={variantField}
                           onChange={(e) => { setVariantField(e.target.value as VariantField); setVariantsScanned(false); setValueVariants([]); }}
                         >
@@ -9166,7 +9346,7 @@ function App() {
                         </select>
                       </div>
                       <div className="search-actions">
-                        <label>.</label>
+                        <span aria-hidden="true" className="field-spacer" />
                         <button className="secondary" disabled={variantsLoading} onClick={() => void loadValueVariants(variantField)}>
                           {variantsLoading ? t('settings.vc.scanning') : t('settings.vc.scan')}
                         </button>
@@ -9200,8 +9380,8 @@ function App() {
                     <p className="muted small" style={{ marginBottom: '1rem' }}>{t('settings.merge.intro')}</p>
                     <div className="search-bar" style={{ alignItems: 'flex-end' }}>
                       <div className="filter-field">
-                        <label>{t('settings.merge.match')}</label>
-                        <select
+                        <label htmlFor="fld-settings-merge-match">{t('settings.merge.match')}</label>
+                        <select id="fld-settings-merge-match"
                           value={mergeStrict ? 'strict' : 'loose'}
                           onChange={(e) => { setMergeStrict(e.target.value === 'strict'); setMergeScanned(false); setMergeGroups([]); }}
                         >
@@ -9210,15 +9390,15 @@ function App() {
                         </select>
                       </div>
                       <div className="filter-field">
-                        <label>{t('settings.merge.filter')}</label>
-                        <input
+                        <label htmlFor="fld-settings-merge-filter">{t('settings.merge.filter')}</label>
+                        <input id="fld-settings-merge-filter"
                           value={mergeQuery}
                           placeholder={t('settings.merge.filterHint')}
                           onChange={(e) => { setMergeQuery(e.target.value); setMergeScanned(false); }}
                         />
                       </div>
                       <div className="search-actions">
-                        <label>.</label>
+                        <span aria-hidden="true" className="field-spacer" />
                         <button className="secondary" disabled={mergeLoading} onClick={() => void loadMergeCandidates(mergeStrict)}>
                           {mergeLoading ? t('settings.vc.scanning') : t('settings.vc.scan')}
                         </button>
@@ -9260,7 +9440,7 @@ function App() {
               </>
             )}
 
-          </div>
+          </main>
         </>
       )}
 

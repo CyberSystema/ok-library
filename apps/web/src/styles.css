@@ -1,20 +1,42 @@
+/* Colour tokens.
+ *
+ * Every foreground below was MEASURED against the surfaces it actually lands on
+ * (--surface #ffffff, --surface-2 #f8fafc and --bg #f1f5f9) rather than eyeballed.
+ * The previous values failed WCAG 1.4.3 in ways that were invisible in review
+ * because each looked fine on white and most of the app is not on white:
+ *   --text-light  #94a3b8  2.34:1 on --bg   → #667485  4.35:1
+ *   --text-muted  #64748b  4.34:1 on --bg   → #5b6878  5.19:1
+ *   --warning     #d97706  2.91:1 on --bg   → #b45309  4.58:1
+ *   --success     #059669  3.77:1 as a button fill → #047857  5.48:1
+ *   --danger      #dc2626  4.41:1 on --danger-bg   → #c81e1e  5.24:1
+ * Changing the token rather than the call sites is deliberate: --text-light had
+ * eight consumers and failed in all of them, so patching each rule would have
+ * left the token itself as a trap for the next component.
+ */
 :root {
   --bg: #f1f5f9;
   --surface: #ffffff;
   --surface-2: #f8fafc;
   --text: #0f172a;
-  --text-muted: #64748b;
-  --text-light: #94a3b8;
+  --text-muted: #5b6878;
+  --text-light: #626f80;
   --border: #e2e8f0;
   --border-strong: #cbd5e1;
+  /* Form fields are identified ONLY by their border — the field background
+     equals the card background — so it is a UI component boundary under
+     SC 1.4.11 and needs 3:1, not the 1.23:1 --border gives. */
+  --field-border: #767f8c;
   --accent: #2563eb;
   --accent-dark: #1e40af;
   --accent-light: #eff6ff;
-  --success: #059669;
+  /* What goes ON an accent fill. In dark mode --accent flips to a light blue
+     and every hardcoded `color: #fff` on it silently dropped to 2.54:1. */
+  --on-accent: #ffffff;
+  --success: #047857;
   --success-bg: #ecfdf5;
-  --warning: #d97706;
+  --warning: #b45309;
   --warning-bg: #fffbeb;
-  --danger: #dc2626;
+  --danger: #c81e1e;
   --danger-bg: #fef2f2;
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
   --shadow-md: 0 4px 16px rgba(0,0,0,0.1);
@@ -30,10 +52,14 @@
   --surface-2: #1a2438;
   --text: #e2e8f0;
   --text-muted: #94a3b8;
-  --text-light: #64748b;
+  --text-light: #8b98ab;
   --border: #1e293b;
   --border-strong: #334155;
+  --field-border: #6b7891;
   --accent: #60a5fa;
+  /* Dark's accent is a LIGHT blue, so the readable foreground on it is the
+     page background, not white (7.36:1 against 2.54:1). */
+  --on-accent: #0b1220;
   --accent-dark: #3b82f6;
   --accent-light: #1e293b;
   --success: #34d399;
@@ -83,7 +109,7 @@ button {
 }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button:not(:disabled):hover { opacity: 0.88; }
-button.primary { background: var(--accent); color: #fff; }
+button.primary { background: var(--accent); color: var(--on-accent); }
 button.primary:not(:disabled):hover { background: var(--accent-dark); opacity: 1; }
 button.secondary { background: var(--surface); color: var(--accent); border: 1.5px solid var(--border-strong); }
 button.secondary:not(:disabled):hover { background: var(--accent-light); border-color: var(--accent); opacity: 1; }
@@ -95,7 +121,10 @@ input, select, textarea {
   font-family: inherit;
   font-size: 0.9375rem;
   padding: 0.5625rem 0.75rem;
-  border: 1.5px solid var(--border);
+  /* --field-border, not --border: this line is the ONLY thing that identifies
+     a text field (its background equals the card's), so SC 1.4.11 applies and
+     1.23:1 was not a boundary anyone could see. */
+  border: 1.5px solid var(--field-border);
   border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
@@ -103,9 +132,21 @@ input, select, textarea {
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 input:focus, select:focus, textarea:focus {
-  outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(37,99,235,0.12);
+}
+
+/* ONE focus indicator for the whole app.
+ *
+ * `outline: none` used to be set on every form control and on the context-menu
+ * items, with replacements measured at 1.08–1.18:1 — i.e. no visible focus at
+ * all for a keyboard user on the densest screens in the app. Buttons were fine
+ * only because they kept the UA default. A single rule here means the next
+ * component author cannot get it wrong by omission. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 label {
@@ -120,7 +161,11 @@ label {
 
 /* ================== APP SHELL ================== */
 .app-shell { min-height: 100vh; }
-.app-shell[aria-busy="true"] { opacity: 0.65; pointer-events: none; }
+/* Was `opacity: 0.65`, which composited the entire subtree over the page and
+   dropped --text from 17.85:1 to 5.70:1 and --text-light to 1.79:1 — on EVERY
+   API call, so a routinely-occurring state and not an edge case. The working
+   pill already announces the request; the page does not need to fade. */
+.app-shell[aria-busy="true"] { cursor: progress; pointer-events: none; }
 
 /* Offline banner: shown at the very top while serving cached data. */
 .offline-banner {
@@ -1249,10 +1294,10 @@ label {
 .chip:hover { border-color: var(--accent); color: var(--accent); }
 .chip.is-active {
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-color: var(--accent);
 }
-.chip.is-active:hover { color: #fff; opacity: 0.92; }
+.chip.is-active:hover { color: var(--on-accent); opacity: 0.92; }
 .chip.ghost {
   background: transparent;
   border-color: var(--border);
@@ -1368,16 +1413,23 @@ label {
   color: var(--text-muted);
   margin-right: 0.4rem;
 }
-.is-active .cat-code { background: rgba(255,255,255,0.6); color: var(--accent-dark); }
+/* --accent, not --accent-dark. In the DARK theme --accent-dark (#3b82f6) is
+   darker than --accent (#60a5fa), which is backwards on a dark surface: the
+   code read at 1.56:1 and the count at 3.98:1 while the label beside them was
+   fine at 5.66:1. Same token as the label, so they cannot diverge again. */
+.is-active .cat-code { background: var(--surface); color: var(--accent); }
 .cat-text { color: inherit; }
 .cat-count {
   flex-shrink: 0;
   font-size: 0.72rem;
-  color: var(--text-muted);
+  /* --text, not --text-muted: measured at 3.98:1 in dark, and this is the
+     number the librarian counts the shelf against — the most-read value in the
+     rail. Muting it was the wrong emphasis as well as the wrong contrast. */
+  color: var(--text);
   font-variant-numeric: tabular-nums;
   font-weight: 600;
 }
-.is-active .cat-count { color: var(--accent-dark); }
+.is-active .cat-count { color: var(--accent); }
 
 @media (max-width: 768px) {
   .library-layout { grid-template-columns: 1fr; }
@@ -1631,7 +1683,7 @@ label {
   gap: 0.75rem;
   padding: 0.625rem 1rem;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   border-radius: var(--radius);
   margin-bottom: 1rem;
   position: sticky;
@@ -1641,21 +1693,23 @@ label {
 }
 .bulk-bar-info { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 .bulk-bar-info strong { font-size: 1rem; }
-.bulk-bar-info .muted { color: rgba(255,255,255,0.85); }
-.bulk-bar-info .small { color: rgba(255,255,255,0.85); font-weight: 500; }
+.bulk-bar-info .muted { color: var(--on-accent); opacity: 0.92; }
+.bulk-bar-info .small { color: var(--on-accent); opacity: 0.92; font-weight: 500; }
 .link-btn {
   background: transparent;
   border: none;
-  color: #fff;
+  color: var(--on-accent);
   text-decoration: underline;
   font-size: 0.8125rem;
   padding: 0.1rem 0.3rem;
 }
 .bulk-bar-actions { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
 .bulk-bar-actions select, .bulk-bar-actions input {
-  background: rgba(255,255,255,0.16);
-  color: #fff;
-  border: 1px solid rgba(255,255,255,0.3);
+  /* Opaque, not a 16%-white wash over the accent: the wash put placeholder
+     text at 2.39:1 and the field boundary below 3:1. */
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--field-border);
   font-size: 0.8125rem;
   padding: 0.35rem 0.55rem;
   width: auto;
@@ -1663,10 +1717,10 @@ label {
 }
 .bulk-bar-actions select option { color: var(--text); }
 .bulk-bar-actions select:focus, .bulk-bar-actions input:focus {
-  border-color: #fff;
-  box-shadow: 0 0 0 2px rgba(255,255,255,0.3);
+  border-color: var(--accent-dark);
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.5);
 }
-.bulk-bar-actions input::placeholder { color: rgba(255,255,255,0.6); }
+.bulk-bar-actions input::placeholder { color: var(--text-muted); }
 
 .book-select {
   position: absolute;
@@ -2028,7 +2082,10 @@ mark.hl {
 .ctx-item:focus-visible {
   background: var(--accent-light);
   color: var(--accent);
-  outline: none;
+  /* No `outline: none` here. This menu is entirely keyboard-driven, and the
+     background replacement measured 1.09:1 — no visible focus at all. The
+     global :focus-visible ring is what identifies the item; the tint is
+     reinforcement, not the indicator. */
 }
 .ctx-item:disabled { opacity: 0.45; cursor: default; }
 .ctx-item.danger { color: var(--danger); }
@@ -2109,7 +2166,7 @@ mark.hl {
   text-align: left; font-size: 0.82rem; color: var(--text); cursor: pointer;
 }
 .ob-toc-item:hover { background: var(--accent-light); }
-.ob-toc-item.is-active { background: var(--accent); color: #fff; font-weight: 600; }
+.ob-toc-item.is-active { background: var(--accent); color: var(--on-accent); font-weight: 600; }
 .ob-toc-item.is-active .ob-toc-icon { filter: none; }
 .ob-toc-item.is-done .ob-toc-icon { color: var(--success); }
 .ob-toc-icon { width: 1.2rem; text-align: center; flex-shrink: 0; }
@@ -2458,7 +2515,7 @@ mark.hl {
   border-radius: 100px;
   font-size: 0.6875rem;
   font-weight: 700;
-  color: #fff;
+  color: var(--on-accent);
   background: var(--accent);
 }
 .copies-list .badge.ready { margin-left: 0.4rem; }
@@ -2501,3 +2558,90 @@ mark.hl {
    defaults are usually right, but the fields must be reachable. */
 .copies-editor { margin-top: 0.75rem; }
 .copies-editor summary { cursor: pointer; font-size: 0.8125rem; font-weight: 600; color: var(--accent); }
+
+
+/* ===== Reduced motion =====
+ * SC 2.2.2 / 2.3.3. Only `.btn-download` was guarded before; the three INFINITE
+ * animations (both spinners and the skeleton pulse) are the ones that matter,
+ * because on a slow connection they run well past five seconds with no way to
+ * stop them. Transitions are left alone — they are brief and carry state. */
+@media (prefers-reduced-motion: reduce) {
+  .splash-spinner,
+  .spinner,
+  .skeleton {
+    animation: none !important;
+  }
+  /* The spinners still have to READ as "working", so give them a static ring
+     rather than removing the affordance along with the motion. */
+  .splash-spinner, .spinner { border-top-color: currentColor; opacity: 0.6; }
+  .skeleton { background: var(--border); }
+  .toast, .modal, .ctx-menu, .cover-zoom-img, .offline-banner {
+    animation: none !important;
+  }
+}
+
+/* Skip link: off-screen until focused, then pinned to the top-left so it is
+   the first thing a keyboard user can reach. SC 2.4.1. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 1000;
+  padding: 0.6rem 1rem;
+  background: var(--accent);
+  color: var(--on-accent);
+  border-radius: 0 0 var(--radius-sm) 0;
+  font-weight: 600;
+  text-decoration: none;
+}
+.skip-link:focus { left: 0; }
+/* The target must not draw a focus ring when reached programmatically — it is
+   a landing point, not a control. */
+.simple-content:focus:not(:focus-visible) { outline: none; }
+
+/* A label styled as a button that wraps a visually-hidden file input: the
+   input keeps focus, so the pair is keyboard-reachable, and the ring has to
+   land on the label the user can actually see. */
+.button-like:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* A copyable identifier. Was a styled <div onClick> — invisible to the
+   keyboard and not announced as interactive. As a button it needs its button
+   styling stripped back to looking like the text it replaced. */
+.uuid-copy {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+  background: rgba(127, 127, 127, 0.1);
+  color: var(--text);
+  border: none;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
+  word-break: break-all;
+  margin-top: 0.25rem;
+  cursor: pointer;
+}
+.uuid-copy.muted {
+  background: none;
+  padding: 0;
+  margin-top: 0.15rem;
+  color: var(--text-muted);
+}
+.uuid-copy:hover { color: var(--accent); }
+
+/* A heading for a group of controls. Looks like a label but is not one — a
+   <label> must name exactly one control, and using it for a group leaves an
+   element in the a11y tree pointing at nothing. */
+.field-group-label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin-bottom: 0.3125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
