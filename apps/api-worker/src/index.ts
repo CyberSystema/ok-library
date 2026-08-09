@@ -5006,12 +5006,17 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 			}
 		});
 
-		if (dryRun) { created += 1; continue; }
-
+		// The match is looked up BEFORE the dry-run guard. It used to come after,
+		// so a test run counted every record as new — a librarian testing a
+		// re-send from a partner library was told they were about to add 1,200
+		// records when the real run would have updated 1,200. Predicting the
+		// wrong thing is worse than not offering to predict.
 		const existing = payload.isbn
 			? await c.env.DB.prepare('SELECT id, version FROM books WHERE isbn = ? AND deleted_at IS NULL LIMIT 1')
 				.bind(payload.isbn).first<{ id: string; version: number }>()
 			: null;
+
+		if (dryRun) { if (existing) updated += 1; else created += 1; continue; }
 
 		try {
 			if (existing) {
@@ -5602,7 +5607,15 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 	const format = c.req.query('format') === 'json' ? 'json' : 'marcxml';
 	const settings = await getLibrarySettings(c.env);
 	const isil = settings.isil ?? null;
-	const pageSize = 200;
+	// `queryBooksWithFilters` clamps pageSize to 100. Asking for 200 got 100
+	// back, the "short page means we are done" test fired on the FIRST page, and
+	// the export wrote a properly-closed <collection> containing 100 of 12,608
+	// records. A truncated file that looks complete is the worst possible
+	// failure for an exchange format: the receiving library has no way to tell.
+	const pageSize = 100;
+	// Same ceiling as the CSV export. Reaching it is reported in-band rather
+	// than silently, for the same reason.
+	const EXPORT_ROW_LIMIT = 20_000;
 
 	const stream = new ReadableStream({
 		async start(controller) {
@@ -5611,6 +5624,7 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 			write(format === 'json' ? '[\n' : MARCXML_COLLECTION_OPEN + '\n');
 			let page = 1;
 			let first = true;
+			let written = 0;
 			try {
 				for (;;) {
 					const result = await queryBooksWithFilters(c.env, {
@@ -5642,8 +5656,20 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 							write(toMarcXml(input) + '\n');
 						}
 						first = false;
+						written += 1;
 					}
-					if (result.rows.length < pageSize) break;
+					// Stop on an EMPTY page, not a short one. A short page only means
+					// "we are done" if the callee returned exactly what was asked for,
+					// and this one clamps — one extra query at the end is a small price
+					// for an export that cannot silently truncate.
+					if (result.rows.length === 0) break;
+					if (written >= EXPORT_ROW_LIMIT) {
+						// Never drop records without saying so. A harvester ignores an XML
+						// comment, but the librarian who opens the file can see it.
+						if (format !== 'json') write(`  <!-- truncated at ${EXPORT_ROW_LIMIT} records -->\n`);
+						console.warn(`MARC export truncated at ${EXPORT_ROW_LIMIT} records`);
+						break;
+					}
 					page += 1;
 				}
 				write(format === 'json' ? '\n]\n' : MARCXML_COLLECTION_CLOSE + '\n');

@@ -325,6 +325,34 @@ export async function apiRequest<T>(
   throw lastErr instanceof Error ? lastErr : new Error('Request failed');
 }
 
+/**
+ * Download a streamed export straight to a Blob.
+ *
+ * `apiRequest(path, undefined, true)` buffers the whole response into a JS
+ * string first, which is fine for a CSV and wrong for MARCXML: the catalogue is
+ * roughly 19 MB of it, and the string plus the Blob made from it are two copies
+ * held at once. `response.blob()` consumes the stream directly.
+ *
+ * No retry and no cache — an export is a large, idempotent GET, and retrying it
+ * silently would double the transfer for a librarian on a slow connection.
+ */
+export async function apiBlob(path: string): Promise<Blob> {
+  const response = await fetch(joinApiUrl(path), {
+    credentials: 'include',
+    headers: authToken ? { Authorization: `Bearer ${authToken}` } : {}
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    let message = `Request failed with status ${response.status}`;
+    try {
+      message = (JSON.parse(text) as { error?: string }).error ?? message;
+    } catch { /* a streamed export fails as XML or plain text, not JSON */ }
+    throw new ApiRequestError(response.status, message);
+  }
+  setNetStatus('online');
+  return response.blob();
+}
+
 export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }

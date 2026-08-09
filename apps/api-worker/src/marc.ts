@@ -11,6 +11,8 @@
  * librarian's everyday route; MARC is for exchange with other libraries.
  */
 
+import { fromIso639_2, toIso639_2 } from '@ok-library/shared';
+
 export type MarcSubfield = { code: string; value: string };
 export type MarcField =
   | { tag: string; value: string }
@@ -92,6 +94,71 @@ function isbd(value: string, trailing: string): string {
  * Parallel script forms become 880 fields linked with $6, which is how MARC
  * carries a vernacular/romanized pair — the whole reason those columns exist.
  */
+/**
+ * MARC 21 008 — forty fixed positions, and the field an importing system reads
+ * for the language and the publication date.
+ *
+ *   00-05  date entered on file, yymmdd
+ *   06     type of date   s = single, m = multiple, q = questionable,
+ *                         c = continuing and still published, n = unknown
+ *   07-10  date 1         four digits, or uuuu
+ *   11-14  date 2         blank for a single date, 9999 for an open serial
+ *   15-17  place of publication, MARC country code
+ *   18-34  material-specific; '|' throughout means "no attempt to code",
+ *          which is the honest answer for a catalogue that does not record
+ *          illustration statements or literary form
+ *   35-37  language, ISO 639-2/B
+ *   38     modified record, blank = not modified
+ *   39     cataloguing source, d = other
+ *
+ * `|` is the standard fill character, and a wrong code here is worse than an
+ * uncoded one: it asserts something about the book that nobody checked.
+ */
+function marc008(book: MarcRecordInput): string {
+  const entered = (book.updatedAt ?? '').replace(/[-:TZ.]/g, '').slice(2, 8) || '000000';
+  const serial = book.bibLevel === 'serial';
+  const y1 = book.publicationYear;
+  const y2 = book.publicationYearEnd;
+  // A '?' or '~' in the EDTF expression is the librarian saying the date is
+  // uncertain or approximate; MARC has a code for exactly that.
+  const uncertain = /[?~]/.test(book.dateEdtf ?? '');
+
+  let type: string;
+  let date1: string;
+  let date2: string;
+  if (serial) {
+    type = 'c';
+    date1 = y1 ? String(y1).padStart(4, '0') : 'uuuu';
+    date2 = y2 ? String(y2).padStart(4, '0') : '9999';
+  } else if (y1 && y2 && y2 !== y1) {
+    type = 'm';
+    date1 = String(y1).padStart(4, '0');
+    date2 = String(y2).padStart(4, '0');
+  } else if (y1) {
+    type = uncertain ? 'q' : 's';
+    date1 = String(y1).padStart(4, '0');
+    // A questionable date is a RANGE in MARC, so date2 has to carry the other
+    // end of it; a single date leaves the field blank.
+    date2 = uncertain ? String(y1).padStart(4, '0') : '    ';
+  } else {
+    type = 'n';
+    date1 = 'uuuu';
+    date2 = 'uuuu';
+  }
+
+  // The place is transcribed free text ("Θεσσαλονίκη"), and there is no
+  // reliable way from that to a MARC country code. 'xx ' is the code for
+  // "no place, unknown or undetermined" — the truthful one.
+  const place = 'xx ';
+  const lang = (toIso639_2(book.language)[0] ?? 'und').slice(0, 3).padEnd(3, ' ');
+
+  const value = entered.padEnd(6, '0') + type + date1 + date2 + place + '|'.repeat(17) + lang + ' ' + 'd';
+  // Same reasoning as the leader: a mis-sized 008 makes the record unreadable
+  // elsewhere and fails silently here.
+  if (value.length !== 40) throw new Error(`MARC 008 must be 40 chars, got ${value.length}: ${value}`);
+  return value;
+}
+
 export function toMarcFields(book: MarcRecordInput): MarcField[] {
   const fields: MarcField[] = [];
   const df = (tag: string, ind1: string, ind2: string, subs: Array<[string, string | null | undefined]>): void => {
@@ -108,10 +175,24 @@ export function toMarcFields(book: MarcRecordInput): MarcField[] {
     fields.push({ tag: '005', value: book.updatedAt.replace(/[-:TZ]/g, '').slice(0, 14) + '.0' });
   }
 
+  // 008, the fixed-length data elements. 35-37 is where a MARC reader looks for
+  // the language of a record — 041 is the supplementary field, used when a work
+  // is a translation or is in more than one language. Exporting 041 alone left
+  // every importing system with no language in the slot it actually reads.
+  fields.push({ tag: '008', value: marc008(book) });
+
   df('020', ' ', ' ', [['a', book.isbn]]);
   df('022', ' ', ' ', [['a', book.issn]]);
-  // 041 wants ISO 639-2/B; the catalogue stores that shape already (B7).
-  df('041', '0', ' ', (book.language ?? '').split(',').map((l) => ['a', l.trim()] as [string, string]));
+  // 041 wants ISO 639-2/B. The catalogue stores ISO 639-1 in upper case ("EL"),
+  // which the comment here used to claim was already the right shape — so every
+  // record exported a code no MARC system recognises. `toIso639_2` is the map,
+  // and it has existed since B7.
+  //
+  // ind1 = 1 marks a record that includes a translation; with one language the
+  // field is redundant beside 008 and is emitted anyway, because a reader that
+  // ignores 008 still finds it.
+  const langs = toIso639_2(book.language);
+  df('041', langs.length > 1 ? '1' : '0', ' ', langs.map((l) => ['a', l] as [string, string]));
   df('082', '0', '4', [['a', book.ddc], ['2', book.ddc ? '23' : null]]);
   // 090 is the conventional local-classification slot.
   df('090', ' ', ' ', [['a', book.localClass]]);
@@ -278,7 +359,9 @@ export function toDublinCoreXml(book: MarcRecordInput): string {
     el('identifier', book.isbn ? `urn:isbn:${book.isbn}` : null),
     el('identifier', book.issn ? `urn:issn:${book.issn}` : null),
     el('identifier', book.id),
-    el('language', book.language),
+    // DCMI's recommended encoding scheme for dc:language is ISO 639, one
+    // element per language — not the catalogue's internal "EL,EN".
+    ...toIso639_2(book.language).map((l) => el('language', l)),
     el('relation', book.seriesTitle)
   );
   return [
@@ -497,7 +580,17 @@ export function marcToBookFields(rec: ParsedMarcRecord): Partial<MarcRecordInput
     publicationYear: yearMatch ? Number(yearMatch[1]) : undefined,
     // 300$a is the extent, free text — exactly what the `pages` field now holds.
     extent: unIsbd(first('300', 'a')) ?? undefined,
-    language: all('041', 'a')[0] ?? undefined,
+    // Read every 041$a, not just the first — a bilingual record lost its second
+    // language on the way in. Records from other libraries are often
+    // monolingual and carry no 041 at all, so 008/35-37 is the fallback, and
+    // the codes come back as the two-letter upper-case form the catalogue
+    // stores so an exported record re-imports as what it started as.
+    language: fromIso639_2(
+      (all('041', 'a').length ? all('041', 'a') : [(rec.controlFields['008'] ?? '').slice(35, 38)])
+        // und / mul / zxx say "we did not determine one" — storing them would
+        // put a fake language on the record and into the facet rail.
+        .filter((c) => !['und', 'mul', 'zxx', ''].includes(c.trim().toLowerCase()))
+    ) || undefined,
     description: first('520', 'a') ?? undefined,
     ddc: first('082', 'a') ?? undefined,
     edition: unIsbd(first('250', 'a')) ?? undefined,

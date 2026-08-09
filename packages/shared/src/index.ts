@@ -350,6 +350,30 @@ export function toIso639_2(raw: string | null | undefined): string[] {
     .filter((v, i, arr) => arr.indexOf(v) === i);
 }
 
+// Derived from the table above rather than written out again: a second hand-kept
+// map would drift, and a language that exports as `gre` but imports as anything
+// else breaks the round trip silently.
+const ISO639_2B_TO_1: Record<string, string> = Object.fromEntries(
+  Object.entries(ISO639_1_TO_2B).map(([two, three]) => [three, two])
+);
+
+/**
+ * The inverse of `toIso639_2`: ISO 639-2/B codes back into the two-letter
+ * upper-case form the catalogue stores. `["gre","eng"]` → `"EL,EN"`.
+ *
+ * A code with no two-letter equivalent (grc, chu, syr, cop) is kept as it came,
+ * upper-cased — losing it would be worse than storing three letters, and
+ * `toIso639_2` passes those straight back out again.
+ */
+export function fromIso639_2(codes: string[] | null | undefined): string {
+  return (codes ?? [])
+    .map((c) => c.trim().toLowerCase())
+    .filter(Boolean)
+    .map((c) => (ISO639_2B_TO_1[c] ?? c).toUpperCase())
+    .filter((v, i, arr) => arr.indexOf(v) === i)
+    .join(',');
+}
+
 // ─── Authority control ─────────────────────────────────────────────────────
 //
 // One controlled term: a preferred form, the variants that mean the same thing,

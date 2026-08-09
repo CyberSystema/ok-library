@@ -35,6 +35,7 @@ import type {
 } from './types';
 import { OnboardingCourse } from './onboarding';
 import { LibraryIdentityCard } from './screens/identity';
+import { MarcIoCard } from './screens/marcio';
 import { RoomsCard } from './screens/rooms';
 import { TrashCard } from './screens/trash';
 import './styles.css';
@@ -7932,6 +7933,10 @@ function App() {
                     <button className="secondary" onClick={exportCsv}>{t('import.downloadCsv')}</button>
                   </div>
                 )}
+
+                {/* The spreadsheet above is the everyday route; this is the one
+                    for talking to another library. */}
+                <MarcIoCard canExport={canExportCsv} canImport={canImport} />
 
                 <div className="card">
                   <h3>{t('import.setupHeading')}</h3>

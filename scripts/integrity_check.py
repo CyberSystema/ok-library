@@ -1041,7 +1041,12 @@ mb, _ = mkbook(
     title=f"ZZITEST Κλήμης Ῥώμης {uniq}", author="Κλήμης Ῥώμης",
     titleRomanized="Klemes Romes", publisher="Αποστολική Διακονία",
     isbn="978" + uuid.uuid4().hex[:10], publicationYear=None, dateEdtf="1955/1957",
-    language="gre", ddc="270",
+    # "EL" is what the catalogue actually stores — 8,765 records of it. This
+    # fixture used to say "gre", written when the export was believed to hold
+    # ISO 639-2/B already; it does not, which is the defect §48 fixes. A record
+    # that DID arrive with "gre" now comes back as "EL", which is the
+    # catalogue's own form, and that normalisation is asserted in §48.
+    language="EL", ddc="270",
     customFields={"pages": "156,[3]σ.", "place_of_publication": "ΑΘΗΝΑ",
                   "series": "ΒΙΒΛΙΟΘΗΚΗ ΕΛΛΗΝΩΝ ΠΑΤΕΡΩΝ", "edition": "2η έκδ."})
 before = get(mb)
@@ -1836,6 +1841,123 @@ st, all_books = call("GET", "/api/books?pageSize=1")
 check("per-room plus unassigned equals the whole catalogue",
       per_room + unassigned == (all_books or {}).get("total"),
       f'{per_room} + {unassigned} vs {(all_books or {}).get("total")}')
+
+print("=== 48. REGRESSION: MARC 21 exchange speaks the standard's language ===")
+uniq = uuid.uuid4().hex[:8]
+mb, _ = mkbook(title=f"ZZITEST Marc {uniq}", author="ZZ Marc", language="EL,EN",
+               isbn="978" + uniq[:6] + "999", publicationYear=1987)
+st, mj = call("GET", f"/api/books/{mb}/marc?format=json")
+fields = {list(f.keys())[0]: list(f.values())[0] for f in (mj or {}).get("fields", [])}
+f041 = fields.get("041") or {}
+codes = [list(x.values())[0] for x in (f041.get("subfields") or [])]
+# 041 is documented as ISO 639-2/B and emitted the raw stored value ("EL"),
+# so every record this catalogue exported carried a language code no MARC
+# system recognises.
+check("041 carries ISO 639-2/B, not the stored two-letter code", codes == ["gre", "eng"], codes)
+check("041 ind1 marks a record with more than one language", f041.get("ind1") == "1", f041.get("ind1"))
+
+# 008/35-37 is where a MARC reader ACTUALLY looks for the language. The export
+# had no 008 at all, so an importing system got no language in the slot it reads.
+f008 = fields.get("008")
+check("008 is present", isinstance(f008, str), f008)
+check("008 is exactly 40 characters", len(f008 or "") == 40, len(f008 or ""))
+check("008/35-37 is the language", (f008 or "")[35:38] == "gre", (f008 or "")[35:38])
+check("008/06-14 carries the single publication date", (f008 or "")[6:15] == "s1987    ", repr((f008 or "")[6:15]))
+
+st, dc = call_text("GET", f"/api/books/{mb}/marc?format=dc")
+check("Dublin Core language is ISO 639, one element each",
+      "<dc:language>gre</dc:language>" in dc and "<dc:language>eng</dc:language>" in dc,
+      [l for l in dc.splitlines() if "language" in l])
+
+# The round trip is the real test: what this catalogue exports, it must be able
+# to read back as what it started as.
+st, xml = call_text("GET", f"/api/books/{mb}/marc?format=marcxml")
+st, rep = call("POST", "/api/import/marcxml", raw=xml.encode(), ctype="application/xml")
+check("re-importing an exported record updates rather than duplicates",
+      st == 200 and (rep or {}).get("updated") == 1 and (rep or {}).get("created") == 0, f"{st} {rep}")
+check("and the language survives the round trip unchanged", get(mb).get("language") == "EL,EN",
+      get(mb).get("language"))
+
+# The dry run exists to predict what the real run will do. It returned before
+# the match lookup, so it counted EVERY record as new — testing a re-send from a
+# partner library said "1,200 new" where the real import would update 1,200.
+untouched = get(mb).get("version")
+st, dry = call("POST", "/api/import/marcxml?dryRun=1", raw=xml.encode(), ctype="application/xml")
+check("a dry run of a file that would update reports it as an update",
+      st == 200 and (dry or {}).get("updated") == 1 and (dry or {}).get("created") == 0, f"{st} {dry}")
+check("and a dry run still writes nothing", get(mb).get("version") == untouched,
+      f'{get(mb).get("version")} vs {untouched}')
+
+# A record from another library is usually monolingual and carries no 041 at
+# all — the language is only in 008.
+solo = f"ZZITEST Marc Solo {uniq}"
+minimal = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<collection xmlns="http://www.loc.gov/MARC21/slim"><record>'
+    '<leader>00000nam a2200000 i 4500</leader>'
+    '<controlfield tag="008">260101s1990    xx |||||||||||||||||fre d</controlfield>'
+    f'<datafield tag="245" ind1="1" ind2="0"><subfield code="a">{solo}</subfield></datafield>'
+    '<datafield tag="100" ind1="1" ind2=" "><subfield code="a">ZZ Marc</subfield></datafield>'
+    '</record></collection>'
+)
+st, rep = call("POST", "/api/import/marcxml", raw=minimal.encode(), ctype="application/xml")
+check("a record with no 041 imports", st == 200 and (rep or {}).get("created") == 1, f"{st} {rep}")
+st, found = call("GET", f"/api/books?search={urllib.parse.quote(solo)}&pageSize=5")
+hit = next((b for b in (found or {}).get("items", []) if b["title"] == solo), None)
+if hit: CREATED.append(hit["id"])
+check("the language is read from 008 when 041 is absent", (hit or {}).get("language") == "FR", hit)
+
+# und / mul / zxx mean "not determined". Storing one would put a fake language
+# on the record and a fake bucket in the facet rail.
+undet = f"ZZITEST Marc Und {uniq}"
+st, rep = call("POST", "/api/import/marcxml",
+               raw=minimal.replace("fre d", "und d").replace(solo, undet).encode(),
+               ctype="application/xml")
+st, found = call("GET", f"/api/books?search={urllib.parse.quote(undet)}&pageSize=5")
+hit2 = next((b for b in (found or {}).get("items", []) if b["title"] == undet), None)
+if hit2: CREATED.append(hit2["id"])
+check("an undetermined language is left empty, not stored as 'und'",
+      not (hit2 or {}).get("language"), hit2)
+
+# The bulk export asked for pages of 200 from a query builder that clamps at
+# 100, so "a short page means we are done" fired on the FIRST page: the file was
+# a properly-closed <collection> holding 100 records out of 12,608. A truncated
+# export that looks complete is the worst failure an exchange format can have.
+def count_records(path):
+    """Stream the export and count records without holding 20 MB in memory."""
+    req = urllib.request.Request(BASE + path, headers={"Authorization": f"Bearer {TOKEN}"})
+    n, tail, total = 0, b"", 0
+    with urllib.request.urlopen(req, timeout=300) as r:
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            buf = tail + chunk
+            n += buf.count(b"<record>")
+            tail = buf[-16:]
+    return n, tail, total
+
+st, everything = call("GET", "/api/books?pageSize=1")
+expected = (everything or {}).get("total")
+exported, tail, size = count_records("/api/export/books.marcxml")
+check("the bulk MARCXML export contains every record, not the first page",
+      exported == expected, f"{exported} of {expected}")
+check("and the collection is closed", tail.strip().endswith(b"</collection>"), tail)
+
+# A serial is an open-ended run: 008/06 = c, and date 2 is 9999 rather than blank.
+sb, _ = mkbook(title=f"ZZITEST Marc Serial {uniq}", author="ZZ Marc", language="EL",
+               publicationYear=1975)
+call("PUT", f"/api/books/{sb}", {**get(sb), "bibLevel": "serial"})
+st, sj = call("GET", f"/api/books/{sb}/marc?format=json")
+sfields = {list(f.keys())[0]: list(f.values())[0] for f in (sj or {}).get("fields", [])}
+s008 = sfields.get("008") or ""
+if get(sb).get("bibLevel") == "serial":
+    check("a serial's 008 is an open run", s008[6:15] == "c19759999", repr(s008[6:15]))
+else:
+    # bibLevel has no write path yet (Phase 2, step 7) — the monograph shape is
+    # what the exporter can be held to today.
+    check("a monograph's 008 leaves date 2 blank", s008[6:15] == "s1975    ", repr(s008[6:15]))
 
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
