@@ -4461,22 +4461,91 @@ app.put('/api/rooms/:id', requirePermission('rooms.write', { librarian: true }),
 	const payload = UpsertRoomSchema.parse(await c.req.json());
 	const now = nowIso();
 
-	await c.env.DB.prepare(
-		`UPDATE rooms SET code = ?, name = ?, description = ?, map_metadata = ?, updated_at = ? WHERE id = ?`
-	)
-		.bind(payload.code, payload.name, payload.description ?? null, JSON.stringify(payload.mapMetadata), now, id)
-		.run();
+	const existing = await c.env.DB.prepare('SELECT code FROM rooms WHERE id = ?')
+		.bind(id).first<{ code: string }>();
+	if (!existing) throw new HTTPException(404, { message: 'Room not found' });
+
+	// `books.room_code` is a foreign key onto `rooms.code`, so renaming a room
+	// whose books still point at the old code failed the constraint and surfaced
+	// as an opaque 500 — which the web client then RETRIED four times, because it
+	// treats any 5xx as worth repeating.
+	//
+	// A room code is a label, and renaming it plainly means "these books are now
+	// in the room called X", so the books have to come along. The obvious order
+	// does not work: SQLite's foreign keys are IMMEDIATE, so books can never
+	// point at a code that does not exist yet, and the room can never be renamed
+	// while books still point at the old one. `PRAGMA defer_foreign_keys` would
+	// solve it but its behaviour inside a D1 batch is undocumented, and a
+	// constraint that silently stops being enforced is a bad thing to depend on.
+	//
+	// So: create the new code first, move everything onto it, then retire the old
+	// one. Every step is legal on its own, in any SQLite, with the constraint
+	// fully armed throughout. The original row id is restored at the end because
+	// the audit log references it.
+	const nextCode = normalizeCode(payload.code.trim());
+	const statements: D1PreparedStatement[] = [];
+	if (nextCode !== existing.code) {
+		const tempId = newId('room');
+		statements.push(
+			c.env.DB.prepare(
+				`INSERT INTO rooms (id, code, name, description, map_metadata, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+			).bind(tempId, nextCode, payload.name, payload.description ?? null,
+				JSON.stringify(payload.mapMetadata), now, now),
+			c.env.DB.prepare('UPDATE books SET room_code = ?, updated_at = ? WHERE room_code = ?')
+				.bind(nextCode, now, existing.code),
+			// items.room_code carries no FK, but it must follow or the shelf
+			// browser and the record would disagree about where the book is.
+			c.env.DB.prepare('UPDATE items SET room_code = ?, updated_at = ? WHERE room_code = ?')
+				.bind(nextCode, now, existing.code),
+			c.env.DB.prepare('DELETE FROM rooms WHERE id = ?').bind(id),
+			c.env.DB.prepare('UPDATE rooms SET id = ? WHERE id = ?').bind(id, tempId)
+		);
+	} else {
+		statements.push(
+			c.env.DB.prepare(
+				`UPDATE rooms SET name = ?, description = ?, map_metadata = ?, updated_at = ? WHERE id = ?`
+			).bind(payload.name, payload.description ?? null, JSON.stringify(payload.mapMetadata), now, id)
+		);
+	}
+	await runAtomic(c.env, statements);
 
 	await bumpBooksCacheVersion(c.env); // rooms/summary + list cache invalidation
 	await insertAuditLog(c.env, c.get('user').sub, 'room.update', 'room', id ?? null, {
-		code: payload.code
+		code: nextCode,
+		...(nextCode !== existing.code ? { renamedFrom: existing.code } : {})
 	});
 
-	return c.json({ id });
+	return c.json({ id, code: nextCode, renamedFrom: nextCode !== existing.code ? existing.code : null });
 });
 
 app.delete('/api/rooms/:id', requirePermission('rooms.delete'), async (c) => {
 	const id = c.req.param('id');
+
+	// Refuse with a COUNT rather than letting the foreign key throw a 500 the
+	// client will retry. Same shape as DELETE /api/borrowers/:id, which already
+	// refuses while loans reference the borrower: the operator is told what is
+	// in the way and can go and move it.
+	const room = await c.env.DB.prepare('SELECT code FROM rooms WHERE id = ?').bind(id).first<{ code: string }>();
+	if (!room) throw new HTTPException(404, { message: 'Room not found' });
+	// Counts SOFT-DELETED books too. The foreign key does not know about
+	// `deleted_at`, so a room whose only remaining reference is a book in the
+	// trash still cannot be dropped — filtering them out here produced a guard
+	// that passed and then let the constraint throw the 500 it exists to prevent.
+	const inUse = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n, SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS live
+		   FROM books WHERE room_code = ?`
+	).bind(room.code).first<{ n: number; live: number }>();
+	const total = Number(inUse?.n ?? 0);
+	const live = Number(inUse?.live ?? 0);
+	if (total > 0) {
+		throw new HTTPException(409, {
+			message: live > 0
+				? `Cannot delete: ${live} book(s) are in this room. Move them to another room first.`
+				: `Cannot delete: ${total} deleted book(s) still reference this room. Purge them from the trash first.`
+		});
+	}
+
 	const result = await c.env.DB.prepare('DELETE FROM rooms WHERE id = ?').bind(id).run();
 	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Room not found' });
