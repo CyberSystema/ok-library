@@ -1726,6 +1726,46 @@ st, after = call("GET", "/api/books?invalidIsbn=1&pageSize=100")
 check("and it leaves the smart list with no backfill",
       bad not in {b["id"] for b in (after or {}).get("items", [])})
 
+print("=== 46. REGRESSION: library identity and the sharing switch ===")
+# `library_settings` shipped in 0026 with a working PUT and no screen, so the
+# ISIL — which MARC 852 $a and the OAI-PMH repository description both need —
+# could not be set by anyone without an HTTP client, and `publicSharing`, the
+# only thing keeping SRU and OAI shut, could not be switched on at all.
+st, before = call("GET", "/api/library-settings")
+check("library settings are readable", st == 200 and "settings" in (before or {}), st)
+prior = (before or {}).get("settings", {})
+
+check("SRU is shut before sharing is enabled", anon("/api/sru?operation=explain")[0] == 503)
+check("OAI is shut before sharing is enabled", anon("/api/oai?verb=Identify")[0] == 503)
+
+st, _ = call("PUT", "/api/library-settings", {
+    "isil": "GR-ZZTEST", "libraryName": "ZZ Test Library",
+    "libraryPlace": "Thessaloniki", "catalogueLanguage": "gre", "publicSharing": "on"})
+check("identity + sharing save together", st == 200, st)
+check("SRU opens once sharing is on", anon("/api/sru?operation=explain")[0] == 200)
+check("OAI opens once sharing is on", anon("/api/oai?verb=Identify")[0] == 200)
+
+# The point of the ISIL: it must reach the records and the repository, which is
+# what it could never do while nothing could set it.
+st, ident = anon("/api/oai?verb=Identify")
+check("the OAI repository is named by the library", "ZZ Test Library" in ident, ident[:160])
+ib, _ = mkbook(title=f"ZZITEST Isil {uuid.uuid4().hex[:6]}", author="ZZ Isil", shelfCode="ZZ-ISIL")
+st, marc = call_text("GET", f"/api/books/{ib}/marc")
+check("MARC 852 $a carries the ISIL", 'code="a">GR-ZZTEST' in marc, marc[:200])
+
+# An unknown key must not be storable — the table is a whitelist, not a bag.
+call("PUT", "/api/library-settings", {"zzBogusKey": "nope"})
+st, after = call("GET", "/api/library-settings")
+check("an unwhitelisted setting is refused", "zzBogusKey" not in (after or {}).get("settings", {}))
+
+# Off again, and the doors shut.
+call("PUT", "/api/library-settings", {"publicSharing": "off"})
+check("SRU shuts again when sharing is turned off", anon("/api/sru?operation=explain")[0] == 503)
+check("OAI shuts again when sharing is turned off", anon("/api/oai?verb=Identify")[0] == 503)
+# Restore whatever the database had before this section ran.
+call("PUT", "/api/library-settings", {k: prior.get(k) for k in
+     ("isil", "libraryName", "libraryPlace", "catalogueLanguage", "publicSharing")})
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

@@ -2654,3 +2654,23 @@ mark.hl {
   background: var(--warning-bg);
   border-color: var(--warning);
 }
+
+/* ===== Library identity ===== */
+/* The sharing switch is set apart because it is the one control on that card
+   whose effect leaves the building — once a harvester has cached the records,
+   turning it back off does not un-publish them. */
+.sharing-block {
+  margin-top: 1.25rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+.sharing-block:has(.badge.ready) { border-left-color: var(--accent); }
+.sharing-state { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.35rem; }
+.sharing-state .badge { background: var(--border-strong); color: var(--text); }
+.sharing-state .badge.ready { background: var(--accent); color: var(--on-accent); }
+.sharing-endpoints { list-style: none; margin: 0.4rem 0; padding: 0; }
+.sharing-endpoints code { font-size: 0.75rem; }
+.sharing-block button { margin-top: 0.5rem; }

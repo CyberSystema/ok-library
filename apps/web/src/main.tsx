@@ -34,6 +34,7 @@ import type {
   ValueVariantGroup, MergeCandidateItem, MergeCandidateBook, MergeCandidateGroup, MergePreview
 } from './types';
 import { OnboardingCourse } from './onboarding';
+import { LibraryIdentityCard } from './screens/identity';
 import './styles.css';
 
 // Lazy-loaded only when the user opens the Import tab — saves ~1MB from the initial bundle.
@@ -7961,6 +7962,8 @@ function App() {
                 </div>
 
                 {/* Training / Start guide — replay the onboarding course anytime */}
+                <LibraryIdentityCard canEdit={isAdmin} />
+
                 <div className="card">
                   <h3>🎓 {t('settings.training.heading')}</h3>
                   <p className="muted small" style={{ marginBottom: '1rem' }}>
