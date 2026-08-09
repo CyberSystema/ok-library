@@ -2674,3 +2674,12 @@ mark.hl {
 .sharing-endpoints { list-style: none; margin: 0.4rem 0; padding: 0; }
 .sharing-endpoints code { font-size: 0.75rem; }
 .sharing-block button { margin-top: 0.5rem; }
+
+/* Inline create/edit form inside the rooms card. */
+.room-form {
+  margin-top: 0.75rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2, var(--bg));
+}

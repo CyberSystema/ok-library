@@ -4270,8 +4270,30 @@ app.get('/api/scan/:value', async (c) => {
 });
 
 app.get('/api/rooms', async (c) => {
-	const rows = await c.env.DB.prepare('SELECT * FROM rooms ORDER BY code ASC').all();
-	return c.json({ items: rows.results ?? [] });
+	// camelCase, like every other endpoint. This returned raw `SELECT *` rows —
+	// map_metadata, created_at — which nothing consumed, so it was a trap waiting
+	// for the first caller rather than a live bug. Book counts come along because
+	// every caller wants them and the join is the same cost as the bare list.
+	const rows = await c.env.DB.prepare(
+		`SELECT r.id, r.code, r.name, r.description, r.map_metadata, r.created_at, r.updated_at,
+		        COUNT(b.id) AS book_count
+		   FROM rooms r
+		   LEFT JOIN books b ON b.room_code = r.code AND b.deleted_at IS NULL
+		  GROUP BY r.id, r.code, r.name, r.description, r.map_metadata, r.created_at, r.updated_at
+		  ORDER BY r.code ASC`
+	).all<Record<string, unknown>>();
+	return c.json({
+		items: (rows.results ?? []).map((r) => ({
+			id: r.id,
+			code: r.code,
+			name: r.name,
+			description: r.description,
+			mapMetadata: safeJsonParse<Record<string, unknown>>((r.map_metadata as string) ?? '{}', {}),
+			bookCount: Number(r.book_count ?? 0),
+			createdAt: r.created_at,
+			updatedAt: r.updated_at
+		}))
+	});
 });
 
 app.get('/api/setup/default-book-structure', async (c) => {
@@ -4400,6 +4422,12 @@ app.get('/api/rooms/summary', async (c) => {
 			 ORDER BY r.code ASC`
 		).all();
 
+		// The residual bucket is "belongs to no room", NOT "room_code is blank".
+		// A book whose room_code matches no rooms row used to fall into neither
+		// this nor the per-room join, so the Library tab's tiles would silently
+		// under-count. The foreign key makes that unreachable today — but FK
+		// enforcement is a per-connection PRAGMA, so the two buckets should be a
+		// true partition on their own terms rather than by relying on it.
 		const unassigned = await c.env.DB.prepare(
 			`SELECT
 				COUNT(*) AS total_books,
@@ -4407,8 +4435,9 @@ app.get('/api/rooms/summary', async (c) => {
 				SUM(CASE WHEN status = 'borrowed' THEN 1 ELSE 0 END) AS borrowed_books,
 				SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) AS lost_books,
 				SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance_books
-			 FROM books
-			 WHERE deleted_at IS NULL AND (room_code IS NULL OR TRIM(room_code) = '')`
+			 FROM books b
+			 WHERE b.deleted_at IS NULL
+			   AND NOT EXISTS (SELECT 1 FROM rooms r WHERE r.code = b.room_code)`
 		).first<Record<string, unknown>>();
 
 		const ua = unassigned ?? {};
@@ -4441,17 +4470,26 @@ app.post('/api/rooms', requirePermission('rooms.write', { librarian: true }), as
 	const id = crypto.randomUUID();
 	const now = nowIso();
 
+	// Normalise EXACTLY as the book and item writers do. `normalizeBookData`
+	// upper-cases every incoming roomCode, so a room stored verbatim as "a1"
+	// could never be filed in: the book arrived as "A1", matched no rooms row,
+	// and the foreign key threw a 500 — which the client retried four times.
+	// The room was creatable, visible, and unusable.
+	const code = normalizeCode(payload.code.trim());
+	if (!code) throw new HTTPException(400, { message: 'Room code is required' });
+	// The UNIQUE index would otherwise throw the same retried 500.
+	const clash = await c.env.DB.prepare('SELECT id FROM rooms WHERE code = ?').bind(code).first();
+	if (clash) throw new HTTPException(409, { message: `A room with code ${code} already exists.` });
+
 	await c.env.DB.prepare(
 		`INSERT INTO rooms (id, code, name, description, map_metadata, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`
 	)
-		.bind(id, payload.code, payload.name, payload.description ?? null, JSON.stringify(payload.mapMetadata), now, now)
+		.bind(id, code, payload.name, payload.description ?? null, JSON.stringify(payload.mapMetadata), now, now)
 		.run();
 
 	await bumpBooksCacheVersion(c.env); // invalidate the version-keyed rooms/summary cache
-	await insertAuditLog(c.env, c.get('user').sub, 'room.create', 'room', id, {
-		code: payload.code
-	});
+	await insertAuditLog(c.env, c.get('user').sub, 'room.create', 'room', id, { code });
 
 	return c.json({ id }, 201);
 });
@@ -4483,8 +4521,14 @@ app.put('/api/rooms/:id', requirePermission('rooms.write', { librarian: true }),
 	// fully armed throughout. The original row id is restored at the end because
 	// the audit log references it.
 	const nextCode = normalizeCode(payload.code.trim());
+	if (!nextCode) throw new HTTPException(400, { message: 'Room code is required' });
 	const statements: D1PreparedStatement[] = [];
 	if (nextCode !== existing.code) {
+		// Renaming onto a code another room already holds hits the same UNIQUE
+		// index, so refuse it here rather than 500 halfway through the batch.
+		const clash = await c.env.DB.prepare('SELECT id FROM rooms WHERE code = ? AND id <> ?')
+			.bind(nextCode, id).first();
+		if (clash) throw new HTTPException(409, { message: `A room with code ${nextCode} already exists.` });
 		const tempId = newId('room');
 		statements.push(
 			c.env.DB.prepare(

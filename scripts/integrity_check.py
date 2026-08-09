@@ -1766,6 +1766,77 @@ check("OAI shuts again when sharing is turned off", anon("/api/oai?verb=Identify
 call("PUT", "/api/library-settings", {k: prior.get(k) for k in
      ("isil", "libraryName", "libraryPlace", "catalogueLanguage", "publicSharing")})
 
+print("=== 47. REGRESSION: rooms and the trash ===")
+uniq = uuid.uuid4().hex[:6]
+# `rooms.write` / `rooms.delete` governed nothing reachable until now, and both
+# write endpoints threw a raw 500 the moment any book referenced the room —
+# which the web client then retried four times.
+# The code is deliberately lower-case here. Every book and item write runs its
+# roomCode through normalizeCode (upper-case), so a room stored verbatim was a
+# room no book could ever be filed in — the foreign key threw a 500 that the web
+# client then retried four times.
+raw_code = f"zzr{uniq}"
+st, rr = call("POST", "/api/rooms", {"code": raw_code, "name": "ZZ Room", "mapMetadata": {}})
+rid = (rr or {}).get("id")
+check("a room can be created", st == 201 and rid, f"{st} {rr}")
+st, listed = call("GET", "/api/rooms")
+mine = next((r for r in (listed or {}).get("items", []) if r["id"] == rid), None)
+check("the rooms list speaks camelCase with a book count",
+      mine is not None and "bookCount" in mine and "mapMetadata" in mine and "map_metadata" not in mine, mine)
+code = raw_code.upper()
+check("a room code is stored the same way a book stores it", (mine or {}).get("code") == code, mine)
+st, dup = call("POST", "/api/rooms", {"code": raw_code.upper(), "name": "ZZ Dup", "mapMetadata": {}})
+check("a duplicate code is refused, not a UNIQUE 500", st == 409, f"{st} {dup}")
+
+rb, _ = mkbook(title=f"ZZITEST InRoom {uniq}", author="ZZ Room", roomCode=raw_code)
+check("a book can actually be filed in the room it was given", get(rb).get("roomCode") == code,
+      get(rb).get("roomCode"))
+st, listed = call("GET", "/api/rooms")
+mine = next((r for r in (listed or {}).get("items", []) if r["id"] == rid), None)
+check("the count follows the books", (mine or {}).get("bookCount") == 1, mine)
+
+# Renaming carries the books. SQLite's foreign keys are immediate, so the naive
+# ordering cannot work and used to 500.
+st, renamed = call("PUT", f"/api/rooms/{rid}",
+                   {"code": f"zzq{uniq}", "name": "ZZ Room Renamed", "mapMetadata": {}})
+check("renaming a room in use succeeds", st == 200, f"{st} {renamed}")
+check("the room keeps its id through a rename", (renamed or {}).get("id") == rid, renamed)
+check("the books came with it", get(rb).get("roomCode") == f"ZZQ{uniq}".upper(), get(rb).get("roomCode"))
+
+# Deleting refuses with a count instead of letting the constraint throw.
+st, refused = call("DELETE", f"/api/rooms/{rid}")
+check("deleting a room in use is refused, not a 500", st == 409, f"{st} {refused}")
+check("and it says how many books are in the way", "1" in str(refused), refused)
+
+# A SOFT-DELETED book still holds the foreign key: the guard that filtered on
+# deleted_at passed and then let the constraint throw the 500 it exists to stop.
+call("DELETE", f"/api/books/{rb}")
+st, refused2 = call("DELETE", f"/api/rooms/{rid}")
+check("a trashed book still blocks the delete, with its own message",
+      st == 409 and "trash" in str(refused2).lower(), f"{st} {refused2}")
+
+# The trash itself: list, restore, purge.
+st, trash = call("GET", "/api/books/trash?pageSize=100")
+check("the deleted book is in the trash",
+      any(b["id"] == rb for b in (trash or {}).get("items", [])), (trash or {}).get("total"))
+st, _ = call("POST", f"/api/books/{rb}/restore")
+check("restore brings it back", st == 200 and get(rb) is not None, st)
+call("DELETE", f"/api/books/{rb}")
+st, _ = call("DELETE", f"/api/books/{rb}/purge")
+check("purge destroys it", st == 204 and get(rb) is None, st)
+st, gone = call("DELETE", f"/api/rooms/{rid}")
+check("the room deletes once nothing references it", st == 204, f"{st} {gone}")
+
+# The two room buckets must be a true partition of the catalogue, or the Library
+# tab's tiles silently under-count.
+st, summary = call("GET", "/api/rooms/summary")
+per_room = sum(int(r.get("total_books") or 0) for r in (summary or {}).get("items", []))
+unassigned = int(((summary or {}).get("unassigned") or {}).get("totalBooks") or 0)
+st, all_books = call("GET", "/api/books?pageSize=1")
+check("per-room plus unassigned equals the whole catalogue",
+      per_room + unassigned == (all_books or {}).get("total"),
+      f'{per_room} + {unassigned} vs {(all_books or {}).get("total")}')
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

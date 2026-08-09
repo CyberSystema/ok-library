@@ -35,6 +35,8 @@ import type {
 } from './types';
 import { OnboardingCourse } from './onboarding';
 import { LibraryIdentityCard } from './screens/identity';
+import { RoomsCard } from './screens/rooms';
+import { TrashCard } from './screens/trash';
 import './styles.css';
 
 // Lazy-loaded only when the user opens the Import tab — saves ~1MB from the initial bundle.
@@ -7963,6 +7965,16 @@ function App() {
 
                 {/* Training / Start guide — replay the onboarding course anytime */}
                 <LibraryIdentityCard canEdit={isAdmin} />
+
+                <RoomsCard
+                  canWrite={can('rooms.write')}
+                  canDelete={can('rooms.delete')}
+                  onChanged={() => { void loadRoomSummary(); void loadBooks(); }}
+                />
+
+                {canDelete && (
+                  <TrashCard canDelete={canDelete} onChanged={() => { void loadBooks(); void loadRoomSummary(); }} />
+                )}
 
                 <div className="card">
                   <h3>🎓 {t('settings.training.heading')}</h3>
