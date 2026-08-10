@@ -103,6 +103,46 @@ for (const file of packs) {
   }
 }
 
+// (1b) A translated chapter must carry the SAME blocks as the English, in order.
+//
+// This lived only in the generator, which runs once per batch — so a later hand
+// edit could quietly drop a 'rule' and take a warning out of a translation with
+// nothing to notice. A handbook that omits a caution in one language is worse
+// than one that omits a chapter: the reader believes they have read it.
+function chapterBody(src, id) {
+  const m = new RegExp(`^ {2}'?${id}'?:\\s*\\{$`, 'm').exec(src);
+  if (!m) return null;
+  let depth = 0;
+  const start = src.indexOf('{', m.index);
+  for (let i = start; i < src.length; i += 1) {
+    if (src[i] === '{') depth += 1;
+    else if (src[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return src.slice(m.index, i + 1);
+    }
+  }
+  return null;
+}
+const kindsOf = (body) => [...body.matchAll(/kind:\s*'([a-z]+)'/g)].map((x) => x[1]).join(',');
+
+if (packs.includes('en.ts')) {
+  const enSrc = read(join(contentDir, 'en.ts'));
+  for (const file of packs.filter((f) => f !== 'en.ts')) {
+    const lang = file.replace(/\.ts$/, '');
+    const src = read(join(contentDir, file));
+    for (const id of chapterIds) {
+      const mine = chapterBody(src, id);
+      if (!mine) continue; // not translated yet — English fills in at runtime
+      const theirs = chapterBody(enSrc, id);
+      if (!theirs) continue;
+      if (kindsOf(mine) !== kindsOf(theirs)) {
+        fail(`${lang}: chapter '${id}' has a different block sequence from the English`,
+          [`en:  ${kindsOf(theirs)}`, `${lang}: ${kindsOf(mine)}`]);
+      }
+    }
+  }
+}
+
 // (2) every registry chapter is present in English.
 if (packs.includes('en.ts')) {
   const en = read(join(contentDir, 'en.ts'));

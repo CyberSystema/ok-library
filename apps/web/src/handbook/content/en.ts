@@ -1089,9 +1089,6 @@ const pack: ContentPack = {
       { kind: 'h', text: 'Categories, and why they matter', anchor: 'reader-categories' },
       { kind: 'p', text:
         'The category is what decides the loan rules that apply: how many days, how many renewals, how many books at once. A member of the brotherhood, a visiting scholar and a student are not the same case, and the category is how the difference is expressed once instead of remembered at the desk every time.' },
-      { kind: 'fields', rows: [
-        { fact: 'isil', note: 'Unrelated — but the same principle: one setting, applied everywhere, rather than a decision repeated.' }
-      ] },
       { kind: 'rule', text:
         'The category on the reader must match the category in the loan rule EXACTLY. They are free text on both sides, so “student” and “Student” are two categories and one of them has no rule.' },
       { kind: 'steps', items: [

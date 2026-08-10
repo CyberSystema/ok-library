@@ -115,10 +115,52 @@ now rather than after twenty-three more chapters.
 
 ---
 
+## Status: all thirty-one chapters are now in Greek
+
+The terminology above was confirmed and the remaining twenty-three chapters were
+written against it. What follows is what the review pass caught in them, because
+several were the kind of error that is invisible unless someone reads the two
+languages side by side.
+
+**Two reversed the advice.**
+
+- `series-and-sets` rendered "record its run" as «καταγράψτε τη σειρά της». But
+  *σειρά* is that chapter's own word for *series*, so the Greek told the librarian
+  to record the periodical's series — the opposite instruction. Now «καταγράψτε τα
+  τεύχη που κατέχουμε».
+- `readers-and-loans` rendered "Take it back first" as «Παραλάβετέ το πρώτα»,
+  using the same verb the chapter uses two blocks earlier for the *reader*
+  collecting a hold. One verb naming both directions of the same transaction. Now
+  «Δεχθείτε πρώτα την επιστροφή του».
+
+**One destroyed a distinction the chapter exists to draw.** `data-protection` used
+*διαγραφή* for both erasing a reader's personal data and deleting the reader — and
+the whole chapter is about why those are different. Erasure is *ανωνυμοποίηση*
+throughout now, which is also what the interface says.
+
+**Glossary drift, all corrected**: *τεκμήριο* where *αντίτυπο* was meant (it is
+reserved for *είδος τεκμηρίου*); *κατηγορία τεκμηρίου* where *είδος τεκμηρίου* is
+approved, colliding with the subject category of the classification chapter;
+*χρήστες* for readers; *βιβλίο* where a room holds *αντίτυπα*; *εκτύπωση* (a
+print-out) where *ανατύπωση* (a printing) was meant.
+
+**Two factual slips**: an exact "all of them" claim used the rounded 12.700 instead
+of 12.675, and the tag number *880* — the one token a librarian can quote to a
+partner library — had been dropped from the transliteration chapter.
+
+**Register**: *ώς* for *ως* twice, the archaic *αντικατασταθέν* and
+*καταγεγραμμένον*, and two colloquialisms («σε μία καθισιά», «Κατεβείτε τη
+λίστα») that sat below the register the eight approved chapters keep.
+
+### One correction to the English
+
+The review also found a weakness in the English, not the translation:
+`readers-and-loans` had a field table whose single row pointed at `isil` with the
+note "Unrelated — but the same principle…". A field table names the field the
+reader should go and fill in, so admitting it is irrelevant sends them to the
+wrong screen. It is removed from both languages.
+
 ## What happens next
 
-1. You read the eight chapters — the fastest way is the Handbook tab with the
-   language set to Greek.
-2. You tell me what to change. Terminology changes are mechanical.
-3. I write the remaining twenty-three with the confirmed vocabulary, then Russian
-   and Korean.
+Russian and Korean, on the same glossary-plus-exemplar method. Then step 15: the
+mandatory course rewritten on this renderer.
