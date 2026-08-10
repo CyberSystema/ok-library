@@ -2578,6 +2578,77 @@ check("and that count opens a list of the same size",
       (listed or {}).get("total") == (shown or {}).get("bookCount"),
       f'{(listed or {}).get("total")} vs {(shown or {}).get("bookCount")}')
 
+print("=== 55. REGRESSION: the Handbook's mechanism (static) ===")
+import glob as _glob
+import subprocess as _sp
+_REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_HB = os.path.join(_REPO, "apps", "web", "src", "handbook")
+
+
+def _slurp(*parts):
+    with open(os.path.join(*parts), encoding="utf-8") as fh:
+        return fh.read()
+
+
+hb_ctx = _slurp(_HB, "context.tsx")
+hb_idx = _slurp(_HB, "index.tsx")
+hb_reg = _slurp(_HB, "registry.ts")
+main_tsx = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+css_all = _slurp(_REPO, "apps", "web", "src", "styles.css")
+
+# The provider has to be above App, or a "?" inside the edit dialog cannot reach
+# the Handbook without a prop threaded through every form between them.
+check("the Handbook provider wraps App", "<HandbookProvider>" in main_tsx and "<App />" in main_tsx, None)
+
+# The "?" opens a DRAWER and never switches tab. Switching would unmount the edit
+# form and lose every keystroke the librarian typed — which is what they opened
+# the Handbook to finish.
+check("the help link never changes the current section",
+      "setCurrentSection" not in hb_ctx and "setCurrentSection" not in hb_idx, None)
+check("and it opens the drawer", "setDrawerOpen(true)" in hb_ctx, None)
+
+# A bare "?" is not an accessible name.
+check("the help link is named after the field it explains",
+      "aria-label={label}" in hb_ctx and "'handbook.helpAbout'" in main_tsx, None)
+
+# Anchors, not chapters: a form must not have to know how the Handbook is
+# organised, or reorganising it breaks forms.
+help_uses = re.findall(r"<HelpLink\s+anchor=\"([a-z0-9-]+)\"", main_tsx)
+check("forms point at anchors, and at least one really does", len(help_uses) >= 3, help_uses)
+declared = set(re.findall(r"^\s{2}'([a-z0-9-]+)':\s*'[a-z0-9-]+',?$", hb_reg, re.M))
+check("every anchor a form points at is declared",
+      all(a in declared for a in help_uses), [a for a in help_uses if a not in declared])
+
+# The prose is the biggest thing in the app and is loaded on demand. A static
+# import would undo that silently, so the check that catches it must exist and run.
+check("the handbook check is wired into CI",
+      "check:handbook" in _slurp(_REPO, "package.json")
+      and "check:handbook" in _slurp(_REPO, ".github", "workflows", "ci.yml"), None)
+res = _sp.run(["node", "scripts/check_handbook.mjs"], cwd=_REPO, capture_output=True, text=True)
+check("and it passes", res.returncode == 0, (res.stdout + res.stderr)[-300:])
+
+# Printing is the point of a reference book: the printed copy sits by the desk the
+# laptop is not on. Nothing in this app had a print stylesheet before.
+check("a print stylesheet exists", "@media print" in css_all, None)
+check("paper gets every chapter, not the one on screen",
+      ".hb-print-only" in css_all and "<HandbookPrintable />" in main_tsx, None)
+check("and a rule is never split across two pages",
+      "break-inside: avoid" in css_all, None)
+
+# The renderer must handle every block kind. The exhaustive `never` in the switch
+# makes a new kind a compile error rather than a silently blank paragraph.
+kinds = set(re.findall(r"\|\s*\{\s*kind:\s*'([a-z]+)'", _slurp(_HB, "types.ts")))
+rendered = set(re.findall(r"case '([a-z]+)':", hb_idx))
+check("the renderer handles every block kind", kinds and kinds <= rendered, sorted(kinds - rendered))
+check("and a new kind would be a compile error", "const never: never = b" in hb_idx, None)
+
+# MARC tags live in facts.ts once. Four translations each carrying "245 $a" is
+# four copies of one fact, and being wrong in exactly one is the likeliest outcome.
+for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
+    body = _slurp(pack)
+    stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
+    check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

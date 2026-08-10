@@ -17,7 +17,8 @@
     "lint": "echo 'lint placeholder'",
     "import:xlsx:d1:local": "node scripts/import_xlsx_to_d1.mjs",
     "import:xlsx:d1:remote": "node scripts/import_xlsx_to_d1.mjs --remote",
-    "check:i18n": "node scripts/check_i18n.mjs"
+    "check:i18n": "node scripts/check_i18n.mjs",
+    "check:handbook": "node scripts/check_handbook.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.111.0",

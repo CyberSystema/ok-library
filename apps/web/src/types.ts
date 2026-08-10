@@ -261,7 +261,7 @@ export type FacetResponse = {
   items: FacetItem[];
 };
 
-export type AppSection = 'dashboard' | 'books' | 'circulation' | 'import' | 'settings';
+export type AppSection = 'dashboard' | 'books' | 'circulation' | 'import' | 'settings' | 'handbook';
 
 export type StatsResponse = {
   byStatus: Array<{ status: string; count: number }>;

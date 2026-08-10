@@ -2806,3 +2806,189 @@ mark.hl {
   word-break: break-all;
   user-select: all;
 }
+
+/* ── The Handbook ─────────────────────────────────────────────────────────── */
+/* Two containers, one renderer: a full-page reader and a drawer that opens over
+   an edit form. The layout differences live here so the renderer stays about
+   content. */
+.hb {
+  display: grid;
+  grid-template-columns: minmax(11rem, 15rem) minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+}
+@media (max-width: 46rem) {
+  /* The contents list goes above the prose rather than beside it, and stops
+     being sticky — a sticky nav on a phone eats the screen. */
+  .hb { grid-template-columns: minmax(0, 1fr); gap: 0.75rem; }
+  .hb-contents { position: static !important; max-height: none !important; }
+}
+.hb-contents {
+  position: sticky;
+  top: 0.5rem;
+  max-height: 75vh;
+  overflow-y: auto;
+}
+.hb-contents ol {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: none;
+}
+.hb-contents-link {
+  display: flex;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.4rem 0.5rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+.hb-contents-link:hover { background: var(--surface-2, var(--bg)); }
+.hb-contents-link.is-active {
+  background: var(--accent);
+  /* Paired token, contrast-checked by the gate — never --accent-dark, which in
+     the dark theme is darker than --accent. */
+  color: var(--on-accent);
+  font-weight: 600;
+}
+.hb-contents-n { opacity: 0.7; font-variant-numeric: tabular-nums; }
+
+.hb-body { min-width: 0; max-width: 42rem; }
+.hb-drawer-body .hb-body { max-height: 65vh; overflow-y: auto; }
+.hb-drawer { max-width: 54rem; }
+.hb-title { margin: 0 0 0.25rem; }
+.hb-summary { margin: 0 0 1.25rem; font-size: 1.0625rem; color: var(--text-muted); }
+.hb-h { margin: 1.75rem 0 0.5rem; font-size: 1.0625rem; scroll-margin-top: 1rem; }
+.hb-p { margin: 0 0 0.85rem; line-height: 1.65; }
+.hb-steps, .hb-list { margin: 0 0 1rem; padding-inline-start: 1.5rem; line-height: 1.6; }
+.hb-steps li, .hb-list li { margin-bottom: 0.35rem; }
+
+.hb-callout {
+  margin: 0 0 1rem;
+  padding: 0.7rem 0.85rem;
+  border-inline-start: 3px solid var(--border);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2, var(--bg));
+  line-height: 1.6;
+}
+.hb-callout-label { display: block; font-weight: 600; margin-bottom: 0.2rem; }
+.hb-tip { border-inline-start-color: var(--accent); }
+.hb-rule { border-inline-start-color: var(--warn-border, var(--accent)); }
+.hb-auto { border-inline-start-color: var(--field-border); }
+
+/* The right-and-wrong pair. The two rows must be distinguishable without colour,
+   hence the ✓/✗ in the label rather than green and red alone. */
+.hb-compare {
+  margin: 0 0 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.hb-compare-row {
+  display: grid;
+  grid-template-columns: minmax(5.5rem, auto) minmax(0, 1fr);
+  gap: 0.6rem;
+  padding: 0.6rem 0.85rem;
+  line-height: 1.55;
+}
+.hb-compare-row + .hb-compare-row { border-top: 1px solid var(--border); }
+.hb-compare-label { font-weight: 600; }
+.hb-compare-why {
+  margin: 0;
+  padding: 0.6rem 0.85rem;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2, var(--bg));
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+
+.hb-quote { margin: 0 0 1rem; }
+.hb-quote blockquote {
+  margin: 0;
+  padding: 0.6rem 0.85rem;
+  border-inline-start: 3px solid var(--field-border);
+  background: var(--surface-2, var(--bg));
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+.hb-quote figcaption { margin-top: 0.3rem; font-size: 0.8125rem; color: var(--text-muted); }
+
+/* A field table can be wider than a phone. It scrolls in its own box; the page
+   body never scrolls sideways. */
+.hb-fields-wrap { overflow-x: auto; margin: 0 0 1rem; }
+.hb-fields { border-collapse: collapse; width: 100%; font-size: 0.875rem; }
+.hb-fields th, .hb-fields td {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  text-align: start;
+  vertical-align: top;
+}
+.hb-fields thead th { background: var(--surface-2, var(--bg)); }
+.hb-fieldkey { display: block; font-size: 0.75rem; color: var(--text-muted); font-weight: 400; }
+.hb-see { margin: 0 0 1rem; }
+.hb-chapter-nav {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+/* The "?" beside a field label. Small, but a real button with a real name. */
+.help-link {
+  margin-inline-start: 0.35rem;
+  width: 1.15rem;
+  height: 1.15rem;
+  padding: 0;
+  border: 1px solid var(--field-border);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1;
+  cursor: pointer;
+  vertical-align: middle;
+}
+.help-link:hover { border-color: var(--accent); color: var(--accent); }
+
+.hb-print-only { display: none; }
+.hb-print-chapter + .hb-print-chapter { margin-top: 2rem; }
+
+/* ── Print ────────────────────────────────────────────────────────────────── */
+/* The Handbook is the first thing in this app anyone would want on paper: a
+   printed copy sits next to the desk where the laptop is not. On paper there is
+   no navigation, no chrome, and every chapter rather than the one on screen. */
+@media print {
+  .app-header, .app-nav, .toast-stack, .mini-bar, .section-header-actions,
+  .hb-contents, .hb-chapter-nav, .help-link, .modal-backdrop {
+    display: none !important;
+  }
+  .hb-print-only { display: block !important; }
+  .hb-page > .hb-body { display: none !important; }
+  .hb { display: block !important; }
+  .hb-body { max-width: none; }
+  .card, .hb-card {
+    border: 0 !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+    background: transparent !important;
+  }
+  /* Never break a rule or a comparison across a page — half of a right-and-wrong
+     pair on its own is worse than nothing. */
+  .hb-callout, .hb-compare, .hb-quote, .hb-fields { break-inside: avoid; }
+  .hb-h { break-after: avoid; }
+  .hb-print-chapter { break-before: page; }
+  .hb-print-chapter:first-child { break-before: auto; }
+  /* Black on white, whatever theme the screen was in. */
+  :root { --text-light: #000; --text-muted: #333; --border: #999; }
+  body { background: #fff !important; color: #000 !important; }
+}

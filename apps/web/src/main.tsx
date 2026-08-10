@@ -1,4 +1,4 @@
-import React, { Fragment, FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { Fragment, FormEvent, Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactDOM from 'react-dom/client';
 import {
   BookCardSkeleton,
@@ -35,6 +35,12 @@ import type {
   ValueVariantGroup, MergeCandidateItem, MergeCandidateBook, MergeCandidateGroup, MergePreview
 } from './types';
 import { OnboardingCourse } from './onboarding';
+// The Handbook's mechanism is eager — a few hundred bytes of ids and the provider
+// — while the renderer and the prose are lazy. `check_handbook.mjs` asserts the
+// content packs never reach the main chunk.
+import { HandbookProvider, HelpLink, useHandbook } from './handbook/context';
+const HandbookView = lazy(() => import('./handbook').then((m) => ({ default: m.Handbook })));
+const HandbookPrintable = lazy(() => import('./handbook').then((m) => ({ default: m.HandbookPrintable })));
 import { AuthoritiesCard, BookAuthorities } from './screens/authorities';
 import { BorrowersCard } from './screens/borrowers';
 import { CopiesEditor } from './screens/copies';
@@ -1406,7 +1412,10 @@ function App() {
     ...(canSeeCirculation ? [{ key: 'circulation' as AppSection, label: t('tab.circulation'), icon: '🔁' }] : []),
     ...(canImport ? [{ key: 'import' as AppSection, label: t('tab.import'), icon: '⇅' }] : []),
     ...(canSeeDashboard ? [{ key: 'dashboard' as AppSection, label: t('tab.dashboard'), icon: '📊' }] : []),
-    ...(canSeeSettings ? [{ key: 'settings' as AppSection, label: t('tab.settings'), icon: '⚙️' }] : [])
+    ...(canSeeSettings ? [{ key: 'settings' as AppSection, label: t('tab.settings'), icon: '⚙️' }] : []),
+    // Visible to every role. A viewer who cannot change a record still has to be
+    // able to look up what a field means.
+    { key: 'handbook' as AppSection, label: t('tab.handbook'), icon: '📖' }
   ];
 
   // If the user lands on a section they no longer have access to (after role
@@ -1414,7 +1423,7 @@ function App() {
   // Library tab so they don't see a blank screen.
   useEffect(() => {
     if (!currentUser) return;
-    const allowed = new Set<AppSection>(['books']);
+    const allowed = new Set<AppSection>(['books', 'handbook']);
     if (canSeeCirculation) allowed.add('circulation');
     if (canImport) allowed.add('import');
     if (canSeeDashboard) allowed.add('dashboard');
@@ -5305,6 +5314,8 @@ function App() {
         />
       )}
 
+      <HandbookDrawer />
+
       {copiesEditorOpen && detailBook && canWrite && (
         <CopiesEditor
           book={detailBook}
@@ -6019,6 +6030,7 @@ function App() {
                     </div>
                     <div>
                       <label htmlFor="fld-detail-author">{t('detail.author')}</label>
+                      <HelpLink anchor="greek-name-order" label={t('handbook.helpAbout', { field: t('detail.author') })} />
                       <input id="fld-detail-author" list="suggest-author" value={editForm.author} onChange={(e) => setEditForm({ ...editForm, author: e.target.value })} />
                     </div>
                   </div>
@@ -6029,6 +6041,7 @@ function App() {
                     </div>
                     <div>
                       <label htmlFor="fld-detail-yearpublished">{t('detail.yearPublished')}</label>
+                      <HelpLink anchor="uncertain-dates" label={t('handbook.helpAbout', { field: t('detail.yearPublished') })} />
                       <input id="fld-detail-yearpublished"
                         value={editForm.publicationYear}
                         onChange={(e) => setEditForm({ ...editForm, publicationYear: e.target.value })}
@@ -6080,6 +6093,7 @@ function App() {
                           no way to set it, so every record was a monograph and
                           the ISO 2789 return said the library held no serials. */}
                       <label htmlFor="fld-detail-biblevel">{t('library.add.bibLevel')}</label>
+                      <HelpLink anchor="date-ranges" label={t('handbook.helpAbout', { field: t('library.add.bibLevel') })} />
                       <select
                         id="fld-detail-biblevel"
                         value={editForm.bibLevel}
@@ -6908,6 +6922,7 @@ function App() {
                       <div className="form-row">
                         <div>
                           <label htmlFor="fld-library-add-year">{t('library.add.year')}</label>
+                          <HelpLink anchor="uncertain-dates" label={t('handbook.helpAbout', { field: t('library.add.year') })} />
                           <input id="fld-library-add-year"
                             value={createForm.publicationYear}
                             onChange={(e) => setCreateForm({ ...createForm, publicationYear: e.target.value })}
@@ -6944,6 +6959,7 @@ function App() {
                         </div>
                         <div>
                           <label htmlFor="fld-library-add-biblevel">{t('library.add.bibLevel')}</label>
+                          <HelpLink anchor="date-ranges" label={t('handbook.helpAbout', { field: t('library.add.bibLevel') })} />
                           <select
                             id="fld-library-add-biblevel"
                             value={createForm.bibLevel}
@@ -7961,6 +7977,33 @@ function App() {
             )}
 
             {/* ═══ IMPORT TAB ═══ */}
+            {currentSection === 'handbook' && (
+              <>
+                <div className="section-header">
+                  <div className="section-header-text">
+                    <h2>{t('handbook.title')}</h2>
+                    <p>{t('handbook.description')}</p>
+                  </div>
+                  <div className="section-header-actions">
+                    <button className="secondary small" onClick={() => window.print()}>
+                      {t('handbook.print')}
+                    </button>
+                  </div>
+                </div>
+                <div className="card hb-card">
+                  <Suspense fallback={<p className="muted">{t('common.loading')}</p>}>
+                    <HandbookView mode="page" />
+                    {/* Printing one chapter is almost never what someone wants
+                        from a handbook, so paper gets all of them. Hidden on
+                        screen, shown by the print stylesheet. */}
+                    <div className="hb-print-only">
+                      <HandbookPrintable />
+                    </div>
+                  </Suspense>
+                </div>
+              </>
+            )}
+
             {currentSection === 'import' && (
               <>
                 <div className="section-header">
@@ -8726,12 +8769,46 @@ function App() {
   );
 }
 
+/**
+ * The "?" drawer.
+ *
+ * A separate container from the Handbook tab for one reason: it has to be able to
+ * open OVER the edit-book dialog. Switching to the Handbook tab instead would
+ * unmount the form and lose everything typed into it, which is exactly what the
+ * librarian was consulting the Handbook in order to finish.
+ *
+ * It reuses `Dialog`'s focus trap and, more importantly, its focus RESTORE — when
+ * the drawer closes, focus returns to the "?" the librarian pressed, which is next
+ * to the field they were filling in.
+ */
+function HandbookDrawer() {
+  const t = useT();
+  const { drawerOpen, close } = useHandbook();
+  if (!drawerOpen) return null;
+  return (
+    <Dialog onClose={close} labelledBy="hb-drawer-title" className="modal hb-drawer">
+      <div className="modal-header">
+        <h3 id="hb-drawer-title">📖 {t('handbook.title')}</h3>
+        <button className="icon-button" onClick={close} aria-label={t('common.close')}>✕</button>
+      </div>
+      <Suspense fallback={<p className="muted">{t('common.loading')}</p>}>
+        <HandbookView mode="drawer" />
+      </Suspense>
+    </Dialog>
+  );
+}
+
 function Root() {
   return (
     <I18nProvider>
       <ToastProvider>
         <ConfirmProvider>
-          <App />
+          {/* Inside the i18n provider (it picks the language pack) and outside
+              App, so a "?" six components deep inside the edit dialog can open
+              the Handbook without a single prop being drilled. */}
+          <HandbookProvider>
+            <App />
+          </HandbookProvider>
         </ConfirmProvider>
       </ToastProvider>
     </I18nProvider>

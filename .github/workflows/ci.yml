@@ -35,5 +35,10 @@ jobs:
       - name: Build web app
         run: npm --workspace apps/web run build
 
+      # AFTER the build: half of this check reads the built chunks to prove the
+      # Handbook prose is still loaded on demand rather than at startup.
+      - name: Check the Handbook
+        run: npm run check:handbook
+
       - name: Security audit (production deps; advisory only)
         run: npm audit --omit=dev || true
