@@ -127,9 +127,16 @@ function marc008(book: MarcRecordInput): string {
   let date1: string;
   let date2: string;
   if (serial) {
+    // 'c' is "continuing, currently published"; 'd' would be "ceased". Nothing
+    // in this catalogue records a cessation, and a librarian marks a title a
+    // serial precisely because it keeps arriving — so 9999 unless a real range
+    // was authored. `publicationYearEnd` falls back to `publicationYear` on
+    // read, which is right for a book (published 1987, spans 1987) and a false
+    // claim for a periodical: it coded ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ as having stopped
+    // in the year it started.
     type = 'c';
     date1 = y1 ? String(y1).padStart(4, '0') : 'uuuu';
-    date2 = y2 ? String(y2).padStart(4, '0') : '9999';
+    date2 = y2 && y1 && y2 > y1 ? String(y2).padStart(4, '0') : '9999';
   } else if (y1 && y2 && y2 !== y1) {
     type = 'm';
     date1 = String(y1).padStart(4, '0');
@@ -559,7 +566,15 @@ export function marcToBookFields(rec: ParsedMarcRecord): Partial<MarcRecordInput
     subjectTerms.push({ term: unIsbd(term) ?? term, source: f.ind2 === '0' ? 'lcsh' : 'imported' });
   }
 
+  // leader/07 is the bibliographic level. 's' is a serial; the other five
+  // values MARC defines all describe kinds of monograph as far as this
+  // catalogue is concerned. `undefined` rather than 'monograph' when it is not
+  // a serial, so re-importing a plain record can never DEMOTE a title the
+  // librarian has already marked as one.
+  const bibLevel = (rec.leader ?? '')[7] === 's' ? 'serial' : undefined;
+
   return {
+    bibLevel,
     title: title ?? undefined,
     subtitle: subtitle ?? undefined,
     titleRomanized: linkedFor('245'),

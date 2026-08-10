@@ -38,6 +38,8 @@ const ReservedBookAttributeKeys = new Set([
 ]);
 
 export const BookStatusSchema = z.enum(['available', 'borrowed', 'lost', 'maintenance']);
+export const BibLevelSchema = z.enum(['monograph', 'serial']);
+export const BIB_LEVELS = BibLevelSchema.options;
 
 export const ISODateTimeSchema = z
   .string()
@@ -79,6 +81,16 @@ export const BookCoreSchema = z.object({
   // replacing it — no re-shelving, but imported records keep their DDC and the
   // catalogue gains a standard subject handle. MARC 082.
   ddc: z.string().max(40).optional().nullable(),
+  // IFLA LRM's bibliographic level, and MARC leader/07: a monograph is a work
+  // that is finished, a serial one that keeps arriving. Migration 0024 added
+  // the column and nothing could ever write it, so all 12,675 records sat at
+  // the default while thirteen of them carried an ISSN — and the ISO 2789
+  // return the librarian files reported zero serial titles held.
+  //
+  // Deliberately just these two. MARC defines seven values (a, b, c, d, i, m,
+  // s); the exporter understands 'm' and 's', and offering a level it would
+  // silently flatten would be worse than not offering it.
+  bibLevel: BibLevelSchema.optional(),
   publisher: z.string().max(200).optional().nullable(),
   // Catalogues frequently use multi-language tags like "EL,EN,FR" so we keep
   // the field free-form text rather than enumerated.

@@ -9,6 +9,8 @@
 // A PURE MOVE. Only `export` was added.
 
 export type BookStatus = 'available' | 'borrowed' | 'lost' | 'maintenance';
+/** MARC leader/07 and IFLA LRM: a work that is finished vs one that keeps arriving. */
+export type BibLevel = 'monograph' | 'serial';
 
 export type Book = {
   id: string;
@@ -38,6 +40,7 @@ export type Book = {
    * no re-shelving, but imported records keep their classification. MARC 082.
    */
   ddc?: string | null;
+  bibLevel?: BibLevel | null;
   customFields?: Record<string, string | number | boolean | null>;
   version: number;
   publisher?: string | null;

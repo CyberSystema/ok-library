@@ -129,7 +129,18 @@ const SNAKE_TO_CAMEL_BOOK_FIELDS: Record<string, string> = {
   created_at: 'createdAt',
   updated_at: 'updatedAt',
   deleted_at: 'deletedAt',
-  merged_into: 'mergedInto'
+  merged_into: 'mergedInto',
+  // The four columns migration 0024 added. They were never listed here, so they
+  // passed through under their raw names — and `marc.ts` reads `row.bibLevel`
+  // and `row.volumeDesignation`, which were therefore ALWAYS undefined. Every
+  // serial-aware branch of the exporter was dead code: leader/07 could only be
+  // 'm', 008/06 never took the 'c' branch, and MARC 490$v could only ever come
+  // from the custom attribute. The comment above states the rule; these four
+  // were the exception that proved nobody was checking it.
+  bib_level: 'bibLevel',
+  set_id: 'setId',
+  set_position: 'setPosition',
+  volume_designation: 'volumeDesignation'
 };
 
 // Internal search-index columns. `SELECT b.*` picks them up and parseBook used
@@ -147,7 +158,14 @@ const INTERNAL_BOOK_COLUMNS = new Set([
   'custom_fields_fold',
   'title_romanized_fold',
   'author_romanized_fold',
-  'publisher_romanized_fold'
+  'publisher_romanized_fold',
+  // The GENERATED column migration 0031 added. It exists so `invalidIsbn=1` can
+  // be a WHERE clause; the value every consumer reads is `isbnValid`, computed
+  // below from the same ISBN. Emitting both invited them to disagree — and they
+  // do: SQLite's `GLOB '[0-9]*'` only constrains the FIRST character, so a
+  // stored "978C91105B479" is judged valid by the column and invalid by
+  // checkIsbn, which strips the letters. One fact, one key.
+  'isbn_valid'
 ]);
 
 export function parseBook(row: Record<string, unknown>): Record<string, unknown> {
@@ -186,6 +204,12 @@ export function parseBook(row: Record<string, unknown>): Record<string, unknown>
   // The forwarding address left by a merge. Only ever set on a soft-deleted
   // row, so the trash view can say where the record went.
   out.mergedInto = row.merged_into ?? null;
+  // IFLA LRM: 'monograph' is a work that is complete, 'serial' one that keeps
+  // arriving. It drives MARC leader/07, 008/06, and the ISO 2789 serial count.
+  out.bibLevel = row.bib_level ?? 'monograph';
+  out.setId = row.set_id ?? null;
+  out.setPosition = row.set_position ?? null;
+  out.volumeDesignation = row.volume_designation ?? null;
   return out;
 }
 
@@ -476,7 +500,10 @@ const SNAKE_TO_CAMEL_ITEM_FIELDS: Record<string, string> = {
   acquisition_date: 'acquisitionDate',
   created_at: 'createdAt',
   updated_at: 'updatedAt',
-  deleted_at: 'deletedAt'
+  deleted_at: 'deletedAt',
+  // Added by migration 0030 for the ISO 2789 withdrawal count and, like the
+  // book columns above, never listed here.
+  withdrawal_reason: 'withdrawalReason'
 };
 
 export function parseItem(row: Record<string, unknown>): Record<string, unknown> {

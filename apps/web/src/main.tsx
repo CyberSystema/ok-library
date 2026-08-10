@@ -26,7 +26,7 @@ import {
   type NetStatus
 } from './api';
 import type {
-  BookStatus, Book, Borrower, SmartList, CatalogRow, CustomFieldType, CustomField,
+  BookStatus, BibLevel, Book, Borrower, SmartList, CatalogRow, CustomFieldType, CustomField,
   SessionUser, LoginResponse, SessionResponse, ActiveBorrow, Iso2789Report, ScanHit,
   LoanPolicy, Hold, AuditLogItem, StaffRole, StaffUser, BorrowHistoryItem, RoomSummaryItem,
   FacetItem, SetSummary, FacetResponse, AppSection, StatsResponse, Theme, DuplicateEntry,
@@ -970,6 +970,7 @@ function App() {
     publisher: '',
     language: '',
     ddc: '',
+    bibLevel: 'monograph' as BibLevel,
     description: ''
   });
   const [createAttrValues, setCreateAttrValues] = useState<Record<string, unknown>>({});
@@ -999,6 +1000,7 @@ function App() {
     publisher: '',
     language: '',
     ddc: '',
+    bibLevel: 'monograph' as BibLevel,
     description: ''
   });
   // Missing-required field keys flagged on the last edit-save attempt (mirrors
@@ -2815,6 +2817,7 @@ function App() {
           authorRomanized: createForm.authorRomanized.trim() || null,
           publisherRomanized: createForm.publisherRomanized.trim() || null,
           ddc: createForm.ddc.trim() || null,
+          bibLevel: createForm.bibLevel,
           dateEdtf,
           tags: [],
           customFields: customFieldsValue,
@@ -2837,6 +2840,7 @@ function App() {
         publisher: '',
         language: '',
         ddc: '',
+        bibLevel: 'monograph' as BibLevel,
         description: ''
       });
       setCreateFieldErrors(new Set());
@@ -3058,6 +3062,7 @@ function App() {
       publisher: book.publisher ?? '',
       language: book.language ?? '',
       ddc: book.ddc ?? '',
+      bibLevel: (book.bibLevel ?? 'monograph') as BibLevel,
       description: book.description ?? ''
     });
     setCurrentSection('books');
@@ -3141,6 +3146,7 @@ function App() {
           authorRomanized: editForm.authorRomanized.trim() || null,
           publisherRomanized: editForm.publisherRomanized.trim() || null,
           ddc: editForm.ddc.trim() || null,
+          bibLevel: editForm.bibLevel,
           dateEdtf,
           customFields: customFieldsValue,
           status: editForm.status,
@@ -5099,6 +5105,7 @@ function App() {
       publisher: b.publisher ?? '',
       language: b.language ?? '',
       ddc: b.ddc ?? '',
+      bibLevel: (b.bibLevel ?? 'monograph') as BibLevel,
       description: b.description ?? ''
     });
     setAttributeEditorValues(b.customFields ?? {});
@@ -6046,6 +6053,20 @@ function App() {
                         placeholder={t('library.add.ddcPh')}
                       />
                     </div>
+                    <div>
+                      {/* MARC leader/07. The column has existed since 0024 with
+                          no way to set it, so every record was a monograph and
+                          the ISO 2789 return said the library held no serials. */}
+                      <label htmlFor="fld-detail-biblevel">{t('library.add.bibLevel')}</label>
+                      <select
+                        id="fld-detail-biblevel"
+                        value={editForm.bibLevel}
+                        onChange={(e) => setEditForm({ ...editForm, bibLevel: e.target.value as BibLevel })}
+                      >
+                        <option value="monograph">{t('bibLevel.monograph')}</option>
+                        <option value="serial">{t('bibLevel.serial')}</option>
+                      </select>
+                    </div>
                   </div>
                   <div className="form-field">
                     <label htmlFor="fld-library-add-description">{t('library.add.description')}</label>
@@ -6886,6 +6907,17 @@ function App() {
                             onChange={(e) => setCreateForm({ ...createForm, ddc: e.target.value })}
                             placeholder={t('library.add.ddcPh')}
                           />
+                        </div>
+                        <div>
+                          <label htmlFor="fld-library-add-biblevel">{t('library.add.bibLevel')}</label>
+                          <select
+                            id="fld-library-add-biblevel"
+                            value={createForm.bibLevel}
+                            onChange={(e) => setCreateForm({ ...createForm, bibLevel: e.target.value as BibLevel })}
+                          >
+                            <option value="monograph">{t('bibLevel.monograph')}</option>
+                            <option value="serial">{t('bibLevel.serial')}</option>
+                          </select>
                         </div>
                       </div>
                       <div className="form-field">

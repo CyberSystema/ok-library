@@ -2218,13 +2218,13 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 	await c.env.DB.prepare(
 		`INSERT OR IGNORE INTO books (
 			id, title, author, isbn, publication_year, publication_year_end, date_edtf,
-			publisher, language, description, ddc,
+			publisher, language, description, ddc, bib_level,
 			title_romanized, author_romanized, publisher_romanized,
 			room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 			legacy_id, created_at, updated_at, deleted_at,
 			title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
 			title_romanized_fold, author_romanized_fold, publisher_romanized_fold
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	)
 		.bind(
 			id,
@@ -2238,6 +2238,7 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			payload.language ?? null,
 			payload.description ?? null,
 			payload.ddc ?? null,
+			payload.bibLevel ?? 'monograph',
 			payload.titleRomanized ?? null,
 			payload.authorRomanized ?? null,
 			payload.publisherRomanized ?? null,
@@ -2470,7 +2471,7 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	const updateBookStmt = c.env.DB.prepare(
 		`UPDATE books SET
 			title = ?, author = ?, isbn = ?, publication_year = ?, publication_year_end = ?, date_edtf = ?,
-			publisher = ?, language = ?, description = ?, ddc = ?,
+			publisher = ?, language = ?, description = ?, ddc = ?, bib_level = ?,
 			title_romanized = ?, author_romanized = ?, publisher_romanized = ?,
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 			legacy_id = ?, version = ?, updated_at = ?,
@@ -2489,6 +2490,9 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			merged.language ?? null,
 			merged.description ?? null,
 			merged.ddc ?? null,
+			// `merged` is the stored row overlaid with the payload, so an omitted
+			// bibLevel keeps what is there rather than resetting to monograph.
+			(merged as { bibLevel?: string | null }).bibLevel ?? (existingMap.bib_level as string | null) ?? 'monograph',
 			merged.titleRomanized ?? null,
 			merged.authorRomanized ?? null,
 			merged.publisherRomanized ?? null,
@@ -3197,10 +3201,12 @@ app.get('/api/reports/iso2789', requirePermission('dashboard', { librarian: true
 			`SELECT (SELECT COUNT(*) FROM items WHERE deleted_at IS NULL AND acquisition_date IS NULL) AS noAcquisitionDate,
 			        (SELECT COUNT(*) FROM books WHERE deleted_at IS NULL AND TRIM(COALESCE(language,'')) = '') AS noLanguage,
 			        (SELECT COUNT(*) FROM items WHERE deleted_at IS NULL AND TRIM(COALESCE(item_type,'')) IN ('', 'book')) AS untypedCopies,
+			        (SELECT COUNT(*) FROM books WHERE deleted_at IS NULL AND bib_level <> 'serial'
+			           AND TRIM(COALESCE(json_extract(custom_fields,'$.issn'),'')) <> '') AS issnNotSerial,
 			        (SELECT COUNT(*) FROM borrow_transactions WHERE borrowed_at >= ?1 AND borrowed_at < ?2 AND borrower_id IS NULL) AS anonymousLoans,
 			        (SELECT COUNT(*) FROM books WHERE merged_into IS NOT NULL AND deleted_at >= ?1 AND deleted_at < ?2) AS mergeTombstones`
 		).bind(from, to).first<{
-			noAcquisitionDate: number; noLanguage: number; untypedCopies: number;
+			noAcquisitionDate: number; noLanguage: number; untypedCopies: number; issnNotSerial: number;
 			anonymousLoans: number; mergeTombstones: number;
 		}>()
 	]);
@@ -3225,6 +3231,17 @@ app.get('/api/reports/iso2789', requirePermission('dashboard', { librarian: true
 		caveats.push(
 			`${quality?.untypedCopies} copies are recorded as the default document category 'book'. `
 			+ 'The breakdown by category is only as good as that field.'
+		);
+	}
+	// A serial count of zero is a claim, not an absence of one — the librarian
+	// signs a statutory return with it. Until this release nothing could set
+	// bib_level, so the figure was structurally zero and said so nowhere, while
+	// records carrying an ISSN sat on the shelf. Every other blind spot in this
+	// report earns a caveat; this one had none.
+	if (Number(quality?.issnNotSerial ?? 0) > 0) {
+		caveats.push(
+			`${quality?.issnNotSerial} records carry an ISSN but are catalogued as monographs, so they are `
+			+ 'not in the serial-title count. Set "Kind of publication" to periodical on each one.'
 		);
 	}
 	if (Number(quality?.noLanguage ?? 0) > 0) {
@@ -4990,6 +5007,9 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 			language: f.language ?? null,
 			description: f.description ?? null,
 			ddc: f.ddc ?? null,
+			// Only ever set when leader/07 says serial, so an ordinary record
+			// cannot demote a title the librarian has already marked as one.
+			...(f.bibLevel ? { bibLevel: f.bibLevel } : {}),
 			dateEdtf: edtf,
 			// Derived from dateEdtf by normalizeBookData; declared so the shape
 			// carries them.
@@ -5026,7 +5046,8 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 				const cf = await validateCustomFields(c.env, payload.customFields as Record<string, unknown>);
 				await c.env.DB.prepare(
 					`UPDATE books SET title = ?, author = ?, publisher = ?, language = ?, description = ?,
-					        ddc = COALESCE(?, ddc), date_edtf = COALESCE(?, date_edtf),
+					        ddc = COALESCE(?, ddc), bib_level = COALESCE(?, bib_level),
+					        date_edtf = COALESCE(?, date_edtf),
 					        publication_year = COALESCE(?, publication_year),
 					        publication_year_end = COALESCE(?, publication_year_end),
 					        title_romanized = COALESCE(?, title_romanized),
@@ -5037,7 +5058,8 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 					  WHERE id = ?`
 				).bind(
 					payload.title, payload.author, payload.publisher ?? null, payload.language ?? null,
-					payload.description ?? null, payload.ddc ?? null, payload.dateEdtf ?? null,
+					payload.description ?? null, payload.ddc ?? null,
+					(payload as { bibLevel?: string }).bibLevel ?? null, payload.dateEdtf ?? null,
 					payload.publicationYear ?? null, payload.publicationYearEnd ?? null,
 					payload.titleRomanized ?? null, payload.authorRomanized ?? null, payload.publisherRomanized ?? null,
 					JSON.stringify(cf), now, existing.id
@@ -5061,17 +5083,18 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 				});
 				await c.env.DB.prepare(
 					`INSERT INTO books (id, title, author, isbn, publication_year, publication_year_end, date_edtf,
-					                    publisher, language, description, ddc,
+					                    publisher, language, description, ddc, bib_level,
 					                    title_romanized, author_romanized, publisher_romanized,
 					                    tags, custom_fields, status, version, created_at, updated_at,
 					                    title_fold, author_fold, isbn_fold, publisher_fold, description_fold,
 					                    tags_fold, custom_fields_fold,
 					                    title_romanized_fold, author_romanized_fold, publisher_romanized_fold)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 'available', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 'available', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				).bind(
 					id, payload.title, payload.author, payload.isbn ?? null,
 					payload.publicationYear ?? null, payload.publicationYearEnd ?? null, payload.dateEdtf ?? null,
 					payload.publisher ?? null, payload.language ?? null, payload.description ?? null, payload.ddc ?? null,
+					(payload as { bibLevel?: string }).bibLevel ?? 'monograph',
 					payload.titleRomanized ?? null, payload.authorRomanized ?? null, payload.publisherRomanized ?? null,
 					cfJson, now, now,
 					folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,

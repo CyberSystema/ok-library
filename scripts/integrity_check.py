@@ -1959,6 +1959,69 @@ else:
     # what the exporter can be held to today.
     check("a monograph's 008 leaves date 2 blank", s008[6:15] == "s1975    ", repr(s008[6:15]))
 
+print("=== 49. REGRESSION: a record can say it is a serial ===")
+uniq = uuid.uuid4().hex[:8]
+# migration 0024 added books.bib_level and NOTHING could ever write it: every
+# one of the books-writing statements omitted it and no schema accepted it, so
+# all 12,675 records sat at the default while thirteen carried an ISSN — and the
+# ISO 2789 return the librarian signs reported zero serial titles held.
+sb, _ = mkbook(title=f"ZZITEST Serial {uniq}", author="ZZ Serial", language="EL", publicationYear=1975)
+check("a new record defaults to monograph", get(sb).get("bibLevel") == "monograph", get(sb))
+check("and says so in camelCase, like every other field",
+      "bib_level" not in get(sb) and "set_id" not in get(sb) and "isbn_valid" not in get(sb),
+      [k for k in get(sb) if "_" in k])
+check("the copies do too", all("_" not in k for k in get(sb)["items"][0]), get(sb)["items"][0])
+
+before = get(sb)
+st, _ = call("PUT", f"/api/books/{sb}", {"bibLevel": "serial", "version": before["version"]})
+after = get(sb)
+check("it can be marked a serial", st == 200 and after.get("bibLevel") == "serial", f"{st} {after.get('bibLevel')}")
+# The `.partial()` default-substitution trap: a one-field update must not wipe
+# the rest of the record.
+check("a one-field update leaves the rest alone",
+      after["title"] == before["title"] and after["author"] == before["author"]
+      and after["customFields"] == before["customFields"] and after.get("isbn") == before.get("isbn"),
+      after)
+
+# And the reverse of the trap: an update that says nothing about the level must
+# not quietly return the record to monograph.
+st, _ = call("PUT", f"/api/books/{sb}", {"shelfCode": "ZZ-9", "version": get(sb)["version"]})
+check("an unrelated partial update does not demote a serial",
+      get(sb).get("bibLevel") == "serial" and get(sb).get("shelfCode") == "ZZ-9", get(sb).get("bibLevel"))
+
+st, mj = call("GET", f"/api/books/{sb}/marc?format=json")
+fields = {list(f.keys())[0]: list(f.values())[0] for f in (mj or {}).get("fields", [])}
+leader = (mj or {}).get("leader", "")
+# Every serial-aware branch of the exporter was dead code: parseBook never
+# camelCased bib_level, so marc.ts read `row.bibLevel` and got undefined.
+check("MARC leader/07 says serial", leader[7:8] == "s", repr(leader))
+s008 = fields.get("008") or ""
+check("008/06 codes a continuing resource", s008[6:7] == "c", repr(s008[6:15]))
+# `publicationYearEnd` falls back to the start year on read, which is right for
+# a book and a false claim for a periodical — it coded the title as having
+# ceased in the year it began.
+check("and an open run is 9999, not an invented cessation", s008[11:15] == "9999", repr(s008[6:15]))
+
+# The round trip: leader/07 must survive out and back.
+st, xml = call_text("GET", f"/api/books/{sb}/marc?format=marcxml")
+st, rep = call("POST", "/api/import/marcxml", raw=xml.encode(), ctype="application/xml")
+check("re-importing a serial keeps it a serial", get(sb).get("bibLevel") == "serial", get(sb).get("bibLevel"))
+# An ordinary record must never DEMOTE a title the librarian marked as a serial.
+plain = xml.replace("00000nas", "00000nam")
+st, rep = call("POST", "/api/import/marcxml", raw=plain.encode(), ctype="application/xml")
+check("and a monograph-level record does not demote it",
+      get(sb).get("bibLevel") == "serial", get(sb).get("bibLevel"))
+
+# The report must name its own blind spot rather than publishing a structural
+# zero as a measurement.
+st, rep = call("GET", "/api/reports/iso2789")
+check("the serial count sees it", (rep or {}).get("collection", {}).get("serialTitles", 0) >= 1,
+      (rep or {}).get("collection", {}).get("serialTitles"))
+issn_book, _ = mkbook(title=f"ZZITEST Issn {uniq}", author="ZZ Serial", customFields={"issn": "2093-6494"})
+st, rep = call("GET", "/api/reports/iso2789")
+check("and an ISSN catalogued as a monograph earns a caveat",
+      any("ISSN" in c for c in (rep or {}).get("caveats", [])), (rep or {}).get("caveats"))
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look
