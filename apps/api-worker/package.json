@@ -11,12 +11,12 @@
   },
   "dependencies": {
     "@ok-library/shared": "0.1.0",
-    "hono": "^4.6.10",
+    "hono": "^4.13.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260716.1",
     "typescript": "^7.0.2",
-    "wrangler": "^4.111.0"
+    "wrangler": "^4.120.1"
   }
 }

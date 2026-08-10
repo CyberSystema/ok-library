@@ -21,7 +21,7 @@
     "check:handbook": "node scripts/check_handbook.mjs"
   },
   "devDependencies": {
-    "wrangler": "^4.111.0",
+    "wrangler": "^4.120.1",
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   }
 }
