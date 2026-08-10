@@ -36,6 +36,7 @@ import type {
 } from './types';
 import { OnboardingCourse } from './onboarding';
 import { AuthoritiesCard, BookAuthorities } from './screens/authorities';
+import { BorrowersCard } from './screens/borrowers';
 import { CopiesEditor } from './screens/copies';
 import { SerialHoldingsEditor, type SerialHolding } from './screens/serials';
 import { LibraryIdentityCard } from './screens/identity';
@@ -7679,6 +7680,11 @@ function App() {
                     <p>{t('loans.description')}</p>
                   </div>
                 </div>
+
+                {/* Readers. Lives in Circulation rather than Settings because it
+                    is desk work — and because the category set here is what the
+                    loan rules resolve on. */}
+                <BorrowersCard canWrite={canSeeCirculation} canAdmin={isAdmin || can('setup')} />
 
                 {/* Scan — the desk's fastest path to a copy. A handheld scanner
                     types the code and presses Enter, so this is the whole UI. */}

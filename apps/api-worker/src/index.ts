@@ -8243,7 +8243,12 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 
 app.get('/api/borrowers', requirePermission('circulation', { librarian: true }), async (c) => {
 	const q = (c.req.query('q') ?? '').trim();
-	const limit = Math.max(1, Math.min(50, Number(c.req.query('limit') ?? 20)));
+	// `Number('abc')` is NaN and Math.min/max propagate it, so ?limit=abc bound
+	// NaN as the SQL LIMIT and came back as a 500.
+	const rawLimit = Number(c.req.query('limit') ?? 25);
+	const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(100, Math.trunc(rawLimit))) : 25;
+	const rawPage = Number(c.req.query('page') ?? 1);
+	const page = Number.isFinite(rawPage) ? Math.max(1, Math.trunc(rawPage)) : 1;
 	const params: unknown[] = [];
 	let where = '';
 	if (q) {
@@ -8269,14 +8274,23 @@ app.get('/api/borrowers', requirePermission('circulation', { librarian: true }),
 		 ) c ON c.borrower_id = b.id
 		 ${where}
 		 ORDER BY total_loans DESC, LOWER(b.name) ASC
-		 LIMIT ?`
-	).bind(nowIso(), ...params, limit).all<{
+		 LIMIT ? OFFSET ?`
+	).bind(nowIso(), ...params, limit, (page - 1) * limit).all<{
 		id: string; name: string; contact: string | null; notes: string | null; category: string | null;
 		created_at: string; updated_at: string;
 		total_loans: number; open_loans: number; overdue_loans: number;
 	}>();
 
+	// A total, so a screen can page. There was no offset and a hard cap of 50, so
+	// a list built on this endpoint could not reach borrower 51 of 101.
+	const counted = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM borrowers b ${where}`
+	).bind(...params).first<{ n: number }>();
+
 	return c.json({
+		total: Number(counted?.n ?? 0),
+		page,
+		pageSize: limit,
 		items: (rows.results ?? []).map((r) => ({
 			id: r.id,
 			name: r.name,
@@ -8292,11 +8306,54 @@ app.get('/api/borrowers', requirePermission('circulation', { librarian: true }),
 	});
 });
 
+// Registered BEFORE /api/borrowers/:id. Hono matches in registration order, so
+// declaring the param route first swallows every literal path under the same
+// prefix: this endpoint sat 167 lines further down and every request for it
+// resolved to the by-id handler with id='export.csv', answering
+// 404 "Borrower not found". It had no caller either, so nothing noticed.
+app.get('/api/borrowers/export.csv', requirePermission('circulation', { librarian: true }), async (c) => {
+	const rows = await c.env.DB.prepare(
+		`SELECT b.id, b.name, b.contact, b.notes, b.category, b.created_at, b.updated_at,
+		        COUNT(bt.id) AS total_loans,
+		        SUM(CASE WHEN bt.returned_at IS NULL THEN 1 ELSE 0 END) AS open_loans,
+		        SUM(CASE WHEN bt.returned_at IS NULL AND bt.due_at < ? THEN 1 ELSE 0 END) AS overdue_loans
+		   FROM borrowers b
+		   LEFT JOIN borrow_transactions bt ON bt.borrower_id = b.id
+		  GROUP BY b.id
+		  ORDER BY total_loans DESC, LOWER(b.name) ASC`
+	).bind(nowIso()).all<{
+		id: string; name: string; contact: string | null; notes: string | null; category: string | null;
+		created_at: string; updated_at: string;
+		total_loans: number; open_loans: number; overdue_loans: number;
+	}>();
+
+	const csv = toCsv(
+		(rows.results ?? []).map((r) => ({
+			ID: r.id,
+			Name: r.name,
+			Contact: r.contact ?? '',
+			Notes: r.notes ?? '',
+			Category: r.category ?? 'standard',
+			'Total loans': Number(r.total_loans ?? 0),
+			'Open loans': Number(r.open_loans ?? 0),
+			'Overdue loans': Number(r.overdue_loans ?? 0),
+			'Created at': r.created_at,
+			'Updated at': r.updated_at
+		})),
+		['ID', 'Name', 'Contact', 'Notes', 'Category', 'Total loans', 'Open loans', 'Overdue loans', 'Created at', 'Updated at']
+	);
+
+	c.header('Content-Type', 'text/csv; charset=utf-8');
+	c.header('Content-Disposition', 'attachment; filename="borrowers.csv"');
+	// UTF-8 BOM so Excel renders non-Latin borrower names correctly (see books.csv).
+	return c.body('﻿' + csv);
+});
+
 app.get('/api/borrowers/:id', requirePermission('circulation', { librarian: true }), async (c) => {
 	const id = c.req.param('id');
 	const row = await c.env.DB.prepare('SELECT * FROM borrowers WHERE id = ? LIMIT 1').bind(id).first<{
 		id: string; name: string; contact: string | null; notes: string | null;
-		created_at: string; updated_at: string;
+		category: string | null; created_at: string; updated_at: string;
 	}>();
 	if (!row) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
@@ -8315,6 +8372,11 @@ app.get('/api/borrowers/:id', requirePermission('circulation', { librarian: true
 		name: row.name,
 		contact: row.contact,
 		notes: row.notes,
+		// The column the loan policy resolves on. `SELECT *` read it and the
+		// response object then dropped it, so the natural backing for a profile
+		// screen could not show — or round-trip — the one field that matters to
+		// how long this reader may keep a book.
+		category: row.category ?? 'standard',
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,
 		loans: (loans.results ?? []).map((r) => {
@@ -8359,7 +8421,11 @@ app.put('/api/borrowers/:id', requirePermission('circulation', { librarian: true
 	return c.json({ id });
 });
 
-app.delete('/api/borrowers/:id', requirePermission('circulation'), async (c) => {
+// `{ librarian: true }` like the other seven borrower routes. Equivalent today
+// only because role_permissions happens to grant librarian/circulation; an admin
+// who revoked that would have made DELETING a borrower more permissive than
+// reading one.
+app.delete('/api/borrowers/:id', requirePermission('circulation', { librarian: true }), async (c) => {
 	const id = c.req.param('id') ?? '';
 	// Refuse if the borrower has any historical loans — better to mark inactive
 	// than orphan transaction history. Frontend can suggest the rename flow.
@@ -8383,11 +8449,13 @@ app.delete('/api/borrowers/:id', requirePermission('circulation'), async (c) => 
 // the privacy-sensitive surface area.
 app.get('/api/borrowers/:id/export', requirePermission('setup'), async (c) => {
 	const id = c.req.param('id') ?? '';
+	// `category` is personal data held about the subject and drives what they may
+	// borrow, so a subject-access request that withheld it was incomplete.
 	const borrower = await c.env.DB.prepare(
-		'SELECT id, name, contact, notes, created_at, updated_at FROM borrowers WHERE id = ? LIMIT 1'
+		'SELECT id, name, contact, notes, category, created_at, updated_at FROM borrowers WHERE id = ? LIMIT 1'
 	).bind(id).first<{
 		id: string; name: string; contact: string | null; notes: string | null;
-		created_at: string; updated_at: string;
+		category: string | null; created_at: string; updated_at: string;
 	}>();
 	if (!borrower) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
@@ -8403,6 +8471,14 @@ app.get('/api/borrowers/:id/export', requirePermission('setup'), async (c) => {
 		borrowed_at: string; due_at: string; returned_at: string | null; notes: string | null;
 	}>();
 
+	// Holds are personal data too — a queue position is a record of what this
+	// reader asked for — and they were absent from the export entirely.
+	const holds = await c.env.DB.prepare(
+		`SELECT h.id, h.book_id, b.title, h.status, h.placed_at, h.expires_at, h.closed_at, h.notes
+		   FROM holds h LEFT JOIN books b ON b.id = h.book_id
+		  WHERE h.borrower_id = ? ORDER BY h.placed_at ASC`
+	).bind(id).all<Record<string, unknown>>();
+
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.export', 'borrower', id, {});
 
 	const filename = `borrower-${id}.json`;
@@ -8415,6 +8491,7 @@ app.get('/api/borrowers/:id/export', requirePermission('setup'), async (c) => {
 			name: borrower.name,
 			contact: borrower.contact,
 			notes: borrower.notes,
+			category: borrower.category ?? 'standard',
 			createdAt: borrower.created_at,
 			updatedAt: borrower.updated_at
 		},
@@ -8426,6 +8503,16 @@ app.get('/api/borrowers/:id/export', requirePermission('setup'), async (c) => {
 			borrowedAt: r.borrowed_at,
 			dueAt: r.due_at,
 			returnedAt: r.returned_at,
+			notes: r.notes
+		})),
+		holds: (holds.results ?? []).map((r) => ({
+			id: r.id,
+			bookId: r.book_id,
+			title: r.title,
+			status: r.status,
+			placedAt: r.placed_at,
+			expiresAt: r.expires_at,
+			closedAt: r.closed_at,
 			notes: r.notes
 		}))
 	}, null, 2));
@@ -8439,8 +8526,18 @@ app.get('/api/borrowers/:id/export', requirePermission('setup'), async (c) => {
 app.post('/api/borrowers/:id/erase', requirePermission('setup'), async (c) => {
 	const id = c.req.param('id') ?? '';
 	const sentinel = `[Erased ${id.slice(0, 8)}]`;
+	// Read the identifying values BEFORE overwriting them. Some rows carry a
+	// denormalized name with no borrower_id at all — the mobile app and the
+	// offline sync push both create them — so a sweep on the id alone cannot
+	// reach every copy of the name.
+	const subject = await c.env.DB.prepare('SELECT name, contact FROM borrowers WHERE id = ? LIMIT 1')
+		.bind(id).first<{ name: string; contact: string | null }>();
+	if (!subject) throw new HTTPException(404, { message: 'Borrower not found' });
+	const priorName = subject.name;
+	const priorContact = subject.contact;
+
 	const result = await c.env.DB.prepare(
-		`UPDATE borrowers SET name = ?, contact = NULL, notes = NULL, updated_at = ? WHERE id = ?`
+		`UPDATE borrowers SET name = ?, contact = NULL, notes = NULL, category = 'standard', updated_at = ? WHERE id = ?`
 	).bind(sentinel, nowIso(), id).run();
 	if ((result.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
@@ -8450,52 +8547,56 @@ app.post('/api/borrowers/:id/erase', requirePermission('setup'), async (c) => {
 	// `borrowers` row therefore erased nothing that mattered — the name and
 	// phone number stayed readable in loan history, exports, and the overdue
 	// list. Anonymize the snapshots and the free-text notes on both sides.
-	await c.env.DB.prepare(
-		`UPDATE borrow_transactions
-		 SET borrower_name = ?, borrower_contact = NULL, notes = NULL, return_notes = NULL, updated_at = ?
-		 WHERE borrower_id = ?`
-	).bind(sentinel, nowIso(), id).run();
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [
+		c.env.DB.prepare(
+			`UPDATE borrow_transactions
+			 SET borrower_name = ?, borrower_contact = NULL, notes = NULL, return_notes = NULL, updated_at = ?
+			 WHERE borrower_id = ?`
+		).bind(sentinel, now, id),
+		// `holds` keeps the same denormalized snapshot, and migration 0029 says so
+		// explicitly — the queue has to read correctly after an erase. The erase
+		// then never touched the table, so a reader erased while a hold was still
+		// waiting or ready kept their name AND phone number on public display in
+		// the Circulation tab's hold list. The leak was by construction.
+		c.env.DB.prepare(
+			`UPDATE holds
+			 SET borrower_name = ?, borrower_contact = NULL, notes = NULL, updated_at = ?
+			 WHERE borrower_id = ?`
+		).bind(sentinel, now, id),
+		// And the rows that carry the name with no id.
+		c.env.DB.prepare(
+			`UPDATE borrow_transactions
+			 SET borrower_name = ?, borrower_contact = NULL, notes = NULL, return_notes = NULL, updated_at = ?
+			 WHERE borrower_id IS NULL AND borrower_name = ?`
+		).bind(sentinel, now, priorName),
+		c.env.DB.prepare(
+			`UPDATE holds
+			 SET borrower_name = ?, borrower_contact = NULL, notes = NULL, updated_at = ?
+			 WHERE borrower_id IS NULL AND borrower_name = ?`
+		).bind(sentinel, now, priorName),
+		// The audit log is a record of what STAFF did, not of the data subject, but
+		// two entries embed the reader's name in their metadata: 'book.borrow' and
+		// the 'holdFilledFor' on 'book.return'. An erasure that leaves the name
+		// legible in a table the Settings tab renders has not erased it.
+		c.env.DB.prepare(
+			`UPDATE audit_logs
+			 SET metadata = REPLACE(metadata, ?, ?)
+			 WHERE metadata LIKE ?`
+		).bind(priorName, sentinel, `%${priorName}%`)
+	];
+	if (priorContact && priorContact.trim()) {
+		statements.push(
+			c.env.DB.prepare(
+				`UPDATE audit_logs SET metadata = REPLACE(metadata, ?, '') WHERE metadata LIKE ?`
+			).bind(priorContact, `%${priorContact}%`)
+		);
+	}
+	await runAtomic(c.env, statements);
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.erase', 'borrower', id, {});
 	return c.json({ id, anonymizedName: sentinel });
 });
 
-app.get('/api/borrowers/export.csv', requirePermission('circulation', { librarian: true }), async (c) => {
-	const rows = await c.env.DB.prepare(
-		`SELECT b.id, b.name, b.contact, b.notes, b.category, b.created_at, b.updated_at,
-		        COUNT(bt.id) AS total_loans,
-		        SUM(CASE WHEN bt.returned_at IS NULL THEN 1 ELSE 0 END) AS open_loans,
-		        SUM(CASE WHEN bt.returned_at IS NULL AND bt.due_at < ? THEN 1 ELSE 0 END) AS overdue_loans
-		   FROM borrowers b
-		   LEFT JOIN borrow_transactions bt ON bt.borrower_id = b.id
-		  GROUP BY b.id
-		  ORDER BY total_loans DESC, LOWER(b.name) ASC`
-	).bind(nowIso()).all<{
-		id: string; name: string; contact: string | null; notes: string | null; category: string | null;
-		created_at: string; updated_at: string;
-		total_loans: number; open_loans: number; overdue_loans: number;
-	}>();
-
-	const csv = toCsv(
-		(rows.results ?? []).map((r) => ({
-			ID: r.id,
-			Name: r.name,
-			Contact: r.contact ?? '',
-			Notes: r.notes ?? '',
-			Category: r.category ?? 'standard',
-			'Total loans': Number(r.total_loans ?? 0),
-			'Open loans': Number(r.open_loans ?? 0),
-			'Overdue loans': Number(r.overdue_loans ?? 0),
-			'Created at': r.created_at,
-			'Updated at': r.updated_at
-		})),
-		['ID', 'Name', 'Contact', 'Notes', 'Category', 'Total loans', 'Open loans', 'Overdue loans', 'Created at', 'Updated at']
-	);
-
-	c.header('Content-Type', 'text/csv; charset=utf-8');
-	c.header('Content-Disposition', 'attachment; filename="borrowers.csv"');
-	// UTF-8 BOM so Excel renders non-Latin borrower names correctly (see books.csv).
-	return c.body('﻿' + csv);
-});
 
 // Maintenance endpoint: orphan cleanup. Sweeps:
 //   • code_assignments / book_attribute_values whose book row is gone

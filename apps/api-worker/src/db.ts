@@ -881,7 +881,31 @@ export async function expireStaleHolds(env: Env, now: string): Promise<number> {
     `UPDATE holds SET status = 'expired', closed_at = ?, updated_at = ?
       WHERE status = 'ready' AND expires_at IS NOT NULL AND expires_at < ?`
   ).bind(now, now, now).run();
-  return res.meta?.changes ?? 0;
+  const expired = res.meta?.changes ?? 0;
+  // Expiring a hold frees the copy it was pinning, and the queue behind it has
+  // to move. This used to stop at the expiry, so the second reader waited for a
+  // return that had already happened: the copy sat on the hold shelf marked
+  // available, and nothing promoted the next 'waiting' hold until someone
+  // borrowed and returned the book again.
+  //
+  // Promotion is deliberately just 'waiting' -> 'ready' with no expiry set here.
+  // The pickup clock belongs to the desk — it starts when the copy is put aside
+  // for a named reader, which is what `fillNextHold` does on a real return, and
+  // this sweep runs on any read of the queue.
+  if (expired > 0) {
+    await env.DB.prepare(
+      `UPDATE holds SET status = 'ready', updated_at = ?
+        WHERE id IN (
+          SELECT h.id FROM holds h
+           WHERE h.status = 'waiting'
+             AND h.book_id IN (SELECT book_id FROM holds WHERE status = 'expired' AND closed_at = ?)
+             AND NOT EXISTS (SELECT 1 FROM holds r WHERE r.book_id = h.book_id AND r.status = 'ready')
+           ORDER BY h.placed_at ASC, h.rowid ASC
+           LIMIT 1
+        )`
+    ).bind(now, now).run();
+  }
+  return expired;
 }
 
 /** How many copies of a record could be lent right now. Drives the UI's "2 of 3 available". */

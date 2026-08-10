@@ -2398,6 +2398,112 @@ check("retiring a heading unlinks the books that used it", len(links["links"]) =
 st, gone = call("GET", f"/api/authorities/{aid}")
 check("and the heading is gone", st == 404, st)
 
+print("=== 53. REGRESSION: readers, their category, and erasure that erases ===")
+uniq = uuid.uuid4().hex[:8]
+
+# Hono matches in registration order, so a `:id` route declared first swallows
+# every literal path under the prefix. This one sat 167 lines below /:id, so every
+# request for it answered 404 "Borrower not found" — and it had no caller, so
+# nothing noticed. Third instance of this fault in the codebase.
+st, csv_body = call_text("GET", "/api/borrowers/export.csv")
+check("the borrower CSV export is not shadowed by /:id",
+      st == 200 and "Name" in csv_body.split("\n")[0], f"{st} {csv_body[:80]}")
+
+# Number('abc') is NaN, Math.min/max propagate it, and NaN bound as a SQL LIMIT
+# is a 500 rather than a 400.
+st, r = call("GET", "/api/borrowers?limit=abc")
+check("a non-numeric limit does not 500", st == 200, st)
+st, r = call("GET", "/api/borrowers?limit=5&page=1")
+check("the list reports a total so a screen can page",
+      st == 200 and isinstance((r or {}).get("total"), int) and (r or {}).get("page") == 1, r and list(r)[:4])
+if (r or {}).get("total", 0) > 5:
+    st, p2 = call("GET", "/api/borrowers?limit=5&page=2")
+    first = {x["id"] for x in (r or {}).get("items", [])}
+    second = {x["id"] for x in (p2 or {}).get("items", [])}
+    check("and page 2 is a different page", first and second and not (first & second),
+          f"{len(first)} vs {len(second)}, overlap {len(first & second)}")
+
+# `category` is the axis a loan policy resolves on, and `resolveBorrower` — the
+# only path that ever created a borrower in practice — omits it from its INSERT.
+# So every reader took the 'standard' default, the (category x item type) matrix
+# could only ever match the '*' fallback, and half the policy engine was dead.
+st, br = call("POST", "/api/borrowers", {
+    "name": f"ΖΖ Φοιτητής {uniq}", "contact": "+30 210 1234567",
+    "category": f"zzstudent{uniq[:4]}", "notes": "ZZ note"})
+brid = (br or {}).get("id")
+check("a reader can be created with a category", st == 201 and brid, f"{st} {br}")
+USERS.append(("borrower", brid))
+st, one = call("GET", f"/api/borrowers/{brid}")
+# SELECT * read the column and the response object dropped it, so the natural
+# backing for a profile screen could not show the one field that decides how long
+# this reader may keep a book.
+check("the single-reader endpoint returns the category",
+      one.get("category") == f"zzstudent{uniq[:4]}", one)
+st, _ = call("PUT", f"/api/borrowers/{brid}", {"name": f"ΖΖ Φοιτητής {uniq}", "category": "zzstaff"})
+check("and it can be changed", call("GET", f"/api/borrowers/{brid}")[1].get("category") == "zzstaff",
+      call("GET", f"/api/borrowers/{brid}")[1].get("category"))
+
+# The end of the chain: a category-specific rule must actually win over the
+# fallback. Nothing asserted this because nothing could set a category.
+st, pol = call("GET", "/api/loan-policies")
+existing = [{k: v for k, v in p.items() if k != "id"} for p in (pol or {}).get("policies", [])]
+st, r = call("PUT", "/api/loan-policies", {"policies": existing + [
+    {"borrowerCategory": "zzstaff", "itemType": "*", "loanDays": 90,
+     "renewalLimit": 5, "renewalDays": None, "maxConcurrentLoans": None,
+     "lendable": True, "notes": "ZZ staff rule"}]})
+if st == 200:
+    lb, _ = mkbook(title=f"ZZITEST Policy {uniq}", author="ZZ")
+    st, loan = call("POST", f"/api/books/{lb}/borrow", {"borrowerId": brid})
+    if st in (200, 201):
+        due = (loan or {}).get("dueAt") or (loan or {}).get("expectedDueAt") or ""
+        days = None
+        if due:
+            d = datetime.datetime.fromisoformat(due.replace("Z", "+00:00"))
+            days = (d - datetime.datetime.now(datetime.timezone.utc)).days
+        check("a category-specific loan rule beats the fallback",
+              days is not None and days >= 85, f"{days} days from {due}")
+        call("POST", f"/api/books/{lb}/return", {})
+    else:
+        check("a category-specific loan rule beats the fallback", False, f"could not lend: {st} {loan}")
+    # put the policy table back
+    call("PUT", "/api/loan-policies", {"policies": existing})
+else:
+    check("a category-specific loan rule beats the fallback", False, f"policy write refused: {st} {r}")
+
+# GDPR. The export withheld the category (personal data held about the subject)
+# and omitted holds entirely (a queue position is a record of what they asked for).
+hb, _ = mkbook(title=f"ZZITEST Hold GDPR {uniq}", author="ZZ")
+st, h = call("POST", f"/api/books/{hb}/holds", {"borrowerId": brid})
+check("a hold can be placed for them", st in (200, 201), f"{st} {h}")
+st, exported = call("GET", f"/api/borrowers/{brid}/export")
+check("the subject-access export includes the category",
+      (exported or {}).get("borrower", {}).get("category") == "zzstaff", (exported or {}).get("borrower"))
+check("and the holds they placed", len((exported or {}).get("holds", [])) >= 1, (exported or {}).get("holds"))
+
+# Erasure. `holds` carries the same denormalized name and contact that
+# borrow_transactions does — migration 0029 says so explicitly, because the queue
+# has to read correctly after an erase — and the erase never touched the table. A
+# reader erased while a hold was waiting kept their name AND phone number on
+# display in the Circulation tab.
+st, erased = call("POST", f"/api/borrowers/{brid}/erase")
+sentinel = (erased or {}).get("anonymizedName")
+check("erasure reports the placeholder it used", st == 200 and sentinel, f"{st} {erased}")
+st, holds = call("GET", "/api/holds")
+mine = [x for x in (holds or {}).get("items", []) if x.get("bookId") == hb]
+check("the hold queue no longer names them",
+      mine and mine[0].get("borrowerName") == sentinel and not mine[0].get("borrowerContact"), mine)
+st, one = call("GET", f"/api/borrowers/{brid}")
+check("the reader row is anonymized", one.get("name") == sentinel and not one.get("contact"), one)
+check("and the category is reset — it is personal data too", one.get("category") == "standard", one.get("category"))
+if LOCAL:
+    left = local_sql(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE metadata LIKE '%ΖΖ Φοιτητής " + uniq + "%'")
+    check("and the activity log stops naming them",
+          int((left or [{}])[0].get("n") or 0) == 0, left)
+else:
+    print("  SKIP  1 audit-log sweep check needs direct D1 access (local runs only)")
+call("DELETE", f"/api/holds/{(h or {}).get('id')}") if (h or {}).get("id") else None
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look
