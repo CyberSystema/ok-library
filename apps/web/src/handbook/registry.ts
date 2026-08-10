@@ -36,6 +36,15 @@ export const CHAPTER_IDS = [
   'periodical-runs',
   'withdrawal',
   'trash-and-merge',
+  // Exchange and housekeeping
+  'library-identity',
+  'marc-exchange',
+  'sharing',
+  'spreadsheets',
+  'readers-and-loans',
+  'statistics',
+  'data-protection',
+  'daily-work',
   // Reference
   'glossary'
 ] as const;
@@ -50,6 +59,34 @@ export type ChapterId = (typeof CHAPTER_IDS)[number];
  * difference between "this anchor is not written yet" and "this anchor is a typo".
  */
 export const ANCHOR_OWNERS = {
+  // library-identity
+  'isil': 'library-identity',
+  'identity-fields': 'library-identity',
+  // marc-exchange
+  'sending-records': 'marc-exchange',
+  'receiving-records': 'marc-exchange',
+  'dry-run': 'marc-exchange',
+  // sharing
+  'turning-sharing-on': 'sharing',
+  'harvesting': 'sharing',
+  // spreadsheets
+  'spreadsheet-import': 'spreadsheets',
+  'backup': 'spreadsheets',
+  // readers-and-loans
+  'readers': 'readers-and-loans',
+  'reader-categories': 'readers-and-loans',
+  'lending': 'readers-and-loans',
+  'renewals-and-holds': 'readers-and-loans',
+  // statistics
+  'iso-2789': 'statistics',
+  'report-caveats': 'statistics',
+  // data-protection
+  'subject-access': 'data-protection',
+  'erasure': 'data-protection',
+  // daily-work
+  'correcting-the-import': 'daily-work',
+  'new-acquisitions': 'daily-work',
+  'shelf-reconciliation': 'daily-work',
   // copies-and-shelves
   'adding-a-copy': 'copies-and-shelves',
   'copy-order': 'copies-and-shelves',

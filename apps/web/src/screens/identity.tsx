@@ -14,6 +14,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { apiRequest } from '../api';
 import { useT } from '../i18n';
 import { useConfirm, useToast } from '../ui';
+import { HelpLink } from '../handbook/context';
 
 /** The six keys `PUT /api/library-settings` will accept. Anything else is dropped server-side. */
 type Settings = {
@@ -113,7 +114,10 @@ export function LibraryIdentityCard({ canEdit }: { canEdit: boolean }) {
 
   return (
     <div className="card">
-      <h3>{t('identity.heading')}</h3>
+      <h3>
+        {t('identity.heading')}
+        <HelpLink anchor="isil" label={t('handbook.helpAbout', { field: t('identity.heading') })} />
+      </h3>
       <p className="muted small" style={{ marginBottom: '1rem' }}>{t('identity.intro')}</p>
 
       <div className="form-row">

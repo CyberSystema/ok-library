@@ -8,10 +8,11 @@
 //
 // The consequence was not cosmetic. `resolveBorrower`, the only path that ever
 // created a borrower in practice, omits `category` from its INSERT, so every
-// reader took the 'standard' default and nothing could change it: all 101
-// borrowers were 'standard', the (category × item type) matrix could only ever
-// match the '*' fallback row, and half of Phase D's policy engine was dead. The
-// category control here is what turns it on.
+// reader took the 'standard' default and nothing could change it. Every borrower
+// in the development database was 'standard'; the (category × item type) matrix
+// could only ever match the '*' fallback row, and half of Phase D's policy engine
+// was dead. The category control here is what turns it on. (Production has no
+// readers at all yet, so this is a capability waiting rather than a repair.)
 //
 // The GDPR pair is admin-only (`setup`), which is why it is a separate block: a
 // librarian runs the desk, an administrator answers a data-subject request.
@@ -19,6 +20,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { apiRequest } from '../api';
 import { useT } from '../i18n';
 import { Dialog, fmt, useConfirm, useToast } from '../ui';
+import { HelpLink } from '../handbook/context';
 
 export type Borrower = {
   id: string;
@@ -207,9 +209,15 @@ export function BorrowersCard({ canWrite, canAdmin }: { canWrite: boolean; canAd
 
   return (
     <div className="card">
-      <h3>👤 {t('borrowers.heading')}</h3>
+      <h3>
+        👤 {t('borrowers.heading')}
+        <HelpLink anchor="readers" label={t('handbook.helpAbout', { field: t('borrowers.heading') })} />
+      </h3>
       <p className="muted small" style={{ marginBottom: '0.5rem' }}>{t('borrowers.intro')}</p>
-      <p className="muted small callout">{t('borrowers.categoryNote')}</p>
+      <p className="muted small callout">
+        {t('borrowers.categoryNote')}
+        <HelpLink anchor="reader-categories" label={t('handbook.helpAbout', { field: t('borrowers.category') })} />
+      </p>
 
       <div className="form-row" style={{ marginTop: '0.75rem' }}>
         <div>
@@ -315,6 +323,7 @@ export function BorrowersCard({ canWrite, canAdmin }: { canWrite: boolean; canAd
                 purpose — the loan-rules table is free text too — but offered as a
                 list so the two sides of the matrix are typed the same way. */}
             <label htmlFor="bor-f-category">{t('borrowers.category')}</label>
+            <HelpLink anchor="reader-categories" label={t('handbook.helpAbout', { field: t('borrowers.category') })} />
             <input id="bor-f-category" list="bor-categories" value={form.category}
               onChange={(e) => setForm({ ...form, category: e.target.value })} />
             <datalist id="bor-categories">

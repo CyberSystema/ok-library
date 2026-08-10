@@ -8,9 +8,11 @@
 // Two directions, and they are not symmetrical:
 //   · OUT is a download of the whole catalogue. It is the format you hand to a
 //     union catalogue, a national library, or a system you are migrating to.
-//   · IN is matched on ISBN and then on title+author, so a re-import updates
-//     rather than duplicates. The dry run is the point: it reports exactly what
-//     WOULD happen and writes nothing.
+//   · IN is matched on ISBN ALONE, so a record with no ISBN always arrives as a
+//     new one — which matters here, where only 602 of 12,675 records have one.
+//     The dry run is the point: it reports exactly what WOULD happen and writes
+//     nothing, so the new-versus-updated split tells you whether the matching is
+//     working before anything is committed.
 //
 // The harvesting endpoints are shown rather than called: SRU and OAI-PMH exist
 // so that a peer library's software fetches from us on its own schedule. What
@@ -18,6 +20,7 @@
 import React, { useState } from 'react';
 import { API_BASE, apiBlob, apiRequest, joinApiUrl } from '../api';
 import { useT } from '../i18n';
+import { HelpLink } from '../handbook/context';
 import { useToast } from '../ui';
 
 type ImportReport = {
@@ -103,7 +106,10 @@ export function MarcIoCard({ canExport, canImport }: { canExport: boolean; canIm
 
   return (
     <div className="card">
-      <h3>🌍 {t('marc.heading')}</h3>
+      <h3>
+        🌍 {t('marc.heading')}
+        <HelpLink anchor="sending-records" label={t('handbook.helpAbout', { field: t('marc.heading') })} />
+      </h3>
       <p className="muted small" style={{ marginBottom: '1.25rem' }}>{t('marc.intro')}</p>
 
       {canExport && (
@@ -124,7 +130,10 @@ export function MarcIoCard({ canExport, canImport }: { canExport: boolean; canIm
       {canImport && (
         <>
           <h4 className="subhead">{t('marc.importHeading')}</h4>
-          <p className="muted small">{t('marc.importIntro')}</p>
+          <p className="muted small">
+            {t('marc.importIntro')}
+            <HelpLink anchor="dry-run" label={t('handbook.helpAbout', { field: t('marc.importHeading') })} />
+          </p>
           <form onSubmit={runImport} className="simple-form">
             <div className="import-dropzone">
               <p style={{ fontSize: '2.25rem', marginBottom: '0.5rem' }}>🌍</p>
@@ -172,7 +181,10 @@ export function MarcIoCard({ canExport, canImport }: { canExport: boolean; canIm
       )}
 
       <h4 className="subhead">{t('marc.harvestHeading')}</h4>
-      <p className="muted small">{t('marc.harvestIntro')}</p>
+      <p className="muted small">
+        {t('marc.harvestIntro')}
+        <HelpLink anchor="harvesting" label={t('handbook.helpAbout', { field: t('marc.harvestHeading') })} />
+      </p>
       <ul className="plain-list">
         <li className="endpoint-row">
           <div>

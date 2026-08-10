@@ -943,6 +943,305 @@ const pack: ContentPack = {
     ]
   },
 
+  'library-identity': {
+    id: 'library-identity',
+    title: 'The library’s own record',
+    summary:
+      'Before this catalogue can talk to another one, it has to be able to say who it is.',
+    blocks: [
+      { kind: 'h', text: 'The ISIL', anchor: 'isil' },
+      { kind: 'p', text:
+        'Every library that exchanges records has a standard identifier — an ISIL, which looks like a country code and a local part: GR-AT001. It is what appears on a record to say where it came from, and it is what a partner library uses to say “this record is theirs, not ours”.' },
+      { kind: 'fields', rows: [
+        { fact: 'isil', note: 'Appears on every exported record, and on every copy as the holding institution.' }
+      ] },
+      { kind: 'p', text:
+        'This library has not got one recorded. Until it does, records exported from here are anonymous: a library receiving them can read the description and cannot tell who holds the book.' },
+      { kind: 'steps', items: [
+        'An ISIL is assigned by a national agency, which in Greece is the National Library.',
+        'Ask them for one, giving the library’s official name and address.',
+        'When it arrives, enter it in the library identity card in Settings.'
+      ] },
+      { kind: 'tip', text:
+        'Everything else in this catalogue works without an ISIL. Only exchange needs it — so this is a letter to write, not a blocker.' },
+
+      { kind: 'h', text: 'Name, place and catalogue language', anchor: 'identity-fields' },
+      { kind: 'p', text:
+        'Three more fields, all of them for the outside world: the library’s name as it should appear to others, where it is, and which language this catalogue is kept in. A harvester asks for all three when it first connects.' },
+      { kind: 'rule', text:
+        'Nothing may be shared until the name and the ISIL are filled in. Publishing anonymous records to a harvester is worse than not publishing: they cannot be attributed and they cannot be withdrawn.' },
+      { kind: 'see', chapter: 'sharing', anchor: 'turning-sharing-on', text:
+        'What turning sharing on actually does, and why it is hard to undo.' }
+    ]
+  },
+
+  'marc-exchange': {
+    id: 'marc-exchange',
+    title: 'Sending and receiving records',
+    summary:
+      'The standard format libraries use to hand each other records, and the dry run that stops it going wrong.',
+    blocks: [
+      { kind: 'h', text: 'Sending records out', anchor: 'sending-records' },
+      { kind: 'p', text:
+        'The export produces the whole catalogue as MARCXML, which is what almost every library system in the world can read. This is the file you send when a union catalogue, a national library or a system you are migrating to asks for your records.' },
+      { kind: 'p', text:
+        'The same button also offers MARC-in-JSON, which is the same data in a form some software prefers. Neither is a backup: for that, use the spreadsheet export, which round-trips back into this catalogue.' },
+      { kind: 'see', chapter: 'spreadsheets', anchor: 'backup', text: 'What to keep as a backup, and why it is the other file.' },
+      { kind: 'auto', text:
+        'The punctuation other libraries expect — the ISBD colons and slashes — is added on the way out. The romanized forms are paired with the Greek automatically. Language codes are converted to the three-letter standard. None of that is typed by hand.' },
+
+      { kind: 'h', text: 'Receiving records', anchor: 'receiving-records' },
+      { kind: 'p', text:
+        'A MARCXML file from another library imports directly, and it is the cheapest cataloguing available: a record that another library has already described arrives described, often with subject headings and a Dewey number this catalogue does not have.' },
+      { kind: 'rule', text:
+        'Records are matched on ISBN. A record with no ISBN always arrives as a NEW record, even if the library already holds the book — so importing a file of pre-1970 material twice creates duplicates.' },
+      { kind: 'p', text:
+        'That is worth reading twice, because only 602 of the records here have an ISBN. For most of this collection the matching cannot work, and the import will add rather than update.' },
+      { kind: 'see', chapter: 'trash-and-merge', anchor: 'merging-duplicates', text:
+        'If it does duplicate something, this is the way back.' },
+
+      { kind: 'h', text: 'Always run the test first', anchor: 'dry-run' },
+      { kind: 'p', text:
+        'The import has a test mode that reads the whole file, reports exactly what it would do, and writes nothing. It is on by default and there is no good reason to turn it off before you have read the report.' },
+      { kind: 'steps', items: [
+        'Choose the file and leave “test first” ticked.',
+        'Read the report: how many records, how many would be new, how many would update, how many would be skipped and why.',
+        'If the new-versus-updated split is not what you expected, stop. That is the file telling you the matching is not working the way you assumed.',
+        'Untick the test and run it again.'
+      ] },
+      { kind: 'tip', text:
+        'A file of a few thousand records at a time. Larger than that and the import cannot finish inside one request, so split it.' }
+    ]
+  },
+
+  sharing: {
+    id: 'sharing',
+    title: 'Letting others search this catalogue',
+    summary:
+      'Two standard services that let a partner library fetch from here on their own schedule.',
+    blocks: [
+      { kind: 'h', text: 'Turning sharing on', anchor: 'turning-sharing-on' },
+      { kind: 'p', text:
+        'Sharing is off. While it is off, the two services below answer every request with a refusal, and nothing about this catalogue is visible to anyone without a password.' },
+      { kind: 'rule', text:
+        'Turning sharing on is easy to do and hard to undo. Once a harvester has taken a copy of these records, that copy exists on their side; switching sharing off later stops new requests and does not recall what has already gone.' },
+      { kind: 'p', text:
+        'So the decision is not technical. It is whether this library wants its holdings publicly searchable — which for most theological libraries is a straightforward yes, and is the point of cataloguing to a standard in the first place, but it is the library’s decision and not the cataloguer’s.' },
+      { kind: 'auto', text:
+        'Only bibliographic data is ever served. Readers, loans, holds and staff accounts are not reachable through either service, and the gate that enforces that is tested.' },
+
+      { kind: 'h', text: 'What the two services are', anchor: 'harvesting' },
+      { kind: 'p', text:
+        'SRU answers a search: a partner library sends a query and gets matching records back, live. OAI-PMH answers “give me everything you have changed since this date”, which is how a union catalogue keeps a copy of your holdings up to date without asking you to send anything.' },
+      { kind: 'list', items: [
+        'SRU — search and retrieve, one query at a time. Records come back as MARCXML or Dublin Core.',
+        'OAI-PMH — bulk harvesting, incremental. The same two formats.'
+      ] },
+      { kind: 'p', text:
+        'Both addresses are shown on the exchange card, ready to be given to whoever asks. Handing over the address is the whole of the work: their software does the rest on its own schedule, and there is nothing to send by hand ever again.' },
+      { kind: 'see', chapter: 'library-identity', anchor: 'isil', text:
+        'Neither service will start until the library has a name and an ISIL.' }
+    ]
+  },
+
+  spreadsheets: {
+    id: 'spreadsheets',
+    title: 'Spreadsheets and backups',
+    summary:
+      'The everyday route in and out, and the file to keep somewhere else.',
+    blocks: [
+      { kind: 'h', text: 'Importing a spreadsheet', anchor: 'spreadsheet-import' },
+      { kind: 'p', text:
+        'This whole catalogue arrived as a spreadsheet, and the importer is still the fastest way to add a large batch — a donation, a shelf someone inventoried on a laptop, a list from another institution.' },
+      { kind: 'p', text:
+        'Re-running the same sheet updates the records it created rather than duplicating them, because the importer remembers the row identifier each record came from. That makes correcting a bad import a matter of fixing the sheet and running it again.' },
+      { kind: 'rule', text:
+        'Run the test first, here as with MARC. The report tells you how many rows would be created and how many updated, and those two numbers are how you find out whether the identifiers are matching.' },
+
+      { kind: 'h', text: 'Backups', anchor: 'backup' },
+      { kind: 'p', text:
+        'The spreadsheet export is this library’s off-site backup, and it is deliberately the fullest file the system produces: every field, every attribute the library added, the tags, the status, the room, the acquisition date, the identifiers. A MARC export is smaller and cannot carry the attributes.' },
+      { kind: 'steps', items: [
+        'Export the collection as a spreadsheet.',
+        'Put it somewhere that is not this computer and not this building.',
+        'Do it on a schedule you will actually keep. Monthly, done, beats daily, intended.'
+      ] },
+      { kind: 'tip', text:
+        'A backup you have never restored is a hope rather than a backup. Once, on a copy, import the export into an empty catalogue and see that the count matches.' }
+    ]
+  },
+
+  'readers-and-loans': {
+    id: 'readers-and-loans',
+    title: 'Readers and lending',
+    summary:
+      'Who may borrow what, for how long. Nothing has been lent from this catalogue yet, so this describes a system waiting to be used.',
+    blocks: [
+      { kind: 'p', text:
+        'There are no readers and no loans in this catalogue — not one, ever. That is worth saying at the top, because it means everything below is a description of how lending will work rather than of how it has been working, and the first few weeks of real use will teach more than this chapter can.' },
+
+      { kind: 'h', text: 'Readers', anchor: 'readers' },
+      { kind: 'p', text:
+        'A reader is created automatically the first time you lend to them: type the name at the desk and the record appears. What that does not give them is a contact, a note, or a category — those are added afterwards from the readers card.' },
+      { kind: 'tip', text:
+        'Adding a contact is worth the ten seconds. It is the difference between an overdue list you can act on and one you can only look at.' },
+
+      { kind: 'h', text: 'Categories, and why they matter', anchor: 'reader-categories' },
+      { kind: 'p', text:
+        'The category is what decides the loan rules that apply: how many days, how many renewals, how many books at once. A member of the brotherhood, a visiting scholar and a student are not the same case, and the category is how the difference is expressed once instead of remembered at the desk every time.' },
+      { kind: 'fields', rows: [
+        { fact: 'isil', note: 'Unrelated — but the same principle: one setting, applied everywhere, rather than a decision repeated.' }
+      ] },
+      { kind: 'rule', text:
+        'The category on the reader must match the category in the loan rule EXACTLY. They are free text on both sides, so “student” and “Student” are two categories and one of them has no rule.' },
+      { kind: 'steps', items: [
+        'Decide the handful of categories this library actually needs. Three or four is usually plenty.',
+        'Write a loan rule for each, in Loan rules.',
+        'Set the category on each reader as you meet them, not in one sitting.'
+      ] },
+      { kind: 'auto', text:
+        'A reader whose category has no matching rule falls back to the general rule rather than being refused. So a missing rule is a silent default, not an error — which is why the two lists are worth comparing occasionally.' },
+
+      { kind: 'h', text: 'Lending and returning', anchor: 'lending' },
+      { kind: 'p', text:
+        'A loan is against a COPY, not a record: the system records which physical volume went out, which is what makes “where is our second copy” answerable while the first one is on loan.' },
+      { kind: 'p', text:
+        'The due date is worked out from the rules rather than typed. If you type one, you are overriding a decision the library already made, which is occasionally right and usually a sign the rule needs changing instead.' },
+      { kind: 'see', chapter: 'barcodes', anchor: 'why-barcodes', text:
+        'With barcodes, lending is a scan. Without them it is a search, which is where the time goes.' },
+
+      { kind: 'h', text: 'Renewals and holds', anchor: 'renewals-and-holds' },
+      { kind: 'p', text:
+        'A renewal extends a loan, up to the limit the rule sets. A hold is a reader’s place in a queue for a title whose copies are all out — the queue is on the title, and a copy is assigned to the first person waiting when one comes back.' },
+      { kind: 'list', items: [
+        'A copy on the hold shelf cannot be lent to anyone else, and cannot be withdrawn.',
+        'A hold that is not collected expires, and the next reader in the queue is promoted.',
+        'A reader who already has the book on loan cannot also queue for it.'
+      ] },
+      { kind: 'rule', text:
+        'A copy that is on loan cannot be removed from a record. Take it back first — otherwise the loan is stranded and the record of who has the book is gone.' }
+    ]
+  },
+
+  statistics: {
+    id: 'statistics',
+    title: 'Statistics',
+    summary:
+      'The annual figures, and — just as important — what the report says it cannot tell you.',
+    blocks: [
+      { kind: 'h', text: 'The standard return', anchor: 'iso-2789' },
+      { kind: 'p', text:
+        'ISO 2789 is the international standard for library statistics, and the report produces its figures directly: titles and volumes held, serial titles, the breakdown by document category and by language, additions and withdrawals in a period, loans, and registered users.' },
+      { kind: 'p', text:
+        'It exists so that the figures a library reports are comparable with other libraries’ and with its own from five years ago. Counting “books” a different way each year produces a series of numbers that cannot be compared with anything.' },
+      { kind: 'tip', text:
+        'Export it as a spreadsheet at the end of each year and keep it. The report is computed from the current state of the catalogue, so it tells you about now — last year’s figures are only preserved if you saved them.' },
+
+      { kind: 'h', text: 'Read the caveats', anchor: 'report-caveats' },
+      { kind: 'p', text:
+        'The report lists what it cannot tell you, in plain sentences, underneath the figures. That list is the most useful part of it, because a figure with an unstated gap is worse than no figure — it gets signed and filed.' },
+      { kind: 'list', items: [
+        'No copy has an acquisition date, so nothing can be reported as an addition in a period. Everything is stock held at the baseline.',
+        'Every copy is recorded as the default document category, so the breakdown by category says only that.',
+        'Thirteen records carry an ISSN and are catalogued as monographs, so the serial count does not include them.',
+        'Records folded together by the duplicate tool are excluded from withdrawals — they are duplicate records, not stock that left the building.',
+        'The language breakdown legitimately sums to more than the number of titles, because a bilingual record is counted under each of its languages.'
+      ] },
+      { kind: 'rule', text:
+        'Every one of those caveats is a piece of cataloguing waiting to be done. When the caveat disappears, the figure has become true.' },
+      { kind: 'see', chapter: 'identifiers', anchor: 'issn', text:
+        'The serial caveat is a thirteen-record job that makes a statutory return correct.' }
+    ]
+  },
+
+  'data-protection': {
+    id: 'data-protection',
+    title: 'Readers’ personal data',
+    summary:
+      'A reader’s name, contact and borrowing history are personal data. Two obligations follow, and the catalogue can meet both.',
+    blocks: [
+      { kind: 'p', text:
+        'A borrowing record says what a named person has been reading. That is sensitive in a way a book record is not, and in Greece it is governed by the GDPR. Two rights matter in practice: the right to be given a copy of what you hold about someone, and the right to have it erased.' },
+      { kind: 'rule', text:
+        'Both actions are restricted to an administrator. A librarian runs the desk; answering a data-subject request is a different job with different consequences.' },
+
+      { kind: 'h', text: 'When someone asks what you hold', anchor: 'subject-access' },
+      { kind: 'p', text:
+        'The export produces a single file with everything held about that reader: the reader record, every loan with its dates, and every hold they placed. Give them the file.' },
+      { kind: 'steps', items: [
+        'Find the reader in the readers card.',
+        'Press “Export their data”. A file downloads.',
+        'Send it to them. Keep a note of the date you did.'
+      ] },
+      { kind: 'p', text:
+        'The action is recorded in the activity log, which is what lets the library show it responded.' },
+
+      { kind: 'h', text: 'When someone asks to be erased', anchor: 'erasure' },
+      { kind: 'p', text:
+        'Erasure replaces the reader’s name with a placeholder everywhere it appears — the reader record, every loan, every hold in the queue, and the activity log — and clears their contact and any notes. What survives is the shape of the borrowing without the person: the loan counts remain as anonymous statistics.' },
+      { kind: 'compare', good: 'Erase the reader. The loan history survives as anonymous figures, and the annual statistics stay correct.',
+        bad: 'Delete the reader. The loan records go with them.',
+        why: 'Erasure satisfies the request and keeps the library’s figures. Deleting satisfies the request and quietly changes how many loans the library reports having made.' },
+      { kind: 'rule', text:
+        'Erasure cannot be undone. There is no copy of the name kept anywhere afterwards — that is the point of it.' },
+      { kind: 'tip', text:
+        'Do not erase a reader who still has a book out. Take the book back first; afterwards there is no name to chase it with.' }
+    ]
+  },
+
+  'daily-work': {
+    id: 'daily-work',
+    title: 'The work of a week',
+    summary:
+      'Three jobs make up almost everything a librarian does here. This is what each of them looks like.',
+    blocks: [
+      { kind: 'p', text:
+        'This catalogue was imported rather than typed, which shapes the work: most of it is not cataloguing new books but repairing the description of books already recorded. That is less glamorous than it sounds and more valuable — every correction makes a search that was failing start working.' },
+
+      { kind: 'h', text: 'Correcting the import', anchor: 'correcting-the-import' },
+      { kind: 'p', text:
+        'The largest job, and the one with the clearest finish line, because the smart lists count it down for you. Work a list rather than a shelf: twenty bad ISBNs is a session, and it is over when the list is empty.' },
+      { kind: 'steps', items: [
+        'Pick one list — bad ISBNs, no shelf mark, needs review.',
+        'Work down it with the book in hand where you need it.',
+        'Stop when the list is empty or the session is over, whichever comes first. The list remembers.'
+      ] },
+      { kind: 'p', text:
+        'Then the duplicates. Matching on folded title and author finds 379 groups covering 1,001 records, of which up to 622 could be removed — but that number is an upper bound and not a target. Two printings of one work match exactly the same way, and merging those loses a date. Every group needs a human look.' },
+      { kind: 'see', chapter: 'trash-and-merge', anchor: 'merging-duplicates', text:
+        'What merging does, and the case that looks identical and is not.' },
+
+      { kind: 'h', text: 'New acquisitions', anchor: 'new-acquisitions' },
+      { kind: 'steps', items: [
+        'Check first whether the library already holds it. Search the title with near-miss matching OFF, so a fuzzy match cannot look like a hit.',
+        'If it is already there, this is a second copy, not a new record. Add the copy.',
+        'If it is not, and it has an ISBN, try the lookup — it fills what it can and leaves the Greek alone.',
+        'Fill the title, author, publisher, place and date from the title page. Take the suggestions the fields offer.',
+        'Give the copy a shelf mark, and a barcode if the library is using them.'
+      ] },
+      { kind: 'rule', text:
+        'The check for an existing record comes first, before anything is typed. It is the only step that cannot be done afterwards.' },
+      { kind: 'see', chapter: 'searching', anchor: 'partial-and-fuzzy', text:
+        'Why near-miss matching is the wrong setting for this particular search.' },
+
+      { kind: 'h', text: 'Reconciling a shelf', anchor: 'shelf-reconciliation' },
+      { kind: 'p', text:
+        'Standing at the shelf, counting what is there, and comparing it with what the catalogue claims. This is the check that finds everything the other two miss: a book on the wrong shelf, a book present and uncatalogued, a record for a book that is gone.' },
+      { kind: 'steps', items: [
+        'Choose a shelf in the location browser. It shows how many volumes the catalogue puts there.',
+        'Count the shelf.',
+        'If the numbers agree, move on. Most will.',
+        'If they do not, open the list and go through it against the books.'
+      ] },
+      { kind: 'rule', text:
+        'The number in the browser and the number of books in the list it opens are the same number. If they ever differ, that is a fault in the software and worth reporting rather than working around.' },
+      { kind: 'p', text:
+        'Forty-four copies are on a back shelf, which is the usual place a second copy ends up. When you find one, check whether it is recorded as a second copy of the front-shelf record or as its own record — the second is the commonest single error in this catalogue.' },
+      { kind: 'see', chapter: 'what-a-catalogue-is-for', anchor: 'record-vs-copy', text:
+        'Why that one matters more than it looks.' }
+    ]
+  },
+
   glossary: {
     id: 'glossary',
     title: 'Glossary',
