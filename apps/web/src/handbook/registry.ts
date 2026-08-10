@@ -212,11 +212,11 @@ export const CHAPTER_ORDER: readonly ChapterId[] = CHAPTER_IDS;
 export const CONTENT_LOADERS = {
   en: () => import('./content/en'),
   el: () => import('./content/el'),
-  ru: () => import('./content/en'),
+  ru: () => import('./content/ru'),
   ko: () => import('./content/en')
 } as const;
 
 export type ContentLang = keyof typeof CONTENT_LOADERS;
 
 /** Languages with a pack of their own, as opposed to falling back to English. */
-export const TRANSLATED_LANGS: readonly ContentLang[] = ['en', 'el'];
+export const TRANSLATED_LANGS: readonly ContentLang[] = ['en', 'el', 'ru'];

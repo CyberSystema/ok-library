@@ -150,6 +150,28 @@ if (packs.includes('en.ts')) {
   if (missing.length) fail('chapters in the registry with no English text', missing);
 }
 
+// (3b) A language listed as TRANSLATED must actually be complete.
+//
+// `TRANSLATED_LANGS` is a claim, and the runtime uses it to decide whether to stop
+// fetching the English fallback. A language listed there with chapters missing
+// would show a reader blank pages where English used to appear — the claim has to
+// be checked rather than trusted.
+const translated = (/TRANSLATED_LANGS[^=]*=\s*\[([^\]]*)\]/.exec(registry)?.[1] ?? '')
+  .split(',').map((v) => v.trim().replace(/['"]/g, '')).filter(Boolean);
+for (const lang of translated) {
+  const file = join(contentDir, `${lang}.ts`);
+  if (!existsSync(file)) {
+    fail(`registry lists '${lang}' as translated, but content/${lang}.ts does not exist`);
+    continue;
+  }
+  const src = read(file);
+  const missing = chapterIds.filter((id) => !new RegExp(`^ {2}'?${id}'?:\\s*\\{$`, 'm').test(src));
+  if (missing.length) {
+    fail(`registry lists '${lang}' as translated, but ${missing.length} chapter(s) are missing`, missing);
+  }
+}
+console.log(`  complete languages: ${translated.join(', ')}`);
+
 // ── (4) the packs must be LAZY ──────────────────────────────────────────────
 // Two checks, because the obvious one is not enough. "The prose is in its own
 // chunk" proves nothing: a static import leaves the chunk separate and merely
