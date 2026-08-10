@@ -2768,6 +2768,16 @@ mark.hl {
   max-width: 46rem;
 }
 
+/* A short "use this, not that" note. Two tools solve one librarian problem in
+   opposite directions, so the distinction has to be visible at the point of use
+   rather than only in the Handbook. */
+.callout {
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid var(--accent);
+  background: var(--surface-2, var(--bg));
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
 /* The 866 statement the librarian's entry will produce, shown as they type. */
 .holdings-preview {
   margin-top: 0.5rem;

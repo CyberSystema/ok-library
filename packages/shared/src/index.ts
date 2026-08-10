@@ -426,6 +426,18 @@ export const UpsertAuthoritySchema = z.object({
   variants: z.array(z.string().min(1).max(300)).max(50).default([])
 });
 
+// Turn approved category labels into subject headings, in one action.
+//
+// `GET /api/authorities/subject-candidates` has always been preview-only, and
+// deliberately so: which of the 628 labels the librarian wrote are real headings
+// is their judgement. But there was no POST to accept the ones they approved, so
+// the only way to act on the preview was 628 individual creates.
+export const SeedSubjectsSchema = z.object({
+  labels: z.array(z.string().min(1).max(300)).min(1).max(500),
+  /** Link every book carrying the label to the heading it becomes. */
+  link: z.boolean().default(true)
+});
+
 export const LinkAuthoritiesSchema = z.object({
   links: z.array(z.object({
     authorityId: z.string().min(1),

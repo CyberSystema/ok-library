@@ -7,6 +7,7 @@ import {
 	GenerateCodeSchema,
 	ReplaceItemsSchema,
 	ReplaceSerialHoldingsSchema,
+	SeedSubjectsSchema,
 	formatHoldingStatement,
 	computeSetGaps,
 	LinkAuthoritiesSchema,
@@ -1742,6 +1743,174 @@ app.get('/api/authorities/subject-candidates', requirePermission('books.write', 
 	});
 });
 
+// Accept the candidates the librarian approved.
+//
+// The preview above is deliberately read-only, because which labels are real
+// headings is a judgement call. What was missing was any way to act on that
+// judgement short of 628 separate creates. Existing headings are skipped rather
+// than duplicated, and — since the label is already on the books — each new
+// heading is linked to every book carrying it, which is the whole reason the
+// category labels are a good seed in the first place.
+app.post('/api/authorities/seed-subjects', requirePermission('books.write', { librarian: true }), async (c) => {
+	const payload = SeedSubjectsSchema.parse(await c.req.json());
+	const now = nowIso();
+
+	const existing = await c.env.DB.prepare(
+		"SELECT preferred_form_fold AS f, id FROM authorities WHERE kind = 'subject' AND deleted_at IS NULL"
+	).all<{ f: string; id: string }>();
+	const known = new Map((existing.results ?? []).map((r) => [r.f, r.id]));
+
+	let created = 0;
+	let skipped = 0;
+	let linked = 0;
+	const statements: D1PreparedStatement[] = [];
+
+	for (const raw of payload.labels) {
+		const label = raw.trim();
+		if (!label) { skipped += 1; continue; }
+		const fold = foldDiacritics(label);
+		if (known.has(fold)) { skipped += 1; continue; }
+		const id = newId('auth');
+		known.set(fold, id);
+		created += 1;
+		statements.push(
+			c.env.DB.prepare(
+				`INSERT INTO authorities (id, kind, preferred_form, preferred_form_romanized, preferred_form_fold,
+				                          source, viaf_id, lc_id, isni, dates, notes, created_at, updated_at)
+				 VALUES (?, 'subject', ?, NULL, ?, 'local', NULL, NULL, NULL, NULL, ?, ?, ?)`
+			).bind(id, label, fold, 'Seeded from the catalogue’s own category labels.', now, now)
+		);
+		if (payload.link) {
+			// 'sub' is this catalogue's marker for a subject heading in the relator
+			// list, and 650 is what it exports as.
+			statements.push(
+				c.env.DB.prepare(
+					`INSERT OR IGNORE INTO book_authorities (book_id, authority_id, role, seq, created_at)
+					 SELECT id, ?, 'sub', 0, ?
+					   FROM books
+					  WHERE deleted_at IS NULL
+					    AND TRIM(COALESCE(CAST(json_extract(custom_fields, '$.category_label') AS TEXT), '')) = ?`
+				).bind(id, now, label)
+			);
+			linked += 1;
+		}
+	}
+
+	if (statements.length > 0) await runAtomic(c.env, statements);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'authority.seedSubjects', 'authority', null, {
+		requested: payload.labels.length, created, skipped, linked
+	});
+	return c.json({ created, skipped, linked });
+});
+
+// Registered AFTER /api/authorities/subject-candidates on purpose. Hono matches
+// in registration order, so a `:id` route declared first swallows every literal
+// path under the same prefix — the same fault that made
+// /api/books/merge-candidates and /api/borrowers/export.csv unreachable.
+// One heading, with its variants and what points at it.
+//
+// The list endpoint's `q` is a PREFIX match and returns no variants, so there
+// was no way to fetch a known heading at all — which is also why there was no
+// way to edit one.
+app.get('/api/authorities/:id', async (c) => {
+	const id = c.req.param('id') ?? '';
+	const row = await c.env.DB.prepare(
+		'SELECT * FROM authorities WHERE id = ? AND deleted_at IS NULL'
+	).bind(id).first<Record<string, unknown>>();
+	if (!row) throw new HTTPException(404, { message: 'Authority not found' });
+
+	const [variants, links] = await Promise.all([
+		c.env.DB.prepare('SELECT id, form FROM authority_variants WHERE authority_id = ? ORDER BY form ASC')
+			.bind(id).all<{ id: string; form: string }>(),
+		c.env.DB.prepare(
+			`SELECT ba.role, b.id, b.title, b.author
+			   FROM book_authorities ba JOIN books b ON b.id = ba.book_id
+			  WHERE ba.authority_id = ? AND b.deleted_at IS NULL
+			  ORDER BY b.title ASC LIMIT 100`
+		).bind(id).all<Record<string, unknown>>()
+	]);
+
+	return c.json({
+		id: row.id,
+		kind: row.kind,
+		preferredForm: row.preferred_form,
+		preferredFormRomanized: row.preferred_form_romanized,
+		source: row.source,
+		viafId: row.viaf_id,
+		lcId: row.lc_id,
+		isni: row.isni,
+		dates: row.dates,
+		notes: row.notes,
+		variants: (variants.results ?? []).map((v) => v.form),
+		// Capped at 100: this is "what would I break by editing this?", not a
+		// browse. Subject browse is a separate, unbuilt thing.
+		usedBy: (links.results ?? []).map((r) => ({ id: r.id, title: r.title, author: r.author, role: r.role })),
+		useCount: (links.results ?? []).length
+	});
+});
+
+// Correct a heading in place.
+//
+// There was no update path of any kind: the only UPDATE on the table was the
+// soft-delete, and DELETE hard-deletes every link. So fixing one typo in a
+// preferred form meant destroying the heading and every book that pointed at it,
+// then re-linking each by hand. For a controlled vocabulary — whose entire value
+// is that the record is long-lived and pointed at — that made the feature
+// unusable past the first mistake.
+app.put('/api/authorities/:id', requirePermission('books.write', { librarian: true }), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const existing = await c.env.DB.prepare(
+		'SELECT id, kind FROM authorities WHERE id = ? AND deleted_at IS NULL'
+	).bind(id).first<{ id: string; kind: string }>();
+	if (!existing) throw new HTTPException(404, { message: 'Authority not found' });
+
+	const payload = UpsertAuthoritySchema.parse(await c.req.json());
+	const preferred = payload.preferredForm.trim();
+	if (!preferred) throw new HTTPException(400, { message: 'A preferred form is required' });
+
+	// Same uniqueness rule the create path enforces, minus this row: two headings
+	// for one person is the problem the table exists to solve.
+	const clash = await c.env.DB.prepare(
+		`SELECT id FROM authorities
+		  WHERE kind = ? AND preferred_form_fold = ? AND deleted_at IS NULL AND id <> ? LIMIT 1`
+	).bind(payload.kind, foldDiacritics(preferred), id).first<{ id: string }>();
+	if (clash) throw new HTTPException(409, { message: 'Another authority already has that preferred form' });
+
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [
+		c.env.DB.prepare(
+			`UPDATE authorities SET kind = ?, preferred_form = ?, preferred_form_romanized = ?,
+			        preferred_form_fold = ?, source = ?, viaf_id = ?, lc_id = ?, isni = ?,
+			        dates = ?, notes = ?, updated_at = ?
+			  WHERE id = ?`
+		).bind(
+			payload.kind, preferred, payload.preferredFormRomanized ?? null, foldDiacritics(preferred),
+			payload.source, payload.viafId ?? null, payload.lcId ?? null, payload.isni ?? null,
+			payload.dates ?? null, payload.notes ?? null, now, id
+		),
+		// Variants are a set, not a history, so replace them wholesale. The links
+		// in `book_authorities` are untouched — that is the whole point of being
+		// able to edit rather than delete and recreate.
+		c.env.DB.prepare('DELETE FROM authority_variants WHERE authority_id = ?').bind(id)
+	];
+	for (const variant of payload.variants) {
+		const form = variant.trim();
+		if (!form || foldDiacritics(form) === foldDiacritics(preferred)) continue;
+		statements.push(
+			c.env.DB.prepare(
+				'INSERT INTO authority_variants (id, authority_id, form, form_fold, created_at) VALUES (?, ?, ?, ?, ?)'
+			).bind(newId('avar'), id, form, foldDiacritics(form), now)
+		);
+	}
+	await runAtomic(c.env, statements);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'authority.update', 'authority', id, {
+		kind: payload.kind, preferredForm: preferred, variants: payload.variants.length
+	});
+	return c.json({ id });
+});
+
 // ─── Multi-part works: which volume is missing? ───────────────────────────
 //
 // "Μπορώ να κάνω έλεγχο … έπειτα να ψάξω ποιο βιβλίο λείπει" — the same
@@ -2742,6 +2911,11 @@ app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) 
 		c.env.DB.prepare('DELETE FROM borrow_transactions WHERE book_id = ?').bind(id),
 		// Before the book row: items hold an FK to it, and purge is a hard delete.
 		c.env.DB.prepare('DELETE FROM bound_with_items WHERE book_id = ?').bind(id),
+		// The authority links. This route names every child table explicitly
+		// rather than trusting a declared cascade, and this one was missed — so a
+		// purged record left rows in `book_authorities` pointing at an id that no
+		// longer exists, which then inflated every heading's use count.
+		c.env.DB.prepare('DELETE FROM book_authorities WHERE book_id = ?').bind(id),
 		c.env.DB.prepare('DELETE FROM items WHERE book_id = ?').bind(id),
 		// A record that absorbed a merge is pointed at by its tombstones, and
 		// `merged_into` is a real foreign key — without this the DELETE below
@@ -5103,6 +5277,58 @@ app.delete('/api/custom-fields/:id', requirePermission('customFields.manage', { 
  * the same contract the XLSX import has via `legacy_id`. A record with no ISBN
  * always inserts, because there is nothing to match it on.
  */
+/**
+ * Attach the subject headings a MARC record carried.
+ *
+ * `marcToBookFields` has always parsed every 650$a, with the thesaurus correctly
+ * derived from ind2, and the import loop then never looked at the result — so the
+ * single richest source of subject headings available to this library, records
+ * sent by another library that already carry LCSH, arrived with no subjects at
+ * all and left 628 headings to be typed by hand.
+ *
+ * Headings are matched on the folded preferred form so a heading that differs
+ * only in accents or case is reused rather than duplicated, and existing links
+ * are left alone: this adds, never replaces, so a heading a librarian attached
+ * by hand survives a re-import.
+ */
+async function linkImportedSubjects(
+	env: Env,
+	bookId: string,
+	terms: Array<{ term: string; source: string }> | undefined
+): Promise<void> {
+	if (!terms || terms.length === 0) return;
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [];
+	let seq = 0;
+	for (const { term, source } of terms) {
+		const form = term.trim();
+		if (!form) continue;
+		const fold = foldDiacritics(form);
+		const existing = await env.DB.prepare(
+			"SELECT id FROM authorities WHERE kind = 'subject' AND preferred_form_fold = ? AND deleted_at IS NULL LIMIT 1"
+		).bind(fold).first<{ id: string }>();
+		let authorityId = existing?.id;
+		if (!authorityId) {
+			authorityId = newId('auth');
+			statements.push(
+				env.DB.prepare(
+					`INSERT INTO authorities (id, kind, preferred_form, preferred_form_romanized, preferred_form_fold,
+					                          source, viaf_id, lc_id, isni, dates, notes, created_at, updated_at)
+					 VALUES (?, 'subject', ?, NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, ?, ?)`
+				).bind(authorityId, form, fold, source === 'lcsh' ? 'lcsh' : 'imported', now, now)
+			);
+		}
+		statements.push(
+			env.DB.prepare(
+				`INSERT OR IGNORE INTO book_authorities (book_id, authority_id, role, seq, created_at)
+				 VALUES (?, ?, 'sub', ?, ?)`
+			).bind(bookId, authorityId, seq, now)
+		);
+		seq += 1;
+	}
+	if (statements.length > 0) await runAtomic(env, statements);
+}
+
 app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 	const dryRun = c.req.query('dryRun') === '1';
 	const xml = await c.req.text();
@@ -5208,6 +5434,10 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 				// location onto the primary copy, and this payload carries none —
 				// re-importing would blank the shelf the librarian assigned. MARC
 				// 852 holdings import is its own job.
+				// Also on an update: a partner library that added headings since the
+				// last send should have them land here too. Nothing is removed —
+				// this ADDS, so a heading the librarian attached by hand survives.
+				await linkImportedSubjects(c.env, existing.id, f.subjectTerms);
 				updated += 1;
 			} else {
 				const id = crypto.randomUUID();
@@ -5244,6 +5474,7 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 				// A new record needs a copy to exist at all, or it is invisible to
 				// every location filter. Unshelved until someone places it.
 				await ensurePrimaryItem(c.env, id, {});
+				await linkImportedSubjects(c.env, id, f.subjectTerms);
 				created += 1;
 			}
 		} catch (error) {

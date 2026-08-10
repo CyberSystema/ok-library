@@ -2256,6 +2256,148 @@ if LOCAL:
 else:
     print("  SKIP  2 cascade checks need direct D1 access (local runs only)")
 
+print("=== 52. REGRESSION: a heading can be corrected without losing its links ===")
+uniq = uuid.uuid4().hex[:8]
+# Migration 0025 built three tables and six endpoints, and there was no UPDATE of
+# any kind: the only UPDATE on `authorities` was the soft-delete, and DELETE
+# hard-deletes every link. So fixing one typo in a preferred form meant destroying
+# the heading and every book pointing at it. For a controlled vocabulary — whose
+# whole value is that the record is long-lived and pointed at — that made the
+# feature unusable past the first mistake.
+st, a = call("POST", "/api/authorities", {
+    "kind": "person", "preferredForm": f"ΖΖ Επιφάνιοσ {uniq}", "dates": "315-403",
+    "source": "local", "variants": [f"Epiphanius ZZ {uniq}"]})
+aid = (a or {}).get("id")
+check("a heading can be created", st == 201 and aid, f"{st} {a}")
+
+# There was no GET for one heading either — the list endpoint is a PREFIX match
+# and returns no variants, so a known heading could not be fetched at all.
+st, one = call("GET", f"/api/authorities/{aid}")
+check("one heading can be read back", st == 200 and one.get("preferredForm") == f"ΖΖ Επιφάνιοσ {uniq}", f"{st} {one}")
+check("with its variants", one.get("variants") == [f"Epiphanius ZZ {uniq}"], one.get("variants"))
+check("and what points at it", one.get("usedBy") == [], one.get("usedBy"))
+
+ab, _ = mkbook(title=f"ZZITEST Authority {uniq}", author="ΖΖ Επιφάνιοσ")
+st, _ = call("PUT", f"/api/books/{ab}/authorities", {"links": [{"authorityId": aid, "role": "aut"}]})
+st, links = call("GET", f"/api/books/{ab}/authorities")
+check("a book can be linked to it", st == 200 and len(links["links"]) == 1, links)
+
+# The typo. Correcting it must keep the link.
+st, r = call("PUT", f"/api/authorities/{aid}", {
+    "kind": "person", "preferredForm": f"ΖΖ Επιφάνιος {uniq}", "dates": "315-403",
+    "source": "local", "variants": [f"Epiphanius ZZ {uniq}", f"Ἐπιφάνιος ΖΖ {uniq}"]})
+check("a heading can be corrected in place", st == 200, f"{st} {r}")
+st, links = call("GET", f"/api/books/{ab}/authorities")
+check("and the book still points at it",
+      len(links["links"]) == 1 and links["links"][0]["preferredForm"] == f"ΖΖ Επιφάνιος {uniq}", links)
+st, one = call("GET", f"/api/authorities/{aid}")
+check("variants are replaced wholesale, not appended", len(one["variants"]) == 2, one["variants"])
+check("and the use count sees the link", one.get("useCount") == 1, one.get("useCount"))
+
+# Searching by a VARIANT is the whole reason variants are stored.
+st, found = call("GET", f"/api/authorities?kind=person&q={urllib.parse.quote(f'Epiphanius ZZ {uniq}')}")
+check("a heading is findable by any of its variants",
+      any(x["id"] == aid for x in (found or {}).get("items", [])), found)
+
+# One preferred form per kind, on update as well as create.
+st, b2 = call("POST", "/api/authorities",
+              {"kind": "person", "preferredForm": f"ΖΖ Άλλος {uniq}", "source": "local", "variants": []})
+st, r = call("PUT", f"/api/authorities/{b2['id']}",
+             {"kind": "person", "preferredForm": f"ΖΖ Επιφάνιος {uniq}", "source": "local", "variants": []})
+check("an update cannot collide with another heading", st == 409, f"{st} {r}")
+call("DELETE", f"/api/authorities/{b2['id']}")
+
+# The literal route must not be swallowed by /:id. Two earlier instances of this
+# exact fault shipped (/api/books/merge-candidates, /api/borrowers/export.csv).
+st, cands = call("GET", "/api/authorities/subject-candidates?limit=5")
+check("subject-candidates is not shadowed by /:id",
+      st == 200 and isinstance((cands or {}).get("items"), list), f"{st} {str(cands)[:90]}")
+
+# The preview was read-only with no POST to act on it, so the only way to use the
+# librarian's own 628 category labels was 628 individual creates.
+labels = [c["label"] for c in (cands or {}).get("items", []) if not c["alreadyExists"]][:2]
+if labels:
+    st, seeded = call("POST", "/api/authorities/seed-subjects", {"labels": labels, "link": True})
+    check("approved candidates can be seeded in one action",
+          st == 200 and seeded.get("created") == len(labels), f"{st} {seeded}")
+    st, again = call("POST", "/api/authorities/seed-subjects", {"labels": labels, "link": True})
+    check("and seeding the same labels twice creates nothing new",
+          (again or {}).get("created") == 0 and (again or {}).get("skipped") == len(labels), again)
+    st, subs = call("GET", f"/api/authorities?kind=subject&q={urllib.parse.quote(labels[0][:12])}")
+    seeded_id = next((x["id"] for x in (subs or {}).get("items", []) if x["preferredForm"] == labels[0]), None)
+    check("a seeded heading is linked to the books carrying the label",
+          seeded_id is not None and next(x["useCount"] for x in subs["items"] if x["id"] == seeded_id) > 0,
+          [(x["preferredForm"], x["useCount"]) for x in (subs or {}).get("items", [])[:3]])
+    if seeded_id: call("DELETE", f"/api/authorities/{seeded_id}")
+    for lb in labels[1:]:
+        st, subs = call("GET", f"/api/authorities?kind=subject&q={urllib.parse.quote(lb[:12])}")
+        for x in (subs or {}).get("items", []):
+            if x["preferredForm"] == lb: call("DELETE", f"/api/authorities/{x['id']}")
+else:
+    check("approved candidates can be seeded in one action", False, "no unseeded candidates to test with")
+
+# MARCXML ingest parsed every 650$a correctly and then threw the result away, so
+# the richest available source of subject headings — records from another library
+# that already carry LCSH — arrived with no subjects at all.
+subj_title = f"ZZITEST Subjects {uniq}"
+xml = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<collection xmlns="http://www.loc.gov/MARC21/slim"><record>'
+    '<leader>00000nam a2200000 i 4500</leader>'
+    f'<datafield tag="245" ind1="1" ind2="0"><subfield code="a">{subj_title}</subfield></datafield>'
+    '<datafield tag="650" ind1=" " ind2="0"><subfield code="a">Orthodox Eastern Church</subfield></datafield>'
+    '<datafield tag="650" ind1=" " ind2="7"><subfield code="a">ΖΖ Πατερική θεολογία</subfield></datafield>'
+    '</record></collection>'
+)
+st, rep = call("POST", "/api/import/marcxml", raw=xml.encode(), ctype="application/xml")
+st, found = call("GET", f"/api/books?pageSize=5&q={urllib.parse.quote(subj_title)}&partialWords=true&fuzzyTypos=false")
+hit = next((b for b in (found or {}).get("items", []) if b["title"] == subj_title), None)
+if hit:
+    CREATED.append(hit["id"])
+    st, links = call("GET", f"/api/books/{hit['id']}/authorities")
+    forms = sorted(x["preferredForm"] for x in links["links"])
+    check("MARCXML subject headings are no longer discarded",
+          forms == ["Orthodox Eastern Church", "ΖΖ Πατερική θεολογία"], forms)
+    check("and they link as subjects, which is what exports as 650",
+          all(x["role"] == "sub" for x in links["links"]), links["links"])
+    # ind2 = 0 is LCSH; anything else names its own thesaurus.
+    st, subs = call("GET", "/api/authorities?kind=subject&q=Orthodox")
+    lcsh = next((x for x in (subs or {}).get("items", []) if x["preferredForm"] == "Orthodox Eastern Church"), None)
+    check("the thesaurus from ind2 is kept", (lcsh or {}).get("source") == "lcsh", lcsh)
+    st, marc = call_text("GET", f"/api/books/{hit['id']}/marc")
+    check("and they come back out as 650", marc.count('tag="650"') == 2, marc.count('tag="650"'))
+    # A second import must not double them up.
+    call("POST", "/api/import/marcxml", raw=xml.encode(), ctype="application/xml")
+    st, links = call("GET", f"/api/books/{hit['id']}/authorities")
+    check("re-importing does not duplicate the headings", len(links["links"]) == 2, links["links"])
+    if lcsh: call("DELETE", f"/api/authorities/{lcsh['id']}")
+    st, subs = call("GET", "/api/authorities?kind=subject&q=%CE%96%CE%96")
+    for x in (subs or {}).get("items", []):
+        if x["preferredForm"].startswith("ΖΖ"): call("DELETE", f"/api/authorities/{x['id']}")
+else:
+    check("MARCXML subject headings are no longer discarded", False, f"import failed: {rep}")
+
+# Purge names every child table explicitly rather than trusting a cascade, and
+# this one was missed — leaving rows pointing at a book id that no longer exists,
+# which then inflated every heading's use count.
+if LOCAL:
+    pb2, _ = mkbook(title=f"ZZITEST Purge Auth {uniq}", author="ΖΖ")
+    call("PUT", f"/api/books/{pb2}/authorities", {"links": [{"authorityId": aid, "role": "aut"}]})
+    call("DELETE", f"/api/books/{pb2}")
+    call("DELETE", f"/api/books/{pb2}/purge")
+    rows = local_sql(f"SELECT COUNT(*) AS n FROM book_authorities WHERE book_id = '{pb2}'")
+    check("purging a record takes its authority links with it",
+          int((rows or [{}])[0].get("n") or 0) == 0, rows)
+else:
+    print("  SKIP  1 purge-cascade check needs direct D1 access (local runs only)")
+
+# Retiring unlinks, deliberately — a book must not point at a retired heading.
+st, _ = call("DELETE", f"/api/authorities/{aid}")
+st, links = call("GET", f"/api/books/{ab}/authorities")
+check("retiring a heading unlinks the books that used it", len(links["links"]) == 0, links)
+st, gone = call("GET", f"/api/authorities/{aid}")
+check("and the heading is gone", st == 404, st)
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

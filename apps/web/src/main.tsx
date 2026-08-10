@@ -35,6 +35,7 @@ import type {
   ValueVariantGroup, MergeCandidateItem, MergeCandidateBook, MergeCandidateGroup, MergePreview
 } from './types';
 import { OnboardingCourse } from './onboarding';
+import { AuthoritiesCard, BookAuthorities } from './screens/authorities';
 import { CopiesEditor } from './screens/copies';
 import { SerialHoldingsEditor, type SerialHolding } from './screens/serials';
 import { LibraryIdentityCard } from './screens/identity';
@@ -5787,6 +5788,18 @@ function App() {
                     )}
                   </div>
 
+                  {/* Controlled headings: who this is, under one form, with the
+                      variant spellings recorded rather than overwritten. This is
+                      what MARC 100/700/650 export from. */}
+                  <div className="detail-section">
+                    <div className="detail-section-title">{t('authorities.onBook')}</div>
+                    <BookAuthorities
+                      bookId={detailBook.id}
+                      canWrite={canWrite}
+                      onChanged={() => { void loadBooks(); }}
+                    />
+                  </div>
+
                   {/* The run of a periodical. Only for a serial — MARC keeps a
                       holdings statement instead of a record per issue, which is
                       the whole point: ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ is 47 book rows
@@ -8551,11 +8564,20 @@ function App() {
                   </div>
                 )}
 
+                {canWrite && (
+                  <AuthoritiesCard canWrite={canWrite} onChanged={() => { void loadBooks(); }} />
+                )}
+
                 {/* Value consistency: consolidate the librarians' spelling variants */}
                 {canWrite && (
                   <div className="card">
                     <h3>{t('settings.vc.heading')}</h3>
-                    <p className="muted small" style={{ marginBottom: '1rem' }}>{t('settings.vc.intro')}</p>
+                    <p className="muted small" style={{ marginBottom: '0.5rem' }}>{t('settings.vc.intro')}</p>
+                    {/* This tool REWRITES; authority control POINTS. Two answers to
+                        one librarian problem, and neither knew the other existed. */}
+                    <p className="muted small callout" style={{ marginBottom: '1rem' }}>
+                      {t('settings.vc.vsAuthorities')}
+                    </p>
                     <div className="search-bar" style={{ alignItems: 'flex-end' }}>
                       <div className="filter-field">
                         <label htmlFor="fld-settings-vc-field">{t('settings.vc.field')}</label>
