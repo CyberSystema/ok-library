@@ -6010,6 +6010,7 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label htmlFor="fld-detail-title">{t('detail.title')}<span className="required-mark"> *</span></label>
+                      <HelpLink anchor="title-proper" label={t('handbook.helpAbout', { field: t('detail.title') })} />
                       <input id="fld-detail-title"
                         ref={editTitleInputRef}
                         className={editFieldErrors.has('title') ? 'input-error' : undefined}
@@ -6037,6 +6038,7 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label htmlFor="fld-detail-isbn">{t('detail.isbn')}</label>
+                      <HelpLink anchor="isbn" label={t('handbook.helpAbout', { field: t('detail.isbn') })} />
                       <input id="fld-detail-isbn" className="isbn-input" value={editForm.isbn} onChange={(e) => setEditForm({ ...editForm, isbn: e.target.value })} placeholder={t('detail.isbnPh')} inputMode="text" autoComplete="off" autoCapitalize="characters" spellCheck={false} />
                     </div>
                     <div>
@@ -6073,6 +6075,7 @@ function App() {
                   <div className="form-row">
                     <div>
                       <label htmlFor="fld-detail-publisher">{t('detail.publisher')}</label>
+                      <HelpLink anchor="publisher" label={t('handbook.helpAbout', { field: t('detail.publisher') })} />
                       <input id="fld-detail-publisher" list="suggest-publisher" value={editForm.publisher} onChange={(e) => setEditForm({ ...editForm, publisher: e.target.value })} placeholder={t('detail.publisherPh')} />
                     </div>
                     <div>
@@ -6081,6 +6084,7 @@ function App() {
                     </div>
                     <div>
                       <label htmlFor="fld-detail-ddc">{t('library.add.ddc')}</label>
+                      <HelpLink anchor="ddc" label={t('handbook.helpAbout', { field: t('library.add.ddc') })} />
                       <input
                         id="fld-detail-ddc"
                         value={editForm.ddc}
@@ -6938,6 +6942,7 @@ function App() {
                       <div className="form-row">
                         <div>
                           <label htmlFor="fld-library-add-publisher">{t('library.add.publisher')}</label>
+                          <HelpLink anchor="publisher" label={t('handbook.helpAbout', { field: t('library.add.publisher') })} />
                           <input id="fld-library-add-publisher" list="suggest-publisher" value={createForm.publisher} onChange={(e) => setCreateForm({ ...createForm, publisher: e.target.value })} placeholder={t('library.add.publisherPh')} />
                         </div>
                         <div>
@@ -6950,6 +6955,7 @@ function App() {
                               accepted by the API and written by the ISBN lookup and
                               MARC import since Phase B with no field to show it. */}
                           <label htmlFor="fld-library-add-ddc">{t('library.add.ddc')}</label>
+                          <HelpLink anchor="ddc" label={t('handbook.helpAbout', { field: t('library.add.ddc') })} />
                           <input
                             id="fld-library-add-ddc"
                             value={createForm.ddc}

@@ -111,6 +111,235 @@ const pack: ContentPack = {
     ]
   },
 
+  titles: {
+    id: 'titles',
+    title: 'Titles',
+    summary:
+      'The title is the one field nearly every search starts from, so it is transcribed exactly and interpreted nowhere.',
+    blocks: [
+      { kind: 'h', text: 'The title proper', anchor: 'title-proper' },
+      { kind: 'rule', text:
+        'Transcribe the title from the title page, not from the spine and not from the cover. Where they disagree, the title page wins.' },
+      { kind: 'p', text:
+        'Copy the wording, the order and the spelling as printed. Do not expand an abbreviation, do not correct an old spelling, and do not translate. The catalogue is a record of what the library holds, and a reader holding the book in their hand should be able to match it to the record character for character.' },
+      { kind: 'fields', rows: [
+        { fact: 'title', note: 'What the title page says. The one field with no good reason ever to be empty.' }
+      ] },
+      { kind: 'tip', text:
+        'A record may legitimately have no author, no publisher and no date — 3,768 records here have no author and 2,962 no publisher. It should always have a title.' },
+
+      { kind: 'h', text: 'Other title information', anchor: 'subtitle' },
+      { kind: 'p', text:
+        'A subtitle, an alternative title, or the explanatory phrase that follows a colon on the title page goes in its own field rather than being run into the title. That way a search for the title finds it, and the description can still be printed in full.' },
+      { kind: 'compare', good: 'Title: “Η ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ”. Other title information: “ερμηνευτική προσέγγιση”.',
+        bad: 'Title: “Η ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ: ερμηνευτική προσέγγιση”.',
+        why: 'In the second, the title no longer matches the title on any other edition of the same work, so the two will never be recognised as the same thing.' },
+      { kind: 'auto', text:
+        'The punctuation that separates the two on an exported record — the space-colon-space of ISBD — is added when the record leaves. Do not type it.' },
+      { kind: 'p', text:
+        'Nothing in this catalogue currently uses the field: all 12,675 records have an empty subtitle, because the import had nowhere to put one. Where you know the subtitle, adding it costs nothing and makes the record findable by it.' },
+
+      { kind: 'h', text: 'Articles at the front', anchor: 'non-filing' },
+      { kind: 'p', text:
+        'Catalogues traditionally file “Η ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ” under Θ rather than under Η, because the article carries no information. This catalogue does not ask you to do anything about that: type the article, in its place, as printed.' },
+      { kind: 'auto', text:
+        'Search ignores position, so a search for “ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ” finds the record whether or not it starts with an article. On export, the record declares that it has no non-filing characters, which is true because you were not asked to strip any.' },
+
+      { kind: 'h', text: 'When a title changes', anchor: 'title-changes' },
+      { kind: 'p', text:
+        'A periodical that changes its name is the awkward case. Two names means two titles, and MARC deals with it by linking two records. Until this catalogue has that link, record the run under the name it has now and put the former name in a note — which keeps it searchable and leaves the history visible.' },
+      { kind: 'see', chapter: 'notes', anchor: 'when-to-note', text: 'What belongs in a note, and what does not.' }
+    ]
+  },
+
+  'edition-and-imprint': {
+    id: 'edition-and-imprint',
+    title: 'Edition, publisher and place',
+    summary:
+      'Which printing this is, and who put it out. Together these are what distinguish two copies of the same work.',
+    blocks: [
+      { kind: 'p', text:
+        'Two records for the same title by the same author are not necessarily duplicates: a second edition is a different publication, and a reprint by a different press is a different publication again. The edition and the imprint are what let you tell.' },
+
+      { kind: 'h', text: 'Edition', anchor: 'edition' },
+      { kind: 'p', text:
+        'Transcribe the edition statement as printed. Greek title pages usually say “2η έκδ.” or “ἔκδοσις δευτέρα”; record what is there rather than a number you inferred.' },
+      { kind: 'fields', rows: [
+        { fact: 'edition', note: 'Free text. Transcribed, not normalised.' }
+      ] },
+      { kind: 'compare', good: '2η έκδ.', bad: '2',
+        why: 'The catalogue holds 1,386 edition statements and 466 of them are the bare digit “2”. A bare number is readable by a person who already knows what it means and by nothing else — it does not say whether it is an edition, a printing or a volume.' },
+      { kind: 'tip', text:
+        'A reprint is not a new edition. If the title page says the same edition and only the printing differs, the edition statement stays the same; note the printing if it matters.' },
+
+      { kind: 'h', text: 'Publisher', anchor: 'publisher' },
+      { kind: 'p', text:
+        'The name of the press, as printed. This is a field where consistency pays immediately: the catalogue shows every distinct spelling as a separate publisher, so “ΕΚΔΟΣΕΙΣ Π. ΠΟΥΡΝΑΡΑ” and “ΕΚΔΟΣΕΙΣ Π.ΠΟΥΡΝΑΡΑ” — 37 records and 3 — appear as two houses.' },
+      { kind: 'fields', rows: [
+        { fact: 'publisher', note: 'Take the suggestion the field offers if it is the same press.' }
+      ] },
+      { kind: 'see', chapter: 'consistency', anchor: 'consolidate-or-authority', text:
+        'When two spellings of a press are already in the catalogue, one of these two tools is the answer — and which one matters.' },
+
+      { kind: 'h', text: 'Place of publication', anchor: 'place-of-publication' },
+      { kind: 'p', text:
+        'Where the book was published, as printed on the title page: “ΑΘΗΝΑ”, “ΘΕΣΣΑΛΟΝΙΚΗ”, “Ἐν Ἀθήναις”. 10,401 records here carry one.' },
+      { kind: 'fields', rows: [
+        { fact: 'place', note: 'Transcribed. Not converted to a modern form or a country.' }
+      ] },
+
+      { kind: 'h', text: 'When there is no publisher or no date', anchor: 'no-publisher' },
+      { kind: 'p', text:
+        'Old and privately printed books frequently have neither, and 2,962 records here have no publisher. Leave the field empty rather than writing “χ.ε.” or “n.p.”: an empty field is a fact the catalogue can count, and a placeholder is a string it cannot.' },
+      { kind: 'see', chapter: 'consistency', anchor: 'empty-vs-unknown', text:
+        'Why a placeholder is worse than a blank.' },
+      { kind: 'see', chapter: 'dates', anchor: 'uncertain-dates', text:
+        'A date you are unsure of has its own syntax, and does not need a placeholder either.' }
+    ]
+  },
+
+  extent: {
+    id: 'extent',
+    title: 'Extent',
+    summary: 'How much of a thing it is: pages, volumes, plates, size.',
+    blocks: [
+      { kind: 'h', text: 'The form of the statement', anchor: 'extent-form' },
+      { kind: 'p', text:
+        'The extent answers “how big is it?” for someone who cannot see it. ISBD gives it a standard shape — the number of pages or volumes, then the illustrations, then the size — and the field takes it as free text so that shape can be transcribed rather than fought with.' },
+      { kind: 'fields', rows: [
+        { fact: 'extent', note: 'Free text, in the standard order: pages, illustrations, size.' }
+      ] },
+      { kind: 'compare', good: '156, [3] σ. : εικ. ; 21 εκ.', bad: '156',
+        why: 'The catalogue holds 11,717 extent statements and most are a bare number like “31” or “159”. A number alone does not say whether it counts pages, leaves or volumes, and it cannot be printed in a description.' },
+      { kind: 'p', text:
+        'The square brackets in the good example are not decoration: they mark pages that are physically there but not numbered, which is how you record a book with three unpaginated pages at the end without inventing numbers for them.' },
+      { kind: 'tip', text:
+        'You are not expected to go back and rewrite 11,717 statements. Write the full form on new records, and improve an old one when you have the book in your hands for another reason.' },
+
+      { kind: 'h', text: 'Size', anchor: 'dimensions' },
+      { kind: 'p', text:
+        'Height in centimetres, rounded up. A book 20.4 cm tall is 21 εκ. Size matters more than it sounds: it is often the quickest way to tell two printings apart, and it tells whoever is shelving whether the book fits.' },
+      { kind: 'see', chapter: 'what-a-catalogue-is-for', anchor: 'record-vs-copy', text:
+        'Size belongs to the publication; where an oversized volume actually stands belongs to the copy.' }
+    ]
+  },
+
+  classification: {
+    id: 'classification',
+    title: 'Classification',
+    summary:
+      'Two systems side by side: the shelf marks this library already uses, and Dewey for the outside world.',
+    blocks: [
+      { kind: 'h', text: 'The shelf classification', anchor: 'shelf-classification' },
+      { kind: 'p', text:
+        'The shelf marks in this library are a classification: 19-000 is a subject area, not just a location. 8,117 records carry such a code. It works, the spines are labelled with it, and nothing in this Handbook suggests changing it — re-labelling 12,675 spines to gain conformance nobody asked for would be a bad trade.' },
+      { kind: 'fields', rows: [
+        { fact: 'localClass', note: 'The local class number. Exported in the slot MARC keeps for exactly this.' },
+        { fact: 'shelfCode', note: 'Where the copy physically stands. Usually the same code, written as a shelf mark.' }
+      ] },
+
+      { kind: 'h', text: 'Dewey', anchor: 'ddc' },
+      { kind: 'p', text:
+        'Dewey sits alongside the shelf mark and does not replace it. Its value is that it means the same thing everywhere: a record exported with a Dewey number can be placed by any library that receives it, which a local shelf code cannot.' },
+      { kind: 'fields', rows: [
+        { fact: 'ddc', note: 'The Dewey number. Optional, and only worth adding where you are confident.' }
+      ] },
+      { kind: 'p', text:
+        'No record here has one yet. The most useful place to start is the part of the collection most likely to be shared or looked for from outside — patristics sits in 270, liturgy in 264, scripture in 220.' },
+      { kind: 'auto', text:
+        'A record imported from another library keeps the Dewey number it arrived with, so importing is also a way of acquiring classification you did not have to do yourself.' },
+      { kind: 'tip', text:
+        'A partial Dewey number is fine. “270” is true and useful; “270.0947” asserts a precision you may not have.' },
+
+      { kind: 'h', text: 'Code or label — never both', anchor: 'code-vs-label' },
+      { kind: 'p', text:
+        'The import left the collection split down the middle: 8,117 records carry a category CODE and 4,216 carry a category LABEL, and not one record carries both. They came from different source sheets.' },
+      { kind: 'quote', text: '8,117 with a code · 4,216 with a label · 0 with both',
+        source: 'measured on the live catalogue' },
+      { kind: 'p', text:
+        'This is worth knowing because it explains something that otherwise looks like a bug: a subject list built from labels covers a third of the collection, and one built from codes covers two thirds, and neither covers all of it. When you are reconciling a shelf, check which of the two that part of the collection uses.' },
+      { kind: 'see', chapter: 'consistency', anchor: 'one-spelling', text:
+        'The labels are free text, so they drift in exactly the way names do.' }
+    ]
+  },
+
+  identifiers: {
+    id: 'identifiers',
+    title: 'Identifiers',
+    summary:
+      'ISBN and ISSN: what they are for, why one of them checks itself, and what to do when it fails.',
+    blocks: [
+      { kind: 'p', text:
+        'An identifier is the one field where two records can be compared with certainty. Titles vary, names vary, but an ISBN either matches or does not — which is why import, duplicate detection and lookup all reach for it first.' },
+
+      { kind: 'h', text: 'ISBN', anchor: 'isbn' },
+      { kind: 'fields', rows: [
+        { fact: 'isbn', note: 'Type it as printed; the formatting is stripped for you. 10 or 13 digits.' }
+      ] },
+      { kind: 'p', text:
+        'Only 602 of 12,675 records have one, and that is expected rather than a gap: ISBNs began in the 1970s and most of this collection is older. An absent ISBN is not a record that needs fixing.' },
+      { kind: 'auto', text:
+        'Hyphens and spaces are removed on save, so “978-960-315-733-5” and “9789603157335” are stored identically and match each other. A ten-digit ISBN is also converted to its thirteen-digit form for MATCHING only — the number you typed is what stays on the record.' },
+
+      { kind: 'h', text: 'When an ISBN is refused', anchor: 'bad-isbn' },
+      { kind: 'p', text:
+        'The last digit of an ISBN is a check digit computed from the others, so most typing mistakes can be detected without looking anything up. Twenty records here have an ISBN whose check digit does not match.' },
+      { kind: 'rule', text:
+        'A failed check digit is a warning, never a refusal. The record saves. You are transcribing what is printed in a book, and a book with a wrong ISBN printed in it still exists.' },
+      { kind: 'steps', items: [
+        'Check the number against the book once more — a transposed pair of digits is the usual cause.',
+        'If the book really does print that number, leave it. The record is correct and the publisher was wrong.',
+        'If you cannot check the book right now, leave it and move on; the smart list will bring it back to you.'
+      ] },
+      { kind: 'tip', text:
+        'The “Bad ISBN” smart list collects all twenty in one place, which makes them a half-hour job rather than a background worry.' },
+
+      { kind: 'h', text: 'ISSN', anchor: 'issn' },
+      { kind: 'p', text:
+        'A periodical has an ISSN rather than an ISBN, and it identifies the TITLE rather than one issue — the whole run of ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ shares one ISSN. Thirteen records here carry one.' },
+      { kind: 'fields', rows: [
+        { fact: 'issn', note: 'Eight digits, written as four-four with a hyphen.' },
+        { fact: 'bibLevel', note: 'An ISSN is the usual sign that this should be set to periodical.' }
+      ] },
+      { kind: 'p', text:
+        'All thirteen of those records are currently catalogued as monographs, which is why the statistics report says the library holds no serials. Setting the kind of publication on each is a thirteen-record job that makes a statutory return true.' },
+      { kind: 'see', chapter: 'dates', anchor: 'date-ranges', text:
+        'A periodical also wants its run recorded, not one record per issue.' }
+    ]
+  },
+
+  notes: {
+    id: 'notes',
+    title: 'Notes and attributes',
+    summary:
+      'Where to put something true that no field asks for — and where not to.',
+    blocks: [
+      { kind: 'h', text: 'What belongs in a note', anchor: 'when-to-note' },
+      { kind: 'p', text:
+        'A note is for something a reader would want to know that the described fields cannot carry: a dedication, a former owner, the fact that pages are missing, the language of an introduction that differs from the text, a former title.' },
+      { kind: 'fields', rows: [
+        { fact: 'description', note: 'Free text about the PUBLICATION — true of every copy.' }
+      ] },
+      { kind: 'rule', text:
+        'A note about the publication goes on the record. A note about one physical volume goes on that copy. They are different fields because they are different facts.' },
+      { kind: 'compare', good: 'On the record: “Περιέχει βιβλιογραφία σ. 143-156.” On the copy: “Χαλαρή ράχη· δωρεά Π. Παπαδοπούλου.”',
+        bad: 'Both of those on the record.',
+        why: 'The second copy is not damaged and was not donated. A note on the record says it is.' },
+      { kind: 'p', text:
+        'Keep notes short and factual. A note is read by someone deciding whether to walk to the shelf, not by someone who wants an essay.' },
+
+      { kind: 'h', text: 'Attributes', anchor: 'custom-attributes' },
+      { kind: 'p', text:
+        'Attributes are extra fields this library added for itself, and they are how the import brought in columns the standard model has no home for. Some of them are load-bearing — the series, the place of publication, the extent and the category are all attributes — and some are notes by another name.' },
+      { kind: 'tip', text:
+        'Before adding a new attribute, check whether a real field already covers it. An attribute is invisible to MARC export, to Dublin Core, and to any library you send records to; a real field is not.' },
+      { kind: 'p', text:
+        'The everyday attributes are pinned to the top of the form, in the order the library chose, so the handful you fill on nearly every book are not buried among two dozen you rarely open.' },
+      { kind: 'see', chapter: 'what-a-catalogue-is-for', anchor: 'record-vs-copy', text:
+        'A note about one physical volume belongs to the copy, which is a different object from the record.' }
+    ]
+  },
+
   names: {
     id: 'names',
     title: 'Greek and Orthodox names',

@@ -10,11 +10,21 @@
 // finds at the moment they most need the answer.
 
 export const CHAPTER_IDS = [
+  // Foundations
   'what-a-catalogue-is-for',
   'consistency',
+  // Describing the publication
+  'titles',
+  'edition-and-imprint',
+  'extent',
+  'classification',
+  'identifiers',
+  'notes',
+  // Access points — the ways in
   'names',
   'transliteration',
   'dates',
+  // Reference
   'glossary'
 ] as const;
 
@@ -28,6 +38,30 @@ export type ChapterId = (typeof CHAPTER_IDS)[number];
  * difference between "this anchor is not written yet" and "this anchor is a typo".
  */
 export const ANCHOR_OWNERS = {
+  // titles
+  'title-proper': 'titles',
+  'subtitle': 'titles',
+  'non-filing': 'titles',
+  'title-changes': 'titles',
+  // edition-and-imprint
+  'edition': 'edition-and-imprint',
+  'publisher': 'edition-and-imprint',
+  'place-of-publication': 'edition-and-imprint',
+  'no-publisher': 'edition-and-imprint',
+  // extent
+  'extent-form': 'extent',
+  'dimensions': 'extent',
+  // classification
+  'shelf-classification': 'classification',
+  'ddc': 'classification',
+  'code-vs-label': 'classification',
+  // identifiers
+  'isbn': 'identifiers',
+  'bad-isbn': 'identifiers',
+  'issn': 'identifiers',
+  // notes
+  'when-to-note': 'notes',
+  'custom-attributes': 'notes',
   // what-a-catalogue-is-for
   'record-vs-copy': 'what-a-catalogue-is-for',
   'why-standards': 'what-a-catalogue-is-for',
