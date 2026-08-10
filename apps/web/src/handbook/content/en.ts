@@ -557,7 +557,7 @@ const pack: ContentPack = {
       { kind: 'p', text:
         'Volume designations here are genuinely varied — “1”, “12”, “Α΄”, “τ. 3”, “1-2”, “ΜΕΡΟΣ Β΄” — and all of them are accepted as typed. Greek numerals are read as numbers, so “Α΄” counts as volume 1.' },
       { kind: 'auto', text:
-        'A volume designation that cannot be read as a number is counted and shown, never silently dropped, and never used to invent a gap. A set of volumes labelled “πρώτος τόμος”, “δεύτερος τόμος” is reported as three unnumbered volumes rather than as a set with holes in it.' },
+        'A volume designation that cannot be read as a number is counted and shown, never silently dropped, and never used to invent a gap. A set of volumes labelled “πρώτος τόμος”, “δεύτερος τόμος” is reported as two unnumbered volumes rather than as a set with holes in it.' },
 
       { kind: 'h', text: 'Finding the missing volume', anchor: 'missing-volumes' },
       { kind: 'p', text:
@@ -629,7 +629,7 @@ const pack: ContentPack = {
 
       { kind: 'h', text: 'The parallel fields', anchor: 'parallel-fields' },
       { kind: 'p', text:
-        'Three fields on the record hold the romanized reading, one for each thing worth finding in Latin script.' },
+        'Two fields on the record hold the romanized reading — one for the title, one for the author. The Greek forms they pair with are left exactly as they are.' },
       { kind: 'fields', rows: [
         { fact: 'titleRomanized', note: 'The romanized title. Exported as a linked 880 field, which is how MARC carries a script pair.' },
         { fact: 'authorRomanized', note: 'The romanized author. Same treatment.' },
@@ -1028,7 +1028,7 @@ const pack: ContentPack = {
       { kind: 'p', text:
         'So the decision is not technical. It is whether this library wants its holdings publicly searchable — which for most theological libraries is a straightforward yes, and is the point of cataloguing to a standard in the first place, but it is the library’s decision and not the cataloguer’s.' },
       { kind: 'auto', text:
-        'Only bibliographic data is ever served. Readers, loans, holds and staff accounts are not reachable through either service, and the gate that enforces that is tested.' },
+        'Bibliographic records and their holdings are what goes out — the description, and where a copy stands. Readers, loans, holds and staff accounts are not reachable through either service, and the gate that enforces that is tested.' },
 
       { kind: 'h', text: 'What the two services are', anchor: 'harvesting' },
       { kind: 'p', text:

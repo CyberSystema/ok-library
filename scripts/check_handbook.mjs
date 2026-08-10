@@ -172,6 +172,94 @@ for (const lang of translated) {
 }
 console.log(`  complete languages: ${translated.join(', ')}`);
 
+// (3c) Every language the INTERFACE offers must have a loader.
+//
+// `CONTENT_LOADERS[lang]()` is called with no guard, so a language present in the
+// switcher but absent from the map throws the moment a reader opens the Handbook
+// — and the switcher is the one place a new language gets added first. A missing
+// pack is meant to fall back to English; a missing LOADER cannot.
+const uiLangs = (/export type Lang =([^;]*);/.exec(read(join(root, 'apps/web/src/i18n.tsx')))?.[1] ?? '')
+  .split('|').map((v) => v.trim().replace(/['"]/g, '')).filter(Boolean);
+const loaders = [...registry.matchAll(/^ {2}([a-z]{2}):\s*\(\)\s*=>\s*import\(/gm)].map((m) => m[1]);
+if (uiLangs.length === 0) fail('could not read the interface languages from i18n.tsx — has `export type Lang` changed?');
+const unloadable = uiLangs.filter((l) => !loaders.includes(l));
+if (unloadable.length) {
+  fail('the interface offers languages the Handbook cannot load', unloadable.map(
+    (l) => `'${l}' is in i18n.tsx's Lang but has no entry in CONTENT_LOADERS — opening the Handbook in it throws`));
+}
+
+// ── (5) the collisions that broke two translations ──────────────────────────
+//
+// Every previous language pack shipped with a concept collision: one word doing
+// two jobs, in a sentence that read perfectly and instructed the opposite. Greek
+// used σειρά for both a publisher's series and a periodical's run, so "record its
+// run" told the librarian to record the series. Russian did the identical thing
+// with комплект. Greek also used one verb for a reader collecting a hold and the
+// library taking a volume back, and διαγραφή for both erasing a reader's personal
+// data and deleting the reader — in the chapter that exists to distinguish them.
+//
+// None of that is detectable by a compiler, by a fluent reader of one language, or
+// by the block-sequence check: the prose is grammatical and the structure intact.
+// What IS detectable is the vocabulary rule each resolution rests on. A term that
+// must never appear in a given chapter is a grep.
+//
+// So each pack declares, per chapter, which words are REQUIRED (the distinction is
+// actually drawn) and which are FORBIDDEN (its collision partner cannot leak in).
+// English is the reference for what the chapters are about; the rules are per
+// language because the collisions are properties of the language, not the content.
+const COLLISION_RULES = {
+  ko: {
+    // 총서 (a publisher's series) vs 소장권호 (the issues of a periodical we hold)
+    // vs 다권본 (one work in several volumes). The Greek and Russian failure.
+    'periodical-runs': { required: ['소장권호', '결호'], forbidden: ['총서'] },
+    'series-and-sets': { required: ['총서', '다권본'], forbidden: ['소장권호'] },
+    // 제적 (strike a copy from the register) vs 표목 폐지 (retire a heading).
+    'withdrawal': { required: ['제적'], forbidden: ['폐지'] },
+    'headings': { required: ['폐지'], forbidden: ['제적'] },
+    // 개인정보 파기 (destroy personal data, the statutory act) vs 레코드 삭제
+    // (delete the record, reversible). 삭제 must never take 개인정보 as its object.
+    'data-protection': { required: ['파기'], forbiddenPatterns: [/개인정보[^.\n]{0,6}삭제/] },
+    // 반납 (the library receives it back) vs 예약 자료 수령 (the reader collects).
+    'readers-and-loans': { required: ['반납'], forbiddenPatterns: [/반납[^.\n]{0,12}수령|수령[^.\n]{0,12}반납/] }
+  }
+};
+// Words banned pack-wide, each because it can silently take another's job:
+// 사본 is a photocopy and must never mean a volume the library owns; 서명 means
+// both "title" and "signature"; 폐기 would happily serve as both 제적 and 폐지;
+// 복본 sits one syllable from 중복.
+const BANNED_TERMS = { ko: ['사본', '서명', '폐기', '복본', '시리즈'] };
+
+for (const [lang, rules] of Object.entries(COLLISION_RULES)) {
+  const file = join(contentDir, `${lang}.ts`);
+  if (!existsSync(file)) continue;
+  const src = read(file);
+  for (const [chapterId, rule] of Object.entries(rules)) {
+    const body = chapterBody(src, chapterId);
+    if (!body) continue; // not translated yet; English fills in
+    for (const term of rule.required ?? []) {
+      if (!body.includes(term)) {
+        fail(`${lang}: chapter '${chapterId}' never says '${term}' — the distinction it exists to draw may have been flattened`);
+      }
+    }
+    for (const term of rule.forbidden ?? []) {
+      if (body.includes(term)) {
+        fail(`${lang}: '${term}' appears in chapter '${chapterId}', where it names a different concept`,
+          [`this is the collision that reversed the advice in the Greek and Russian packs`]);
+      }
+    }
+    for (const re of rule.forbiddenPatterns ?? []) {
+      const m = re.exec(body);
+      if (m) fail(`${lang}: chapter '${chapterId}' collides two concepts in one sentence`, [m[0].slice(0, 90)]);
+    }
+  }
+  for (const term of BANNED_TERMS[lang] ?? []) {
+    if (src.includes(term)) {
+      const line = src.split('\n').find((l) => l.includes(term))?.trim().slice(0, 100);
+      fail(`${lang}: the banned term '${term}' appears in the pack`, [line ?? '']);
+    }
+  }
+}
+
 // ── (4) the packs must be LAZY ──────────────────────────────────────────────
 // Two checks, because the obvious one is not enough. "The prose is in its own
 // chunk" proves nothing: a static import leaves the chunk separate and merely

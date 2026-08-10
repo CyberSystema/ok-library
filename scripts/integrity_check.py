@@ -2627,6 +2627,34 @@ check("the handbook check is wired into CI",
 res = _sp.run(["node", "scripts/check_handbook.mjs"], cwd=_REPO, capture_output=True, text=True)
 check("and it passes", res.returncode == 0, (res.stdout + res.stderr)[-300:])
 
+# The collision gate is the only defence against the failure that shipped in two
+# languages: one word doing two jobs, in a sentence that reads perfectly and
+# instructs the opposite. check_handbook.mjs enforces it and the check above runs
+# it — but a passing run proves nothing if the rules were quietly emptied, which is
+# exactly what a future edit tidying up "unused" config would do.
+_hbchk = _slurp(_REPO, "scripts", "check_handbook.mjs")
+_rules = re.search(r"COLLISION_RULES = \{(.*?)\n\};", _hbchk, re.S)
+check("the handbook collision gate still declares rules",
+      _rules and _rules.group(1).count("required") >= 5, None)
+check("and still bans the terms that can take another's job",
+      all(t in _hbchk for t in ("사본", "서명", "폐기")), None)
+# The two collisions that actually reversed an instruction in Greek and Russian.
+check("series and a periodical's run are held apart in Korean",
+      "'periodical-runs'" in _hbchk and "'series-and-sets'" in _hbchk
+      and "소장권호" in _hbchk and "총서" in _hbchk, None)
+check("and erasing personal data is held apart from deleting a record",
+      "개인정보" in _hbchk and "파기" in _hbchk, None)
+
+# Four languages, and the Korean pack is the whole thing rather than a stub.
+_ko = _slurp(_HB, "content", "ko.ts")
+_ko_chapters = len(re.findall(r"^  '?[a-z][a-z0-9-]*'?: \{$", _ko, re.M))
+_chapter_ids = re.findall(r"^  '([a-z0-9-]+)',?$", hb_reg, re.M)
+check("the Korean pack carries every chapter", _ko_chapters == len(_chapter_ids),
+      f"{_ko_chapters} of {len(_chapter_ids)}")
+check("Korean is claimed as complete and loads its own pack",
+      "'ko'" in hb_reg.split("TRANSLATED_LANGS")[1][:120]
+      and "ko: () => import('./content/ko')" in hb_reg, None)
+
 # Printing is the point of a reference book: the printed copy sits by the desk the
 # laptop is not on. Nothing in this app had a print stylesheet before.
 check("a print stylesheet exists", "@media print" in css_all, None)

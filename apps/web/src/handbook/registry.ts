@@ -205,18 +205,23 @@ export const CHAPTER_ORDER: readonly ChapterId[] = CHAPTER_IDS;
  * bundles every pack into one chunk or defeats the split entirely, depending on
  * the bundler's mood. Explicit imports make the four chunks a fact.
  *
- * Only English exists at present. Missing packs fall back to it, which is also the
- * runtime behaviour once a pack is partial — a chapter translated tomorrow appears
- * tomorrow, and until then the reader gets English rather than a blank page.
+ * All four now exist. A missing pack — or a pack missing a chapter — falls back to
+ * English per chapter, which is what let Greek, Russian and Korean each land in
+ * batches: a chapter translated on Tuesday appeared on Tuesday, and until then the
+ * reader got English rather than a blank page.
+ *
+ * Every language in `Lang` must appear here. The map is indexed without a guard,
+ * so a language the switcher offers but this map omits throws the moment the
+ * Handbook is opened in it; `check_handbook.mjs` asserts the two agree.
  */
 export const CONTENT_LOADERS = {
   en: () => import('./content/en'),
   el: () => import('./content/el'),
   ru: () => import('./content/ru'),
-  ko: () => import('./content/en')
+  ko: () => import('./content/ko')
 } as const;
 
 export type ContentLang = keyof typeof CONTENT_LOADERS;
 
 /** Languages with a pack of their own, as opposed to falling back to English. */
-export const TRANSLATED_LANGS: readonly ContentLang[] = ['en', 'el', 'ru'];
+export const TRANSLATED_LANGS: readonly ContentLang[] = ['en', 'el', 'ru', 'ko'];
