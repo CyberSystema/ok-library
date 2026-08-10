@@ -600,3 +600,35 @@ export const FOCUSABLE = [
   'select:not([disabled])', 'textarea:not([disabled])', 'summary',
   '[tabindex]:not([tabindex="-1"])'
 ].join(',');
+
+// ─── Local-date helpers ─────────────────────────────────────────────────────
+//
+// Moved down out of App() unchanged so the copies editor — which is a screen,
+// and screens may never import from main.tsx — can use the same two functions
+// rather than a second, subtly different pair.
+
+// Build an end-of-day ISO datetime in the user's local timezone. The date
+// input only gives us YYYY-MM-DD, and naïvely appending "T00:00:00.000Z"
+// shifts the date by up to a day in non-UTC zones. Anchoring to local 23:59
+// means a "due Friday" loan stays due on the librarian's Friday wherever
+// they are.
+export function endOfLocalDayIso(yyyymmdd: string): string {
+  const [y, m, d] = yyyymmdd.split('-').map(Number);
+  if (!y || !m || !d) return '';
+  return new Date(y, m - 1, d, 23, 59, 59, 999).toISOString();
+}
+
+// Inverse of endOfLocalDayIso for the <input type="date"> value. We must NOT
+// use `toISOString().slice(0,10)` here — that converts to UTC first, so a
+// local end-of-day stored as `2026-05-31T06:59:59Z` (UTC-7 user picked
+// May 30) would render back as May 31. Use the *local* Y-M-D so the date
+// shown in the input is the same date the user originally chose.
+export function isoToLocalDateInput(iso: string): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}

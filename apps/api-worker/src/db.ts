@@ -2,7 +2,7 @@ import { HTTPException } from 'hono/http-exception';
 import { defaultPbkdf2Iterations, generateSaltHex, hashPasswordPbkdf2 } from './auth';
 import type { AuthClaims, Env } from './types';
 import { checkIsbn } from '@ok-library/shared';
-import { normalizeCode, nowIso, safeJsonParse } from './utils';
+import { newId, normalizeCode, nowIso, safeJsonParse } from './utils';
 
 type CustomFieldDef = {
   id: string;
@@ -581,12 +581,23 @@ export async function ensurePrimaryItem(
     ).bind(book.shelfCode ?? null, book.roomCode ?? null, now, primary.id).run();
     return;
   }
+  // The deterministic id migration 0021 minted for this book may still be
+  // sitting on a SOFT-DELETED row, in which case inserting it again is a primary
+  // key collision — and this runs inside PUT /api/books/:id, so the record
+  // became permanently uneditable behind a 500 the client retried four times.
+  // Mint a fresh id instead of reviving the old row: the same reasoning as the
+  // trash restore, which deliberately does not call this function, because
+  // clearing `deleted_at` would put back a copy somebody withdrew on purpose.
+  const deterministic = `itm_${bookId.replace(/-/g, '')}`;
+  const taken = await env.DB.prepare('SELECT id FROM items WHERE id = ?')
+    .bind(deterministic).first<{ id: string }>();
+
   await env.DB.prepare(
     `INSERT INTO items (id, book_id, copy_number, room_code, shelf_code, item_type, status,
                         acquisition_date, created_at, updated_at, version)
      VALUES (?, ?, 1, ?, ?, 'book', ?, ?, ?, ?, 0)`
   ).bind(
-    `itm_${bookId.replace(/-/g, '')}`,
+    taken ? newId('itm') : deterministic,
     bookId,
     book.roomCode ?? null,
     book.shelfCode ?? null,

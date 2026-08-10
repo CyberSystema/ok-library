@@ -72,6 +72,26 @@ def login(user=ADMIN_USER, pw=ADMIN_PW):
         return json.load(r)["token"]
 
 
+# Whether we are talking to a local dev D1. A handful of assertions need to set
+# up a state the API deliberately refuses to produce (a record with no copies);
+# those run only here, and say so out loud when they do not.
+LOCAL = BASE.startswith("http://127.0.0.1") or BASE.startswith("http://localhost")
+
+
+def local_sql(query):
+    """Run one statement against the LOCAL D1 and return its rows."""
+    import subprocess
+    out = subprocess.run(
+        ["npx", "wrangler", "d1", "execute", "ok_library", "--local",
+         "--config", "apps/api-worker/wrangler.toml", "--command", query, "--json"],
+        capture_output=True, text=True
+    )
+    try:
+        return json.loads(out.stdout)[0]["results"]
+    except Exception:
+        return None
+
+
 def mkbook(**over):
     b = {"title": "ZZITEST " + uuid.uuid4().hex[:8], "author": "ZZ Author", "isbn": "978" + uuid.uuid4().hex[:10],
          "publisher": "ZZ Publisher", "language": "EL", "description": "ZZ description",
@@ -809,7 +829,12 @@ check("restoring does NOT resurrect a copy removed earlier",
 
 # Optimistic locking on the holdings list — losing hand-entered copies to a
 # concurrent save is the loss §3/§14 guard against elsewhere.
-st, r = call("PUT", f"/api/books/{hb}/items", {"expectedVersion": 0, "items": []})
+# A real one-item array, not an empty one: the schema now refuses an empty list
+# outright (§50), which would 400 before the version was ever looked at and make
+# this assertion pass for the wrong reason.
+st, r = call("PUT", f"/api/books/{hb}/items",
+             {"expectedVersion": 0,
+              "items": [{"id": get(hb)["items"][0]["id"], "itemType": "book"}]})
 check("a stale expectedVersion is rejected", st == 409, f"{st} {r}")
 
 print("=== 31. REGRESSION: EDTF publication dates ===")
@@ -1924,25 +1949,48 @@ check("an undetermined language is left empty, not stored as 'und'",
 # a properly-closed <collection> holding 100 records out of 12,608. A truncated
 # export that looks complete is the worst failure an exchange format can have.
 def count_records(path):
-    """Stream the export and count records without holding 20 MB in memory."""
+    """Stream the export, counting records and DISTINCT record ids.
+
+    Streamed rather than buffered because the export is ~20 MB. The distinct
+    count matters on its own: OFFSET paging over a sort key thousands of rows
+    share does not just risk truncation, it can emit one record twice and drop
+    another, and both files are the right length.
+    """
     req = urllib.request.Request(BASE + path, headers={"Authorization": f"Bearer {TOKEN}"})
-    n, tail, total = 0, b"", 0
+    n, tail, total, ids = 0, b"", 0, set()
     with urllib.request.urlopen(req, timeout=300) as r:
         while True:
             chunk = r.read(1 << 20)
             if not chunk:
                 break
             total += len(chunk)
+            # The carried tail is rescanned on this pass, so anything already
+            # counted in it has to come back off — otherwise a <record> sitting
+            # in the overlap is counted twice and the export looks like it
+            # duplicated records it did not. (It did not. This helper did.)
             buf = tail + chunk
-            n += buf.count(b"<record>")
-            tail = buf[-16:]
-    return n, tail, total
+            n += buf.count(b"<record>") - tail.count(b"<record>")
+            # Ids go into a set, so rescanning the overlap is harmless, and the
+            # tail has to be long enough to hold a whole 001 field split across
+            # a chunk boundary.
+            for m in re.finditer(rb'<controlfield tag="001">([^<]+)</controlfield>', buf):
+                ids.add(m.group(1))
+            tail = buf[-200:]
+    return n, len(ids), tail, total
 
-st, everything = call("GET", "/api/books?pageSize=1")
-expected = (everything or {}).get("total")
-exported, tail, size = count_records("/api/export/books.marcxml")
+# The list endpoint's total is served from a version-keyed cache, so comparing it
+# to a live stream is a race: this suite creates records as it runs, and the
+# export legitimately saw one more than a cached total did. Read the total either
+# side of the export and require the export to land inside that window — and,
+# separately, require every record in it to be distinct, which is the property
+# OFFSET paging over a non-unique sort key would actually break.
+before_total = (call("GET", "/api/books?pageSize=1")[1] or {}).get("total")
+exported, distinct, tail, size = count_records("/api/export/books.marcxml")
+after_total = (call("GET", "/api/books?pageSize=1")[1] or {}).get("total")
+lo, hi = min(before_total, after_total), max(before_total, after_total)
 check("the bulk MARCXML export contains every record, not the first page",
-      exported == expected, f"{exported} of {expected}")
+      lo <= exported <= hi, f"{exported} not in [{lo}, {hi}]")
+check("and emits each record exactly once", exported == distinct, f"{exported} emitted, {distinct} distinct")
 check("and the collection is closed", tail.strip().endswith(b"</collection>"), tail)
 
 # A serial is an open-ended run: 008/06 = c, and date 2 is 9999 rather than blank.
@@ -2021,6 +2069,101 @@ issn_book, _ = mkbook(title=f"ZZITEST Issn {uniq}", author="ZZ Serial", customFi
 st, rep = call("GET", "/api/reports/iso2789")
 check("and an ISSN catalogued as a monograph earns a caveat",
       any("ISSN" in c for c in (rep or {}).get("caveats", [])), (rep or {}).get("caveats"))
+
+print("=== 50. REGRESSION: a record always keeps a copy ===")
+uniq = uuid.uuid4().hex[:8]
+cb, _ = mkbook(title=f"ZZITEST Copies {uniq}", author="ZZ Copies", shelfCode="ZZ-COP")
+base = get(cb)
+EDITABLE = ("id", "volumeNum", "volumeLabel", "roomCode", "shelfCode", "callNumber",
+            "itemType", "condition", "acquisitionDate", "notes", "barcode")
+def draft(it):
+    return {k: v for k, v in it.items() if k in EDITABLE}
+
+# An empty array was accepted, soft-deleted every copy, and syncBookFromItems then
+# nulled the record's own shelf: the record fell out of every location facet and
+# out of the ISO 2789 stock count, with nothing to bring it back.
+st, r = call("PUT", f"/api/books/{cb}/items", {"items": []})
+check("a record cannot be stripped of every copy", st == 400, f"{st} {r}")
+check("and its copy is still there", len(get(cb)["items"]) == 1, get(cb)["items"])
+check("and it still knows its own shelf", get(cb).get("shelfCode") == "ZZ-COP", get(cb).get("shelfCode"))
+
+# The nine columns the endpoint has always written and no control ever set.
+st, r = call("PUT", f"/api/books/{cb}/items", {"items": [
+    {**draft(base["items"][0]), "callNumber": "270 ZZ", "volumeNum": "Α'", "volumeLabel": "τ. 1",
+     "condition": "good", "notes": "front shelf", "barcode": "9000" + uniq[:4]},
+    {"itemType": "serial", "shelfCode": "ZZ-BACK", "callNumber": "270 ZZ b", "notes": "back shelf"}
+]})
+two = get(cb)["items"]
+check("every writable column round-trips", st == 200 and len(two) == 2
+      and two[0]["callNumber"] == "270 ZZ" and two[0]["volumeNum"] == "Α'"
+      and two[0]["volumeLabel"] == "τ. 1" and two[0]["condition"] == "good"
+      and two[0]["notes"] == "front shelf" and two[1]["itemType"] == "serial", two)
+check("copy numbers follow list order", [i["copyNumber"] for i in two] == [1, 2],
+      [i["copyNumber"] for i in two])
+# MARC 852$h is the reason call_number matters outside this screen.
+st, marc = call_text("GET", f"/api/books/{cb}/marc")
+check("the call number reaches MARC 852$h", '<subfield code="h">270 ZZ</subfield>' in marc,
+      [l for l in marc.splitlines() if "852" in l or 'code="h"' in l])
+
+# items.barcode is UNIQUE catalogue-wide and neither branch pre-checked it, so a
+# clash came out of the D1 batch as a raw 500 — which the client retries 4x.
+ob, _ = mkbook(title=f"ZZITEST Copies Other {uniq}", author="ZZ Copies")
+st, _ = call("PUT", f"/api/books/{ob}/items",
+             {"items": [{**draft(get(ob)["items"][0]), "barcode": "9111" + uniq[:4]}]})
+st, r = call("PUT", f"/api/books/{cb}/items",
+             {"items": [{**draft(two[0]), "barcode": "9111" + uniq[:4]}, draft(two[1])]})
+check("a barcode already on another record is refused, not a 500", st == 409, f"{st} {r}")
+st, r = call("PUT", f"/api/books/{cb}/items", {"items": [
+    {**draft(two[0]), "barcode": "9222" + uniq[:4]},
+    {**draft(two[1]), "barcode": "9222" + uniq[:4]}]})
+check("the same barcode twice in one list is refused too", st == 409, f"{st} {r}")
+
+# Removing a copy is a WITHDRAWAL. ISO 2789 B.2.4 counts them and the column has
+# existed since 0030 with no writer, so it could only ever report 'unrecorded'.
+st, r = call("PUT", f"/api/books/{cb}/items",
+             {"items": [draft(two[0])], "withdrawalReason": "damaged beyond repair"})
+check("a copy can be withdrawn", st == 200 and len(get(cb)["items"]) == 1, f"{st} {get(cb)['items']}")
+# The reason is visible where it matters: ISO 2789 B.2.4 groups withdrawals by
+# reason, and with nothing able to write one it could only ever report
+# "unrecorded" — 4,550 of them on this catalogue.
+st, rep = call("GET", "/api/reports/iso2789")
+reasons = {r["reason"]: r["items"] for r in (rep or {}).get("flow", {}).get("withdrawals", {}).get("byReason", [])}
+check("the reason reaches the ISO 2789 withdrawal breakdown",
+      reasons.get("damaged beyond repair", 0) >= 1, list(reasons.items())[:6])
+
+# A copy on the hold shelf is pinned exactly as a borrowed one is: ITEM_IS_FREE,
+# which every other path uses, says so. This guard looked only at 'borrowed'.
+st, r = call("PUT", f"/api/books/{cb}/items", {"items": [draft(get(cb)["items"][0]), {"itemType": "book"}]})
+copies = get(cb)["items"]
+st, bor = call("POST", f"/api/books/{cb}/borrow",
+               {"borrowerName": f"ZZ Holder {uniq}", "itemId": copies[1]["id"]})
+if st in (200, 201):
+    st, r = call("PUT", f"/api/books/{cb}/items", {"items": [draft(copies[0])]})
+    check("a copy on loan cannot be removed", st == 409, f"{st} {r}")
+    call("POST", f"/api/books/{cb}/return", {"itemId": copies[1]["id"]})
+else:
+    check("a copy on loan cannot be removed", False, f"could not lend: {st} {bor}")
+
+# The follow-on failure: once a record HAD zero copies, ensurePrimaryItem tried to
+# insert the deterministic id `itm_<bookId>` that was already sitting soft-deleted,
+# so every later edit of that record was a primary-key collision behind a 500 the
+# client retried four times. The damaged state can no longer be produced through
+# the API — that is the point — so it is set up in the database directly, which
+# only works against a local dev D1.
+if LOCAL:
+    zb, _ = mkbook(title=f"ZZITEST Zero {uniq}", author="ZZ Copies")
+    det = get(zb)["items"][0]["id"]
+    local_sql(f"UPDATE items SET deleted_at = '2026-01-01T00:00:00.000Z' WHERE id = '{det}'")
+    check("the damaged state is reachable in data", len(get(zb)["items"]) == 0, get(zb)["items"])
+    st, r = call("PUT", f"/api/books/{zb}", {"title": f"ZZITEST Zero {uniq} ed", "version": get(zb)["version"]})
+    check("a record with no copies can still be edited", st == 200, f"{st} {r}")
+    fresh = get(zb)["items"]
+    check("and gets a copy back", len(fresh) == 1, fresh)
+    check("without resurrecting the withdrawn one", fresh and fresh[0]["id"] != det, fresh)
+    still = local_sql(f"SELECT deleted_at AS d FROM items WHERE id = '{det}'")
+    check("the withdrawn copy stays withdrawn", still and still[0].get("d") is not None, still)
+else:
+    print("  SKIP  4 zero-copy repair checks need direct D1 access (local runs only)")
 
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN

@@ -13,7 +13,7 @@
  *
  * Exits non-zero on any problem so CI fails.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -30,17 +30,26 @@ for (const k of keyLines) counts.set(k, (counts.get(k) ?? 0) + 1);
 const LOCALES = 4;
 const drift = [...counts.entries()].filter(([, n]) => n !== LOCALES);
 
-// Keys the app asks for. The negative lookbehind avoids matching `.t('…')` or
-// any other method call that merely ends in `t`.
-const consumers = ['apps/web/src/main.tsx', 'apps/web/src/ui.tsx', 'apps/web/src/onboarding.tsx'];
-const referenced = new Set();
-for (const rel of consumers) {
-  let text;
-  try {
-    text = readFileSync(join(root, rel), 'utf8');
-  } catch {
-    continue;
+// Keys the app asks for. Discovered by walking the whole source tree rather than
+// from a hand-kept list: that list named three files, so every screen under
+// `screens/` — four of them by the time this was noticed — referenced keys that
+// nothing checked, and a missing one renders as the raw dotted key on screen.
+// The same blind spot the accessibility section of the gate had.
+function walk(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...walk(full));
+    else if (/\.(tsx?|ts)$/.test(entry.name)) out.push(full);
   }
+  return out;
+}
+const consumers = walk(join(root, 'apps/web/src'));
+// The negative lookbehind avoids matching `.t('…')` or any other method call
+// that merely ends in `t`.
+const referenced = new Set();
+for (const abs of consumers) {
+  const text = readFileSync(abs, 'utf8');
   for (const m of text.matchAll(/(?<![A-Za-z0-9_.])t\('([a-zA-Z0-9_.]+)'/g)) referenced.add(m[1]);
 }
 // Template keys like t(`status.${x}`) cannot be resolved statically; they are
@@ -61,4 +70,4 @@ if (undefinedKeys.length) {
 }
 
 if (failed) process.exit(1);
-console.log(`✓ i18n: ${counts.size} keys × ${LOCALES} locales, no drift; ${referenced.size} referenced keys all defined.`);
+console.log(`✓ i18n: ${counts.size} keys × ${LOCALES} locales, no drift; ${referenced.size} referenced keys all defined across ${consumers.length} files.`);

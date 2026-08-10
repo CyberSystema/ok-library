@@ -581,13 +581,26 @@ export const ItemSchema = ItemCoreSchema.extend({
 // `id` is optional: present means "update this copy", absent means "add one".
 export const ReplaceItemsSchema = z.object({
   expectedVersion: z.number().int().min(0).optional(),
+  // ISO 2789 B.2.4 counts withdrawals, and the column to record one has existed
+  // since migration 0030 with nothing able to write it. Removing a copy through
+  // this endpoint IS a withdrawal, so it can carry the reason.
+  withdrawalReason: z.string().max(200).optional().nullable(),
   items: z.array(
     ItemCoreSchema.extend({
       id: z.string().min(1).optional(),
       // Status is owned by the circulation flow, never by this form.
       copyNumber: z.number().int().min(1).optional()
     })
-  ).max(200)
+  )
+    // At least one. A record with no copies is not a record with no copies — it
+    // is a record that has fallen out of the catalogue: invisible to every
+    // location facet (which filter through EXISTS over items), absent from the
+    // ISO 2789 stock count, and with its own shelf_code nulled by
+    // syncBookFromItems. An empty array used to be accepted and did exactly
+    // that, and the NEXT edit of the record then 500'd forever. Withdrawing the
+    // last copy means withdrawing the record, which is what the trash is for.
+    .min(1)
+    .max(200)
 });
 
 // Add N copies to each of the given books, optionally overriding where they go.

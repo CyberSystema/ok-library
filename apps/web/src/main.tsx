@@ -10,7 +10,8 @@ import {
   normalizeForCompare,
   useConfirm,
   useToast,
-  StatCard, SectionHeader, EdtfHint, Combobox, Dialog
+  StatCard, SectionHeader, EdtfHint, Combobox, Dialog,
+  endOfLocalDayIso, isoToLocalDateInput
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
 import { formatEdtfRange, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
@@ -34,6 +35,7 @@ import type {
   ValueVariantGroup, MergeCandidateItem, MergeCandidateBook, MergeCandidateGroup, MergePreview
 } from './types';
 import { OnboardingCourse } from './onboarding';
+import { CopiesEditor } from './screens/copies';
 import { LibraryIdentityCard } from './screens/identity';
 import { MarcIoCard } from './screens/marcio';
 import { RoomsCard } from './screens/rooms';
@@ -1067,6 +1069,7 @@ function App() {
   // browsing surface uncluttered — nothing is selectable until requested.
   const [selectionMode, setSelectionMode] = useState(false);
   const [detailBook, setDetailBook] = useState<Book | null>(null);
+  const [copiesEditorOpen, setCopiesEditorOpen] = useState(false);
   const [detailMode, setDetailMode] = useState<'view' | 'edit'>('view');
   // Full-screen cover zoom (lightbox). Holds the resolved cover URL while open,
   // null while closed. Opened by clicking the large cover in the detail view.
@@ -3381,45 +3384,6 @@ function App() {
     }
   }
 
-  /**
-   * Edit one field on one copy.
-   *
-   * PUT /api/books/:id/items is a whole-array replace, so every copy has to be
-   * resent — sending only the edited one would delete the rest. The version is
-   * carried for the optimistic-concurrency check the endpoint performs.
-   */
-  async function updateCopyFields(book: Book, index: number, patch: Record<string, unknown>) {
-    clearStatus();
-    const items = (book.items ?? []).map((it, i) => ({
-      id: it.id,
-      barcode: it.barcode ?? null,
-      copyNumber: it.copyNumber,
-      volumeNum: it.volumeNum ?? null,
-      volumeLabel: it.volumeLabel ?? null,
-      roomCode: it.roomCode ?? null,
-      shelfCode: it.shelfCode ?? null,
-      callNumber: it.callNumber ?? null,
-      itemType: it.itemType ?? 'book',
-      status: it.status,
-      condition: it.condition ?? null,
-      acquisitionDate: it.acquisitionDate ?? null,
-      notes: it.notes ?? null,
-      ...(i === index ? patch : {})
-    }));
-    try {
-      await runAction(() => apiRequest(`/api/books/${book.id}/items`, {
-        method: 'PUT',
-        body: JSON.stringify({ items, expectedVersion: book.version })
-      }));
-      setMessage(t('copies.saved'));
-      const fresh = await apiRequest<Book>(`/api/books/${book.id}`);
-      setDetailBook(fresh);
-      await loadBooks();
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-
   async function loadBookHolds(bookId: string) {
     if (!canSeeCirculation) { setDetailHolds([]); return; }
     try {
@@ -3525,32 +3489,6 @@ function App() {
     } catch (e) {
       setError((e as Error).message);
     }
-  }
-
-  // Build an end-of-day ISO datetime in the user's local timezone. The date
-  // input only gives us YYYY-MM-DD, and naïvely appending "T00:00:00.000Z"
-  // shifts the date by up to a day in non-UTC zones. Anchoring to local 23:59
-  // means a "due Friday" loan stays due on the librarian's Friday wherever
-  // they are.
-  function endOfLocalDayIso(yyyymmdd: string): string {
-    const [y, m, d] = yyyymmdd.split('-').map(Number);
-    if (!y || !m || !d) return '';
-    return new Date(y, m - 1, d, 23, 59, 59, 999).toISOString();
-  }
-
-  // Inverse of endOfLocalDayIso for the <input type="date"> value. We must NOT
-  // use `toISOString().slice(0,10)` here — that converts to UTC first, so a
-  // local end-of-day stored as `2026-05-31T06:59:59Z` (UTC-7 user picked
-  // May 30) would render back as May 31. Use the *local* Y-M-D so the date
-  // shown in the input is the same date the user originally chose.
-  function isoToLocalDateInput(iso: string): string {
-    if (!iso) return '';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
-    const year = d.getFullYear();
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
   }
 
   function setDueInDays(days: number) {
@@ -5320,6 +5258,21 @@ function App() {
         </div>
       )}
 
+      {copiesEditorOpen && detailBook && canWrite && (
+        <CopiesEditor
+          book={detailBook}
+          onClose={() => setCopiesEditorOpen(false)}
+          onSaved={async () => {
+            // The record's own shelf/room/status are DERIVED from its copies, so
+            // both the detail panel and the list have to be refetched or the
+            // header badge disagrees with the copies underneath it.
+            const fresh = await apiRequest<Book>(`/api/books/${detailBook.id}`);
+            setDetailBook(fresh);
+            await loadBooks();
+          }}
+        />
+      )}
+
       {/* ═══ BULK EDIT MODAL ═══ */}
       {/* Reaches every field a bulk edit may touch. The rule the whole panel is
           built around: a control the librarian did not touch writes NOTHING.
@@ -5823,43 +5776,19 @@ function App() {
                           </li>
                         ))}
                       </ul>
-                      {/* What kind of thing each copy is, and when it was
-                          acquired. Both columns have existed since the holdings
-                          layer and neither has ever had a screen, which is why
-                          every copy reads 'book' with no acquisition date and
-                          why ISO 2789 cannot report additions or medium. */}
+                      {/* The full per-copy editor. It used to be two controls
+                          in a <details> — a type select and a date — that saved
+                          on every change event, so nine writable columns had no
+                          control at all and a librarian moving quickly through
+                          the dropdown collided with their own in-flight save. */}
                       {canWrite && (
-                        <details className="copies-editor">
-                          <summary>{t('copies.editHeading')}</summary>
-                          <p className="muted small" style={{ margin: '0.5rem 0' }}>{t('copies.editIntro')}</p>
-                          {(detailBook.items ?? []).map((item, idx) => (
-                            <div className="form-row" key={item.id}>
-                              <div>
-                                <label htmlFor={`ct-${item.id}`}>
-                                  {t('library.copies.nth', { n: item.copyNumber })} · {t('policies.itemType')}
-                                </label>
-                                <select
-                                  id={`ct-${item.id}`}
-                                  value={String(item.itemType ?? 'book')}
-                                  onChange={(e) => void updateCopyFields(detailBook, idx, { itemType: e.target.value })}
-                                >
-                                  {ITEM_TYPES.map((it) => <option key={it} value={it}>{t(`itemType.${it}`)}</option>)}
-                                </select>
-                              </div>
-                              <div>
-                                <label htmlFor={`ca-${item.id}`}>{t('copies.acquired')}</label>
-                                <input
-                                  id={`ca-${item.id}`}
-                                  type="date"
-                                  value={isoToLocalDateInput(item.acquisitionDate ?? '')}
-                                  onChange={(e) => void updateCopyFields(detailBook, idx, {
-                                    acquisitionDate: e.target.value ? endOfLocalDayIso(e.target.value) : null
-                                  })}
-                                />
-                              </div>
-                            </div>
-                          ))}
-                        </details>
+                        <button
+                          className="secondary small"
+                          style={{ marginTop: '0.5rem' }}
+                          onClick={() => setCopiesEditorOpen(true)}
+                        >
+                          {t('copies.editHeading')}
+                        </button>
                       )}
                     </div>
                   )}

@@ -326,6 +326,8 @@ export type Item = {
   // import timestamp for the whole legacy catalogue, so it cannot stand in.
   acquisitionDate?: string | null;
   notes?: string | null;
+  /** Why this copy left the collection. Only ever set on a withdrawn copy. */
+  withdrawalReason?: string | null;
   version: number;
 };
 

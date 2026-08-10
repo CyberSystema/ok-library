@@ -3929,16 +3929,65 @@ app.put('/api/books/:id/items', requirePermission('books.write', { librarian: tr
 	const statements: D1PreparedStatement[] = [];
 
 	// A copy that is on loan cannot be removed — that would strand the loan and
-	// lose the record of who has the book.
-	for (const prior of existing) {
-		if (keptIds.has(String(prior.id))) continue;
-		if (prior.status === 'borrowed') {
-			throw new HTTPException(409, { message: 'Cannot remove a copy that is on loan. Return it first.' });
+	// lose the record of who has the book. A copy waiting on the hold shelf is
+	// equally pinned: `ITEM_IS_FREE`, which every other path uses, treats a ready
+	// hold as making a copy unavailable, and this guard used to look only at
+	// `status === 'borrowed'` — so a replace that omitted it soft-deleted the copy
+	// out from under the reader it was being held for.
+	const removing = existing.filter((prior) => !keptIds.has(String(prior.id)));
+	if (removing.length > 0) {
+		const onHold = await c.env.DB.prepare(
+			`SELECT item_id FROM holds WHERE status = 'ready' AND item_id IS NOT NULL
+			   AND item_id IN (${removing.map(() => '?').join(', ')})`
+		).bind(...removing.map((r) => String(r.id))).all<{ item_id: string }>();
+		const pinned = new Set((onHold.results ?? []).map((r) => r.item_id));
+		for (const prior of removing) {
+			if (prior.status === 'borrowed') {
+				throw new HTTPException(409, { message: 'Cannot remove a copy that is on loan. Return it first.' });
+			}
+			if (pinned.has(String(prior.id))) {
+				throw new HTTPException(409, {
+					message: 'Cannot remove a copy that is waiting on the hold shelf. Cancel the hold first.'
+				});
+			}
 		}
-		statements.push(
-			c.env.DB.prepare('UPDATE items SET deleted_at = ?, updated_at = ? WHERE id = ?')
-				.bind(now, now, prior.id)
-		);
+		// Removing a copy is a WITHDRAWAL — ISO 2789 B.2.4 counts them, and the
+		// column to say why has existed since 0030 with no way to write it. The
+		// version bump matters too: the copy changed, and an unversioned change is
+		// invisible to any client holding the old row.
+		const reason = payload.withdrawalReason?.trim() || null;
+		for (const prior of removing) {
+			statements.push(
+				c.env.DB.prepare(
+					`UPDATE items SET deleted_at = ?, updated_at = ?, withdrawal_reason = ?,
+					        version = version + 1 WHERE id = ?`
+				).bind(now, now, reason, prior.id)
+			);
+		}
+	}
+
+	// items.barcode is UNIQUE across the whole catalogue, and neither branch below
+	// pre-checked it: a barcode already on another copy came back out of the D1
+	// batch as a raw constraint error, i.e. a 500 the client retried four times
+	// rather than "that barcode is already on another copy".
+	const typedBarcodes = payload.items
+		.map((i) => i.barcode?.trim())
+		.filter((b): b is string => Boolean(b));
+	const dupInPayload = typedBarcodes.find((b, i) => typedBarcodes.indexOf(b) !== i);
+	if (dupInPayload) {
+		throw new HTTPException(409, { message: `Barcode ${dupInPayload} is on two copies in this list.` });
+	}
+	if (typedBarcodes.length > 0) {
+		const clash = await c.env.DB.prepare(
+			`SELECT barcode FROM items
+			  WHERE deleted_at IS NULL AND book_id <> ?
+			    AND barcode IN (${typedBarcodes.map(() => '?').join(', ')}) LIMIT 1`
+		).bind(id, ...typedBarcodes).first<{ barcode: string }>();
+		if (clash) {
+			throw new HTTPException(409, {
+				message: `Barcode ${clash.barcode} is already on a copy of another record.`
+			});
+		}
 	}
 
 	payload.items.forEach((item, index) => {
@@ -5630,14 +5679,16 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 	const format = c.req.query('format') === 'json' ? 'json' : 'marcxml';
 	const settings = await getLibrarySettings(c.env);
 	const isil = settings.isil ?? null;
-	// `queryBooksWithFilters` clamps pageSize to 100. Asking for 200 got 100
-	// back, the "short page means we are done" test fired on the FIRST page, and
-	// the export wrote a properly-closed <collection> containing 100 of 12,608
-	// records. A truncated file that looks complete is the worst possible
-	// failure for an exchange format: the receiving library has no way to tell.
-	const pageSize = 100;
-	// Same ceiling as the CSV export. Reaching it is reported in-band rather
-	// than silently, for the same reason.
+	// Same ceiling as the CSV export, and reaching it is reported in-band rather
+	// than silently — for the same reason a truncated exchange file that looks
+	// complete is the worst kind of failure: the receiving library cannot tell.
+	//
+	// This export used to page with OFFSET, and got that wrong twice. It asked
+	// for pages of 200 from a query builder that clamps at 100, so "a short page
+	// means we are done" fired on the first page and the whole catalogue came out
+	// as 100 records inside a properly-closed <collection>. Fixing the page size
+	// then exposed the deeper problem, which is that OFFSET paging cannot be used
+	// here at all — see the id resolution below.
 	const EXPORT_ROW_LIMIT = 20_000;
 
 	const stream = new ReadableStream({
@@ -5645,29 +5696,65 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 			const enc = new TextEncoder();
 			const write = (s: string) => controller.enqueue(enc.encode(s));
 			write(format === 'json' ? '[\n' : MARCXML_COLLECTION_OPEN + '\n');
-			let page = 1;
 			let first = true;
 			let written = 0;
 			try {
-				for (;;) {
-					const result = await queryBooksWithFilters(c.env, {
-						sortBy: 'updatedAt', sortDir: 'desc', page, pageSize,
-						customFilters: [],
-						// The total is discarded on every page, so don't pay for the
-						// COUNT(*) scan 63 times over.
-						skipCount: true
-					});
-					if (result.rows.length === 0) break;
-					const ids = result.rows.map((r) => String((r as { id: unknown }).id));
+				// Resolve every id in ONE query, then read the rows BY ID — the same
+				// change /api/export/books.csv already made, for the same two reasons.
+				//
+				// Correctness first: this used to walk page=1,2,3… ordered by
+				// `updated_at DESC`, a value 2,357 groups of records in this catalogue
+				// share. OFFSET paging over a sort key with ties gives no stable order
+				// between statements, so the stream emitted some records twice and
+				// dropped others — measured at three duplicates in 12,616 — and the
+				// resulting file is the right length and looks complete. A peer library
+				// importing it silently gets a duplicate and a hole.
+				//
+				// Cost second: OFFSET makes SQLite re-scan and discard every row before
+				// the offset, so a 12.6K export cost ~800K row reads and grew with the
+				// SQUARE of the catalogue. By id it is linear.
+				const idResult = await queryBooksWithFilters(c.env, {
+					sortBy: 'updatedAt', sortDir: 'desc',
+					page: 1, pageSize: 1,
+					customFilters: [],
+					includeDeleted: false,
+					idsOnly: true,
+					idsLimit: EXPORT_ROW_LIMIT,
+					skipCount: true
+				});
+				const exportIds = (
+					idResult.ids ?? (idResult.rows as Array<Record<string, unknown>>).map((r) => String(r.id ?? ''))
+				).filter(Boolean);
+				if (exportIds.length >= EXPORT_ROW_LIMIT) {
+					// Never drop records without saying so. A harvester ignores an XML
+					// comment, but the librarian who opens the file can see it.
+					if (format !== 'json') write(`  <!-- truncated at ${EXPORT_ROW_LIMIT} records -->\n`);
+					console.warn(`MARC export truncated at ${EXPORT_ROW_LIMIT} records`);
+				}
+
+				// D1 allows 100 bound parameters per statement, so 90 ids each.
+				const IDS_PER_STATEMENT = 90;
+				for (let i = 0; i < exportIds.length; i += IDS_PER_STATEMENT) {
+					const slice = exportIds.slice(i, i + IDS_PER_STATEMENT);
+					const placeholders = slice.map(() => '?').join(',');
+					const res = await c.env.DB.prepare(
+						`SELECT * FROM books WHERE id IN (${placeholders}) AND deleted_at IS NULL`
+					).bind(...slice).all<Record<string, unknown>>();
+					const rows = (res.results ?? []).map((r) => parseBook(r));
+					// `IN (...)` does not preserve the requested order.
+					const order = new Map(slice.map((v, n) => [v, n]));
+					rows.sort((a, b) => (order.get(String(a.id)) ?? 0) - (order.get(String(b.id)) ?? 0));
+
+					const ids = rows.map((r) => String(r.id));
 					const [itemsByBook, extras] = await Promise.all([
 						loadItemsForBooks(c.env, ids),
 						loadMarcExtrasForBooks(c.env, ids)
 					]);
-					for (const row of result.rows) {
-						const id = String((row as { id: unknown }).id);
-						const extra = extras.get(id);
+					for (const row of rows) {
+						const bookId = String(row.id);
+						const extra = extras.get(bookId);
 						const input = bookRowToMarcInput(row as Record<string, unknown>, {
-							items: itemsByBook.get(id) ?? [],
+							items: itemsByBook.get(bookId) ?? [],
 							contributors: extra?.contributors,
 							subjects: extra?.subjects,
 							seriesTitle: extra?.seriesTitle,
@@ -5681,19 +5768,6 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 						first = false;
 						written += 1;
 					}
-					// Stop on an EMPTY page, not a short one. A short page only means
-					// "we are done" if the callee returned exactly what was asked for,
-					// and this one clamps — one extra query at the end is a small price
-					// for an export that cannot silently truncate.
-					if (result.rows.length === 0) break;
-					if (written >= EXPORT_ROW_LIMIT) {
-						// Never drop records without saying so. A harvester ignores an XML
-						// comment, but the librarian who opens the file can see it.
-						if (format !== 'json') write(`  <!-- truncated at ${EXPORT_ROW_LIMIT} records -->\n`);
-						console.warn(`MARC export truncated at ${EXPORT_ROW_LIMIT} records`);
-						break;
-					}
-					page += 1;
 				}
 				write(format === 'json' ? '\n]\n' : MARCXML_COLLECTION_CLOSE + '\n');
 			} catch (error) {
