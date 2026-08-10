@@ -16,6 +16,7 @@ import { apiRequest } from '../api';
 import { useT } from '../i18n';
 import { useConfirm, useToast } from '../ui';
 import { fmt } from '../ui';
+import { HelpLink } from '../handbook/context';
 
 type TrashedBook = {
   id: string;
@@ -104,7 +105,10 @@ export function TrashCard({ canDelete, onChanged }: { canDelete: boolean; onChan
 
   return (
     <div className="card">
-      <h3>🗑 {t('trash.heading')}</h3>
+      <h3>
+        🗑 {t('trash.heading')}
+        <HelpLink anchor="the-trash" label={t('handbook.helpAbout', { field: t('trash.heading') })} />
+      </h3>
       <p className="muted small" style={{ marginBottom: '0.75rem' }}>{t('trash.intro')}</p>
 
       {!open ? (

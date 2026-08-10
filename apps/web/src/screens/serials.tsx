@@ -22,6 +22,7 @@ import type { Book } from '../types';
 import { apiRequest } from '../api';
 import { useT } from '../i18n';
 import { Dialog, useToast } from '../ui';
+import { HelpLink } from '../handbook/context';
 
 export type SerialHolding = {
   id: string;
@@ -131,7 +132,10 @@ export function SerialHoldingsEditor({ book, holdings, onClose, onSaved }: {
   return (
     <Dialog onClose={onClose} labelledBy="serials-editor-title" className="modal wide">
       <div className="modal-header">
-        <h3 id="serials-editor-title">{t('serials.editorTitle')}</h3>
+        <h3 id="serials-editor-title">
+          {t('serials.editorTitle')}
+          <HelpLink anchor="recording-a-run" label={t('handbook.helpAbout', { field: t('serials.editorTitle') })} />
+        </h3>
         <button className="icon-button" onClick={onClose} aria-label={t('common.close')}>✕</button>
       </div>
 
@@ -207,6 +211,7 @@ export function SerialHoldingsEditor({ book, holdings, onClose, onSaved }: {
 
                 <div className="form-field">
                   <label htmlFor={`sh-gaps-${d.key}`}>{t('serials.gaps')}</label>
+                  <HelpLink anchor="gaps-in-a-run" label={t('handbook.helpAbout', { field: t('serials.gaps') })} />
                   <input id={`sh-gaps-${d.key}`} value={d.gaps}
                     onChange={(e) => patch(d.key, { gaps: e.target.value })}
                     placeholder={t('serials.gapsPh')} />

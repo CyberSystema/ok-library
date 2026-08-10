@@ -29,6 +29,13 @@ export const CHAPTER_IDS = [
   'searching',
   'transliteration',
   'dates',
+  // Holdings — the physical side
+  'copies-and-shelves',
+  'shelf-marks',
+  'barcodes',
+  'periodical-runs',
+  'withdrawal',
+  'trash-and-merge',
   // Reference
   'glossary'
 ] as const;
@@ -43,6 +50,31 @@ export type ChapterId = (typeof CHAPTER_IDS)[number];
  * difference between "this anchor is not written yet" and "this anchor is a typo".
  */
 export const ANCHOR_OWNERS = {
+  // copies-and-shelves
+  'adding-a-copy': 'copies-and-shelves',
+  'copy-order': 'copies-and-shelves',
+  'copy-notes': 'copies-and-shelves',
+  'oversize': 'copies-and-shelves',
+  'copy-condition': 'copies-and-shelves',
+  // shelf-marks
+  'shelf-mark-form': 'shelf-marks',
+  'rooms': 'shelf-marks',
+  'call-numbers': 'shelf-marks',
+  // barcodes
+  'why-barcodes': 'barcodes',
+  'assigning-barcodes': 'barcodes',
+  'printing-labels': 'barcodes',
+  // periodical-runs
+  'recording-a-run': 'periodical-runs',
+  'gaps-in-a-run': 'periodical-runs',
+  // withdrawal
+  'withdrawing-a-copy': 'withdrawal',
+  'withdrawal-reasons': 'withdrawal',
+  // trash-and-merge
+  'the-trash': 'trash-and-merge',
+  'restoring': 'trash-and-merge',
+  'purging': 'trash-and-merge',
+  'merging-duplicates': 'trash-and-merge',
   // headings
   'what-a-heading-is': 'headings',
   'making-a-heading': 'headings',

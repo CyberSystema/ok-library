@@ -26,6 +26,7 @@ import type { Book, Item } from '../types';
 import { apiRequest } from '../api';
 import { useT } from '../i18n';
 import { Dialog, endOfLocalDayIso, isoToLocalDateInput, useConfirm, useToast } from '../ui';
+import { HelpLink } from '../handbook/context';
 
 /** The editable projection of a copy. `id` absent means "this one is new". */
 type Draft = {
@@ -193,7 +194,10 @@ export function CopiesEditor({ book, onClose, onSaved }: {
   return (
     <Dialog onClose={onClose} labelledBy="copies-editor-title" className="modal wide">
       <div className="modal-header">
-        <h3 id="copies-editor-title">{t('copies.editorTitle', { n: drafts.length })}</h3>
+        <h3 id="copies-editor-title">
+          {t('copies.editorTitle', { n: drafts.length })}
+          <HelpLink anchor="adding-a-copy" label={t('handbook.helpAbout', { field: t('copies.editorTitle', { n: drafts.length }) })} />
+        </h3>
         <button className="icon-button" onClick={onClose} aria-label={t('common.close')}>✕</button>
       </div>
 
@@ -240,6 +244,7 @@ export function CopiesEditor({ book, onClose, onSaved }: {
               </div>
               <div>
                 <label htmlFor={`cd-barcode-${d.key}`}>{t('copies.barcode')}</label>
+                <HelpLink anchor="why-barcodes" label={t('handbook.helpAbout', { field: t('copies.barcode') })} />
                 <input
                   id={`cd-barcode-${d.key}`}
                   className="mono"
@@ -270,6 +275,7 @@ export function CopiesEditor({ book, onClose, onSaved }: {
               <div>
                 {/* MARC 852$h. Exported to every library we send records to. */}
                 <label htmlFor={`cd-call-${d.key}`}>{t('copies.callNumber')}</label>
+                <HelpLink anchor="call-numbers" label={t('handbook.helpAbout', { field: t('copies.callNumber') })} />
                 <input
                   id={`cd-call-${d.key}`}
                   value={d.callNumber}
@@ -345,6 +351,7 @@ export function CopiesEditor({ book, onClose, onSaved }: {
 
       {removedIds.length > 0 && (
         <div className="form-field withdrawal-reason">
+          <HelpLink anchor="withdrawal-reasons" label={t('handbook.helpAbout', { field: t('copies.withdrawalReason', { n: removedIds.length }) })} />
           <label htmlFor="cd-withdrawal-reason">
             {t('copies.withdrawalReason', { n: removedIds.length })}
           </label>

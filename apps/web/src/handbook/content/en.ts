@@ -219,8 +219,8 @@ const pack: ContentPack = {
       { kind: 'h', text: 'Size', anchor: 'dimensions' },
       { kind: 'p', text:
         'Height in centimetres, rounded up. A book 20.4 cm tall is 21 εκ. Size matters more than it sounds: it is often the quickest way to tell two printings apart, and it tells whoever is shelving whether the book fits.' },
-      { kind: 'see', chapter: 'what-a-catalogue-is-for', anchor: 'record-vs-copy', text:
-        'Size belongs to the publication; where an oversized volume actually stands belongs to the copy.' }
+      { kind: 'see', chapter: 'copies-and-shelves', anchor: 'oversize', text:
+        'An oversized volume often cannot stand with the rest of its set. That is a decision about the copy.' }
     ]
   },
 
@@ -335,8 +335,8 @@ const pack: ContentPack = {
         'Before adding a new attribute, check whether a real field already covers it. An attribute is invisible to MARC export, to Dublin Core, and to any library you send records to; a real field is not.' },
       { kind: 'p', text:
         'The everyday attributes are pinned to the top of the form, in the order the library chose, so the handful you fill on nearly every book are not buried among two dozen you rarely open.' },
-      { kind: 'see', chapter: 'what-a-catalogue-is-for', anchor: 'record-vs-copy', text:
-        'A note about one physical volume belongs to the copy, which is a different object from the record.' }
+      { kind: 'see', chapter: 'copies-and-shelves', anchor: 'copy-notes', text:
+        'The per-copy note, and the nine other things one volume can record.' }
     ]
   },
 
@@ -689,6 +689,257 @@ const pack: ContentPack = {
         'ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ is currently catalogued as 47 separate books. It is one periodical with 47 issues held. Recording it that way replaces 47 records with one title and one run statement.' },
       { kind: 'p', text:
         'Nothing in this catalogue uses an uncertain date yet — every stored date is a plain year. That is not a sign the collection has no doubtful dates; it is a sign the field could not express them before.' }
+    ]
+  },
+
+  'copies-and-shelves': {
+    id: 'copies-and-shelves',
+    title: 'Copies',
+    summary:
+      'The physical volumes. One record, as many copies as the library owns — and ten things each of them can say.',
+    blocks: [
+      { kind: 'p', text:
+        'There are 12,675 copies in this catalogue and 12,675 records, which means nobody has ever recorded a second copy of anything. Where the library owns a book twice, one of the two is either uncatalogued or catalogued again as its own record.' },
+      { kind: 'see', chapter: 'what-a-catalogue-is-for', anchor: 'record-vs-copy', text:
+        'Why the second of those is the expensive mistake.' },
+
+      { kind: 'h', text: 'Adding a copy', anchor: 'adding-a-copy' },
+      { kind: 'steps', items: [
+        'Open the record and press the copies button.',
+        'Press “Add a copy”. It inherits the room, shelf and kind of the one above it, because a second copy of a book is nearly always the same sort of thing in nearly the same place.',
+        'Give it whatever distinguishes it: a different shelf, a volume number, a barcode.',
+        'Press Save once, at the end.'
+      ] },
+      { kind: 'rule', text:
+        'Nothing is written until you press Save. Editing several copies and saving once is one change to the record, not one per keystroke.' },
+      { kind: 'auto', text:
+        'A record always keeps at least one copy. Removing the last one is refused, because a record with no copies falls out of every shelf search and out of the stock count — to remove the whole thing, delete the record.' },
+      { kind: 'p', text:
+        'For many records at once — “29 volumes, each also on the back shelf” — the bulk add-copies action in the library view does it in one step rather than 29.' },
+
+      { kind: 'h', text: 'The order is the numbering', anchor: 'copy-order' },
+      { kind: 'p', text:
+        'Copies are numbered by their position in the list, so the arrows that move a copy up or down are how you renumber. Copy 1 is the first, and its shelf mark is the one shown on the record itself.' },
+      { kind: 'tip', text:
+        'That last part matters when a book is in two places: put the copy a reader is most likely to be sent to first, because that is the location the record advertises.' },
+
+      { kind: 'h', text: 'Condition', anchor: 'copy-condition' },
+      { kind: 'p', text:
+        'Free text about the state of this volume: “καλή”, “χαλαρή ράχη”, “λείπει το εξώφυλλο”. It belongs to the copy and not to the record, because the other copy may be perfect.' },
+      { kind: 'fields', rows: [
+        { fact: 'copyNumber', note: 'Derived from the order. Not typed.' },
+        { fact: 'shelfCode', note: 'Where this volume stands.' },
+        { fact: 'callNumber', note: 'The classification-based location. Exported to other libraries.' },
+        { fact: 'barcode', note: 'This volume’s own number, for scanning.' }
+      ] },
+
+      { kind: 'h', text: 'Notes on one volume', anchor: 'copy-notes' },
+      { kind: 'p', text:
+        'Provenance, a donor, a dedication written inside, the fact that this copy is water-damaged. Anything true of this physical object and not of the publication.' },
+      { kind: 'see', chapter: 'notes', anchor: 'when-to-note', text:
+        'The other kind of note — the one that belongs to the publication.' },
+
+      { kind: 'h', text: 'When a volume does not fit', anchor: 'oversize' },
+      { kind: 'p', text:
+        'An oversized volume often cannot stand with the rest of its set, and the honest way to record that is to give that copy its own shelf mark rather than the set’s. The record still holds them together through the series; only the copy moves.' },
+      { kind: 'see', chapter: 'extent', anchor: 'dimensions', text:
+        'The size belongs to the publication. Where it stands belongs to the copy.' }
+    ]
+  },
+
+  'shelf-marks': {
+    id: 'shelf-marks',
+    title: 'Shelf marks, rooms and call numbers',
+    summary:
+      'Three different answers to “where is it?”, and which one each is for.',
+    blocks: [
+      { kind: 'h', text: 'The shelf mark', anchor: 'shelf-mark-form' },
+      { kind: 'p', text:
+        'The shelf marks here take the form 15-003: a subject area and a position within it. They are a classification as much as a location, which is why the same code appears as both a shelf mark on the copy and a class number on the record.' },
+      { kind: 'quote', text: '15-003 · 28-003 · 25-003 · 14-005 · 30-000',
+        source: 'the busiest shelf marks, 185 to 123 volumes each' },
+      { kind: 'auto', text:
+        'Shelf marks are stored upper-cased, and Greek ones are upper-cased the Greek way — so “πισω” and “ΠΙΣΩ” are the same shelf and a search for either finds both.' },
+      { kind: 'p', text:
+        'Seventy-three copies have no shelf mark at all. Those are the ones a reader cannot be sent to, which makes them the most useful list in the catalogue to work through.' },
+      { kind: 'see', chapter: 'searching', anchor: 'smart-lists', text:
+        'The “no shelf mark” smart list collects them.' },
+
+      { kind: 'h', text: 'Rooms', anchor: 'rooms' },
+      { kind: 'p', text:
+        'A room is the space the shelves are in — a reading room, a back store, a chapel library. It is worth recording when the library occupies more than one space, because a shelf mark alone then does not say which building to walk to.' },
+      { kind: 'p', text:
+        'There are no rooms defined here yet, and all 12,675 copies are unassigned. If everything is in one space, that is the correct state and there is nothing to do.' },
+      { kind: 'rule', text:
+        'Renaming a room moves every book in it. Deleting one is refused while any book is still there, including a book in the trash — the trash still points at the room.' },
+
+      { kind: 'h', text: 'Call numbers', anchor: 'call-numbers' },
+      { kind: 'p', text:
+        'The call number is the location as another library would understand it, and it is the field that travels: it is exported with the holdings, so a library that receives these records knows how they are arranged.' },
+      { kind: 'fields', rows: [
+        { fact: 'callNumber', note: 'Exported with the copy. Usually the classification plus a cutter for the author.' },
+        { fact: 'shelfCode', note: 'Local. Not exported as a classification.' }
+      ] },
+      { kind: 'p', text:
+        'No copy here has one. That is worth changing only on the records you actually share; for internal use the shelf mark already does the job.' },
+      { kind: 'see', chapter: 'classification', anchor: 'ddc', text:
+        'A call number is most useful together with a standard class number.' }
+    ]
+  },
+
+  barcodes: {
+    id: 'barcodes',
+    title: 'Barcodes and labels',
+    summary:
+      'A number a scanner can read, so lending a book takes one beep instead of a search.',
+    blocks: [
+      { kind: 'h', text: 'What a barcode is for', anchor: 'why-barcodes' },
+      { kind: 'p', text:
+        'It identifies one physical volume, not a publication — which is why it belongs to the copy. An ISBN says which book this is; a barcode says which of the library’s copies of it you are holding. That distinction is what lets loan history be per copy.' },
+      { kind: 'fields', rows: [
+        { fact: 'barcode', note: 'Unique across the whole catalogue. Exported with the holdings.' }
+      ] },
+      { kind: 'p', text:
+        'No copy here has one yet, so every loan is currently found by searching. A handheld scanner types the number and presses Enter, and the scan box in Circulation is built for exactly that: it is the fastest path from a book in your hand to its record.' },
+
+      { kind: 'h', text: 'Assigning them', anchor: 'assigning-barcodes' },
+      { kind: 'p', text:
+        'Barcodes are assigned in bulk rather than typed. The action works through the collection a few hundred copies at a time and can be stopped and resumed — running it twice does not renumber anything, because it only touches copies that have no barcode.' },
+      { kind: 'steps', items: [
+        'Run the assign-barcodes action from the library view.',
+        'Print the labels for the copies that just got one.',
+        'Stick them on. This is the slow part, and it is the only part software cannot do.'
+      ] },
+      { kind: 'tip', text:
+        'You can also type a barcode by hand on one copy, which is what to do when a book already carries a number from a previous system. The catalogue refuses a number that is already on another copy rather than creating two volumes with one identity.' },
+      { kind: 'auto', text:
+        'Automatic numbers are allocated after the highest existing numeric one, and a hand-typed value that is not a number cannot disturb that sequence.' },
+
+      { kind: 'h', text: 'Printing labels', anchor: 'printing-labels' },
+      { kind: 'p', text:
+        'A label carries the shelf mark, the barcode, and the volume as printed on the label field of the copy — which is why that field is separate from the volume number. “τ. Α΄” fits a spine; “Α΄” alone does not say what it counts.' },
+      { kind: 'rule', text:
+        'Print labels for a whole shelf at once, and stick them in the order they printed. A pile of labels in a different order from the pile of books is how a barcode ends up on the wrong volume.' },
+      { kind: 'p', text:
+        'The barcode symbology is Code 128, which is what library scanners expect, and every code carries a check character so a misread is detected rather than silently accepted.' }
+    ]
+  },
+
+  'periodical-runs': {
+    id: 'periodical-runs',
+    title: 'Periodical runs',
+    summary:
+      'One title, many issues. Recording the run instead of 47 records.',
+    blocks: [
+      { kind: 'p', text:
+        'ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ is catalogued here as 47 separate books. It is one periodical of which the library holds 47 issues. The difference is not tidiness: as 47 records it cannot be counted as a serial, its gaps cannot be seen, and a reader looking for the title finds 47 things that all look the same.' },
+      { kind: 'see', chapter: 'identifiers', anchor: 'issn', text:
+        'An ISSN on a record is the usual sign that this is what you are looking at.' },
+
+      { kind: 'h', text: 'Recording a run', anchor: 'recording-a-run' },
+      { kind: 'steps', items: [
+        'Set the kind of publication on the record to periodical.',
+        'Open “Record the run”.',
+        'Add one line per unbroken stretch you hold: what the numbering is called, from which volume to which, and the years.',
+        'Put what is missing from that stretch in its own field rather than in the numbers.'
+      ] },
+      { kind: 'fields', rows: [
+        { fact: 'bibLevel', note: 'Periodical. Changes what the record exports as and what the statistics count.' },
+        { fact: 'serialRun', note: 'The run itself. Exported as a textual holdings statement.' }
+      ] },
+      { kind: 'compare', good: 'One record, kind = periodical, run “τόμος 1-10 (1880-1889)”, missing “τ. 7”.',
+        bad: 'Forty-seven records, one per issue.',
+        why: 'The first says in one line what the second cannot say at all, and it is what a partner library receives when you send the record.' },
+      { kind: 'auto', text:
+        'The editor shows the statement your entry will produce as you type it, using the same code the exporter uses — so what you read is what another library gets.' },
+
+      { kind: 'h', text: 'Gaps', anchor: 'gaps-in-a-run' },
+      { kind: 'p', text:
+        'A real gap statement is “τ. 7, 12-14”, and the field takes it as free text on purpose. Forcing it into a list of numbers would lose the qualification a librarian puts on it — “τ. 7 (ελλιπές)” is not the same claim as “τ. 7 λείπει”.' },
+      { kind: 'rule', text:
+        'The run says what you have. The gaps say what you know you are missing. Not knowing is a third state, and it is expressed by saying nothing.' },
+      { kind: 'see', chapter: 'series-and-sets', anchor: 'missing-volumes', text:
+        'A multi-part monograph is different: there the catalogue can work the gaps out from the volume numbers.' }
+    ]
+  },
+
+  withdrawal: {
+    id: 'withdrawal',
+    title: 'Withdrawing a copy',
+    summary:
+      'A volume leaves the collection. Recording why is what makes the statistics true.',
+    blocks: [
+      { kind: 'h', text: 'Withdrawing', anchor: 'withdrawing-a-copy' },
+      { kind: 'p', text:
+        'A copy is withdrawn when the physical volume leaves the library: damaged beyond use, lost, given away, superseded. The record stays, and the other copies stay — only that volume goes.' },
+      { kind: 'steps', items: [
+        'Open the copies editor on the record.',
+        'Press Withdraw on the copy that is leaving.',
+        'Say why, in the field that appears.',
+        'Save.'
+      ] },
+      { kind: 'rule', text:
+        'A copy that is on loan or waiting on the hold shelf cannot be withdrawn. Take it back or cancel the hold first — otherwise the loan is stranded and the record of who has the book is lost.' },
+      { kind: 'auto', text:
+        'A withdrawn copy is not erased. It stays attached to the record with its reason and the date, which is what the statistics count and what lets a mistake be understood later.' },
+
+      { kind: 'h', text: 'The reason', anchor: 'withdrawal-reasons' },
+      { kind: 'p', text:
+        'The statistics report groups withdrawals by reason. There are six withdrawn copies in this catalogue and all six are recorded as “unrecorded”, because until recently there was no field to write one in. Anything specific is better than that.' },
+      { kind: 'list', items: [
+        'φθορά — damaged beyond repair.',
+        'απώλεια — lost, including a loan never returned.',
+        'δωρεά — given away or transferred.',
+        'αντικατάσταση — replaced by a better copy.',
+        'διπλότυπο — a duplicate the library does not need.'
+      ] },
+      { kind: 'tip', text:
+        'Use a short, consistent phrase rather than a sentence. The report groups by the exact text, so “φθορά” on twenty withdrawals is one line and twenty descriptions are twenty lines.' },
+      { kind: 'p', text:
+        'Withdrawing the last copy of a record is refused. If the library no longer holds the publication at all, delete the record — that is a different act, and it is reversible.' },
+      { kind: 'see', chapter: 'trash-and-merge', anchor: 'the-trash', text:
+        'What happens to a deleted record, and how to get it back.' }
+    ]
+  },
+
+  'trash-and-merge': {
+    id: 'trash-and-merge',
+    title: 'Deleting, restoring and merging',
+    summary:
+      'Nothing is destroyed by accident. Two records that are one book become one record with two copies.',
+    blocks: [
+      { kind: 'h', text: 'The trash', anchor: 'the-trash' },
+      { kind: 'p', text:
+        'Deleting a record does not remove it. It goes to the trash with its copies, its loan history and everything else intact, and it stops appearing in searches and counts. Six records are there now.' },
+      { kind: 'rule', text:
+        'Delete a record when the library does not hold the publication. Withdraw a copy when one volume of it has gone. They are different acts with different consequences.' },
+
+      { kind: 'h', text: 'Restoring', anchor: 'restoring' },
+      { kind: 'p', text:
+        'Restoring brings the record back exactly as it was, with the copies its deletion took down — and only those. A copy you had withdrawn beforehand stays withdrawn, because restoring the record is not meant to put a book back on a shelf it is not on.' },
+
+      { kind: 'h', text: 'Purging', anchor: 'purging' },
+      { kind: 'p', text:
+        'Purging destroys a record permanently, along with its copies, its loan history and its links. There is no way back. It exists for records that should never have existed — a test entry, a scanning accident — and not as a tidier form of deleting.' },
+      { kind: 'rule', text:
+        'If you are unsure whether something should be purged, it should not be purged. The trash costs nothing to leave alone.' },
+
+      { kind: 'h', text: 'Merging duplicates', anchor: 'merging-duplicates' },
+      { kind: 'p', text:
+        'When the same book has been catalogued twice, merging folds one record into the other: the copies move across as additional copies, the loan history follows, and the record that loses keeps a forwarding note saying where it went.' },
+      { kind: 'steps', items: [
+        'Open the duplicate finder. It groups records that match strictly — same title, same author, same identifier.',
+        'Look at both records before merging. Two printings of one work are NOT duplicates, and neither are two volumes of a set.',
+        'Choose which record to keep. Prefer the fuller one; its values win where the two disagree.',
+        'Merge. The other record goes to the trash with a note pointing at the keeper.'
+      ] },
+      { kind: 'compare', good: 'Two records for the same 1987 printing → merge into one record with two copies.',
+        bad: 'A 1955 edition and a 1987 edition → merge.',
+        why: 'Those are two publications. Merging them loses one of the two dates, and the library then appears to hold one book where it holds two.' },
+      { kind: 'auto', text:
+        'A merged-away record can be restored, and the trash marks it differently from an ordinary deletion — restoring it re-creates the duplicate you removed, and it comes back with a fresh empty copy because its own copies stayed with the keeper.' },
+      { kind: 'see', chapter: 'consistency', anchor: 'consolidate-or-authority', text:
+        'Two records for one book is a different problem from one name spelled two ways. Merging is for the first.' }
     ]
   },
 
