@@ -2767,6 +2767,20 @@ mark.hl {
 .modal.wide {
   max-width: 46rem;
 }
+
+/* The 866 statement the librarian's entry will produce, shown as they type. */
+.holdings-preview {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed var(--border);
+}
+.holdings-preview code {
+  font-size: 0.8125rem;
+}
+.meta-chip.warn {
+  border-color: var(--warn-border, var(--border));
+  color: var(--text-light);
+}
 /* The URL is the deliverable here, so it has to be selectable and it must not
    push the card wide on a phone. */
 .endpoint {

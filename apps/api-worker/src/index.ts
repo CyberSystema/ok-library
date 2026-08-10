@@ -6,6 +6,8 @@ import {
 	CreateBookSchema,
 	GenerateCodeSchema,
 	ReplaceItemsSchema,
+	ReplaceSerialHoldingsSchema,
+	formatHoldingStatement,
 	computeSetGaps,
 	LinkAuthoritiesSchema,
 	MergeBooksSchema,
@@ -67,6 +69,8 @@ import {
 	restoreItemsDeletedAt,
 	ITEM_BACKED_FACETS,
 	loadBookItems,
+	loadSerialHoldings,
+	loadSerialHoldingsForBooks,
 	loadItemsForBooks,
 	loadMergeCandidateGroups,
 	pickLendableItem,
@@ -3904,6 +3908,93 @@ app.get('/api/books/:id/items', async (c) => {
 	return c.json({ bookId: id, items: await loadBookItems(c.env, id) });
 });
 
+// ─── Serial holdings: the run of a periodical ─────────────────────────────
+//
+// Migration 0026 built `serial_holdings` for exactly one purpose — so that
+// ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ can be ONE record saying "τόμος 1-10 (1975-1984), λείπει
+// ο τ. 12" instead of the 47 separate book rows it is today — and then nothing
+// in the system could read or write the table. The only statement that named it
+// was a merge re-parent, which could never match a row.
+
+app.get('/api/books/:id/serial-holdings', async (c) => {
+	const id = c.req.param('id') ?? '';
+	const book = await c.env.DB.prepare(
+		'SELECT id, bib_level FROM books WHERE id = ? AND deleted_at IS NULL'
+	).bind(id).first<{ id: string; bib_level: string }>();
+	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+	// Returned for any record, not just serials: a title can be marked a serial
+	// after its run was typed, and refusing to show what is stored would look
+	// like data loss.
+	return c.json({ bookId: id, bibLevel: book.bib_level ?? 'monograph', holdings: await loadSerialHoldings(c.env, id) });
+});
+
+app.put('/api/books/:id/serial-holdings', requirePermission('books.write', { librarian: true }), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const book = await c.env.DB.prepare(
+		'SELECT id, version FROM books WHERE id = ? AND deleted_at IS NULL'
+	).bind(id).first<{ id: string; version: number }>();
+	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+
+	const payload = ReplaceSerialHoldingsSchema.parse(await c.req.json());
+	if (payload.expectedVersion !== undefined && payload.expectedVersion !== book.version) {
+		throw new HTTPException(409, { message: 'Book was modified by someone else' });
+	}
+
+	const existing = await loadSerialHoldings(c.env, id);
+	const existingIds = new Set(existing.map((h) => String(h.id)));
+	const keptIds = new Set(payload.holdings.map((h) => h.id).filter(Boolean) as string[]);
+	const now = nowIso();
+	const statements: D1PreparedStatement[] = [];
+
+	// A holdings statement is a description, not a physical object: removing one
+	// is a correction, so it is a hard delete rather than a withdrawal.
+	for (const gone of existing) {
+		if (!keptIds.has(String(gone.id))) {
+			statements.push(c.env.DB.prepare('DELETE FROM serial_holdings WHERE id = ?').bind(gone.id));
+		}
+	}
+
+	payload.holdings.forEach((h, index) => {
+		// `seq` is list position, for the same reason copy numbers are: the order
+		// the librarian arranged IS the order the run reads in.
+		if (h.id && existingIds.has(h.id)) {
+			statements.push(
+				c.env.DB.prepare(
+					`UPDATE serial_holdings SET caption = ?, from_volume = ?, to_volume = ?,
+					        from_year = ?, to_year = ?, gaps = ?, note = ?, seq = ?, updated_at = ?
+					  WHERE id = ?`
+				).bind(
+					h.caption ?? null, h.fromVolume ?? null, h.toVolume ?? null,
+					h.fromYear ?? null, h.toYear ?? null, h.gaps ?? null, h.note ?? null,
+					index, now, h.id
+				)
+			);
+		} else {
+			statements.push(
+				c.env.DB.prepare(
+					`INSERT INTO serial_holdings (id, book_id, caption, from_volume, to_volume,
+					                              from_year, to_year, gaps, note, seq, created_at, updated_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+				).bind(
+					newId('shd'), id, h.caption ?? null, h.fromVolume ?? null, h.toVolume ?? null,
+					h.fromYear ?? null, h.toYear ?? null, h.gaps ?? null, h.note ?? null,
+					index, now, now
+				)
+			);
+		}
+	});
+
+	statements.push(
+		c.env.DB.prepare('UPDATE books SET updated_at = ?, version = version + 1 WHERE id = ?').bind(now, id)
+	);
+	await runAtomic(c.env, statements);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.serialHoldings.replace', 'book', id, {
+		count: payload.holdings.length
+	});
+	return c.json({ bookId: id, holdings: await loadSerialHoldings(c.env, id) });
+});
+
 // Whole-array replace, mirroring PUT /api/books/:id/attributes — the form edits
 // a record's copies as one list, and replace keeps the offline queue trivial.
 //
@@ -5403,9 +5494,10 @@ async function marcInputsForRows(
   env: Env, rows: Array<Record<string, unknown>>, isil: string | null
 ) {
   const ids = rows.map((r) => String(r.id));
-  const [itemsByBook, extras] = await Promise.all([
+  const [itemsByBook, extras, holdingsByBook] = await Promise.all([
     loadItemsForBooks(env, ids),
-    loadMarcExtrasForBooks(env, ids)
+    loadMarcExtrasForBooks(env, ids),
+    loadSerialHoldingsForBooks(env, ids)
   ]);
   return rows.map((row) => {
     const id = String(row.id);
@@ -5417,6 +5509,7 @@ async function marcInputsForRows(
         contributors: extra?.contributors,
         subjects: extra?.subjects,
         seriesTitle: extra?.seriesTitle,
+        serialHoldings: holdingsByBook.get(id) ?? [],
         isil
       })
     };
@@ -5746,9 +5839,10 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 					rows.sort((a, b) => (order.get(String(a.id)) ?? 0) - (order.get(String(b.id)) ?? 0));
 
 					const ids = rows.map((r) => String(r.id));
-					const [itemsByBook, extras] = await Promise.all([
+					const [itemsByBook, extras, holdingsByBook] = await Promise.all([
 						loadItemsForBooks(c.env, ids),
-						loadMarcExtrasForBooks(c.env, ids)
+						loadMarcExtrasForBooks(c.env, ids),
+						loadSerialHoldingsForBooks(c.env, ids)
 					]);
 					for (const row of rows) {
 						const bookId = String(row.id);
@@ -5758,6 +5852,7 @@ app.get('/api/export/books.marcxml', requirePermission('export.csv', { librarian
 							contributors: extra?.contributors,
 							subjects: extra?.subjects,
 							seriesTitle: extra?.seriesTitle,
+							serialHoldings: holdingsByBook.get(bookId) ?? [],
 							isil
 						});
 						if (format === 'json') {
@@ -5797,14 +5892,15 @@ app.get('/api/books/:id/marc', async (c) => {
 	const row = await c.env.DB.prepare('SELECT * FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
 	if (!row) throw new HTTPException(404, { message: 'Book not found' });
 	const settings = await getLibrarySettings(c.env);
-	const [items, extras] = await Promise.all([
+	const [items, extras, holdings] = await Promise.all([
 		loadBookItems(c.env, id),
-		loadMarcExtrasForBooks(c.env, [id])
+		loadMarcExtrasForBooks(c.env, [id]),
+		loadSerialHoldings(c.env, id)
 	]);
 	const extra = extras.get(id);
 	const input = bookRowToMarcInput(parseBook(row as Record<string, unknown>), {
 		items, contributors: extra?.contributors, subjects: extra?.subjects,
-		seriesTitle: extra?.seriesTitle, isil: settings.isil ?? null
+		seriesTitle: extra?.seriesTitle, serialHoldings: holdings, isil: settings.isil ?? null
 	});
 
 	const format = c.req.query('format') ?? 'marcxml';

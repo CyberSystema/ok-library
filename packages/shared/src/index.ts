@@ -603,6 +603,75 @@ export const ReplaceItemsSchema = z.object({
     .max(200)
 });
 
+// ─── Serial holdings ───────────────────────────────────────────────────────
+//
+// What is actually on the shelf for a periodical, as a RUN rather than as one
+// record per issue. ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ is catalogued as 47 separate books;
+// "τόμος 1-10 (1975-1984), λείπει ο τ. 12" says in one line what 47 rows cannot.
+// Migration 0026 built the table for this and nothing could read or write it.
+//
+// `gaps` is free text on purpose: a real gap statement is "τ. 7, 12-14", and a
+// numeric model would lose the librarian's own qualification of it.
+
+export const SerialHoldingCoreSchema = z.object({
+  /** What the enumeration is called on the piece: "τόμος", "vol.", "έτος". */
+  caption: z.string().max(40).optional().nullable(),
+  fromVolume: z.string().max(40).optional().nullable(),
+  toVolume: z.string().max(40).optional().nullable(),
+  fromYear: z.number().int().min(1000).max(3000).optional().nullable(),
+  toYear: z.number().int().min(1000).max(3000).optional().nullable(),
+  gaps: z.string().max(300).optional().nullable(),
+  note: z.string().max(500).optional().nullable()
+});
+
+export const SerialHoldingSchema = SerialHoldingCoreSchema.extend({
+  id: z.string().min(1),
+  bookId: z.string().min(1),
+  seq: z.number().int().min(0)
+});
+
+// Whole-array replace, like the copies list. An EMPTY array is legitimate here
+// and deliberately allowed — unlike copies, where a record with none falls out
+// of the catalogue: a periodical whose run nobody has written down yet is a
+// normal state, not a broken one.
+export const ReplaceSerialHoldingsSchema = z.object({
+  expectedVersion: z.number().int().min(0).optional(),
+  holdings: z.array(SerialHoldingCoreSchema.extend({ id: z.string().min(1).optional() })).max(50)
+});
+
+/**
+ * Render one holdings row as a MARC 866 $a statement.
+ *
+ * 866 is the TEXTUAL holdings field, and it is the honest choice here. The
+ * structured alternative is a paired 853 caption pattern and 863 enumeration,
+ * which needs a level of detail this catalogue does not hold — emitting a
+ * half-filled 853/863 pair would assert a pattern nobody recorded. 866 exists
+ * precisely for a summary written out in words.
+ *
+ * Gaps and notes are NOT folded in here; they belong in $z, so a system reading
+ * the statement does not have to guess which part of it is a caveat.
+ */
+export function formatHoldingStatement(h: {
+  caption?: string | null;
+  fromVolume?: string | null;
+  toVolume?: string | null;
+  fromYear?: number | null;
+  toYear?: number | null;
+}): string {
+  const from = (h.fromVolume ?? '').trim();
+  const to = (h.toVolume ?? '').trim();
+  const enumeration = from && to && from !== to ? `${from}-${to}` : (from || to);
+  const caption = (h.caption ?? '').trim();
+  const head = [caption, enumeration].filter(Boolean).join(' ');
+
+  const y1 = h.fromYear ?? null;
+  const y2 = h.toYear ?? null;
+  const years = y1 && y2 && y2 !== y1 ? `${y1}-${y2}` : (y1 ?? y2 ?? null);
+
+  if (head && years) return `${head} (${years})`;
+  return head || (years !== null ? String(years) : '');
+}
+
 // Add N copies to each of the given books, optionally overriding where they go.
 // This is the answer to "29 volumes, each also on the back shelf" — one action
 // instead of 29 re-typed records.

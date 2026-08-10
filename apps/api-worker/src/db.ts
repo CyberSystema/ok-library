@@ -514,6 +514,63 @@ export function parseItem(row: Record<string, unknown>): Record<string, unknown>
   return out;
 }
 
+// ─── Serial holdings ───────────────────────────────────────────────────────
+
+const SNAKE_TO_CAMEL_SERIAL_HOLDING_FIELDS: Record<string, string> = {
+  book_id: 'bookId',
+  from_volume: 'fromVolume',
+  to_volume: 'toVolume',
+  from_year: 'fromYear',
+  to_year: 'toYear',
+  created_at: 'createdAt',
+  updated_at: 'updatedAt'
+};
+
+export function parseSerialHolding(row: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(row)) {
+    out[SNAKE_TO_CAMEL_SERIAL_HOLDING_FIELDS[key] ?? key] = value;
+  }
+  return out;
+}
+
+/** The recorded run for one periodical, in the order the librarian arranged. */
+export async function loadSerialHoldings(env: Env, bookId: string): Promise<Array<Record<string, unknown>>> {
+  const rows = await env.DB.prepare(
+    `SELECT * FROM serial_holdings WHERE book_id = ? ORDER BY seq ASC, created_at ASC, id ASC`
+  ).bind(bookId).all<Record<string, unknown>>();
+  return (rows.results ?? []).map(parseSerialHolding);
+}
+
+/**
+ * Holdings for many titles at once, keyed by book id.
+ *
+ * The MARC export walks the whole catalogue, and one query per record would be a
+ * round trip per book. Ids are interpolated after a strict shape check because
+ * SQLite has no array binding — the same approach `loadItemsForBooks` takes.
+ */
+export async function loadSerialHoldingsForBooks(
+  env: Env,
+  bookIds: string[]
+): Promise<Map<string, Array<Record<string, unknown>>>> {
+  const out = new Map<string, Array<Record<string, unknown>>>();
+  const safe = bookIds.filter((id) => /^[A-Za-z0-9_-]+$/.test(id));
+  if (safe.length === 0) return out;
+  const list = safe.map((id) => `'${id}'`).join(',');
+  const rows = await env.DB.prepare(
+    `SELECT * FROM serial_holdings WHERE book_id IN (${list})
+      ORDER BY seq ASC, created_at ASC, id ASC`
+  ).all<Record<string, unknown>>();
+  for (const row of rows.results ?? []) {
+    const parsed = parseSerialHolding(row);
+    const key = String(parsed.bookId);
+    const list2 = out.get(key);
+    if (list2) list2.push(parsed);
+    else out.set(key, [parsed]);
+  }
+  return out;
+}
+
 export async function loadBookItems(env: Env, bookId: string): Promise<Array<Record<string, unknown>>> {
   const rows = await env.DB.prepare(
     `SELECT * FROM items WHERE book_id = ? AND deleted_at IS NULL

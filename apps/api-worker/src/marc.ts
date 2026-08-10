@@ -11,7 +11,7 @@
  * librarian's everyday route; MARC is for exchange with other libraries.
  */
 
-import { fromIso639_2, toIso639_2 } from '@ok-library/shared';
+import { formatHoldingStatement, fromIso639_2, toIso639_2 } from '@ok-library/shared';
 
 export type MarcSubfield = { code: string; value: string };
 export type MarcField =
@@ -47,6 +47,16 @@ export type MarcRecordInput = {
   /** Contributors resolved through the authority file, with relator codes. */
   contributors?: Array<{ name: string; role: string; dates?: string | null; kind?: string | null }>;
   subjects?: Array<{ term: string; source?: string | null }>;
+  /** The recorded run of a periodical — MARC 866 textual holdings. */
+  serialHoldings?: Array<{
+    caption?: string | null;
+    fromVolume?: string | null;
+    toVolume?: string | null;
+    fromYear?: number | null;
+    toYear?: number | null;
+    gaps?: string | null;
+    note?: string | null;
+  }>;
   /** Physical copies — MARC 852 holdings. */
   items?: Array<{
     shelfCode?: string | null;
@@ -267,6 +277,20 @@ export function toMarcFields(book: MarcRecordInput): MarcField[] {
     ]);
   }
 
+  // 866 — textual holdings for the basic bibliographic unit. This is the field
+  // for a run written out in words, which is exactly what the catalogue holds;
+  // the structured alternative is a paired 853 caption pattern and 863
+  // enumeration, and emitting a half-filled pair would assert a pattern nobody
+  // recorded. ind1 '3' is holdings level 3 (a summary), ind2 '0' compressed.
+  //
+  // Gaps and notes go in $z rather than being folded into $a, so a system
+  // reading the statement does not have to guess which part is a caveat.
+  for (const h of book.serialHoldings ?? []) {
+    const statement = formatHoldingStatement(h);
+    const note = [h.gaps, h.note].map((v) => (v ?? '').trim()).filter(Boolean).join('; ');
+    df('866', '3', '0', [['a', statement], ['z', note]]);
+  }
+
   // 880: the vernacular/romanized pairs, linked back by $6 occurrence number.
   let occ = 0;
   const linked = (tag: string, value: string | null | undefined, code = 'a'): void => {
@@ -397,6 +421,7 @@ export function bookRowToMarcInput(
     contributors?: Array<{ name: string; role: string; dates?: string | null; kind?: string | null }>;
     subjects?: Array<{ term: string; source?: string | null }>;
     seriesTitle?: string | null;
+    serialHoldings?: Array<Record<string, unknown>>;
     isil?: string | null;
   } = {}
 ): MarcRecordInput {
@@ -441,6 +466,7 @@ export function bookRowToMarcInput(
       barcode: str(i.barcode),
       copyNumber: typeof i.copyNumber === 'number' ? i.copyNumber : null
     })),
+    serialHoldings: (extra.serialHoldings ?? []) as MarcRecordInput['serialHoldings'],
     isil: extra.isil ?? null
   };
 }

@@ -2165,6 +2165,97 @@ if LOCAL:
 else:
     print("  SKIP  4 zero-copy repair checks need direct D1 access (local runs only)")
 
+print("=== 51. REGRESSION: a periodical can say what it holds ===")
+uniq = uuid.uuid4().hex[:8]
+# Migration 0026 built serial_holdings so that ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ — 47 separate
+# book rows in this catalogue — could be ONE title with a run. Nothing in the
+# system could read or write the table: the single statement naming it was a
+# merge re-parent that could never match a row.
+pb, _ = mkbook(title=f"ZZITEST Περιοδικό {uniq}", author="", language="EL", publicationYear=1880)
+call("PUT", f"/api/books/{pb}", {"bibLevel": "serial", "version": get(pb)["version"]})
+
+st, r = call("GET", f"/api/books/{pb}/serial-holdings")
+check("a serial with no run reads as an empty list, not a 404",
+      st == 200 and r.get("holdings") == [] and r.get("bibLevel") == "serial", f"{st} {r}")
+
+st, r = call("PUT", f"/api/books/{pb}/serial-holdings", {
+    "expectedVersion": get(pb)["version"],
+    "holdings": [
+        {"caption": "τόμος", "fromVolume": "1", "toVolume": "10",
+         "fromYear": 1880, "toYear": 1889, "gaps": "τ. 7", "note": "δεμένα ανά δύο"},
+        {"caption": "τόμος", "fromVolume": "12", "fromYear": 1891}
+    ]})
+held = (r or {}).get("holdings", [])
+check("a run can be recorded", st == 200 and len(held) == 2, f"{st} {r}")
+check("in the order it was arranged", [h["seq"] for h in held] == [0, 1], [h.get("seq") for h in held])
+check("with the gap statement kept as the librarian wrote it",
+      held[0]["gaps"] == "τ. 7" and held[0]["note"] == "δεμένα ανά δύο", held[0])
+check("and no snake_case leaks", all("_" not in k for h in held for k in h),
+      [k for h in held for k in h if "_" in k])
+
+# A stale version must lose, exactly as it does for the copies list.
+st, r = call("PUT", f"/api/books/{pb}/serial-holdings", {"expectedVersion": 0, "holdings": []})
+check("a stale expectedVersion is rejected", st == 409, f"{st} {r}")
+
+# MARC 866 is the whole point: a run that cannot leave the building is a note to
+# self. 853/863 would need a caption PATTERN this catalogue does not hold, so the
+# textual field is the honest one.
+st, xml = call_text("GET", f"/api/books/{pb}/marc")
+fields866 = re.findall(r'<datafield tag="866".*?</datafield>', xml, re.S)
+check("the run is exported as MARC 866", len(fields866) == 2, len(fields866))
+check("866$a is the statement, compressed and at holdings level",
+      '<subfield code="a">τόμος 1-10 (1880-1889)</subfield>' in xml
+      and 'tag="866" ind1="3" ind2="0"' in xml, fields866[:1])
+# Gaps in $z, not folded into $a: a system reading the statement should not have
+# to guess which part of it is a caveat.
+check("gaps and notes are a $z public note, not part of $a",
+      '<subfield code="z">τ. 7; δεμένα ανά δύο</subfield>' in xml
+      and 'τ. 7' not in xml.split('code="z"')[0].split('code="a"')[-1], fields866[:1])
+check("a single volume needs no range", '<subfield code="a">τόμος 12 (1891)</subfield>' in xml, fields866[1:])
+
+# All three MARC render paths had to learn about holdings, not just the one.
+# SRU and OAI-PMH render through `marcInputsForRows`, a DIFFERENT assembly path
+# from the single-record route and from the bulk export — three places that each
+# had to be taught about holdings. SRU is closed unless sharing is on, so it is
+# opened for this check and closed again.
+call("PUT", "/api/library-settings",
+     {"publicSharing": "on", "isil": "GR-ZZTEST", "libraryName": "ZZ Test Library"})
+try:
+    st, sru = call_text("GET", "/api/sru?version=1.2&operation=searchRetrieve&recordSchema=marcxml"
+                        "&query=dc.title%3D" + urllib.parse.quote(f"ZZITEST Περιοδικό {uniq}"))
+    check("SRU carries the run too", 'tag="866"' in sru, sru[:220])
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": "off"})
+exported, distinct, tail, size = count_records("/api/export/books.marcxml")
+st, bulk = call_text("GET", "/api/export/books.marcxml")
+check("and so does the bulk export", bulk.count('tag="866"') >= 2, bulk.count('tag="866"'))
+
+# Removing a statement is a CORRECTION, not a withdrawal — there is no physical
+# object leaving — so it is a hard delete, and an empty run is legitimate.
+st, r = call("PUT", f"/api/books/{pb}/serial-holdings",
+             {"expectedVersion": get(pb)["version"], "holdings": [
+                 {k: v for k, v in held[0].items() if k in
+                  ("id", "caption", "fromVolume", "toVolume", "fromYear", "toYear", "gaps", "note")}]})
+check("a statement can be removed", st == 200 and len(r["holdings"]) == 1, f"{st} {r}")
+st, r = call("PUT", f"/api/books/{pb}/serial-holdings",
+             {"expectedVersion": get(pb)["version"], "holdings": []})
+check("and an empty run is allowed, unlike an empty copies list",
+      st == 200 and r["holdings"] == [], f"{st} {r}")
+
+# The run belongs to the record, so purging the record must take it with it.
+if LOCAL:
+    call("PUT", f"/api/books/{pb}/serial-holdings",
+         {"expectedVersion": get(pb)["version"], "holdings": [{"caption": "τόμος", "fromVolume": "1"}]})
+    rows = local_sql(f"SELECT COUNT(*) AS n FROM serial_holdings WHERE book_id = '{pb}'")
+    check("the run is stored against the record", int((rows or [{}])[0].get("n") or 0) == 1, rows)
+    call("DELETE", f"/api/books/{pb}")
+    call("DELETE", f"/api/books/{pb}/purge")
+    rows = local_sql(f"SELECT COUNT(*) AS n FROM serial_holdings WHERE book_id = '{pb}'")
+    check("and purging the record takes the run with it",
+          int((rows or [{}])[0].get("n") or 0) == 0, rows)
+else:
+    print("  SKIP  2 cascade checks need direct D1 access (local runs only)")
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

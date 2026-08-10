@@ -14,7 +14,7 @@ import {
   endOfLocalDayIso, isoToLocalDateInput
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
-import { formatEdtfRange, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
+import { formatEdtfRange, formatHoldingStatement, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
 import { cacheGet, cacheSet, cacheBustPrefixes, cacheClear } from './cache';
 // The network layer now lives in api.ts. main.tsx exports nothing, so anything a
 // screen outside this file needs has to be reachable from there instead.
@@ -36,6 +36,7 @@ import type {
 } from './types';
 import { OnboardingCourse } from './onboarding';
 import { CopiesEditor } from './screens/copies';
+import { SerialHoldingsEditor, type SerialHolding } from './screens/serials';
 import { LibraryIdentityCard } from './screens/identity';
 import { MarcIoCard } from './screens/marcio';
 import { RoomsCard } from './screens/rooms';
@@ -1070,6 +1071,8 @@ function App() {
   const [selectionMode, setSelectionMode] = useState(false);
   const [detailBook, setDetailBook] = useState<Book | null>(null);
   const [copiesEditorOpen, setCopiesEditorOpen] = useState(false);
+  const [serialsEditorOpen, setSerialsEditorOpen] = useState(false);
+  const [serialHoldings, setSerialHoldings] = useState<SerialHolding[]>([]);
   const [detailMode, setDetailMode] = useState<'view' | 'edit'>('view');
   // Full-screen cover zoom (lightbox). Holds the resolved cover URL while open,
   // null while closed. Opened by clicking the large cover in the detail view.
@@ -3071,6 +3074,22 @@ function App() {
     setCurrentSection('books');
     setAttributeEditorValues(book.customFields ?? {});
     void loadBookHistory(book.id);
+    // Only for a serial: a monograph has no run, and this would be a wasted
+    // request on all 12,675 of them.
+    setSerialHoldings([]);
+    if (book.bibLevel === 'serial') void loadSerialHoldings(book.id);
+  }
+
+  // The run of a periodical. Fetched on demand rather than embedded in the book
+  // payload: it is only ever shown for a serial, and 12,675 monographs should
+  // not pay a join for it on every page of the list.
+  async function loadSerialHoldings(bookId: string) {
+    try {
+      const res = await apiRequest<{ holdings: SerialHolding[] }>(`/api/books/${bookId}/serial-holdings`);
+      setSerialHoldings(res.holdings ?? []);
+    } catch (e) {
+      setError((e as Error).message);
+    }
   }
 
   async function loadBookHistory(bookId: string, offset = 0) {
@@ -4757,6 +4776,10 @@ function App() {
     setBookHistory([]);
     setDetailHolds([]);
     void loadBookHistory(book.id);
+    // Only for a serial: a monograph has no run, and this would be a wasted
+    // request on all 12,675 of them.
+    setSerialHoldings([]);
+    if (book.bibLevel === 'serial') void loadSerialHoldings(book.id);
     void loadBookHolds(book.id);
   }
 
@@ -5258,6 +5281,20 @@ function App() {
         </div>
       )}
 
+      {serialsEditorOpen && detailBook && canWrite && (
+        <SerialHoldingsEditor
+          book={detailBook}
+          holdings={serialHoldings}
+          onClose={() => setSerialsEditorOpen(false)}
+          onSaved={async () => {
+            const fresh = await apiRequest<Book>(`/api/books/${detailBook.id}`);
+            setDetailBook(fresh);
+            await loadSerialHoldings(detailBook.id);
+            await loadBooks();
+          }}
+        />
+      )}
+
       {copiesEditorOpen && detailBook && canWrite && (
         <CopiesEditor
           book={detailBook}
@@ -5749,6 +5786,40 @@ function App() {
                       </p>
                     )}
                   </div>
+
+                  {/* The run of a periodical. Only for a serial — MARC keeps a
+                      holdings statement instead of a record per issue, which is
+                      the whole point: ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ is 47 book rows
+                      today and should be one title with a run. */}
+                  {detailBook.bibLevel === 'serial' && (
+                    <div className="detail-section">
+                      <div className="detail-section-title">{t('serials.heading')}</div>
+                      {serialHoldings.length === 0 ? (
+                        <p className="muted small">{t('serials.none')}</p>
+                      ) : (
+                        <ul className="copies-list">
+                          {serialHoldings.map((h) => (
+                            <li key={h.id}>
+                              <span className="copy-number">
+                                {formatHoldingStatement(h) || t('serials.unspecified')}
+                              </span>
+                              {h.gaps && <span className="meta-chip warn">{t('serials.gapsShort')} {h.gaps}</span>}
+                              {h.note && <span className="muted small">{h.note}</span>}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {canWrite && (
+                        <button
+                          className="secondary small"
+                          style={{ marginTop: '0.5rem' }}
+                          onClick={() => setSerialsEditorOpen(true)}
+                        >
+                          {t('serials.editHeading')}
+                        </button>
+                      )}
+                    </div>
+                  )}
 
                   {/* Holdings: where the physical copies actually are. Shown
                       whenever a record is held more than once — for a single
@@ -6404,7 +6475,7 @@ function App() {
                                   className="recent-link"
                                   onClick={() => {
                                     void apiRequest<{ id: string; title: string; author: string; status: BookStatus; version: number; customFields?: Record<string, string|number|boolean|null>; isbn?: string|null; shelfCode?: string|null; publicationYear?: number|null; publisher?: string|null; language?: string|null; description?: string|null; legacyId?: string|null; }>(`/api/books/${b.id}`)
-                                      .then((book) => { setDetailBook(book as Book); setDetailMode('view'); setBookHistory([]); void loadBookHistory(book.id); setCurrentSection('books'); });
+                                      .then((book) => { setDetailBook(book as Book); setDetailMode('view'); setBookHistory([]); void loadBookHistory(book.id); setSerialHoldings([]); if ((book as Book).bibLevel === 'serial') void loadSerialHoldings(book.id); setCurrentSection('books'); });
                                   }}
                                 >
                                   <strong>{b.title || t('common.untitled')}</strong>
