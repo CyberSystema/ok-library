@@ -126,13 +126,19 @@ function Blocks({ blocks, onNavigate }: {
 
 /** Load the pack for a language, falling back to English per chapter. */
 function useChapters(): { chapters: Chapter[]; loading: boolean } {
-  const { pack, loading, ensure } = useHandbook();
+  const { pack, fallback, loading, ensure } = useHandbook();
   // The pack is fetched on first use rather than at startup, and "first use"
   // includes simply opening the Handbook tab — not only pressing a "?".
   useEffect(() => { ensure(); }, [ensure]);
+  // Chapter by chapter, not pack by pack. A translation in progress shows the
+  // translated chapters in the reader's language and the rest in English, which
+  // is the only useful behaviour: the alternative is a blank page for a chapter
+  // nobody has got to yet.
   const chapters = useMemo(
-    () => CHAPTER_ORDER.map((id) => pack?.[id]).filter((c): c is Chapter => Boolean(c)),
-    [pack]
+    () => CHAPTER_ORDER
+      .map((id) => pack?.[id] ?? fallback?.[id])
+      .filter((c): c is Chapter => Boolean(c)),
+    [pack, fallback]
   );
   return { chapters, loading };
 }

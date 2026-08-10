@@ -10,7 +10,7 @@
 // keystroke the librarian had typed, or leave the answer hidden behind the modal.
 // A drawer is the only container that can appear over a form without disturbing it.
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { CONTENT_LOADERS, type AnchorId, type ChapterId, type ContentLang } from './registry';
+import { CHAPTER_IDS, CONTENT_LOADERS, type AnchorId, type ChapterId, type ContentLang } from './registry';
 import type { ContentPack } from './types';
 import { useI18n } from '../i18n';
 
@@ -18,6 +18,8 @@ export type HandbookTarget = { chapter?: ChapterId; anchor?: AnchorId };
 
 type HandbookValue = {
   pack: ContentPack | null;
+  /** The English pack, for chapters the reader's language has not reached yet. */
+  fallback: ContentPack | null;
   loading: boolean;
   /** Set while the drawer is open. */
   drawerOpen: boolean;
@@ -45,6 +47,7 @@ const packCache = new Map<ContentLang, ContentPack>();
 export function HandbookProvider({ children }: { children: React.ReactNode }) {
   const { lang } = useI18n();
   const [pack, setPack] = useState<ContentPack | null>(packCache.get(lang as ContentLang) ?? null);
+  const [fallback, setFallback] = useState<ContentPack | null>(packCache.get('en') ?? null);
   const [loading, setLoading] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [target, setTarget] = useState<HandbookTarget | null>(null);
@@ -63,6 +66,22 @@ export function HandbookProvider({ children }: { children: React.ReactNode }) {
       const loaded = (mod.default ?? {}) as ContentPack;
       packCache.set(key, loaded);
       setPack(loaded);
+      // English too, but only while this language is INCOMPLETE. A pack part-way
+      // through translation needs somewhere to fall back to per chapter; a
+      // finished one does not, and making a Greek reader fetch the English
+      // handbook forever to cover chapters that are all translated would be a
+      // permanent cost for a temporary state.
+      const complete = CHAPTER_IDS.every((id) => loaded[id]);
+      if (key !== 'en' && !complete) {
+        const enCached = packCache.get('en');
+        if (enCached) setFallback(enCached);
+        else {
+          const enMod = await CONTENT_LOADERS.en();
+          const enPack = (enMod.default ?? {}) as ContentPack;
+          packCache.set('en', enPack);
+          setFallback(enPack);
+        }
+      }
     } catch {
       // A failed chunk must not take the app down: the reader gets an empty
       // Handbook and everything else keeps working.
@@ -108,8 +127,8 @@ export function HandbookProvider({ children }: { children: React.ReactNode }) {
   const ensure = useCallback(() => { void ensurePack(); }, [ensurePack]);
 
   const value = useMemo<HandbookValue>(
-    () => ({ pack, loading, drawerOpen, target, open, openAt, close, ensure }),
-    [pack, loading, drawerOpen, target, open, openAt, close, ensure]
+    () => ({ pack, fallback, loading, drawerOpen, target, open, openAt, close, ensure }),
+    [pack, fallback, loading, drawerOpen, target, open, openAt, close, ensure]
   );
 
   return <HandbookContext.Provider value={value}>{children}</HandbookContext.Provider>;
