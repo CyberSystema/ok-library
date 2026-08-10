@@ -5514,6 +5514,18 @@ function App() {
               </div>
             </div>
             <div style={{ padding: '1rem 1.5rem 1.5rem' }}>
+              {/* The course used to be reachable only from Settings, which needs
+                  the `settings` permission — so the one person the course is FOR,
+                  a librarian without it, could not re-read the thing they were
+                  made to read. The profile dialog is behind nothing. */}
+              <div style={{ marginBottom: '1rem' }}>
+                <button
+                  className="secondary small"
+                  onClick={() => { setProfileOpen(false); setShowOnboarding(true); }}
+                >
+                  🎓 {t('profile.replayCourse')}
+                </button>
+              </div>
               <div style={{ marginBottom: '1rem' }}>
                 <span className="muted small" id="profile-uuid-label">{t('users.uuid')}</span>
                 {/* A real <button>. It was a styled div with an onClick: not
@@ -8104,14 +8116,6 @@ function App() {
                 {canDelete && (
                   <TrashCard canDelete={canDelete} onChanged={() => { void loadBooks(); void loadRoomSummary(); }} />
                 )}
-
-                <div className="card">
-                  <h3>🎓 {t('settings.training.heading')}</h3>
-                  <p className="muted small" style={{ marginBottom: '1rem' }}>
-                    {t('settings.training.intro')}
-                  </p>
-                  <button className="secondary" onClick={() => setShowOnboarding(true)}>{t('settings.training.start')}</button>
-                </div>
 
                 {/* Custom field manager */}
                 <div className="card">

@@ -2175,20 +2175,6 @@ mark.hl {
 .ob-chapter-icon { font-size: 2.75rem; line-height: 1; margin-bottom: 0.5rem; }
 .ob-chapter-title { font-size: 1.5rem; margin-bottom: 0.4rem; }
 .ob-lead { font-size: 1.02rem; color: var(--text-muted); margin-bottom: 1.4rem; line-height: 1.55; }
-.ob-p { font-size: 0.95rem; line-height: 1.65; margin-bottom: 1rem; color: var(--text); }
-.ob-steps { margin: 0 0 1rem; padding-left: 1.3rem; }
-.ob-steps li { font-size: 0.95rem; line-height: 1.6; margin-bottom: 0.6rem; }
-.ob-callout {
-  border-radius: var(--radius-sm); padding: 0.75rem 0.9rem; margin-bottom: 1rem;
-  font-size: 0.92rem; line-height: 1.55; border-left: 3px solid var(--accent);
-  background: var(--accent-light);
-}
-.ob-callout-label {
-  display: block; font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.05em; margin-bottom: 0.25rem; color: var(--accent);
-}
-.ob-rule { border-left-color: var(--warning); background: var(--warning-bg); }
-.ob-rule .ob-callout-label { color: var(--warning); }
 .ob-footer {
   display: flex; align-items: center; justify-content: space-between; gap: 1rem;
   padding: 0.85rem 1.25rem; border-top: 1px solid var(--border); flex-shrink: 0;
@@ -2858,6 +2844,9 @@ mark.hl {
 }
 .hb-contents-n { opacity: 0.7; font-variant-numeric: tabular-nums; }
 
+/* A chapter rendered on its own — inside the course, where the course supplies
+   its own contents rail. One column, or the prose lands in the narrow one. */
+.hb-single { display: block; }
 .hb-body { min-width: 0; max-width: 42rem; }
 .hb-drawer-body .hb-body { max-height: 65vh; overflow-y: auto; }
 .hb-drawer { max-width: 54rem; }

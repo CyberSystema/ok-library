@@ -2649,6 +2649,66 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 56. REGRESSION: the course records that it was read ===")
+uniq = uuid.uuid4().hex[:8]
+_ob = _slurp(_REPO, "apps", "web", "src", "onboarding.tsx")
+
+# The course used to carry its own 56 KB of prose, written before the standards
+# work. It taught re-cataloguing a duplicate as a NEW RECORD — the habit the merge
+# tool exists to clean up — so a librarian who read it carefully was worse off than
+# one who had not. It is now a curated sequence of Handbook chapters: one corpus,
+# one renderer, and a correction to the Handbook is a correction to the course.
+check("the course has no prose of its own",
+      "kind: 'p'" not in _ob and "COURSE_CHAPTERS" in _ob, None)
+course_ids = re.findall(r"^  '([a-z0-9-]+)'", _ob.split("COURSE_CHAPTERS")[1].split(" = [")[1].split("];")[0], re.M)
+declared = set(re.findall(r"^  '([a-z0-9-]+)',?$", hb_reg, re.M))
+check("every course chapter is a real Handbook chapter",
+      course_ids and set(course_ids) <= declared, [c for c in course_ids if c not in declared])
+check("and the course is a subset, not the whole Handbook",
+      0 < len(course_ids) < len(declared), f"{len(course_ids)} of {len(declared)}")
+
+# Finishing used to be `mandatory ? onFinish() : (onClose ?? onFinish)()`. A replay
+# always passes onClose, so pressing Finish on a replay closed the dialog and
+# recorded NOTHING — the librarian had read it to the end and the system did not
+# know, and a version bump could never be acknowledged voluntarily.
+_fin = _ob.split("function finish()")[1].split("}")[0] if "function finish()" in _ob else ""
+check("finishing always records completion, replay included",
+      "onFinish();" in _fin and "??" not in _fin, _fin.strip() or "no finish()")
+
+# The replay lived in Settings, which needs the `settings` permission — so the one
+# person the course is FOR could not re-read it.
+check("the replay is not behind the settings permission",
+      "'profile.replayCourse'" in main_tsx and "settings.training.start" not in main_tsx, None)
+
+# The Handbook prose is a lazy chunk, and the mandatory course is the one screen a
+# librarian cannot get past. Without a fallback it would show an empty panel.
+check("the course shows something while the prose chunk loads",
+      "Suspense" in _ob and "common.loading" in _ob, None)
+
+# The version gate: bumping it is what makes an existing librarian see the new
+# course. If the bump were forgotten, everyone who acknowledged the old one would
+# never be shown the replacement.
+worker = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+ver = re.search(r"const ONBOARDING_VERSION = (\d+);", worker)
+check("the onboarding version was bumped past 1", ver and int(ver.group(1)) >= 2,
+      ver.group(1) if ver else None)
+
+# End to end: a fresh librarian is gated, and completing clears the gate.
+lu = f"zzlib{uniq[:6]}"
+st, made = call("POST", "/api/users", {"username": lu, "password": "ZZlibrarian!2026", "role": "librarian"})
+if st in (200, 201):
+    USERS.append(lu)
+    tok = login(lu, "ZZlibrarian!2026")
+    st, me = call("GET", "/api/auth/session", token=tok)
+    check("a new librarian is asked to read the course",
+          (me or {}).get("user", me).get("needsOnboarding") is True, me)
+    st, _ = call("POST", "/api/me/onboarding-complete", None, token=tok)
+    st, me2 = call("GET", "/api/auth/session", token=tok)
+    check("and finishing it clears the gate",
+          (me2 or {}).get("user", me2).get("needsOnboarding") is False, me2)
+else:
+    check("a new librarian is asked to read the course", False, f"could not create: {st} {made}")
+
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN
 # do is stop the two classes of defect that regrow fastest — because both look

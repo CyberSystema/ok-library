@@ -227,6 +227,35 @@ export function Handbook({ mode }: { mode: 'page' | 'drawer' }) {
   );
 }
 
+/**
+ * One chapter, with no navigation of its own.
+ *
+ * The course is a curated sequence of Handbook chapters, and it supplies its own
+ * frame — progress, next, back, a completion step. What it needs from here is the
+ * prose, rendered exactly as the Handbook renders it, so the two can never drift
+ * into saying different things about the same field.
+ */
+export function HandbookChapter({ id, onNavigate }: {
+  id: ChapterId;
+  onNavigate?: (chapter: ChapterId, anchor?: AnchorId) => void;
+}) {
+  const t = useT();
+  const { chapters, loading } = useChapters();
+  const chapter = chapters.find((c) => c.id === id);
+  if (!chapter) return <p className="muted">{loading ? t('common.loading') : t('handbook.notWritten')}</p>;
+  return (
+    // NOT `.hb` — that is a two-column grid expecting a contents rail beside it,
+    // and with no rail the prose would be laid out in the narrow first column.
+    <article className="hb hb-single">
+      <div className="hb-body">
+        <h2 className="hb-title">{chapter.title}</h2>
+        <p className="hb-summary">{chapter.summary}</p>
+        <Blocks blocks={chapter.blocks} onNavigate={onNavigate ?? (() => { /* the course does not jump */ })} />
+      </div>
+    </article>
+  );
+}
+
 /** The whole Handbook, for printing. Every chapter, no navigation. */
 export function HandbookPrintable() {
   const { chapters } = useChapters();

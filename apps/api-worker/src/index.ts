@@ -523,7 +523,11 @@ app.get('/api/health', async (c) => {
 // staff_users.onboarding_completed_version is below this is shown the mandatory
 // course on next sign-in. Bump this to re-trigger the course for everyone after
 // a major change to the cataloguing workflow.
-const ONBOARDING_VERSION = 1;
+// Bumped to 2 when the course was rewritten. Version 1 taught, among other
+// things, re-cataloguing a duplicate as a new record — so a librarian who
+// completed it needs to see the new one, and `needsOnboarding` becomes true again
+// for everyone who acknowledged only version 1.
+const ONBOARDING_VERSION = 2;
 
 app.post('/api/auth/login', async (c) => {
 	await ensureBootstrapAdmin(c.env);
