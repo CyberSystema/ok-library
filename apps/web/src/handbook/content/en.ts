@@ -393,6 +393,220 @@ const pack: ContentPack = {
     ]
   },
 
+  headings: {
+    id: 'headings',
+    title: 'Controlled headings',
+    summary:
+      'One form of a name, with the other forms recorded beside it. The catalogue keeps what you typed; the heading adds the ways in.',
+    blocks: [
+      { kind: 'h', text: 'What a heading is', anchor: 'what-a-heading-is' },
+      { kind: 'p', text:
+        'A heading is a small record about a name: one preferred form, the variant forms that mean the same thing, dates if the name is a person, and an identifier if the name exists in an international file. Records point at it. They do not become it.' },
+      { kind: 'rule', text:
+        'A heading POINTS. It never rewrites what is on the record. The book keeps saying what its title page said.' },
+      { kind: 'p', text:
+        'That is the whole difference from the spelling-consistency tool, and it is why both exist. This catalogue has 5,427 distinct author strings and no headings at all yet, so every one of those 5,427 is currently its own island.' },
+      { kind: 'see', chapter: 'consistency', anchor: 'consolidate-or-authority', text:
+        'Which of the two tools a given problem wants.' },
+
+      { kind: 'h', text: 'Making one', anchor: 'making-a-heading' },
+      { kind: 'steps', items: [
+        'Decide the preferred form: the one the catalogue will show. Write it as you want it to read in a record sent to another library.',
+        'Choose the kind — person, body, publisher, subject, uniform title. It changes nothing about how the heading behaves; it is what lets you browse them separately.',
+        'Add dates for a person if you know them. “315-403” is enough, and it is often the only way to tell two people with one name apart.',
+        'Add the variant forms, one per line.',
+        'Link the records to it from the book, or link as you go when you next touch each one.'
+      ] },
+      { kind: 'tip', text:
+        'Do not try to build the authority file in one sitting. Start with the names that repeat: the Fathers, the standard series, the presses you buy from. A heading for a name that appears once has cost more than it saved.' },
+
+      { kind: 'h', text: 'Variant forms', anchor: 'variant-forms' },
+      { kind: 'p', text:
+        'The variants are the point of the exercise. Searching finds a heading by any of them, so what belongs there is not every form that exists but every form somebody might type.' },
+      { kind: 'compare', good:
+        'Preferred: “Επιφάνιος Σαλαμίνος”. Variants: “Epiphanius of Salamis”, “Ἐπιφάνιος Κύπρου”, “Επιφάνιος, άγιος”.',
+        bad: 'Preferred: “Επιφάνιος Σαλαμίνος”. Variants: none.',
+        why: 'Without the variants the heading is a label. With them it is an index — someone who knows him only as Epiphanius of Salamis still finds him.' },
+      { kind: 'p', text:
+        'Include the romanized form as a variant even though the record has its own field for it. The field makes one record readable; the variant makes the whole heading findable.' },
+
+      { kind: 'h', text: 'Correcting one', anchor: 'correcting-a-heading' },
+      { kind: 'p', text:
+        'Edit it. Every record that points at the heading keeps pointing at it, and they all show the corrected form at once — which is the entire reason a heading is better than 163 copies of a name.' },
+      { kind: 'auto', text:
+        'Editing a heading never touches the links. Retiring one and re-creating it loses every link, which is why the retire dialog suggests editing instead.' },
+
+      { kind: 'h', text: 'Retiring one', anchor: 'retiring-a-heading' },
+      { kind: 'p', text:
+        'Retiring unlinks every record that used the heading. That is deliberate — a record must not point at a heading that no longer exists — but it is not reversible, so the dialog tells you how many records it will affect before it does it.' },
+      { kind: 'rule', text:
+        'Retire a heading only when it should never have existed. To change what it says, edit it.' }
+    ]
+  },
+
+  contributors: {
+    id: 'contributors',
+    title: 'Editors, translators and others',
+    summary:
+      'Everyone involved in a book who is not its author, and the code that says what they did.',
+    blocks: [
+      { kind: 'p', text:
+        'A great deal of this collection is edited, translated or introduced rather than written: 1,195 records name an editor and 492 name a translator. Those people are how a reader finds the book — someone looking for Ιωήλ Γιαννακόπουλος as a translator will not find him in the author field.' },
+
+      { kind: 'h', text: 'The role codes', anchor: 'relators' },
+      { kind: 'p', text:
+        'A contributor is a heading plus a role. The role is a standard three-letter code, so a record sent to another library says what the person did in a form that library already understands rather than in a word it has to guess at.' },
+      { kind: 'fields', rows: [
+        { fact: 'contributor', note: 'The heading, plus the role code. Exported as an added entry with the role attached.' },
+        { fact: 'author', note: 'Stays as transcribed. A contributor never replaces it.' }
+      ] },
+      { kind: 'list', items: [
+        'aut — author. The main one; usually already in the author field.',
+        'edt — editor. The commonest here after author.',
+        'trl — translator.',
+        'ill — illustrator.',
+        'aui — author of an introduction.',
+        'ann — annotator. Common in patristic editions.',
+        'com — compiler. For a collection assembled rather than written.',
+        'ctb — contributor, for anyone whose part does not fit the others.'
+      ] },
+
+      { kind: 'h', text: 'Editor and translator today', anchor: 'editor-and-translator' },
+      { kind: 'p', text:
+        'Both are currently free-text attributes: 623 distinct editor strings and 398 distinct translator strings, none of them linked to anything. They are searchable as text and invisible as people — the same name spelled two ways is two editors, and none of them reaches a MARC record as an added entry.' },
+      { kind: 'quote', text: '1,195 records name an editor, in 623 different strings · 492 name a translator, in 398',
+        source: 'measured on the live catalogue' },
+      { kind: 'p', text:
+        'Converting them is worth doing gradually and in order of frequency. An editor who appears on forty records is worth a heading this week; one who appears once can wait indefinitely.' },
+
+      { kind: 'h', text: 'What to do with the free text', anchor: 'free-text-contributors' },
+      { kind: 'steps', items: [
+        'Leave the attribute alone. It is what the record says and it stays true.',
+        'Make a heading for the person, with the spellings from the attribute as variant forms.',
+        'Link the records to the heading with the right role.',
+        'Do not delete the attribute afterwards — it costs nothing and it is the evidence of where the heading came from.'
+      ] },
+      { kind: 'see', chapter: 'headings', anchor: 'variant-forms', text:
+        'The variant spellings from the attribute are exactly what the heading should carry.' }
+    ]
+  },
+
+  subjects: {
+    id: 'subjects',
+    title: 'Subjects',
+    summary:
+      'What a book is about, recorded in a way that groups books rather than describing each one separately.',
+    blocks: [
+      { kind: 'h', text: 'A subject is a heading too', anchor: 'subject-headings' },
+      { kind: 'p', text:
+        'Subjects use the same machinery as names: one preferred form, variants, and records pointing at it. That is not an implementation detail — it is why a subject list is useful. Free-text keywords describe each book; a controlled subject collects them.' },
+      { kind: 'fields', rows: [
+        { fact: 'subject', note: 'A heading of kind “subject”, linked to the record.' }
+      ] },
+      { kind: 'rule', text:
+        'A subject answers “what is this about”, not “what is this”. “Liturgy” is a subject; “hardback” is not.' },
+
+      { kind: 'h', text: 'Starting from what you already wrote', anchor: 'seeding-subjects' },
+      { kind: 'p', text:
+        'The catalogue already contains a subject vocabulary: the category labels, 4,216 records’ worth. They were written by the people who know this collection, which makes them a far better starting point than any imported list.' },
+      { kind: 'steps', items: [
+        'Open the subject seeding tool from the headings card.',
+        'It lists the labels with the number of records carrying each — “TRIBUTE TO PERSON · on 178 records”. Read down the list.',
+        'Tick the ones that are real subject headings. Leave the ones that are shelf categories, form descriptions or one-offs.',
+        'Confirm. Each becomes a heading and is linked to every record carrying that label.'
+      ] },
+      { kind: 'tip', text:
+        'Ticking nothing is a valid outcome of a first pass. Reading the list and deciding “these thirty, not those four hundred” is the work; the software only does the typing.' },
+      { kind: 'see', chapter: 'classification', anchor: 'code-vs-label', text:
+        'Only a third of the collection has labels at all, so this covers a third of it. That is not a bug.' },
+
+      { kind: 'h', text: 'Subjects that arrive from elsewhere', anchor: 'imported-subjects' },
+      { kind: 'p', text:
+        'A record imported from another library usually carries subject headings already, often from an international thesaurus. Those arrive as headings and are linked automatically, with the thesaurus they came from recorded — so an imported LCSH heading is marked as LCSH rather than pretending to be ours.' },
+      { kind: 'auto', text:
+        'Importing the same file twice does not duplicate the headings, and it never removes one you attached by hand. Import adds; it does not replace.' },
+      { kind: 'p', text:
+        'This is the cheapest subject cataloguing available: a record received from a library that has already done the work arrives with it done.' }
+    ]
+  },
+
+  'series-and-sets': {
+    id: 'series-and-sets',
+    title: 'Series and multi-part works',
+    summary:
+      'The 161 volumes of the Patrologia Graeca are one series. Recording that is what makes a missing volume visible.',
+    blocks: [
+      { kind: 'h', text: 'The series statement', anchor: 'series-statement' },
+      { kind: 'p', text:
+        'A series is the named collection a book belongs to, printed on the title page or the half-title: ΕΛΛΗΝΙΚΗ ΠΑΤΡΟΛΟΓΙΑ, ΕΛΛΗΝΕΣ ΠΑΤΕΡΕΣ ΤΗΣ ΕΚΚΛΗΣΙΑΣ, ΒΙΒΛΙΟΘΗΚΗ ΕΛΛΗΝΩΝ ΠΑΤΕΡΩΝ. The three largest here run to 161, 102 and 72 volumes.' },
+      { kind: 'fields', rows: [
+        { fact: 'series', note: 'The name of the series, as printed.' },
+        { fact: 'volume', note: 'Which volume of it this is.' }
+      ] },
+      { kind: 'p', text:
+        'Nearly every record has a series value — 12,597 of 12,675 — but that number is misleading. The import copied the title into the series field where it had nothing else to put, so more than half of those are a book’s own title repeated rather than a series it belongs to.' },
+      { kind: 'tip', text:
+        'When you open a record whose series is identical to its title, and it is not part of anything, clear the series. It costs one keystroke and removes one false group from the browser.' },
+
+      { kind: 'h', text: 'Multi-part works', anchor: 'multi-part-works' },
+      { kind: 'p', text:
+        'A work in several volumes where every volume has the same title is the commonest shape here — a 24-volume encyclopaedia, a 47-issue periodical. What makes them tractable is the volume number: with it, the catalogue can put them in order and see what is absent.' },
+      { kind: 'compare', good: 'Series: “ΜΕΓΑΛΗ ΕΛΛΗΝΙΚΗ ΕΓΚΥΚΛΟΠΑΙΔΕΙΑ”. Volume: “7”.',
+        bad: 'Title: “ΜΕΓΑΛΗ ΕΛΛΗΝΙΚΗ ΕΓΚΥΚΛΟΠΑΙΔΕΙΑ ΤΟΜΟΣ 7”, no series, no volume.',
+        why: 'The second is findable and nothing more. The first is a member of a set, so the catalogue can tell you that volume 12 is missing.' },
+      { kind: 'p', text:
+        'Volume designations here are genuinely varied — “1”, “12”, “Α΄”, “τ. 3”, “1-2”, “ΜΕΡΟΣ Β΄” — and all of them are accepted as typed. Greek numerals are read as numbers, so “Α΄” counts as volume 1.' },
+      { kind: 'auto', text:
+        'A volume designation that cannot be read as a number is counted and shown, never silently dropped, and never used to invent a gap. A set of volumes labelled “πρώτος τόμος”, “δεύτερος τόμος” is reported as three unnumbered volumes rather than as a set with holes in it.' },
+
+      { kind: 'h', text: 'Finding the missing volume', anchor: 'missing-volumes' },
+      { kind: 'p', text:
+        'The multi-part browser lists every group with two or more members and says which volumes are absent from the run. That is its whole purpose: a librarian standing at a shelf can compare what is there with what should be.' },
+      { kind: 'rule', text:
+        'A number in the browser opens a list of exactly that many books. If it ever does not, that is a fault worth reporting.' },
+      { kind: 'p', text:
+        'The browser hides groups where there is no evidence of a set at all — every member titled the same as the group and not one carrying a volume number — and says how many it hid. Those are usually the same book catalogued more than once, which is the duplicate tool’s business rather than this one’s.' },
+      { kind: 'see', chapter: 'dates', anchor: 'date-ranges', text:
+        'A periodical is not a multi-part monograph: record its run instead of one record per issue.' }
+    ]
+  },
+
+  searching: {
+    id: 'searching',
+    title: 'Searching',
+    summary:
+      'What the search box does, so that a search that finds nothing tells you something.',
+    blocks: [
+      { kind: 'h', text: 'What it ignores', anchor: 'how-search-works' },
+      { kind: 'p', text:
+        'Search ignores accents and case. “ΓΑΒΡΙΗΛ”, “Γαβριήλ” and “γαβριηλ” are one search. This matters more in Greek than in English, because the same word appears with and without accents throughout an old catalogue, and because a keyboard set to monotonic Greek cannot type a polytonic form at all.' },
+      { kind: 'auto', text:
+        'Every searchable field is stored a second time with the accents removed, and the search compares against that copy. You never see it and never maintain it.' },
+      { kind: 'rule', text:
+        'What search cannot ignore is a missing space or an extra full stop. “J.P.MIGNE” and “J.-P.MIGNE” are two different strings to it, which is why consistency in those fields matters more than it looks.' },
+      { kind: 'see', chapter: 'consistency', anchor: 'one-spelling', text:
+        'The four spellings of Migne, and what they cost.' },
+
+      { kind: 'h', text: 'Partial words and near misses', anchor: 'partial-and-fuzzy' },
+      { kind: 'p', text:
+        'Two switches change how forgiving a search is, and they are separate because they fail differently.' },
+      { kind: 'list', items: [
+        'Partial words — “λειτουργ” matches “λειτουργία” and “λειτουργικός”. Useful in Greek, where the ending changes with the case.',
+        'Near misses — allows a small number of wrong letters, for a name you half remember or half heard. It will also return things you did not mean, which is the price.'
+      ] },
+      { kind: 'tip', text:
+        'Turn near misses OFF when you are checking whether something already exists. A fuzzy match that looks like your book is exactly how a duplicate gets created.' },
+
+      { kind: 'h', text: 'The smart lists', anchor: 'smart-lists' },
+      { kind: 'p', text:
+        'The smart lists are saved questions about the catalogue’s own condition rather than about its subject: records with no author, no shelf mark, no year, a failed ISBN check digit, or flagged as needing review. They are the practical form of “what is left to do”.' },
+      { kind: 'p', text:
+        'Each of them is finite and shrinks as you work. Twenty bad ISBNs is a half-hour; 3,768 records with no author is a fact about the collection rather than a task, because most of them genuinely have no author.' },
+      { kind: 'see', chapter: 'consistency', anchor: 'empty-vs-unknown', text:
+        'This is why a placeholder in an empty field is harmful: it removes the record from the list that would have brought it back to you.' }
+    ]
+  },
+
   transliteration: {
     id: 'transliteration',
     title: 'Transliteration and parallel scripts',

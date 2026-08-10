@@ -30,6 +30,7 @@ import { MARC_RELATORS } from '@ok-library/shared';
 import { apiRequest } from '../api';
 import { useT } from '../i18n';
 import { Combobox, Dialog, fmt, useConfirm, useToast } from '../ui';
+import { HelpLink } from '../handbook/context';
 
 const KINDS = ['person', 'corporate', 'publisher', 'subject', 'uniform_title'] as const;
 const SOURCES = ['local', 'lcsh', 'viaf', 'lc', 'imported'] as const;
@@ -368,7 +369,10 @@ export function AuthoritiesCard({ canWrite, onChanged }: { canWrite: boolean; on
 
   return (
     <div className="card">
-      <h3>🏷 {t('authorities.heading')}</h3>
+      <h3>
+        🏷 {t('authorities.heading')}
+        <HelpLink anchor="making-a-heading" label={t('handbook.helpAbout', { field: t('authorities.heading') })} />
+      </h3>
       <p className="muted small" style={{ marginBottom: '0.5rem' }}>{t('authorities.intro')}</p>
       {/* The reconciliation. Two tools, one librarian problem — say which is which
           at the point of use, not only in the Handbook. */}
@@ -437,7 +441,10 @@ export function AuthoritiesCard({ canWrite, onChanged }: { canWrite: boolean; on
             <h3 id="auth-seed-title">{t('authorities.seedTitle')}</h3>
             <button className="icon-button" onClick={() => setCandidates(null)} aria-label={t('common.close')}>✕</button>
           </div>
-          <p className="muted small">{t('authorities.seedIntro', { n: fmt(candidates.length) })}</p>
+          <p className="muted small">
+            {t('authorities.seedIntro', { n: fmt(candidates.length) })}
+            <HelpLink anchor="seeding-subjects" label={t('handbook.helpAbout', { field: t('authorities.seedTitle') })} />
+          </p>
           <ul className="cf-list" style={{ maxHeight: '50vh', overflowY: 'auto' }}>
             {candidates.map((cand) => (
               <li key={cand.label} className="cf-row">

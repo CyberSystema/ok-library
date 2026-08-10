@@ -5812,7 +5812,10 @@ function App() {
                       variant spellings recorded rather than overwritten. This is
                       what MARC 100/700/650 export from. */}
                   <div className="detail-section">
-                    <div className="detail-section-title">{t('authorities.onBook')}</div>
+                    <div className="detail-section-title">
+                      {t('authorities.onBook')}
+                      <HelpLink anchor="what-a-heading-is" label={t('handbook.helpAbout', { field: t('authorities.onBook') })} />
+                    </div>
                     <BookAuthorities
                       bookId={detailBook.id}
                       canWrite={canWrite}
@@ -6080,6 +6083,7 @@ function App() {
                     </div>
                     <div>
                       <label htmlFor="fld-detail-language">{t('detail.language')}</label>
+                      <HelpLink anchor="parallel-fields" label={t('handbook.helpAbout', { field: t('detail.language') })} />
                       <input id="fld-detail-language" list="suggest-language" value={editForm.language} onChange={(e) => setEditForm({ ...editForm, language: e.target.value })} placeholder={t('detail.languagePh')} />
                     </div>
                     <div>

@@ -22,6 +22,11 @@ export const CHAPTER_IDS = [
   'notes',
   // Access points — the ways in
   'names',
+  'headings',
+  'contributors',
+  'subjects',
+  'series-and-sets',
+  'searching',
   'transliteration',
   'dates',
   // Reference
@@ -38,6 +43,28 @@ export type ChapterId = (typeof CHAPTER_IDS)[number];
  * difference between "this anchor is not written yet" and "this anchor is a typo".
  */
 export const ANCHOR_OWNERS = {
+  // headings
+  'what-a-heading-is': 'headings',
+  'making-a-heading': 'headings',
+  'variant-forms': 'headings',
+  'correcting-a-heading': 'headings',
+  'retiring-a-heading': 'headings',
+  // contributors
+  'relators': 'contributors',
+  'editor-and-translator': 'contributors',
+  'free-text-contributors': 'contributors',
+  // subjects
+  'subject-headings': 'subjects',
+  'seeding-subjects': 'subjects',
+  'imported-subjects': 'subjects',
+  // series-and-sets
+  'series-statement': 'series-and-sets',
+  'multi-part-works': 'series-and-sets',
+  'missing-volumes': 'series-and-sets',
+  // searching
+  'how-search-works': 'searching',
+  'partial-and-fuzzy': 'searching',
+  'smart-lists': 'searching',
   // titles
   'title-proper': 'titles',
   'subtitle': 'titles',
