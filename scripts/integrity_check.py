@@ -952,16 +952,27 @@ if mine:
     check("a Greek numeral volume is read as a number", mine["maxVol"] == 4, mine)
     check("the missing volume is reported", mine["missing"] == [2], mine["missing"])
 
-# A record whose `series` equals its own title is an import artifact, not a set —
-# 7,144 rows look like that. Dropped per book, so one such member cannot
-# disqualify a genuine set.
+# 7,144 records have `series` equal to their own title, because the import
+# auto-filled the field. That used to be handled by dropping such rows PER BOOK,
+# and this assertion checked for exactly that — it required the group above to
+# report 1 of its 2 members.
+#
+# Which is what §54 now forbids. A count in the rail has to open a list of the
+# same size, and the click-through filters on `custom:series = <label>` with no
+# such drop, so a member-level exclusion could only ever advertise a number that
+# was wrong. The evidence test is now per CLUSTER, and a group with one differing
+# title is a group: both members count, and both members open.
 solo = "ZZITEST SOLO " + uuid.uuid4().hex[:6]
 mkbook(title=solo, customFields={"series": solo})
 mkbook(title=solo + " second", customFields={"series": solo})
 st, r = call("GET", "/api/books/sets?minBooks=2&limit=500")
 found = next((x for x in (r or {}).get("items", []) if x["title"] == solo), None)
-check("a series-equals-title row is excluded, and the set still forms from the rest",
-      found is None or found["bookCount"] == 1, found)
+check("a group with one differing title counts every member", (found or {}).get("bookCount") == 2, found)
+q = urllib.parse.urlencode({"facetField": "custom:series", "facetValue": solo, "pageSize": 1})
+st, listed = call("GET", "/api/books?" + q)
+check("and the number it advertises is the number it opens",
+      (listed or {}).get("total") == (found or {}).get("bookCount"),
+      f'{(listed or {}).get("total")} vs {(found or {}).get("bookCount")}')
 
 # Unnumerable volumes are counted and reported, never silently dropped, and
 # never used to fabricate a gap list.
@@ -2503,6 +2514,69 @@ if LOCAL:
 else:
     print("  SKIP  1 audit-log sweep check needs direct D1 access (local runs only)")
 call("DELETE", f"/api/holds/{(h or {}).get('id')}") if (h or {}).get("id") else None
+
+print("=== 54. REGRESSION: a set count opens a list of the same size ===")
+# The rail dropped a book from its cluster whenever `series` equalled the book's
+# own title — 7,144 rows do, because the import auto-filled the field. The
+# click-through filters on `custom:series = <label>` and applies no such drop, so
+# 54 clusters advertised a count 96 books short of what they opened: "ΤΑ ΠΟΙΗΜΑΤΑ"
+# showed 2 and opened 13. The facet-count contract this catalogue is built on says
+# a count in the rail must reproduce as a filtered list.
+st, sets = call("GET", "/api/books/sets?minBooks=2&limit=500")
+items = (sets or {}).get("items", [])
+check("the sets rail returns clusters", st == 200 and len(items) > 0, f"{st} {len(items)}")
+check("and reports how many it matched before the limit",
+      isinstance((sets or {}).get("matched"), int) and sets["matched"] >= len(items),
+      {k: v for k, v in (sets or {}).items() if k != "items"})
+check("and how many groups it suppressed", isinstance((sets or {}).get("suppressed"), int),
+      (sets or {}).get("suppressed"))
+
+# Every count, not a sample: this is the contract, and it is cheap to check in
+# full because the rail is a few hundred rows.
+mismatched = []
+for it in sorted(items, key=lambda x: -x["bookCount"])[:60]:
+    q = urllib.parse.urlencode({"facetField": "custom:series", "facetValue": it["title"], "pageSize": 1})
+    st, listed = call("GET", "/api/books?" + q)
+    if (listed or {}).get("total") != it["bookCount"]:
+        mismatched.append((it["title"][:30], it["bookCount"], (listed or {}).get("total")))
+check("every set count reproduces as a filtered list", not mismatched, mismatched[:6])
+
+# A book whose series equals its title AND carries a volume number is volume N of
+# a work where every volume shares one title — the commonest shape of a multi-part
+# work here, and the member drop hid the two largest examples in the library
+# outright. Neither appeared in the rail at all.
+titles = {it["title"]: it["bookCount"] for it in items}
+big = [t for t in titles if "ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ" in t]
+if big:
+    check("a set whose volumes all share one title is no longer hidden",
+          titles[big[0]] >= 40, (big[0][:40], titles[big[0]]))
+else:
+    check("a set whose volumes all share one title is no longer hidden", False,
+          "ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ absent from the rail")
+
+# And the suppression is per CLUSTER, so it can never change a count: a group is
+# hidden only when every member is titled the same as the group and not one is
+# numbered.
+uniq = uuid.uuid4().hex[:8]
+same = f"ZZITEST Ομάδα {uniq}"
+for _ in range(2):
+    mkbook(title=same, author="ZZ Sets", customFields={"series": same})
+st, sets2 = call("GET", "/api/books/sets?minBooks=2&limit=500")
+check("a group with no differing title and no volume numbers is suppressed",
+      not any(i["title"] == same for i in (sets2 or {}).get("items", [])),
+      [i["title"] for i in (sets2 or {}).get("items", []) if same in i["title"]])
+# One volume number is enough evidence, and the count then includes every member.
+mkbook(title=same, author="ZZ Sets", customFields={"series": same, "volume_num": "3"})
+st, sets3 = call("GET", "/api/books/sets?minBooks=2&limit=500")
+shown = next((i for i in (sets3 or {}).get("items", []) if i["title"] == same), None)
+check("one volume number makes the group appear", shown is not None, shown)
+check("with every member counted, including the ones titled like the group",
+      (shown or {}).get("bookCount") == 3, shown)
+q = urllib.parse.urlencode({"facetField": "custom:series", "facetValue": same, "pageSize": 1})
+st, listed = call("GET", "/api/books?" + q)
+check("and that count opens a list of the same size",
+      (listed or {}).get("total") == (shown or {}).get("bookCount"),
+      f'{(listed or {}).get("total")} vs {(shown or {}).get("bookCount")}')
 
 print("=== 43. REGRESSION: accessibility guards (static) ===")
 # The gate is an HTTP harness, so it cannot drive a screen reader. What it CAN

@@ -927,6 +927,9 @@ function App() {
   // work and reports which volumes are absent, which is a different shape
   // from a value/count list.
   const [bookSets, setBookSets] = useState<SetSummary[]>([]);
+  // What the rail is NOT showing. A rail that quietly omits 357 groups reads as
+  // "the library has 573 sets", which is not what it means.
+  const [setsMeta, setSetsMeta] = useState<{ matched: number; suppressed: number }>({ matched: 0, suppressed: 0 });
   const [setsGapsOnly, setSetsGapsOnly] = useState(false);
   const [setsLoading, setSetsLoading] = useState(false);
   const [needsReviewFilter, setNeedsReviewFilter] = useState(false);
@@ -2081,16 +2084,21 @@ function App() {
     }
   }, []);
 
+  type SetsResponse = { items: SetSummary[]; total: number; matched?: number; suppressed?: number };
   const loadBookSets = useCallback(async (gapsOnly: boolean) => {
     const path = `/api/books/sets?minBooks=2&withGapsOnly=${gapsOnly}&limit=300`;
     setSetsLoading(true);
-    const cached = await cacheGet<{ items: SetSummary[] }>(`GET ${path}`);
-    if (cached) setBookSets(cached.value.items ?? []);
+    const cached = await cacheGet<SetsResponse>(`GET ${path}`);
+    if (cached) {
+      setBookSets(cached.value.items ?? []);
+      setSetsMeta({ matched: cached.value.matched ?? 0, suppressed: cached.value.suppressed ?? 0 });
+    }
     try {
-      const response = await apiRequest<{ items: SetSummary[] }>(path);
+      const response = await apiRequest<SetsResponse>(path);
       setBookSets(response.items ?? []);
+      setSetsMeta({ matched: response.matched ?? 0, suppressed: response.suppressed ?? 0 });
     } catch {
-      if (!cached) setBookSets([]);
+      if (!cached) { setBookSets([]); setSetsMeta({ matched: 0, suppressed: 0 }); }
     } finally {
       setSetsLoading(false);
     }
@@ -6688,6 +6696,18 @@ function App() {
                             />
                             {t('library.sets.gapsOnly')}
                           </label>
+                          {(setsMeta.suppressed > 0 || setsMeta.matched > bookSets.length) && (
+                            <p className="muted small rail-note">
+                              {setsMeta.matched > bookSets.length
+                                ? t('library.sets.showingOf', {
+                                  shown: fmt(bookSets.length), matched: fmt(setsMeta.matched)
+                                })
+                                : t('library.sets.groupCount', { n: fmt(setsMeta.matched) })}
+                              {setsMeta.suppressed > 0
+                                ? ` ${t('library.sets.suppressed', { n: fmt(setsMeta.suppressed) })}`
+                                : ''}
+                            </p>
+                          )}
                           <ul className="category-rail-list">
                             {setsLoading && bookSets.length === 0 && (
                               <li><span className="muted small">{t('app.working')}</span></li>

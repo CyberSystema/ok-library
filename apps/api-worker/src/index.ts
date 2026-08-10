@@ -1958,6 +1958,10 @@ app.get('/api/books/sets', async (c) => {
 	type Cluster = {
 		key: string; label: string; setId: string | null; expected: number | null;
 		labels: Map<string, number>; author: string; volumes: Array<string | null>; bookCount: number;
+		/** Members whose own title IS the series name. */
+		titleEqualsSeries: number;
+		/** Members carrying a volume designation. */
+		numbered: number;
 	};
 	const clusters = new Map<string, Cluster>();
 
@@ -1965,10 +1969,6 @@ app.get('/api/books/sets', async (c) => {
 		const cf = safeJsonParse<Record<string, unknown>>(row.custom_fields ?? '{}', {});
 		const series = String(row.set_title ?? cf.series ?? '').trim();
 		if (!series) continue;
-		// 7,144 rows have `series` equal to their own title — an import artifact,
-		// not a set. Dropped PER BOOK, so one member whose title happens to match
-		// the series name cannot disqualify a genuine set.
-		if (!row.set_id && foldDiacritics(series) === foldDiacritics(row.title ?? '')) continue;
 
 		// Grouped on the EXACT series string, not its fold.
 		//
@@ -1985,18 +1985,49 @@ app.get('/api/books/sets', async (c) => {
 		if (!cluster) {
 			cluster = {
 				key, label: series, setId: row.set_id, expected: row.expected_volumes ?? null,
-				labels: new Map(), author: row.author ?? '', volumes: [], bookCount: 0
+				labels: new Map(), author: row.author ?? '', volumes: [], bookCount: 0,
+				titleEqualsSeries: 0, numbered: 0
 			};
 			clusters.set(key, cluster);
 		}
 		// Display the most frequent original spelling, the way the value facets do.
 		cluster.labels.set(series, (cluster.labels.get(series) ?? 0) + 1);
-		cluster.volumes.push(row.volume_designation ?? (cf.volume_num as string | null) ?? null);
+		const volume = row.volume_designation ?? (cf.volume_num as string | null) ?? null;
+		cluster.volumes.push(volume);
 		cluster.bookCount += 1;
+		if (foldDiacritics(series) === foldDiacritics(row.title ?? '')) cluster.titleEqualsSeries += 1;
+		if (String(volume ?? '').trim()) cluster.numbered += 1;
 	}
 
-	const items = [...clusters.values()]
-		.filter((cluster) => cluster.bookCount >= minBooks)
+	// A cluster is suppressed, never a member.
+	//
+	// 7,144 rows have `series` equal to their own title, because the import
+	// auto-filled the field, and this used to drop those rows one by one. Two
+	// things were wrong with that. It broke the rule the rail is built on — a
+	// count in the rail opens a list of the same size — because the click-through
+	// filters on `custom:series = <label>` and applies no such drop: measured on
+	// this catalogue, 54 clusters advertised a count 96 books short of what they
+	// opened ("ΤΑ ΠΟΙΗΜΑΤΑ" showed 2 and opened 13).
+	//
+	// And it hid the two largest genuine sets in the library. A book whose series
+	// equals its title AND carries a volume number is not an artefact: it is
+	// volume N of a work where every volume shares one title, which is the
+	// commonest shape of a multi-part work here. ΕΚΚΛΗΣΙΑΣΤΙΚΗ ΑΛΗΘΕΙΑ is 47 such
+	// rows, all 47 numbered, and ΜΕΓΑΛΗ ΕΛΛΗΝΙΚΗ ΕΓΚΥΚΛΟΠΑΙΔΕΙΑ is 24 — neither
+	// appeared in the rail at all.
+	//
+	// The evidence that a cluster is NOT a set is therefore: every member is titled
+	// the same as the series, and not one carries a volume number. Applied per
+	// cluster, it cannot change a count.
+	const isEvidenceOfASet = (cluster: Cluster): boolean =>
+		Boolean(cluster.setId) || cluster.titleEqualsSeries < cluster.bookCount || cluster.numbered > 0;
+	const eligible = [...clusters.values()].filter((cluster) => cluster.bookCount >= minBooks);
+	// Reported rather than dropped quietly: a rail that silently omits 357 groups
+	// reads as "there are 573 sets", which is not what it means.
+	const suppressed = eligible.filter((cluster) => !isEvidenceOfASet(cluster)).length;
+
+	const items = eligible
+		.filter(isEvidenceOfASet)
 		.map((cluster) => {
 			const label = [...cluster.labels.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? cluster.label;
 			const gaps = computeSetGaps(cluster.volumes, cluster.expected);
@@ -2017,10 +2048,17 @@ app.get('/api/books/sets', async (c) => {
 			};
 		})
 		.filter((item) => (withGapsOnly ? item.gapsAvailable && item.missingCount > 0 : true))
-		.sort((a, b) => b.missingCount - a.missingCount || b.bookCount - a.bookCount)
-		.slice(0, limit);
+		.sort((a, b) => b.missingCount - a.missingCount || b.bookCount - a.bookCount);
 
-	const response = { items, total: items.length };
+	// `total` is how many rows this response carries; `matched` is how many there
+	// were before the limit. Reporting only the first would tell the librarian the
+	// library has 500 sets when it has 573.
+	const response = {
+		items: items.slice(0, limit),
+		total: Math.min(items.length, limit),
+		matched: items.length,
+		suppressed
+	};
 	if (c.env.CACHE) {
 		try {
 			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 86400 });

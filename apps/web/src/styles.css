@@ -2768,6 +2768,12 @@ mark.hl {
   max-width: 46rem;
 }
 
+/* What the rail is not showing, said in the rail rather than nowhere. */
+.rail-note {
+  margin: 0.35rem 0.5rem 0.5rem;
+  line-height: 1.35;
+}
+
 /* A short "use this, not that" note. Two tools solve one librarian problem in
    opposite directions, so the distinction has to be visible at the point of use
    rather than only in the Handbook. */
