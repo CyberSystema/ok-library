@@ -4126,10 +4126,32 @@ app.post('/api/loans/:id/renew', requirePermission('circulation', { librarian: t
 			message: 'This loan has already been renewed. Refresh to see the current due date.'
 		});
 	}
-	if (payload.expectedDueAt && payload.expectedDueAt !== loan.due_at) {
-		throw new HTTPException(409, {
-			message: 'This loan has already been renewed. Refresh to see the current due date.'
-		});
+	// Compared as INSTANTS, not as strings.
+	//
+	// `expectedDueAt` is canonicalised to `toISOString()` by ISODateTimeSchema on the
+	// way in, while a row written before that normalisation holds whatever the caller
+	// sent — three loans in this catalogue do. A raw string comparison therefore
+	// never matched for them: the client read the stored value, sent it straight
+	// back, and the precondition rejected its own echo. Renewal impossible, forever,
+	// with a message telling the librarian to refresh and try again.
+	//
+	// An unparseable stored value falls back to the string compare, which fails
+	// closed — the safe direction for a precondition whose job is to stop a retried
+	// write from double-extending a loan.
+	if (payload.expectedDueAt) {
+		const asInstant = (v: string | null): string | null => {
+			if (!v) return null;
+			const t = Date.parse(v);
+			return Number.isNaN(t) ? null : new Date(t).toISOString();
+		};
+		const sent = asInstant(payload.expectedDueAt);
+		const stored = asInstant(loan.due_at);
+		const same = sent && stored ? sent === stored : payload.expectedDueAt === loan.due_at;
+		if (!same) {
+			throw new HTTPException(409, {
+				message: 'This loan has already been renewed. Refresh to see the current due date.'
+			});
+		}
 	}
 
 	const policy = await resolveLoanPolicy(c.env, loan.category, loan.item_type ?? 'book');
@@ -8277,6 +8299,15 @@ const CATALOG_CUSTOM_FIELDS: Array<{
 	pinnedOrder?: number;
 }> = [
 	{ key: 'series', label: 'Series', type: 'text' },
+	// camelCase, alone among its snake_case siblings, and deliberately: `marc.ts`
+	// reads `cf.subTitle` for MARC 245 $b and the XLSX column map writes
+	// `subTitle`, so this is the spelling the two ends already agree on.
+	//
+	// It was missing entirely, which made the Handbook's subtitle field
+	// unfillable: 'subtitle' is in the reserved-attribute set, so the
+	// attribute-create form refuses it, and nothing shipped declared it — the
+	// exporter read a key no librarian could produce.
+	{ key: 'subTitle', label: 'Sub Title', type: 'text' },
 	{ key: 'volume_label', label: 'Volume Label', type: 'text' },
 	{ key: 'volume_num', label: 'Volume Number', type: 'text', pinnedOrder: 8 },
 	{ key: 'editor', label: 'Editor', type: 'text', pinnedOrder: 4 },

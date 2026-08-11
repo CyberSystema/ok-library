@@ -2706,7 +2706,7 @@ if mismatched:
     st, fresh = call("GET", "/api/books/sets?minBooks=2&limit=500")
     railed_now = {i["title"]: i["bookCount"] for i in (fresh or {}).get("items", [])}
     confirmed = []
-    for title, was, opened in mismatched:
+    for title, _railed_then, _opened_then in mismatched:
         q = urllib.parse.urlencode({"facetField": "custom:series", "facetValue": title, "pageSize": 1})
         st, listed = call("GET", "/api/books?" + q)
         if (listed or {}).get("total") != railed_now.get(title):
@@ -2813,9 +2813,9 @@ check("opening the drawer moves the reader and nothing else",
       sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _open_body))) or "no open() body found")
 _help_body = (hb_ctx.split("export function HelpLink(", 1)[1]
               if "export function HelpLink(" in hb_ctx else "")
+_help_calls = sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _help_body)) - {"return"})
 check("and the '?' button does nothing but open it",
-      sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _help_body))) == ["open", "return", "useHandbook"],
-      sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _help_body))) or "no HelpLink body found")
+      _help_calls == ["open", "useHandbook"], _help_calls or "no HelpLink body found")
 check("and it opens the drawer", "setDrawerOpen(true)" in hb_ctx, None)
 
 # A bare "?" is not an accessible name.
