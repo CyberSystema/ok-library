@@ -106,9 +106,20 @@ class ApiClient {
     return (body['results'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
   }
 
-  Future<List<Book>> pullChanges({required String token, required String since}) async {
+  /// One page of changes, with the cursor to ask for the next one.
+  ///
+  /// The cursor is a PAIR. `updated_at` alone is not unique in this catalogue —
+  /// the spreadsheet import wrote thousands of records inside the same
+  /// millisecond — so a cursor of just the timestamp steps over every record
+  /// sharing the last one's, and the sync reports success having skipped them.
+  Future<({List<Book> books, String cursor, String cursorId})> pullChanges({
+    required String token,
+    required String since,
+    String sinceId = '',
+  }) async {
     final response = await http.get(
-      Uri.parse('$baseUrl/api/sync/pull?since=${Uri.encodeQueryComponent(since)}'),
+      Uri.parse('$baseUrl/api/sync/pull?since=${Uri.encodeQueryComponent(since)}'
+          '&sinceId=${Uri.encodeQueryComponent(sinceId)}'),
       headers: {'Authorization': 'Bearer $token'},
     );
 
@@ -119,6 +130,10 @@ class ApiClient {
 
     final body = jsonDecode(response.body) as Map<String, dynamic>;
     final items = (body['items'] as List<dynamic>? ?? []).cast<Map<String, dynamic>>();
-    return items.map(Book.fromJson).toList();
+    return (
+      books: items.map(Book.fromJson).toList(),
+      cursor: body['nextCursor'] as String? ?? since,
+      cursorId: body['nextCursorId'] as String? ?? sinceId,
+    );
   }
 }

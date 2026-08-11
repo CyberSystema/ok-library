@@ -2250,6 +2250,22 @@ app.post('/api/books/merge', requirePermission('books.write', { librarian: true 
 		});
 	}
 
+	// Committing a merge REMOVES records, so it needs the delete permission — the
+	// same re-check `sync/push`'s `delete_book` already carries, for the same
+	// reason. The route is gated on the coarse books.write, and `books.delete` is
+	// false for librarians BY DEFAULT (see DEFAULT_PERMS), so without this a
+	// librarian who is refused DELETE /api/books/:id, the trash and restore could
+	// still clear the catalogue twenty records at a time by merging unrelated books
+	// into one — and could not undo it, because seeing the trash needs the
+	// permission they do not have. Verified reachable from the interface too: the
+	// duplicate-merge card renders under `canWrite` alone.
+	//
+	// The dry run deliberately stays on books.write, so a librarian can still review
+	// candidate duplicates and hand the decision to someone who can commit it.
+	if (!(await userHasPermission(c, 'books.delete'))) {
+		throw new HTTPException(403, { message: 'Permission denied: books.delete' });
+	}
+
 	const now = nowIso();
 	const statements: D1PreparedStatement[] = [];
 	const mergePh = mergeIds.map(() => '?').join(',');
@@ -3095,11 +3111,22 @@ app.post('/api/books/:id/borrow', requirePermission('circulation', { librarian: 
 	// tried to paper over that could itself fail. One batch = one D1
 	// transaction, so all three land or none do.
 	//
-	// The INSERT and the copy UPDATE carry the SAME availability guard, so a
-	// concurrent borrow that wins the race makes both no-ops rather than
-	// inserting an orphan ledger row. The INSERT runs first for exactly that
-	// reason — after the UPDATE the copy is no longer 'available' and its own
-	// guard would never match. `idx_borrow_active_item` is the backstop.
+	// The copy UPDATE fires only if the INSERT actually landed, so a refused borrow
+	// makes both no-ops rather than marking a copy borrowed with no ledger row
+	// behind it. The INSERT runs first for exactly that reason — after the UPDATE
+	// the copy is no longer 'available' and its own guard would never match.
+	// `idx_borrow_active_item` is the backstop.
+	//
+	// The UPDATE tests for the inserted row by id rather than repeating the
+	// INSERT's guard. That used to be a copy of the availability conditions, and
+	// when the loan cap was added to the INSERT's guard and not to the UPDATE's the
+	// two silently disagreed: a borrow over the cap inserted nothing, marked the
+	// copy 'borrowed' anyway, and returned 201 with a transaction id that did not
+	// exist. The copy was then unlendable AND unreturnable, in no loan report, with
+	// no path in the interface to repair it. Deriving the UPDATE from the INSERT's
+	// OUTCOME instead of from a duplicate of its reasoning is what makes that class
+	// of divergence impossible — statements in a D1 batch run in order, in one
+	// transaction, so the inserted row is visible here.
 	// The cap lives INSIDE the insert's guard, not in a read before it. Checking
 	// "does this borrower already have N out?" and then inserting is
 	// check-then-act: two borrows arriving together both pass a read of N-1.
@@ -3140,8 +3167,9 @@ app.post('/api/books/:id/borrow', requirePermission('circulation', { librarian: 
 		),
 		c.env.DB.prepare(
 			`UPDATE items SET status = 'borrowed', version = version + 1, updated_at = ?
-			 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
-		).bind(now, item.id),
+			 WHERE id = ? AND deleted_at IS NULL AND status = 'available'
+			   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ?)`
+		).bind(now, item.id, txId),
 		// The record is available while ANY copy still is, so a three-copy book
 		// stays lendable after the first goes out. Same derivation as
 		// syncBookFromItems, inlined so it lands inside this transaction.
@@ -3157,7 +3185,11 @@ app.post('/api/books/:id/borrow', requirePermission('circulation', { librarian: 
 		).bind(now, bookId)
 	]);
 
-	if ((borrowResults[1]?.meta?.changes ?? 0) === 0) {
+	// Read the INSERT, not the UPDATE. The INSERT carries the authoritative guard —
+	// availability, the ready-hold check AND the loan cap — so it is the statement
+	// that knows whether a loan happened. Checking the UPDATE instead is what let a
+	// cap refusal report success.
+	if ((borrowResults[0]?.meta?.changes ?? 0) === 0) {
 		// The guard covers three refusals at once. Distinguish the cap, because
 		// "this reader already has 5 out" is the operator's problem to solve and
 		// "the copy went" is not.
@@ -4633,12 +4665,22 @@ app.get('/api/scan/:value', async (c) => {
 		// rather than guessing.
 		items: await loadBookItems(c.env, bookId),
 		// What a scan is usually a prelude to. Saves the desk a second request.
-		openLoan: await c.env.DB.prepare(
-			`SELECT t.id, t.borrower_name, t.due_at, t.item_id, t.renewal_count
-			   FROM borrow_transactions t
-			  WHERE t.returned_at IS NULL AND ${itemRow ? 't.item_id = ?' : 't.book_id = ?'}
-			  ORDER BY t.borrowed_at ASC LIMIT 1`
-		).bind(itemRow ? String(itemRow.id) : bookId).first()
+		//
+		// But it names the READER, and that is circulation data: `/api/borrow/active`,
+		// `/api/borrowers`, `/api/holds` and `/api/books/:id/history` all require the
+		// `circulation` permission for the same fact. This route needs no permission —
+		// identifying a book from a spine label is what a viewer is for — so the gate
+		// belongs on the FIELD, not the route. Without it a viewer, who is refused all
+		// four of those routes, could walk `/api/books/ids` and rebuild the whole
+		// active-loan roster name by name.
+		openLoan: (await userHasPermission(c, 'circulation', { librarian: true }))
+			? await c.env.DB.prepare(
+				`SELECT t.id, t.borrower_name, t.due_at, t.item_id, t.renewal_count
+				   FROM borrow_transactions t
+				  WHERE t.returned_at IS NULL AND ${itemRow ? 't.item_id = ?' : 't.book_id = ?'}
+				  ORDER BY t.borrowed_at ASC LIMIT 1`
+			).bind(itemRow ? String(itemRow.id) : bookId).first()
+			: null
 	});
 });
 
@@ -6312,18 +6354,42 @@ app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: tr
 	return c.body('﻿' + csv);
 });
 
+// The cursor is (updated_at, id), not updated_at alone.
+//
+// `updated_at` is NOT unique here and not nearly unique: the spreadsheet import
+// wrote thousands of records inside the same millisecond, and 12,145 of the 12,555
+// live records share their timestamp with at least one other — the largest tie
+// group is 186. A cursor of `updated_at > last_seen` therefore steps over every
+// remaining row that shares the last row's timestamp, and a full sync delivered
+// 12,225 of 12,555 records: 330 books that no offline client could ever receive,
+// with the sync reporting success. Measured, not theorised.
+//
+// Adding `id` as a tiebreak makes the sort key a total order, so the keyset
+// comparison can express "strictly after this exact row" and no row can fall in a
+// gap between pages. `since` stays accepted alone so an existing client keeps
+// working; it simply starts from the beginning of that timestamp's group.
 app.get('/api/sync/pull', async (c) => {
 	const since = c.req.query('since') ?? '1970-01-01T00:00:00.000Z';
+	const sinceId = c.req.query('sinceId') ?? '';
 	const rows = await c.env.DB.prepare(
-		`SELECT * FROM books WHERE updated_at > ? AND deleted_at IS NULL ORDER BY updated_at ASC LIMIT 1000`
+		`SELECT * FROM books
+		  WHERE deleted_at IS NULL
+		    AND (updated_at > ? OR (updated_at = ? AND id > ?))
+		  ORDER BY updated_at ASC, id ASC
+		  LIMIT 1000`
 	)
-		.bind(since)
+		.bind(since, since, sinceId)
 		.all();
 
 	const items = (rows.results ?? []).map((row) => parseBook(row as Record<string, unknown>));
-	const nextCursor = items.length > 0 ? (items[items.length - 1].updatedAt as string) : since;
+	const last = items[items.length - 1];
+	const nextCursor = last ? (last.updatedAt as string) : since;
+	const nextCursorId = last ? (last.id as string) : sinceId;
 
-	return c.json({ since, nextCursor, items });
+	// `nextCursor` keeps its meaning for an old client; `nextCursorId` is what makes
+	// the next page exact. A client that ignores it re-reads at most one timestamp
+	// group instead of skipping one.
+	return c.json({ since, sinceId, nextCursor, nextCursorId, items });
 });
 
 app.post('/api/sync/push', requirePermission('books.write', { librarian: true }), async (c) => {

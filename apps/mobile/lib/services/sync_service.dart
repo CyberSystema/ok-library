@@ -14,6 +14,9 @@ class SyncService {
   final Uuid _uuid = const Uuid();
 
   String _lastSyncCursor = '1970-01-01T00:00:00.000Z';
+  /// The second half of the sync cursor. See `pullChanges`: `updated_at` is not
+  /// unique in this catalogue, so the record id breaks the tie.
+  String _lastSyncCursorId = '';
 
   Future<void> enqueueCreateBook(Map<String, dynamic> payload) {
     final mutation = OfflineMutation(
@@ -71,10 +74,29 @@ class SyncService {
       }
     }
 
-    final changes = await apiClient.pullChanges(token: token, since: _lastSyncCursor);
-    if (changes.isNotEmpty) {
-      await localDb.upsertBooks(changes);
-      _lastSyncCursor = changes.last.updatedAt.toUtc().toIso8601String();
+    // Page until the server has nothing left. This used to fetch ONE page and
+    // stop, so a first sync received 1,000 of 12,555 records and every later sync
+    // resumed from a cursor that had already skipped the rest. Two separate
+    // reasons the local copy was silently incomplete; both are fixed here.
+    //
+    // The cursor comes back from the server rather than being derived from the
+    // last book's `updatedAt`, because the server's cursor is the (timestamp, id)
+    // pair that makes the next page exact. Deriving it here from `updatedAt` alone
+    // is what dropped every record sharing the last one's millisecond.
+    var pages = 0;
+    while (pages < 200) {
+      final page = await apiClient.pullChanges(
+        token: token,
+        since: _lastSyncCursor,
+        sinceId: _lastSyncCursorId,
+      );
+      pages++;
+      if (page.books.isEmpty) break;
+      await localDb.upsertBooks(page.books);
+      final done = page.cursor == _lastSyncCursor && page.cursorId == _lastSyncCursorId;
+      _lastSyncCursor = page.cursor;
+      _lastSyncCursorId = page.cursorId;
+      if (done) break; // the server could not advance; stop rather than loop
     }
 
     // Surface rejected mutations (after pulls have run) so they aren't lost

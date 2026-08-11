@@ -1581,7 +1581,22 @@ check("it counts TITLES and ITEMS separately",
 langs = {r["language"] for r in rep["collection"]["byLanguage"]}
 check("languages are ISO 639-2/B three-letter codes",
       all(len(c) == 3 for c in langs), sorted(c for c in langs if len(c) != 3))
-check("records with no language are counted under 'und', not dropped", "und" in langs or True)
+# This assertion used to end in `or True`, which made it unfalsifiable — it read as
+# a guarantee and tested nothing. The substance does hold, so the fix is to assert
+# it properly AND to check the count, not merely the bucket's presence: a report
+# that dropped half the blank-language records would still have shown an 'und'
+# bucket and satisfied the old form even without the `or True`.
+_und = next((r["titles"] for r in rep["collection"]["byLanguage"] if r["language"] == "und"), None)
+if LOCAL:
+    _rows = local_sql("SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL "
+                      "AND (language IS NULL OR TRIM(language) = '')")
+    _blank_lang = int(_rows[0]["n"]) if _rows else None
+    check("records with no language are counted under 'und', not dropped",
+          _und is not None and _blank_lang is not None and _und >= _blank_lang,
+          f"und={_und}, records with no language={_blank_lang}")
+else:
+    check("records with no language are counted under 'und', not dropped",
+          _und is not None, f"no 'und' bucket in {sorted(langs)}")
 
 # The caveats are the point. A figure quoted without its qualification misleads.
 check("the report states what it cannot show", len(rep.get("caveats") or []) > 0, rep.get("caveats"))
@@ -2676,6 +2691,132 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     body = _slurp(pack)
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
+
+print("=== 57. REGRESSION: refusals must not half-apply, and cursors must not skip ===")
+uniq = uuid.uuid4().hex[:8]
+
+# (a) A borrow refused by the loan cap used to return 201 and mark the copy
+# 'borrowed' with NO ledger row behind it. The copy was then unlendable (status
+# says borrowed) AND unreturnable (no open loan to close), in no loan report, with
+# nothing in the interface able to repair it. Cause: the INSERT carried the cap in
+# its guard, the copy UPDATE did not, and the handler read the UPDATE's row count
+# to decide whether a loan had happened.
+_pol = local_sql("SELECT id, max_concurrent_loans FROM loan_policies WHERE id = 'pol_*_*'") if LOCAL else None
+if LOCAL and _pol:
+    _restore = _pol[0]["max_concurrent_loans"]
+    local_sql("UPDATE loan_policies SET max_concurrent_loans = 1 WHERE id = 'pol_*_*'")
+    try:
+        st, br = call("POST", "/api/borrowers", {"name": f"ZZCAP {uniq}", "category": "standard"})
+        brid = (br or {}).get("borrower", br or {}).get("id")
+        st, lst = call("GET", "/api/books?pageSize=8&status=available")
+        two = [b["id"] for b in (lst or {}).get("items", [])][:2]
+        if brid and len(two) == 2:
+            st1, _ = call("POST", f"/api/books/{two[0]}/borrow", {"borrowerId": brid})
+            st2, body2 = call("POST", f"/api/books/{two[1]}/borrow", {"borrowerId": brid})
+            check("a borrow over the loan cap is refused, not half-applied",
+                  st1 in (200, 201) and st2 == 409, f"first={st1}, over-cap={st2} {str(body2)[:120]}")
+            rows = local_sql(f"""SELECT i.status AS s,
+                     (SELECT COUNT(*) FROM borrow_transactions t
+                       WHERE t.item_id = i.id AND t.returned_at IS NULL) AS open_loans
+                     FROM items i WHERE i.book_id = '{two[1]}'""")
+            stuck = [r for r in (rows or []) if r["s"] == "borrowed" and int(r["open_loans"]) == 0]
+            check("and it leaves no copy marked borrowed with no loan behind it",
+                  not stuck, stuck[:3])
+            # Clean up the loan the first call legitimately created.
+            call("POST", f"/api/books/{two[0]}/return", {})
+        else:
+            check("a borrow over the loan cap is refused, not half-applied", False, "setup failed")
+    finally:
+        local_sql("UPDATE loan_policies SET max_concurrent_loans = "
+                  + ("NULL" if _restore is None else str(int(_restore)))
+                  + " WHERE id = 'pol_*_*'")
+
+# The invariant stated globally: this is what the bug above violated, and it is
+# cheap enough to assert over the whole table on every run.
+if LOCAL:
+    orphans = local_sql("""SELECT COUNT(*) AS n FROM items i
+        WHERE i.deleted_at IS NULL AND i.status = 'borrowed'
+          AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
+                           WHERE t.item_id = i.id AND t.returned_at IS NULL)""")
+    check("no copy anywhere is 'borrowed' without an open loan",
+          orphans and int(orphans[0]["n"]) == 0, orphans[0]["n"] if orphans else "query failed")
+
+# (b) /api/sync/pull paged on `updated_at > last_seen`. That column is not unique
+# here — the import wrote thousands of records inside one millisecond — so the
+# cursor stepped over every record sharing the last row's timestamp. Measured: a
+# full sync delivered 12,225 of 12,555 records and reported success.
+_seen, _cur, _cid, _pages = set(), "1970-01-01T00:00:00.000Z", "", 0
+while _pages < 60:
+    st, page = call("GET", f"/api/sync/pull?since={_cur}&sinceId={_cid}")
+    if st != 200:
+        break
+    items = (page or {}).get("items", [])
+    _pages += 1
+    if not items:
+        break
+    for b in items:
+        _seen.add(b["id"])
+    nc, nci = page.get("nextCursor"), page.get("nextCursorId", "")
+    if nc == _cur and nci == _cid:
+        break
+    _cur, _cid = nc, nci
+_total = None
+if LOCAL:
+    r = local_sql("SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL")
+    _total = int(r[0]["n"]) if r else None
+check("a full offline sync delivers every record",
+      _total is not None and len(_seen) == _total, f"{len(_seen)} of {_total} in {_pages} pages")
+check("and the sync cursor is a total order, not a bare timestamp",
+      "nextCursorId" in (page or {}), sorted((page or {}).keys()))
+
+# (c) Committing a merge removes records, so it needs books.delete — which is FALSE
+# for librarians by default. The route is gated on books.write alone, so without the
+# re-check a librarian refused DELETE, the trash and restore could still clear the
+# catalogue by merging unrelated records, and could not undo it.
+lu = f"zzmerge{uniq[:6]}"
+st, _ = call("POST", "/api/users", {"username": lu, "password": "ZZmerge!2026", "role": "librarian"})
+if st in (200, 201):
+    USERS.append(lu)
+    ltok = login(lu, "ZZmerge!2026")
+    st, perms = call("GET", "/api/me/permissions", token=ltok)
+    can_delete = (perms or {}).get("permissions", perms or {}).get("books.delete")
+    check("books.delete is denied to a librarian by default", can_delete is False, perms)
+    a = call("POST", "/api/books", {"title": f"ZZMERGE A {uniq}", "author": "ZZ"})[1]
+    b = call("POST", "/api/books", {"title": f"ZZMERGE B {uniq}", "author": "ZZ"})[1]
+    aid, bid = (a or {}).get("id"), (b or {}).get("id")
+    if aid and bid:
+        CREATED.extend([aid, bid])
+        st, _ = call("POST", "/api/books/merge",
+                     {"keepId": aid, "mergeIds": [bid], "dryRun": True}, token=ltok)
+        check("a librarian may still PREVIEW a merge", st == 200, st)
+        st, body = call("POST", "/api/books/merge",
+                        {"keepId": aid, "mergeIds": [bid], "dryRun": False}, token=ltok)
+        check("but committing one without books.delete is refused", st == 403, f"{st} {str(body)[:110]}")
+        st, _ = call("GET", f"/api/books/{bid}")
+        check("and the record it would have removed is still there", st == 200, st)
+
+# (d) /api/scan/:value names the current reader. Four sibling routes require
+# `circulation` for that same fact, and this one required nothing — so a viewer
+# refused all four could walk /api/books/ids and rebuild the loan roster.
+vu = f"zzscan{uniq[:6]}"
+st, _ = call("POST", "/api/users", {"username": vu, "password": "ZZscan!2026", "role": "viewer"})
+if st in (200, 201):
+    USERS.append(vu)
+    vtok = login(vu, "ZZscan!2026")
+    st, made = call("POST", "/api/books", {"title": f"ZZSCAN {uniq}", "author": "ZZ"})
+    sid = (made or {}).get("id")
+    if sid:
+        CREATED.append(sid)
+        call("POST", f"/api/books/{sid}/borrow", {"borrowerName": f"ZZREADER {uniq}"})
+        st, scan = call("GET", f"/api/scan/{sid}", token=vtok)
+        check("a viewer can still identify a scanned book", st == 200 and (scan or {}).get("book"), st)
+        check("but the scan does not name the reader to them",
+              (scan or {}).get("openLoan") is None, (scan or {}).get("openLoan"))
+        st, scan2 = call("GET", f"/api/scan/{sid}")
+        check("while the desk still sees who has it",
+              ((scan2 or {}).get("openLoan") or {}).get("borrower_name", "").startswith("ZZREADER"),
+              (scan2 or {}).get("openLoan"))
+        call("POST", f"/api/books/{sid}/return", {})
 
 print("=== 56. REGRESSION: the course records that it was read ===")
 uniq = uuid.uuid4().hex[:8]
