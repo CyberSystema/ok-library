@@ -594,17 +594,24 @@ export async function loadItemsForBooks(
   const out = new Map<string, Array<Record<string, unknown>>>();
   const safe = bookIds.filter((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id));
   if (safe.length === 0) return out;
-  const placeholders = safe.map(() => '?').join(',');
-  const rows = await env.DB.prepare(
-    `SELECT * FROM items WHERE deleted_at IS NULL AND book_id IN (${placeholders})
-      ORDER BY copy_number ASC, created_at ASC, id ASC`
-  ).bind(...safe).all<Record<string, unknown>>();
-  for (const row of rows.results ?? []) {
-    const parsed = parseItem(row);
-    const key = String(parsed.bookId);
-    const list = out.get(key);
-    if (list) list.push(parsed);
-    else out.set(key, [parsed]);
+  // CHUNKED at 90: D1 accepts at most 100 bound parameters per statement. This is
+  // a shared helper — the book list, the merge-candidate screen and the MARC export
+  // all reach it — and every caller that passed more than 100 ids got a 500 rather
+  // than a page of results. A book list at pageSize 100 sat exactly on the ceiling.
+  for (let i = 0; i < safe.length; i += 90) {
+    const slice = safe.slice(i, i + 90);
+    const placeholders = slice.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+      `SELECT * FROM items WHERE deleted_at IS NULL AND book_id IN (${placeholders})
+        ORDER BY copy_number ASC, created_at ASC, id ASC`
+    ).bind(...slice).all<Record<string, unknown>>();
+    for (const row of rows.results ?? []) {
+      const parsed = parseItem(row);
+      const key = String(parsed.bookId);
+      const list = out.get(key);
+      if (list) list.push(parsed);
+      else out.set(key, [parsed]);
+    }
   }
   return out;
 }
@@ -961,6 +968,17 @@ export async function loadMarcExtrasForBooks(
   const safe = bookIds.filter((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id));
   if (safe.length === 0) return out;
   for (const id of safe) out.set(id, { contributors: [], subjects: [], seriesTitle: null });
+  // CHUNKED at 90: D1 accepts at most 100 bound parameters per statement, and the
+  // SRU path can ask for 100 records at once. Recursing on slices keeps the two
+  // queries below exactly as they are — this function only ever fills `out` per
+  // book id, so merging the slices is the same as one pass.
+  if (safe.length > 90) {
+    for (let i = 0; i < safe.length; i += 90) {
+      const part = await loadMarcExtrasForBooks(env, safe.slice(i, i + 90));
+      for (const [k, v] of part) out.set(k, v);
+    }
+    return out;
+  }
   const ph = safe.map(() => '?').join(',');
 
   const links = await env.DB.prepare(
@@ -1005,19 +1023,38 @@ export async function loadMarcExtrasForBooks(
  */
 export async function loadOaiPage(
   env: Env,
-  opts: { from?: string; until?: string; offset: number; limit: number }
+  opts: {
+    from?: string; until?: string; limit: number;
+    /** Keyset position — resume strictly after this (updated_at, id). */
+    after?: { updatedAt: string; id: string } | null;
+    /** Legacy offset, for resumption tokens issued before the keyset. */
+    offset?: number;
+  }
 ): Promise<{ rows: Array<Record<string, unknown>>; total: number }> {
   const where: string[] = ['1=1'];
   const values: unknown[] = [];
   if (opts.from) { where.push('updated_at >= ?'); values.push(opts.from); }
   if (opts.until) { where.push('updated_at <= ?'); values.push(opts.until); }
+  // The total is counted over the RANGE, not the remainder, so completeListSize
+  // keeps its meaning across pages.
+  const countSql = `WHERE ${where.join(' AND ')}`;
+  const countValues = [...values];
+
+  // Keyset, not OFFSET. `updated_at` is not unique in this catalogue and rows MOVE
+  // when a record is saved, so an offset over this ordering steps over a row for
+  // every edit made during a harvest. `(updated_at, id)` is a total order, which is
+  // what makes "strictly after this exact row" expressible.
+  if (opts.after) {
+    where.push('(updated_at > ? OR (updated_at = ? AND id > ?))');
+    values.push(opts.after.updatedAt, opts.after.updatedAt, opts.after.id);
+  }
   const whereSql = `WHERE ${where.join(' AND ')}`;
 
   const [countRes, rowsRes] = await Promise.all([
-    env.DB.prepare(`SELECT COUNT(*) AS n FROM books ${whereSql}`).bind(...values).first<{ n: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) AS n FROM books ${countSql}`).bind(...countValues).first<{ n: number }>(),
     env.DB.prepare(
       `SELECT * FROM books ${whereSql} ORDER BY updated_at ASC, id ASC LIMIT ? OFFSET ?`
-    ).bind(...values, opts.limit, opts.offset).all<Record<string, unknown>>()
+    ).bind(...values, opts.limit, opts.after ? 0 : (opts.offset ?? 0)).all<Record<string, unknown>>()
   ]);
   return {
     rows: (rowsRes.results ?? []).map(parseBook),

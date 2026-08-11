@@ -255,19 +255,53 @@ export function parseOaiIdentifier(identifier: string): string | null {
  * arguments are encoded into the token itself. Storing them server-side would
  * mean a KV write per page, and KV writes are the tightest budget here.
  */
-export function encodeResumptionToken(state: {
-  offset: number; from?: string; until?: string; prefix: string;
-}): string {
+export type OaiResumption = {
+  /** Records already delivered — for the spec's `cursor` attribute, not for paging. */
+  delivered: number;
+  /** Keyset position: the (updated_at, id) of the last row handed out. */
+  lastUpdatedAt?: string;
+  lastId?: string;
+  /** Legacy: a bare row offset. Honoured for tokens issued before the keyset. */
+  offset?: number;
+  from?: string; until?: string; prefix: string;
+};
+
+/**
+ * A resumption token is a POSITION, and it has to survive the catalogue changing
+ * underneath a harvest.
+ *
+ * It used to carry a row OFFSET over an `updated_at ASC, id ASC` ordering. Saving
+ * any already-delivered record moves it to the end of that ordering, which shifts
+ * every undelivered row one place earlier — so the row sitting at the next offset is
+ * stepped over and never harvested. A harvest of a live catalogue silently loses a
+ * record for every edit made while it runs, and reports success. The same defect was
+ * found and fixed in `/api/sync/pull`; the ordering here is already the total order
+ * `(updated_at, id)`, so the keyset was available all along.
+ *
+ * `delivered` is kept only to populate the spec's `cursor` attribute honestly.
+ */
+export function encodeResumptionToken(state: OaiResumption): string {
   return btoa(JSON.stringify(state)).replace(/=+$/, '');
 }
 
-export function decodeResumptionToken(token: string): { offset: number; from?: string; until?: string; prefix: string } | null {
+export function decodeResumptionToken(token: string): OaiResumption | null {
   try {
     const parsed = JSON.parse(atob(token)) as Record<string, unknown>;
-    const offset = Number(parsed.offset);
     const prefix = String(parsed.prefix ?? '');
-    if (!Number.isInteger(offset) || offset < 0 || !prefix) return null;
+    if (!prefix) return null;
+    const lastUpdatedAt = typeof parsed.lastUpdatedAt === 'string' ? parsed.lastUpdatedAt : undefined;
+    const lastId = typeof parsed.lastId === 'string' ? parsed.lastId : undefined;
+    const rawOffset = Number(parsed.offset);
+    const offset = Number.isInteger(rawOffset) && rawOffset >= 0 ? rawOffset : undefined;
+    // A token must say WHERE it is, one way or the other. A keyset position is
+    // preferred; a legacy offset-only token still resumes rather than 400ing a
+    // harvest that was already in flight when this shipped.
+    if (lastUpdatedAt === undefined && offset === undefined) return null;
+    const rawDelivered = Number(parsed.delivered);
     return {
+      delivered: Number.isInteger(rawDelivered) && rawDelivered >= 0 ? rawDelivered : (offset ?? 0),
+      lastUpdatedAt,
+      lastId,
       offset,
       prefix,
       from: typeof parsed.from === 'string' ? parsed.from : undefined,

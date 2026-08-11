@@ -2692,6 +2692,157 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 62. REGRESSION: D1's 100-parameter ceiling ===")
+uniq = uuid.uuid4().hex[:8]
+
+# D1 accepts at most 100 BOUND PARAMETERS per statement. Four places built one
+# placeholder per caller-supplied element with no chunking, against schemas that
+# permit far more, so each 500'd the moment a real workload crossed the line:
+#
+#   /api/books/merge-candidates  flattened every id of every group into one IN(...)
+#                                — 500 from limit=5 upward, i.e. every call the
+#                                merge screen makes. Only ?limit=1 ever worked.
+#   /api/books/duplicates        two binds per group, limit clamped to 200 — worked
+#                                only at the default 50, which binds exactly 100.
+#   /api/items/add-copies        schema permits 500 ids, client sends 200.
+#   /api/items/assign-barcodes   same, plus loadItemsForBooks underneath.
+#
+# The gate did not catch any of it: all three merge-candidate assertions used
+# ?limit=1 or a `q` narrow enough to return one group. These probe the sizes a
+# librarian actually produces.
+for _limit in (1, 5, 50, 100):
+    st, body = call("GET", f"/api/books/merge-candidates?limit={_limit}")
+    check(f"merge-candidates answers at limit={_limit}", st == 200, f"{st} {str(body)[:90]}")
+for _limit in (1, 50, 99, 200):
+    st, body = call("GET", f"/api/books/duplicates?limit={_limit}")
+    check(f"duplicates answers at limit={_limit}", st == 200, f"{st} {str(body)[:90]}")
+
+# The bulk actions, at a selection larger than the ceiling. 200 is what the web
+# client sends per batch.
+_ids = []
+for _page in (1, 2):
+    st, pg = call("GET", f"/api/books?pageSize=100&page={_page}")
+    _ids += [b["id"] for b in (pg or {}).get("items", [])]
+check("two pages of ids were fetched for the bulk probes", len(_ids) > 150, len(_ids))
+if len(_ids) > 150:
+    # limit=1 so the sweep labels a single copy: this asserts the QUERY survives the
+    # id list, not that a bulk write is a good idea inside the gate.
+    st, body = call("POST", "/api/items/assign-barcodes", {"bookIds": _ids, "limit": 1})
+    check("assign-barcodes accepts a selection past the parameter ceiling",
+          st == 200, f"{st} {str(body)[:110]}")
+    # add-copies WRITES, so it is exercised against a scratch selection of two.
+    st, mk1 = call("POST", "/api/books", {"title": f"ZZCEIL A {uniq}", "author": "ZZ"})
+    st, mk2 = call("POST", "/api/books", {"title": f"ZZCEIL B {uniq}", "author": "ZZ"})
+    _two = [x for x in [(mk1 or {}).get("id"), (mk2 or {}).get("id")] if x]
+    CREATED.extend(_two)
+    if len(_two) == 2:
+        st, body = call("POST", "/api/items/add-copies", {"bookIds": _two, "count": 1})
+        check("add-copies still works on a small selection", st == 200, f"{st} {str(body)[:90]}")
+
+# The shared loader underneath all of them.
+_db_src2 = _slurp(_REPO, "apps", "api-worker", "src", "db.ts")
+check("loadItemsForBooks chunks its id list",
+      "i += 90" in _db_src2.split("export async function loadItemsForBooks")[1][:900], None)
+
+print("=== 61. REGRESSION: validated input must be written, defaults must not overwrite ===")
+uniq = uuid.uuid4().hex[:8]
+
+# (a) /api/import/books accepted seven CreateBookSchema fields, normalised them,
+# counted the row as imported and wrote none of them: the INSERT and UPDATE column
+# lists simply omitted date_edtf, publication_year_end, ddc, bib_level and the three
+# romanized forms. A sheet carrying an EDTF date or a serial marking lost it in
+# silence, and the import reported success.
+_legacy = f"ZZIMP-{uniq}"
+st, res = call("POST", "/api/import/books", {"dryRun": False, "rows": [{
+    "legacyId": _legacy, "title": f"ZZIMPORT {uniq}", "author": "ZZ",
+    "dateEdtf": "1955/1957", "ddc": "270.1", "bibLevel": "serial",
+    "titleRomanized": "Zz Import", "authorRomanized": "Zz Author",
+    "publisherRomanized": "Zz Pub"}]})
+check("an import row is accepted", st in (200, 201) and (res or {}).get("importedRows") == 1, f"{st} {res}")
+if LOCAL:
+    _r = local_sql(f"""SELECT date_edtf, publication_year_end, ddc, bib_level,
+                              title_romanized, author_romanized, publisher_romanized,
+                              title_romanized_fold, id
+                         FROM books WHERE legacy_id = '{_legacy}'""")
+    row = _r[0] if _r else None
+    if row:
+        CREATED.append(row["id"])
+    check("the import writes the EDTF date it validated",
+          row and row["date_edtf"] == "1955/1957", row)
+    check("and derives the end year from it",
+          row and int(row["publication_year_end"] or 0) == 1957, row)
+    check("and writes the Dewey number and the serial marking",
+          row and row["ddc"] == "270.1" and row["bib_level"] == "serial", row)
+    check("and the three romanized forms, folded so they are searchable",
+          row and row["title_romanized"] == "Zz Import"
+          and row["author_romanized"] == "Zz Author"
+          and row["publisher_romanized"] == "Zz Pub"
+          and (row["title_romanized_fold"] or "") != "", row)
+
+# (b) ItemCoreSchema defaults itemType to 'book'. ReplaceItemsSchema drives the
+# UPDATE of an EXISTING copy too, so an edit that did not resend the type silently
+# reclassified a manuscript as a book — the `.partial()`/`.default()` trap three
+# sibling schemas avoid by hand.
+st, mk = call("POST", "/api/books", {"title": f"ZZTYPE {uniq}", "author": "ZZ"})
+_bid = (mk or {}).get("id")
+if _bid:
+    CREATED.append(_bid)
+    st, got = call("GET", f"/api/books/{_bid}/items")
+    items = (got or {}).get("items", [])
+    if items:
+        _iid = items[0]["id"]
+        st, _ = call("PUT", f"/api/books/{_bid}/items",
+                     {"items": [{"id": _iid, "itemType": "manuscript", "shelfCode": "01-001"}]})
+        check("a copy can be classified as something other than a book", st == 200, st)
+        # The edit that matters: same copy, no itemType in the payload.
+        st, _ = call("PUT", f"/api/books/{_bid}/items",
+                     {"items": [{"id": _iid, "shelfCode": "01-002"}]})
+        st, after = call("GET", f"/api/books/{_bid}/items")
+        kept = ((after or {}).get("items") or [{}])[0].get("itemType")
+        check("and an edit that does not mention the type leaves it alone",
+              kept == "manuscript", f"itemType became {kept!r}")
+
+# (c) Two CSV export paths existed and only the server one neutralised formula
+# injection. They now share one cell escaper, so a title beginning '=' cannot
+# execute when the librarian opens either export.
+_shared = _slurp(_REPO, "packages", "shared", "src", "index.ts")
+check("the CSV cell escaper is shared, not duplicated",
+      "export function csvCell" in _shared
+      and "csvCell" in _slurp(_REPO, "apps", "api-worker", "src", "utils.ts")
+      and "csvCell" in main_tsx, None)
+check("and it neutralises the formula characters",
+      "/^[=+\\-@\\t\\r]/" in _shared, None)
+check("neither export path hand-rolls its own escaper any more",
+      "text.includes(',') || text.includes('\"')" not in main_tsx, None)
+
+# (d) The GDPR erase rewrote the reader's name across the WHOLE audit table by
+# substring. 9,927 book.create entries carry {"title","author"}, and in a Greek
+# library a reader and an author routinely share a surname — so erasing one reader
+# quietly rewrote the catalogue's own history of unrelated books.
+_worker_src = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_erase = _worker_src[_worker_src.index("app.post('/api/borrowers/:id/erase'"):]
+_erase = _erase[:_erase.index("return c.json({ id, anonymizedName")]
+# Strip the comments before matching. The first version of this check searched the
+# raw text for "REPLACE(metadata" and matched the comment that EXPLAINS why the
+# REPLACE was removed — a check that reported the defect it was written to prove
+# absent. Exactly the failure mode this section exists to catch, one level up.
+_erase_code = "\n".join(l for l in _erase.split("\n") if not l.strip().startswith("//"))
+check("erasure targets audit metadata by key, not by substring",
+      "REPLACE(metadata" not in _erase_code and "json_set(metadata" in _erase_code,
+      "an unanchored REPLACE over audit_logs is still present")
+check("and it names the actions that actually carry a reader name",
+      all(a in _erase for a in ("book.return", "hold.place", "borrower.create")), None)
+
+# (e) OAI-PMH paged on a row OFFSET over an ordering whose rows move when a record
+# is saved, so a harvest of a live catalogue skipped a record for every edit made
+# while it ran. Same defect as /api/sync/pull, same fix: a keyset.
+_proto = _slurp(_REPO, "apps", "api-worker", "src", "protocols.ts")
+check("the OAI resumption token carries a keyset position",
+      "lastUpdatedAt" in _proto and "lastId" in _proto, None)
+_db_src = _slurp(_REPO, "apps", "api-worker", "src", "db.ts")
+check("and loadOaiPage resumes strictly after the last row handed out",
+      "updated_at > ? OR (updated_at = ? AND id > ?)" in _db_src, None)
+
 print("=== 60. REGRESSION: EDTF sort sentinels are not dates ===")
 uniq = uuid.uuid4().hex[:8]
 

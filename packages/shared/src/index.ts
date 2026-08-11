@@ -612,7 +612,17 @@ export const ReplaceItemsSchema = z.object({
     ItemCoreSchema.extend({
       id: z.string().min(1).optional(),
       // Status is owned by the circulation flow, never by this form.
-      copyNumber: z.number().int().min(1).optional()
+      copyNumber: z.number().int().min(1).optional(),
+      // `.default('book')` is stripped here on purpose.
+      //
+      // ItemCoreSchema defaults itemType so a NEW copy gets a sensible type. This
+      // schema also drives the UPDATE of an existing one, and a default turns an
+      // omitted field into an assertion: a copy catalogued as a manuscript, a
+      // periodical issue or a microform came back as a 'book' on any edit that did
+      // not resend the type. That is the same `.default()` trap UpdateBookSchema,
+      // UpsertBorrowerSchema and UpsertCustomFieldSchema each avoid by hand; this
+      // one had not. The INSERT path below supplies 'book' explicitly instead.
+      itemType: z.string().max(40).optional()
     })
   )
     // At least one. A record with no copies is not a record with no copies — it
@@ -1047,3 +1057,30 @@ export type UpsertBorrowerInput = z.infer<typeof UpsertBorrowerSchema>;
 // rather than a schema. Re-exported here so callers keep one import path.
 export { code128Values, code128Pattern, code128Svg, formatItemBarcode } from './code128';
 export type { Code128SvgOptions } from './code128';
+
+// ─── CSV ───────────────────────────────────────────────────────────────────
+
+/**
+ * One CSV cell, quoted and made safe to open in a spreadsheet.
+ *
+ * Lives here because there are TWO export paths — the Worker's `toCsv` and the
+ * Library tab's "Export CSV" button — and they had drifted: the server neutralised
+ * formula injection and the browser did not, on the same data, for the same
+ * librarian, opened in the same spreadsheet. A defence that exists on one of two
+ * paths is a defence that is not deployed.
+ *
+ * A cell beginning `=`, `+`, `-`, `@`, or a leading tab/CR is read as a FORMULA by
+ * Excel, LibreOffice and Sheets, so a catalogued title like `=HYPERLINK(...)` or
+ * `+cmd|...` would execute when the export is opened. A leading apostrophe is the
+ * spreadsheet convention for "force text"; it is hidden on display. These exports
+ * are opened, not re-imported — the app imports XLSX — so nothing round-trips it.
+ */
+export function csvCell(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  let text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+    return `"${text.replaceAll('"', '""')}"`;
+  }
+  return text;
+}

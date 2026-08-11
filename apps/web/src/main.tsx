@@ -14,7 +14,7 @@ import {
   endOfLocalDayIso, isoToLocalDateInput
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
-import { formatEdtfRange, formatHoldingStatement, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
+import { csvCell, formatEdtfRange, formatHoldingStatement, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
 import { cacheGet, cacheSet, cacheBustPrefixes, cacheClear } from './cache';
 // The network layer now lives in api.ts. main.tsx exports nothing, so anything a
 // screen outside this file needs has to be reachable from there instead.
@@ -3977,16 +3977,14 @@ function App() {
         throw new Error(t('toast.noBooksToExport'));
       }
 
-      const escape = (value: unknown): string => {
-        if (value === null || value === undefined) {
-          return '';
-        }
-        const text = String(value);
-        if (text.includes(',') || text.includes('"') || text.includes('\n')) {
-          return `"${text.replaceAll('"', '""')}"`;
-        }
-        return text;
-      };
+      // The SHARED cell escaper, not a local one.
+      //
+      // This hand-rolled escape quoted commas and quotes and stopped there, while
+      // the Worker's export neutralised formula injection — same data, same
+      // librarian, same spreadsheet, one path defended. A title like
+      // `=HYPERLINK(...)` opened from this button would execute. Both paths now
+      // call csvCell, so they cannot drift apart again.
+      const escape = csvCell;
 
       const columns = ['id', 'title', 'author', 'isbn', 'status', 'roomCode', 'shelfCode', 'publicationYear'];
       const lines = [columns.join(',')];

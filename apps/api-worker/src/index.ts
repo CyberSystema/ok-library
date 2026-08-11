@@ -1455,31 +1455,39 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 	}
 
 	// Step 2: bulk-fetch only the rows in those duplicate buckets via OR predicates.
-	const orClauses = groups
-		.map(() => `(${TITLE_KEY} = ? AND ${AUTHOR_KEY} = ?)`)
-		.join(' OR ');
-	const params: unknown[] = [];
-	for (const g of groups) {
-		params.push(g.title_key, g.author_key);
+	//
+	// CHUNKED, because each group costs TWO bound parameters and D1 accepts at most
+	// 100 per statement. `limit` is clamped to 200, so the query blew the ceiling at
+	// any limit above 50 — 500, unconditionally, from the endpoint the merge tool
+	// calls. It was invisible because the default limit is exactly 50, which binds
+	// exactly 100: the one value in the accepted range that happens to fit.
+	const GROUPS_PER_QUERY = 45; // 90 parameters, comfortably under the ceiling
+	type DetailRow = {
+		id: string; title: string; author: string; isbn: string | null;
+		title_key: string; author_key: string;
+	};
+	const detailRows: DetailRow[] = [];
+	for (let i = 0; i < groups.length; i += GROUPS_PER_QUERY) {
+		const slice = groups.slice(i, i + GROUPS_PER_QUERY);
+		const orClauses = slice
+			.map(() => `(${TITLE_KEY} = ? AND ${AUTHOR_KEY} = ?)`)
+			.join(' OR ');
+		const params: unknown[] = [];
+		for (const g of slice) {
+			params.push(g.title_key, g.author_key);
+		}
+		const res = await c.env.DB.prepare(
+			`SELECT id, title, author, isbn,
+					${TITLE_KEY} AS title_key, ${AUTHOR_KEY} AS author_key
+			 FROM books
+			 WHERE deleted_at IS NULL AND (${orClauses})
+			 ORDER BY title_key ASC, author_key ASC, id ASC`
+		).bind(...params).all<DetailRow>();
+		detailRows.push(...(res.results ?? []));
 	}
 
-	const detailsRes = await c.env.DB.prepare(
-		`SELECT id, title, author, isbn,
-				${TITLE_KEY} AS title_key, ${AUTHOR_KEY} AS author_key
-		 FROM books
-		 WHERE deleted_at IS NULL AND (${orClauses})
-		 ORDER BY title_key ASC, author_key ASC, id ASC`
-	).bind(...params).all<{
-		id: string;
-		title: string;
-		author: string;
-		isbn: string | null;
-		title_key: string;
-		author_key: string;
-	}>();
-
 	const groupMap = new Map<string, Array<{ id: string; title: string; author: string; isbn: string | null }>>();
-	for (const row of detailsRes.results ?? []) {
+	for (const row of detailRows) {
 		const key = `${row.title_key}|||${row.author_key}`;
 		const list = groupMap.get(key) ?? [];
 		list.push({ id: row.id, title: row.title, author: row.author, isbn: row.isbn });
@@ -2117,20 +2125,37 @@ app.get('/api/books/merge-candidates', requirePermission('books.write', { librar
 	const allIds = groups.flatMap((g) => g.bookIds);
 	if (allIds.length === 0) return c.json({ groups: [], total, limit, offset });
 
-	const ph = allIds.map(() => '?').join(',');
-	const [rows, itemsByBook] = await Promise.all([
-		c.env.DB.prepare(`SELECT * FROM books WHERE id IN (${ph})`).bind(...allIds).all<Record<string, unknown>>(),
+	// CHUNKED. D1 accepts at most 100 bound parameters per statement, and this
+	// flattened EVERY id in every returned group into one `IN (…)`. Two records per
+	// group is the common case, so the ceiling was crossed at about fifty groups —
+	// but measured, this route 500s from limit=5 upward, which is every call the
+	// merge screen makes. Only `?limit=1` ever worked, and that is the value the
+	// gate happened to probe.
+	const chunked = async <T>(ids: string[], run: (slice: string[], ph: string) => Promise<T[]>): Promise<T[]> => {
+		const out: T[] = [];
+		for (let i = 0; i < ids.length; i += 90) {
+			const slice = ids.slice(i, i + 90);
+			out.push(...await run(slice, slice.map(() => '?').join(',')));
+		}
+		return out;
+	};
+
+	const [bookRows, itemsByBook] = await Promise.all([
+		chunked(allIds, async (slice, ph) =>
+			(await c.env.DB.prepare(`SELECT * FROM books WHERE id IN (${ph})`)
+				.bind(...slice).all<Record<string, unknown>>()).results ?? []),
 		loadItemsForBooks(c.env, allIds)
 	]);
-	const byId = new Map((rows.results ?? []).map((r) => [String(r.id), parseBook(r)]));
+	const byId = new Map(bookRows.map((r) => [String(r.id), parseBook(r)]));
 
 	// Open loans block a merge, so surface them here rather than letting the
 	// operator pick a group and only then discover it cannot proceed.
-	const loans = await c.env.DB.prepare(
-		`SELECT book_id, COUNT(*) AS n FROM borrow_transactions
-		  WHERE returned_at IS NULL AND book_id IN (${ph}) GROUP BY book_id`
-	).bind(...allIds).all<{ book_id: string; n: number }>();
-	const openLoans = new Map((loans.results ?? []).map((r) => [r.book_id, Number(r.n)]));
+	const loanRows = await chunked(allIds, async (slice, ph) =>
+		(await c.env.DB.prepare(
+			`SELECT book_id, COUNT(*) AS n FROM borrow_transactions
+			  WHERE returned_at IS NULL AND book_id IN (${ph}) GROUP BY book_id`
+		).bind(...slice).all<{ book_id: string; n: number }>()).results ?? []);
+	const openLoans = new Map(loanRows.map((r) => [r.book_id, Number(r.n)]));
 
 	return c.json({
 		total, limit, offset,
@@ -3683,15 +3708,24 @@ app.post('/api/items/assign-barcodes', requirePermission('books.write', { librar
 		limit: z.number().int().min(1).max(500).default(200)
 	}).parse(await c.req.json().catch(() => ({})));
 
-	const scope = body.bookIds?.length
-		? `AND book_id IN (${body.bookIds.map(() => '?').join(',')})`
+	// The scope ids are INTERPOLATED after a strict shape check rather than bound,
+	// because D1 accepts at most 100 bound parameters and this schema permits 500 —
+	// so a scoped sweep of more than ~99 books 500'd. The regex is the same one the
+	// other id-interpolating readers use (`loadSerialHoldingsForBooks`,
+	// `/api/books/by-ids`): anything that is not [A-Za-z0-9_-] never reaches the SQL,
+	// which is what makes interpolation safe here. `limit` stays bound.
+	const scopeIds = (body.bookIds ?? []).filter((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id));
+	if (body.bookIds?.length && scopeIds.length === 0) {
+		throw new HTTPException(400, { message: 'No valid book ids' });
+	}
+	const scope = scopeIds.length
+		? `AND book_id IN (${scopeIds.map((id) => `'${id}'`).join(',')})`
 		: '';
-	const args: unknown[] = body.bookIds?.length ? [...body.bookIds] : [];
 	const rows = await c.env.DB.prepare(
 		`SELECT id FROM items
 		  WHERE deleted_at IS NULL AND (barcode IS NULL OR TRIM(barcode) = '') ${scope}
 		  ORDER BY created_at ASC, id ASC LIMIT ?`
-	).bind(...args, body.limit).all<{ id: string }>();
+	).bind(body.limit).all<{ id: string }>();
 
 	const todo = rows.results ?? [];
 	let seq = await nextBarcodeSequence(c.env);
@@ -3708,10 +3742,11 @@ app.post('/api/items/assign-barcodes', requirePermission('books.write', { librar
 		await runAtomic(c.env, statements.slice(i, i + 40));
 	}
 
+	// `scope` interpolates its ids, so this statement binds nothing.
 	const left = await c.env.DB.prepare(
 		`SELECT COUNT(*) AS n FROM items
 		  WHERE deleted_at IS NULL AND (barcode IS NULL OR TRIM(barcode) = '') ${scope}`
-	).bind(...args).first<{ n: number }>();
+	).first<{ n: number }>();
 
 	if (todo.length > 0) {
 		await bumpBooksCacheVersion(c.env);
@@ -4390,12 +4425,14 @@ app.put('/api/books/:id/items', requirePermission('books.write', { librarian: tr
 			statements.push(
 				c.env.DB.prepare(
 					`UPDATE items SET copy_number = ?, volume_num = ?, volume_label = ?, room_code = ?,
-					        shelf_code = ?, call_number = ?, item_type = ?, condition = ?,
+					        shelf_code = ?, call_number = ?, item_type = COALESCE(?, item_type), condition = ?,
 					        acquisition_date = ?, notes = ?, barcode = ?, updated_at = ?, version = version + 1
 					  WHERE id = ?`
 				).bind(
 					copyNumber, item.volumeNum ?? null, item.volumeLabel ?? null, roomCode,
-					shelfCode, item.callNumber ?? null, item.itemType, item.condition ?? null,
+					// COALESCE: itemType is optional on this schema now, and an edit that
+					// does not mention the type must not reclassify the copy.
+					shelfCode, item.callNumber ?? null, item.itemType ?? null, item.condition ?? null,
 					item.acquisitionDate ?? null, item.notes ?? null, barcode, now, item.id
 				)
 			);
@@ -4408,7 +4445,9 @@ app.put('/api/books/:id/items', requirePermission('books.write', { librarian: tr
 					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, ?, ?, ?, 0)`
 				).bind(
 					newId('itm'), id, barcode, copyNumber, item.volumeNum ?? null, item.volumeLabel ?? null,
-					roomCode, shelfCode, item.callNumber ?? null, item.itemType,
+					// A NEW copy still gets a type; the default moved here from the schema
+					// so it applies where it is meaningful and not to an omitted edit.
+					roomCode, shelfCode, item.callNumber ?? null, item.itemType ?? 'book',
 					item.condition ?? null, item.acquisitionDate ?? null, item.notes ?? null, now, now
 				)
 			);
@@ -4439,11 +4478,19 @@ app.post('/api/items/add-copies', requirePermission('books.write', { librarian: 
 	const ids = payload.bookIds.filter((id) => /^[a-zA-Z0-9_-]{1,64}$/.test(id));
 	if (ids.length === 0) throw new HTTPException(400, { message: 'No valid book ids' });
 
-	const placeholders = ids.map(() => '?').join(',');
-	const books = await c.env.DB.prepare(
-		`SELECT id FROM books WHERE deleted_at IS NULL AND id IN (${placeholders})`
-	).bind(...ids).all<{ id: string }>();
-	const found = (books.results ?? []).map((b) => b.id);
+	// CHUNKED at 90. AddCopiesSchema permits 500 ids and the web client submits in
+	// batches of 200, but D1 accepts at most 100 bound parameters per statement — so
+	// the bulk action this endpoint exists for failed with a 500 the moment more
+	// than a hundred books were selected, which is the case it was built for.
+	const found: string[] = [];
+	for (let i = 0; i < ids.length; i += 90) {
+		const slice = ids.slice(i, i + 90);
+		const placeholders = slice.map(() => '?').join(',');
+		const books = await c.env.DB.prepare(
+			`SELECT id FROM books WHERE deleted_at IS NULL AND id IN (${placeholders})`
+		).bind(...slice).all<{ id: string }>();
+		found.push(...(books.results ?? []).map((b) => b.id));
+	}
 	if (found.length === 0) throw new HTTPException(404, { message: 'No matching books' });
 
 	const existingItems = await loadItemsForBooks(c.env, found);
@@ -5723,7 +5770,12 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 				publisher: row.publisher ?? null,
 				description: row.description ?? null,
 				tagsJson: importTagsJson,
-				customFieldsJson: importCustomFieldsJson
+				customFieldsJson: importCustomFieldsJson,
+				// The romanized forms fold too, or a romanized title is stored and
+				// then cannot be searched for.
+				titleRomanized: row.titleRomanized ?? null,
+				authorRomanized: row.authorRomanized ?? null,
+				publisherRomanized: row.publisherRomanized ?? null
 			});
 			if (existing) {
 				// Status is deliberately NOT updated: the book's circulation state is
@@ -5733,9 +5785,19 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 					`UPDATE books SET
 						title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?,
 						description = ?, room_code = ?, shelf_code = ?, acquisition_date = ?,
+						publication_year_end = COALESCE(?, publication_year_end),
+						date_edtf = COALESCE(?, date_edtf),
+						ddc = COALESCE(?, ddc),
+						bib_level = COALESCE(?, bib_level),
+						title_romanized = COALESCE(?, title_romanized),
+						author_romanized = COALESCE(?, author_romanized),
+						publisher_romanized = COALESCE(?, publisher_romanized),
 						tags = ?, custom_fields = ?, updated_at = ?, version = version + 1,
 						title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?,
-						description_fold = ?, tags_fold = ?, custom_fields_fold = ?
+						description_fold = ?, tags_fold = ?, custom_fields_fold = ?,
+						title_romanized_fold = COALESCE(?, title_romanized_fold),
+						author_romanized_fold = COALESCE(?, author_romanized_fold),
+						publisher_romanized_fold = COALESCE(?, publisher_romanized_fold)
 					 WHERE id = ? AND deleted_at IS NULL`
 				)
 					.bind(
@@ -5749,6 +5811,13 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						row.roomCode ?? null,
 						row.shelfCode ?? null,
 						row.acquisitionDate ?? null,
+						row.publicationYearEnd ?? null,
+						row.dateEdtf ?? null,
+						row.ddc ?? null,
+						row.bibLevel ?? null,
+						row.titleRomanized ?? null,
+						row.authorRomanized ?? null,
+						row.publisherRomanized ?? null,
 						importTagsJson,
 						importCustomFieldsJson,
 						now,
@@ -5759,17 +5828,29 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						importFolds.description_fold,
 						importFolds.tags_fold,
 						importFolds.custom_fields_fold,
+						importFolds.title_romanized_fold,
+						importFolds.author_romanized_fold,
+						importFolds.publisher_romanized_fold,
 						bookId
 					)
 					.run();
 			} else {
 				await c.env.DB.prepare(
+					// The seven columns after acquisition_date were validated by
+					// CreateBookSchema, normalised by normalizeBookData, reported to the
+					// librarian as imported — and then not written. A sheet carrying an
+					// EDTF date, a Dewey number, a serial marking or a romanized title
+					// lost all of it silently, and the import said it had succeeded.
 					`INSERT INTO books (
 						id, title, author, isbn, publication_year, publisher, language, description,
-						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
+						room_code, shelf_code, acquisition_date,
+						publication_year_end, date_edtf, ddc, bib_level,
+						title_romanized, author_romanized, publisher_romanized,
+						tags, custom_fields, status, version,
 						legacy_id, created_at, updated_at, deleted_at,
-						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
+						title_romanized_fold, author_romanized_fold, publisher_romanized_fold
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						bookId,
@@ -5783,6 +5864,15 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						row.roomCode ?? null,
 						row.shelfCode ?? null,
 						row.acquisitionDate ?? null,
+						row.publicationYearEnd ?? null,
+						row.dateEdtf ?? null,
+						row.ddc ?? null,
+						// NOT NULL DEFAULT 'monograph' (migration 0024). Omitting the column
+						// let the default apply; naming it and binding null does not.
+						row.bibLevel ?? 'monograph',
+						row.titleRomanized ?? null,
+						row.authorRomanized ?? null,
+						row.publisherRomanized ?? null,
 						importTagsJson,
 						importCustomFieldsJson,
 						row.status,
@@ -5797,7 +5887,10 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						importFolds.publisher_fold,
 						importFolds.description_fold,
 						importFolds.tags_fold,
-						importFolds.custom_fields_fold
+						importFolds.custom_fields_fold,
+						importFolds.title_romanized_fold,
+						importFolds.author_romanized_fold,
+						importFolds.publisher_romanized_fold
 					)
 					.run();
 			}
@@ -6064,7 +6157,11 @@ app.get('/api/oai', async (c) => {
 
 	if (verb === 'ListRecords' || verb === 'ListIdentifiers') {
 		const token = q('resumptionToken');
+		// `offset` is now only the count of records already delivered, for the
+		// spec's `cursor` attribute. Paging position lives in `resumeAfter`.
 		let offset = 0;
+		let resumeAfter: { updatedAt: string; id: string } | null = null;
+		let legacyOffset: number | undefined;
 		let prefix = q('metadataPrefix');
 		let from = q('from') || undefined;
 		let until = q('until') || undefined;
@@ -6080,13 +6177,21 @@ app.get('/api/oai', async (c) => {
 			}
 			const state = decodeResumptionToken(token);
 			if (!state) return xml(oaiError(requestUrl, 'badResumptionToken', 'Token is not valid', responseDate));
-			({ offset, prefix } = state);
+			prefix = state.prefix;
+			offset = state.delivered;
+			resumeAfter = state.lastUpdatedAt
+				? { updatedAt: state.lastUpdatedAt, id: state.lastId ?? '' }
+				: null;
+			legacyOffset = resumeAfter ? undefined : state.offset;
 			from = state.from; until = state.until;
 		} else if (!['oai_dc', 'marcxml'].includes(prefix)) {
 			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate));
 		}
 
-		const page = await loadOaiPage(c.env, { from, until, offset, limit: HARVEST_PAGE_SIZE });
+		const page = await loadOaiPage(c.env, {
+			from, until, limit: HARVEST_PAGE_SIZE,
+			after: resumeAfter, offset: legacyOffset
+		});
 		if (page.rows.length === 0) {
 			return xml(oaiError(requestUrl, 'noRecordsMatch', 'No records in that range', responseDate));
 		}
@@ -6115,11 +6220,20 @@ app.get('/api/oai', async (c) => {
 			].join('\n');
 		});
 
-		const nextOffset = offset + page.rows.length;
-		const more = nextOffset < page.total;
+		const delivered = offset + page.rows.length;
+		const more = delivered < page.total;
+		// The next token carries the LAST ROW HANDED OUT, so the following page
+		// resumes strictly after it however much the catalogue changes in between.
+		// `cursor` still counts delivered records, which is all the spec asks of it.
+		const lastRow = page.rows[page.rows.length - 1];
 		const resumption = more
 			? `  <resumptionToken completeListSize="${page.total}" cursor="${offset}">`
-				+ xmlEscape(encodeResumptionToken({ offset: nextOffset, from, until, prefix }))
+				+ xmlEscape(encodeResumptionToken({
+					delivered,
+					lastUpdatedAt: String(lastRow?.updatedAt ?? ''),
+					lastId: String(lastRow?.id ?? ''),
+					from, until, prefix
+				}))
 				+ '</resumptionToken>'
 			// An empty token signals "this was the last page" per the spec.
 			: `  <resumptionToken completeListSize="${page.total}" cursor="${offset}"></resumptionToken>`;
@@ -8752,22 +8866,42 @@ app.post('/api/borrowers/:id/erase', requirePermission('setup'), async (c) => {
 			 WHERE borrower_id IS NULL AND borrower_name = ?`
 		).bind(sentinel, now, priorName),
 		// The audit log is a record of what STAFF did, not of the data subject, but
-		// two entries embed the reader's name in their metadata: 'book.borrow' and
-		// the 'holdFilledFor' on 'book.return'. An erasure that leaves the name
-		// legible in a table the Settings tab renders has not erased it.
+		// four entries embed the reader's name in their metadata. An erasure that
+		// leaves the name legible in a table the Settings tab renders has not erased
+		// it.
+		//
+		// TARGETED BY KEY, not by substring. This used to be
+		// `REPLACE(metadata, priorName, sentinel) WHERE metadata LIKE '%priorName%'`
+		// over the whole table, which rewrote the name wherever it appeared in ANY
+		// metadata — and 9,927 `book.create` entries carry `{"title","author"}`. In a
+		// Greek library a reader and an author routinely share a surname, so erasing
+		// a reader named ΠΑΠΑΔΟΠΟΥΛΟΣ silently rewrote the catalogue's own history of
+		// every book by an author of that name. A short name made it worse: erasing
+		// "Anna" would have edited every title containing those four letters.
+		//
+		// The four keys below are the complete inventory, taken from the
+		// insertAuditLog call sites rather than from the old comment — which claimed
+		// two, and named `book.borrow`, whose metadata contains no reader name at all.
 		c.env.DB.prepare(
-			`UPDATE audit_logs
-			 SET metadata = REPLACE(metadata, ?, ?)
-			 WHERE metadata LIKE ?`
-		).bind(priorName, sentinel, `%${priorName}%`)
+			`UPDATE audit_logs SET metadata = json_set(metadata, '$.holdFilledFor', ?)
+			  WHERE action = 'book.return' AND json_extract(metadata, '$.holdFilledFor') = ?`
+		).bind(sentinel, priorName),
+		c.env.DB.prepare(
+			`UPDATE audit_logs SET metadata = json_set(metadata, '$.borrowerName', ?)
+			  WHERE action = 'hold.place' AND json_extract(metadata, '$.borrowerName') = ?`
+		).bind(sentinel, priorName),
+		c.env.DB.prepare(
+			`UPDATE audit_logs SET metadata = json_set(metadata, '$.name', ?)
+			  WHERE action IN ('borrower.create', 'borrower.update')
+			    AND entity_id = ? AND json_extract(metadata, '$.name') = ?`
+		).bind(sentinel, id, priorName)
 	];
-	if (priorContact && priorContact.trim()) {
-		statements.push(
-			c.env.DB.prepare(
-				`UPDATE audit_logs SET metadata = REPLACE(metadata, ?, '') WHERE metadata LIKE ?`
-			).bind(priorContact, `%${priorContact}%`)
-		);
-	}
+	// No audit metadata carries a borrower CONTACT — verified against every
+	// insertAuditLog call site — so the blanket REPLACE that used to run for it
+	// could only ever have damaged something else. A contact is often a phone number
+	// or an email, and either as a bare substring across 10,000 JSON blobs is the
+	// most destructive of the lot.
+	void priorContact;
 	await runAtomic(c.env, statements);
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.erase', 'borrower', id, {});
 	return c.json({ id, anonymizedName: sentinel });

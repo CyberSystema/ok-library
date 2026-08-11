@@ -1,4 +1,4 @@
-import { parseEdtf } from '@ok-library/shared';
+import { parseEdtf, csvCell } from '@ok-library/shared';
 
 export function nowIso(): string {
   return new Date().toISOString();
@@ -247,25 +247,10 @@ export function normalizeBookData<T extends NormalizableBook>(input: T): T {
 }
 
 export function toCsv(rows: Array<Record<string, unknown>>, orderedColumns: string[]): string {
-  const escape = (value: unknown): string => {
-    if (value === null || value === undefined) {
-      return '';
-    }
-    let text = typeof value === 'string' ? value : JSON.stringify(value);
-    // CSV formula-injection defense: a cell that begins with =, +, -, @, or a
-    // leading tab/CR is interpreted as a formula by Excel/LibreOffice/Sheets, so
-    // a book title like `=HYPERLINK(...)` or `+cmd|...` would execute when the
-    // librarian opens the export. Neutralize by prefixing a single quote, which
-    // spreadsheets treat as "force text" and hide. (This export is opened in a
-    // spreadsheet, not re-imported — the app imports XLSX — so no round-trip drift.)
-    if (/^[=+\-@\t\r]/.test(text)) {
-      text = `'${text}`;
-    }
-    if (text.includes(',') || text.includes('"') || text.includes('\n')) {
-      return `"${text.replaceAll('"', '""')}"`;
-    }
-    return text;
-  };
+  // The cell escaper lives in @ok-library/shared so the browser export cannot
+  // drift from this one again — it already had, and only this side defended
+  // against formula injection.
+  const escape = csvCell;
 
   const lines = [orderedColumns.join(',')];
   for (const row of rows) {
