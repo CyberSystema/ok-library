@@ -2892,6 +2892,36 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 65. REGRESSION: the public endpoints publish no barcodes ===")
+
+# protocols.ts and index.ts both state in their headers that SRU and OAI-PMH "expose
+# bibliographic records ONLY — never borrowers, loans, staff or holdings barcodes".
+# They published 852 $p for every copy to any anonymous caller. A barcode is the token
+# that identifies a physical volume at the desk, and every other route in this worker
+# needs a session to see one.
+st, _cfg65 = call("GET", "/api/library-settings")
+_prior65 = (_cfg65 or {}).get("publicSharing")
+call("PUT", "/api/library-settings", {"publicSharing": "on"})
+try:
+    _bc = local_sql("SELECT book_id FROM items WHERE barcode IS NOT NULL "
+                    "AND TRIM(barcode) <> '' AND deleted_at IS NULL LIMIT 1") if LOCAL else None
+    _bid65 = _bc[0]["book_id"] if _bc else None
+    _isil65 = (_cfg65 or {}).get("isil") or "GR-ZZTEST"
+    if _bid65:
+        st, pub = call_text("GET", f"/api/oai?verb=GetRecord&metadataPrefix=marcxml"
+                                   f"&identifier=oai:{_isil65}:{_bid65}")
+        check("the record is served publicly at all", st == 200 and "<record" in (pub or ""), (pub or "")[:140])
+        check("but the public record carries no barcode subfield",
+              'code="p"' not in (pub or ""), "852 $p is present on an anonymous request")
+        # And the staff export must NOT have been weakened to achieve that.
+        st, staff = call_text("GET", f"/api/books/{_bid65}/marc?format=marcxml")
+        check("while the staff export still carries it, where it belongs",
+              st == 200 and 'code="p"' in (staff or ""), (staff or "")[:140])
+    else:
+        check("a barcoded copy exists to test with", False, "no barcoded copy found")
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": _prior65 or "off"})
+
 print("=== 64. REGRESSION: OAI-PMH argument handling ===")
 
 # Sharing must be ON for these; restored below whatever it was.

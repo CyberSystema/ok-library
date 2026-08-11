@@ -6061,7 +6061,19 @@ async function marcInputsForRows(
     return {
       row,
       input: bookRowToMarcInput(row, {
-        items: itemsByBook.get(id) ?? [],
+        // BARCODES STRIPPED. Every caller of this function is one of the two PUBLIC
+        // endpoints — SRU searchRetrieve, OAI-PMH GetRecord and ListRecords — and both
+        // modules state in their own headers that they "expose bibliographic records
+        // ONLY — never borrowers, loans, staff or holdings barcodes". They did expose
+        // them: 852 $p carried every copy's barcode to any anonymous caller, and a
+        // barcode is the token that identifies a physical volume at the desk. Every
+        // other route in this worker requires a session to see one.
+        //
+        // The AUTHENTICATED exports do not come through here — /api/books/:id/marc and
+        // /api/export/books.marcxml build their input directly — so a librarian
+        // exporting for a partner library still gets $p, which is where a barcode
+        // legitimately belongs.
+        items: (itemsByBook.get(id) ?? []).map((it) => ({ ...it, barcode: null })),
         contributors: extra?.contributors,
         subjects: extra?.subjects,
         seriesTitle: extra?.seriesTitle,
