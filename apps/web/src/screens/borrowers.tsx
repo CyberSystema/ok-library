@@ -16,7 +16,7 @@
 //
 // The GDPR pair is admin-only (`setup`), which is why it is a separate block: a
 // librarian runs the desk, an administrator answers a data-subject request.
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { apiRequest } from '../api';
 import { useT } from '../i18n';
 import { Dialog, fmt, useConfirm, useToast } from '../ui';
@@ -72,21 +72,46 @@ export function BorrowersCard({ canWrite, canAdmin }: { canWrite: boolean; canAd
   /** The categories loan rules actually mention, so the field offers real values. */
   const [knownCategories, setKnownCategories] = useState<string[]>([]);
 
+  /** Only the newest reader search may write its answer into the list. */
+  const seqRef = useRef(0);
+  /** True until the first load lands, so mount does not wait out the debounce. */
+  const firstLoadRef = useRef(true);
+
   const load = useCallback(async (p: number) => {
+    const seq = ++seqRef.current;
     try {
       const params = new URLSearchParams({ limit: String(PAGE), page: String(p) });
       if (query.trim()) params.set('q', query.trim());
       const res = await apiRequest<{ items: Borrower[]; total: number }>(`/api/borrowers?${params}`);
+      // A slow request for "Pol" answering after the one for "Policy" used to
+      // repopulate the list with rows for a prefix the box no longer holds.
+      if (seq !== seqRef.current) return;
       setItems(res.items ?? []);
       setTotal(res.total ?? 0);
       setPage(p);
       setLoaded(true);
     } catch (e) {
+      if (seq !== seqRef.current) return;
       toast.push('error', (e as Error).message);
     }
   }, [query, toast]);
 
-  useEffect(() => { void load(1); }, [load]);
+  // One request per PAUSE in typing, not one per keystroke.
+  //
+  // This effect used to call load(1) synchronously, so typing a six-character
+  // reader name at the desk sent six D1-backed /api/borrowers requests — the
+  // exact cost the checkout autocomplete is debounced at 180 ms to avoid. The
+  // first load is not delayed: the librarian opening the tab should not watch a
+  // spinner for a quarter of a second to be told nothing is happening.
+  useEffect(() => {
+    if (firstLoadRef.current) {
+      firstLoadRef.current = false;
+      void load(1);
+      return;
+    }
+    const handle = window.setTimeout(() => { void load(1); }, 250);
+    return () => window.clearTimeout(handle);
+  }, [load]);
 
   // Both sides of the matrix in one list: the categories some reader already
   // has, and the categories a loan rule is written for. A rule for a category
@@ -278,7 +303,11 @@ export function BorrowersCard({ canWrite, canAdmin }: { canWrite: boolean; canAd
               {t('library.page.prev')}
             </button>
             <span className="muted small" style={{ alignSelf: 'center' }}>
-              {t('library.page.info', { page: fmt(page) })} {t('library.page.of')} {fmt(pages)}
+              {/* `library.page.info` is the bare word "Page" in all four locales —
+                  no {page} placeholder — so passing one interpolated to nothing and
+                  this pager read "Page of 8" at every position. The number is its
+                  own node, exactly as the Library tab's pager renders it. */}
+              {t('library.page.info')} {fmt(page)} {t('library.page.of')} {fmt(pages)}
             </span>
             <button className="secondary small" disabled={page >= pages} onClick={() => void load(page + 1)}>
               {t('library.page.next')}

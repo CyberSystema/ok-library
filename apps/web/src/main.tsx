@@ -964,6 +964,10 @@ function App() {
   // one (fast typing / rapid filter changes) so a slow response can't clobber
   // the current results, total, and page.
   const loadBooksSeqRef = useRef(0);
+  // Same guard for the facet rail. The rail's whole contract is that a bucket's
+  // count reproduces as a filtered list, and a facet response that lands after
+  // the librarian has moved to another field breaks it — see loadFacet.
+  const loadFacetSeqRef = useRef(0);
   const [borrowerQuery, setBorrowerQuery] = useState('');
   const [selectedBorrowerId, setSelectedBorrowerId] = useState<string>('');
   const [needsReviewCount, setNeedsReviewCount] = useState(0);
@@ -1846,19 +1850,36 @@ function App() {
 
   async function refreshEverything() {
     const isAdminUser = currentUser?.role === 'admin';
+    // The two circulation loaders take the answer BY VALUE, from the permissions
+    // request in this very batch.
+    //
+    // They used to be called bare, and each begins by consulting
+    // `canSeeCirculation` — which is derived from `myPermissions`, which this same
+    // batch was still fetching. For anyone but an admin it was `null` at that
+    // instant, so both loaders early-returned, /api/borrow/active and /api/holds
+    // were never requested, and `didBootstrapData` stopped the bootstrap effect
+    // from ever running again: a librarian with books out saw "ACTIVE LOANS 0",
+    // "All clear", no hold shelf, and a permanently-0 Overdue tile until they
+    // performed a circulation action. Awaiting loadMyPermissions() first would NOT
+    // have fixed it — `canSeeCirculation` is a const captured at render, and no
+    // amount of awaiting changes it mid-batch — which is why the permission is
+    // threaded through as an argument instead of read from state.
+    const mayCirculate = loadMyPermissions().then(
+      (perms) => isAdminUser || Boolean(perms?.circulation)
+    );
     await Promise.all([
       loadBooks(),
       loadRoomSummary(),
       loadCustomFields(),
       loadFacets(),
-      loadActiveBorrows(),
-      loadHolds(),
+      mayCirculate.then((ok) => loadActiveBorrows(ok)),
+      mayCirculate.then((ok) => loadHolds(ok)),
       // audit logs + staff users are admin-only endpoints — loading them for a
       // librarian/viewer is a guaranteed 403 + a wasted Workers request each.
       ...(isAdminUser ? [loadAuditLogs(), loadStaffUsers()] : []),
       loadNeedsReviewCount(),
       loadStats(),
-      loadMyPermissions()
+      mayCirculate
     ]);
   }
 
@@ -2076,20 +2097,33 @@ function App() {
   // budget in the system — the rail must not spend eight of them because the
   // librarian opened it.
   const loadFacet = useCallback(async (field: string) => {
+    // A LATER request must win, and only the later one may write.
+    //
+    // The cached branch below always checked that the hit was for the field asked
+    // for; the network branch applied whatever arrived. Pick Publisher, then
+    // Language a moment later: language answers first and renders, then the slow
+    // publisher scan lands and replaces the rail — publisher names, publisher
+    // counts and a "top 600" note, all under a selector reading "Language".
+    // Clicking a bucket then filtered Language by a publisher name and returned
+    // 0 books, i.e. a rail count that does not reproduce as a list, which is the
+    // one promise the rail makes. Same sequence guard as loadBooks.
+    const seq = ++loadFacetSeqRef.current;
+    const isStale = () => seq !== loadFacetSeqRef.current;
     const path = `/api/facets?field=${encodeURIComponent(field)}`;
     const cached = await cacheGet<FacetResponse>(`GET ${path}`);
-    if (cached && cached.value.field === field) {
+    if (cached && cached.value.field === field && !isStale()) {
       setFacetItems(cached.value.items ?? []);
       setFacetTotalBooks(cached.value.totalBooks ?? null);
       setFacetTruncated(Boolean(cached.value.truncated));
     }
     try {
       const response = await apiRequest<FacetResponse>(path);
+      if (isStale()) return;
       setFacetItems(response.items ?? []);
       setFacetTotalBooks(response.totalBooks ?? null);
       setFacetTruncated(Boolean(response.truncated));
     } catch {
-      if (!cached) { setFacetItems([]); setFacetTruncated(false); }
+      if (!cached && !isStale()) { setFacetItems([]); setFacetTruncated(false); }
     }
   }, []);
 
@@ -2495,11 +2529,15 @@ function App() {
     }
   }
 
-  async function loadActiveBorrows() {
+  // `maySee` defaults to the derived permission, which is right everywhere the
+  // matrix has already arrived. Bootstrap passes it explicitly because at that
+  // point `canSeeCirculation` is still false for every non-admin — see
+  // refreshEverything().
+  async function loadActiveBorrows(maySee: boolean = canSeeCirculation) {
     // Active-loan data is patron PII and the endpoint is now circulation-gated;
     // viewers (no circulation) would get a 403. Skip the fetch for them so login
     // doesn't surface a spurious error and we don't hammer a forbidden endpoint.
-    if (!canSeeCirculation) {
+    if (!maySee) {
       setActiveBorrows([]);
       return;
     }
@@ -2536,12 +2574,16 @@ function App() {
     }
   }
 
-  async function loadMyPermissions() {
+  // Returns the matrix as well as storing it: a caller in the same tick cannot
+  // read it back off state (see refreshEverything).
+  async function loadMyPermissions(): Promise<Record<string, boolean> | null> {
     try {
       const res = await apiRequest<{ catalog: string[]; permissions: Record<string, boolean> }>('/api/me/permissions');
       setMyPermissions(res.permissions);
+      return res.permissions;
     } catch {
       setMyPermissions(null);
+      return null;
     }
   }
 
@@ -3379,8 +3421,10 @@ function App() {
     }
   }
 
-  async function loadHolds() {
-    if (!canSeeCirculation) return;
+  // Same argument as loadActiveBorrows: bootstrap must pass the permission in,
+  // because the state it is derived from is still null while this runs.
+  async function loadHolds(maySee: boolean = canSeeCirculation) {
+    if (!maySee) return;
     try {
       const res = await apiRequest<{ items: Hold[] }>('/api/holds');
       setHolds(res.items ?? []);
@@ -4940,12 +4984,17 @@ function App() {
   // Open a book we only hold an id for — the title-duplicate warning carries a
   // trimmed row, not a full record, and the detail modal needs the whole thing
   // (version included, or the first edit would 409).
-  async function openBookDetailById(id: string): Promise<void> {
+  // Reports whether it opened, so a caller that also wants to move the user
+  // somewhere (the dashboard's recent-activity list) doesn't do it for a record
+  // that never loaded.
+  async function openBookDetailById(id: string): Promise<boolean> {
     try {
       const book = await apiRequest<Book>(`/api/books/${id}`);
       openBookDetail(book);
+      return true;
     } catch (e) {
       setError((e as Error).message);
+      return false;
     }
   }
 
@@ -6528,8 +6577,20 @@ function App() {
                                 <button
                                   className="recent-link"
                                   onClick={() => {
-                                    void apiRequest<{ id: string; title: string; author: string; status: BookStatus; version: number; customFields?: Record<string, string|number|boolean|null>; isbn?: string|null; shelfCode?: string|null; publicationYear?: number|null; publisher?: string|null; language?: string|null; description?: string|null; legacyId?: string|null; }>(`/api/books/${b.id}`)
-                                      .then((book) => { setDetailBook(book as Book); setDetailMode('view'); setBookHistory([]); void loadBookHistory(book.id); setSerialHoldings([]); if ((book as Book).bibLevel === 'serial') void loadSerialHoldings(book.id); setCurrentSection('books'); });
+                                    // Was an inline `.then` with no `.catch`: /api/stats is served
+                                    // stale-while-revalidate from IndexedDB, so a row can name a
+                                    // record that has since been deleted — and the click then did
+                                    // nothing at all, no modal, no toast, just an unhandled
+                                    // rejection in the console. openBookDetailById reports the
+                                    // failure and opens the record the same way every other
+                                    // id-only caller does (holds, history and the hold shelf
+                                    // included, which the inline copy had drifted away from).
+                                    // The tab only changes if the record actually opened — a
+                                    // click that failed should not also move the librarian off
+                                    // the Dashboard.
+                                    void openBookDetailById(b.id).then((opened) => {
+                                      if (opened) setCurrentSection('books');
+                                    });
                                   }}
                                 >
                                   <strong>{b.title || t('common.untitled')}</strong>
@@ -8041,9 +8102,23 @@ function App() {
                   <form onSubmit={importFromXlsx} className="simple-form">
                     <div className="import-dropzone">
                       <p style={{ fontSize: '2.25rem', marginBottom: '0.5rem' }}>📂</p>
-                      <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{t('import.choose')}</p>
+                      <p id="import-xlsx-label" style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{t('import.choose')}</p>
                       <p className="muted small" style={{ marginBottom: '1rem' }}>{t('import.supports')}</p>
-                      <input name="xlsxFile" type="file" accept=".xlsx" required style={{ width: 'auto', display: 'block', margin: '0 auto' }} />
+                      {/* The instruction above is a <p>, associated with nothing, so
+                          this control announced only as "Choose File, button" — and
+                          the MARCXML importer further down the page announced
+                          identically. Two indistinguishable controls, both of which
+                          overwrite catalogue records (SC 4.1.2, SC 3.3.2). The
+                          paragraph is the visible label, so point at it rather than
+                          inventing a second wording to keep in step with it. */}
+                      <input
+                        name="xlsxFile"
+                        type="file"
+                        accept=".xlsx"
+                        required
+                        aria-labelledby="import-xlsx-label"
+                        style={{ width: 'auto', display: 'block', margin: '0 auto' }}
+                      />
                     </div>
                     {importFileName && (
                       <p className="muted small">{t('import.selected')} <strong>{importFileName}</strong></p>

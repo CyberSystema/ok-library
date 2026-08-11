@@ -25,7 +25,7 @@
 //
 // Rule of thumb, and what the Handbook will say: if one of the spellings is
 // simply wrong, consolidate it. If all of them are right, make a heading.
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { MARC_RELATORS } from '@ok-library/shared';
 import { apiRequest } from '../api';
 import { useT } from '../i18n';
@@ -241,19 +241,39 @@ export function AuthoritiesCard({ canWrite, onChanged }: { canWrite: boolean; on
   const [candidates, setCandidates] = useState<Array<{ label: string; bookCount: number; alreadyExists: boolean }> | null>(null);
   const [approved, setApproved] = useState<Set<string>>(new Set());
 
+  /** Only the newest heading search may write its answer into the list. */
+  const seqRef = useRef(0);
+  /** True until the first load lands, so opening the card is not delayed. */
+  const firstLoadRef = useRef(true);
+
   const load = useCallback(async () => {
+    const seq = ++seqRef.current;
     try {
       const params = new URLSearchParams({ kind, limit: '100' });
       if (query.trim()) params.set('q', query.trim());
       const res = await apiRequest<{ items: Authority[] }>(`/api/authorities?${params}`);
+      if (seq !== seqRef.current) return;
       setItems(res.items ?? []);
       setLoaded(true);
     } catch (e) {
+      if (seq !== seqRef.current) return;
       toast.push('error', (e as Error).message);
     }
   }, [kind, query, toast]);
 
-  useEffect(() => { void load(); }, [load]);
+  // Debounced for the same reason the reader search is: this effect used to fire
+  // load() on every keystroke, one /api/authorities request each, with nothing to
+  // stop a slow early answer from overwriting a later one. AuthorityPicker, forty
+  // lines up in this same file, has always done it this way.
+  useEffect(() => {
+    if (firstLoadRef.current) {
+      firstLoadRef.current = false;
+      void load();
+      return;
+    }
+    const handle = window.setTimeout(() => { void load(); }, 250);
+    return () => window.clearTimeout(handle);
+  }, [load]);
 
   async function openEdit(id: string) {
     try {

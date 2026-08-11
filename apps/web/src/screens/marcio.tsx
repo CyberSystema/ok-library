@@ -137,11 +137,15 @@ export function MarcIoCard({ canExport, canImport }: { canExport: boolean; canIm
           <form onSubmit={runImport} className="simple-form">
             <div className="import-dropzone">
               <p style={{ fontSize: '2.25rem', marginBottom: '0.5rem' }}>🌍</p>
-              <p style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{t('marc.choose')}</p>
+              <p id="marc-import-label" style={{ fontWeight: 600, marginBottom: '0.25rem' }}>{t('marc.choose')}</p>
               <p className="muted small" style={{ marginBottom: '1rem' }}>{t('marc.supports')}</p>
+              {/* Named, because the paragraph above is only visually a label: this
+                  input and the spreadsheet importer on the same tab both announced
+                  as a bare "Choose File", with nothing to tell them apart. */}
               <input
                 type="file"
                 accept=".xml,.marcxml,text/xml,application/xml"
+                aria-labelledby="marc-import-label"
                 onChange={(e) => { setFile(e.target.files?.[0] ?? null); setReport(null); }}
                 style={{ width: 'auto', display: 'block', margin: '0 auto' }}
               />

@@ -150,7 +150,9 @@ export function TrashCard({ canDelete, onChanged }: { canDelete: boolean; onChan
               {t('library.page.prev')}
             </button>
             <span className="muted small" style={{ alignSelf: 'center' }}>
-              {t('library.page.info', { page: fmt(page) })} {t('library.page.of')} {fmt(pages)}
+              {/* "Page of 8": `library.page.info` carries no {page} placeholder in
+                  any locale, so the argument went nowhere. Render the number. */}
+              {t('library.page.info')} {fmt(page)} {t('library.page.of')} {fmt(pages)}
             </span>
             <button className="secondary small" disabled={page >= pages} onClick={() => void load(page + 1)}>
               {t('library.page.next')}

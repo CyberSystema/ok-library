@@ -12,6 +12,15 @@
  * Changing the token rather than the call sites is deliberate: --text-light had
  * eight consumers and failed in all of them, so patching each rule would have
  * left the token itself as a trap for the next component.
+ *
+ * The --on-* tokens answer the other direction of the same question: what is
+ * readable ON a semantic fill. --accent got one; --danger and --warning did not,
+ * and both then failed in exactly the way the note on --on-accent describes:
+ *   button.danger   #fff on dark --danger  #f87171  2.77:1 → --on-danger   6.77:1
+ *   .offline-banner #1f2937 on light --warning #b45309 2.92:1 → --on-warning 5.02:1
+ * The warning one is the sharper lesson: --warning was DARKENED to #b45309 to
+ * reach 4.58:1 as text on a light surface, which moved the one place it is a
+ * background the wrong way. A token has two jobs and both have to be measured.
  */
 :root {
   --bg: #f1f5f9;
@@ -36,8 +45,13 @@
   --success-bg: #ecfdf5;
   --warning: #b45309;
   --warning-bg: #fffbeb;
+  /* On the amber/ochre fill, not on a page surface: 5.02:1. */
+  --on-warning: #ffffff;
   --danger: #c81e1e;
   --danger-bg: #fef2f2;
+  /* What goes ON a danger fill — every destructive button, and the confirm
+     dialog's own Delete. 5.74:1 here; see the dark override. */
+  --on-danger: #ffffff;
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
   --shadow-md: 0 4px 16px rgba(0,0,0,0.1);
   --shadow-lg: 0 12px 40px rgba(0,0,0,0.16);
@@ -66,8 +80,14 @@
   --success-bg: #064e3b;
   --warning: #fbbf24;
   --warning-bg: #422006;
+  /* Bright amber fill, so the readable foreground is the page background:
+     11.22:1, where the light theme's #1f2937 would have been 1.01:1. */
+  --on-warning: #0b1220;
   --danger: #f87171;
   --danger-bg: #4a1e1e;
+  /* Dark's danger is a LIGHT red, so white on it was 2.77:1 — unreadable on the
+     Delete button of every confirm dialog. The page background gives 6.77:1. */
+  --on-danger: #0b1220;
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
   --shadow-md: 0 4px 16px rgba(0,0,0,0.5);
   --shadow-lg: 0 12px 40px rgba(0,0,0,0.6);
@@ -113,7 +133,7 @@ button.primary { background: var(--accent); color: var(--on-accent); }
 button.primary:not(:disabled):hover { background: var(--accent-dark); opacity: 1; }
 button.secondary { background: var(--surface); color: var(--accent); border: 1.5px solid var(--border-strong); }
 button.secondary:not(:disabled):hover { background: var(--accent-light); border-color: var(--accent); opacity: 1; }
-button.danger { background: var(--danger); color: #fff; }
+button.danger { background: var(--danger); color: var(--on-danger); }
 button.danger:not(:disabled):hover { opacity: 0.88; }
 button.small { padding: 0.3125rem 0.75rem; font-size: 0.8125rem; }
 
@@ -167,14 +187,20 @@ label {
    pill already announces the request; the page does not need to fade. */
 .app-shell[aria-busy="true"] { cursor: progress; pointer-events: none; }
 
-/* Offline banner: shown at the very top while serving cached data. */
+/* Offline banner: shown at the very top while serving cached data.
+ *
+ * The hardcoded #1f2937 was 2.92:1 on the light theme's --warning — the sentence
+ * explaining why the librarian's edits are being refused was the least readable
+ * text in the app, on the DEFAULT theme, while dark measured a comfortable 8.79:1
+ * and hid it from review. Neither #000 (4.18:1 light) nor #fff (1.67:1 dark) works
+ * for both, which is the whole reason --on-warning is a token. */
 .offline-banner {
   position: sticky;
   top: 0;
   z-index: 1000;
   padding: 0.5rem 1rem;
   background: var(--warning, #f59e0b);
-  color: #1f2937;
+  color: var(--on-warning, #1f2937);
   font-size: 0.875rem;
   font-weight: 600;
   text-align: center;

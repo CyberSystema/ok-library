@@ -34,8 +34,20 @@ export function normalizeForCompare(text: string | null | undefined): string {
 export type ToastKind = 'success' | 'error' | 'info';
 export type ToastEntry = { id: number; kind: ToastKind; message: string };
 
+// The context carries the two ACTIONS and never the list.
+//
+// It used to also expose `toasts`, which made the context value change identity
+// on every push AND every auto-dismiss. Screens that (correctly) list `toast` in
+// a useCallback dependency array — identity.tsx, borrowers.tsx, trash.tsx,
+// rooms.tsx, authorities.tsx — therefore re-created their `load` on every toast,
+// and the `useEffect(() => { void load(); }, [load])` that follows re-fetched and
+// overwrote local state. A toast from ANY card on the page silently reverted the
+// half-typed Library-identity form to the stored values and sent the reader list
+// back to page 1; a success toast auto-dismissing 4 s later did it a second time.
+// Nobody reads `toasts` outside this file — the stack below renders it from local
+// state — so keeping it out of the value makes the context identity permanent and
+// those dependency arrays inert.
 type ToastContextValue = {
-  toasts: ToastEntry[];
   push: (kind: ToastKind, message: string) => void;
   dismiss: (id: number) => void;
 };
@@ -67,7 +79,9 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
     }, 4000);
   }, []);
 
-  const value = useMemo(() => ({ toasts, push, dismiss }), [toasts, push, dismiss]);
+  // `push` and `dismiss` are useCallback([]), so this object is created once and
+  // never again. That is the point: see the note on ToastContextValue.
+  const value = useMemo(() => ({ push, dismiss }), [push, dismiss]);
 
   return (
     <ToastContext.Provider value={value}>
