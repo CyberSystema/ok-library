@@ -11,7 +11,7 @@
  * librarian's everyday route; MARC is for exchange with other libraries.
  */
 
-import { formatHoldingStatement, fromIso639_2, toIso639_2 } from '@ok-library/shared';
+import { EDTF_SENTINEL_MAX, EDTF_SENTINEL_MIN, formatHoldingStatement, fromIso639_2, toIso639_2 } from '@ok-library/shared';
 
 export type MarcSubfield = { code: string; value: string };
 export type MarcField =
@@ -127,8 +127,23 @@ function isbd(value: string, trailing: string): string {
 function marc008(book: MarcRecordInput): string {
   const entered = (book.updatedAt ?? '').replace(/[-:TZ.]/g, '').slice(2, 8) || '000000';
   const serial = book.bibLevel === 'serial';
-  const y1 = book.publicationYear;
-  const y2 = book.publicationYearEnd;
+  // EDTF's OPEN ends are stored as sort sentinels, not as dates.
+  //
+  // `parseEdtf` substitutes 1000 for an unknown start and 3000 for an unknown end
+  // so that "../1960" and "1960/.." can be sorted and range-filtered alongside real
+  // years. They are machinery, and this function was reading them as though a
+  // cataloguer had written them down: "before 1960" was exported as a work
+  // published from the year 1000, and "1960 onwards" as ceasing in 3000. That is
+  // exactly what the note above forbids — asserting something about the book that
+  // nobody checked — and it leaves the building inside a record a partner library
+  // ingests.
+  //
+  // MARC has codes for these cases and they are used below: 'u' fills an unknown
+  // digit and 9999 an open end.
+  const openStart = book.publicationYear === EDTF_SENTINEL_MIN;
+  const openEnd = book.publicationYearEnd === EDTF_SENTINEL_MAX;
+  const y1 = openStart ? null : book.publicationYear;
+  const y2 = openEnd ? null : book.publicationYearEnd;
   // A '?' or '~' in the EDTF expression is the librarian saying the date is
   // uncertain or approximate; MARC has a code for exactly that.
   const uncertain = /[?~]/.test(book.dateEdtf ?? '');
@@ -147,6 +162,17 @@ function marc008(book: MarcRecordInput): string {
     type = 'c';
     date1 = y1 ? String(y1).padStart(4, '0') : 'uuuu';
     date2 = y2 && y1 && y2 > y1 ? String(y2).padStart(4, '0') : '9999';
+  } else if (openStart && book.publicationYearEnd) {
+    // "no later than 1960". MARC's continuum type for an unknown start with a
+    // known end: 'uuuu' says the first date is not known, rather than inventing one.
+    type = 'm';
+    date1 = 'uuuu';
+    date2 = String(book.publicationYearEnd).padStart(4, '0');
+  } else if (openEnd && y1) {
+    // "1960 onwards" — 9999 is MARC's open end, the same code the serial branch uses.
+    type = 'm';
+    date1 = String(y1).padStart(4, '0');
+    date2 = '9999';
   } else if (y1 && y2 && y2 !== y1) {
     type = 'm';
     date1 = String(y1).padStart(4, '0');

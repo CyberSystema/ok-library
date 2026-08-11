@@ -205,8 +205,19 @@ export type ParsedEdtf = {
   qualifier: 'exact' | 'uncertain' | 'approximate';
 };
 
-const EDTF_MIN_YEAR = 1000;
-const EDTF_MAX_YEAR = 3000;
+/**
+ * Sort sentinels for an EDTF interval with an OPEN end.
+ *
+ * "../1960" and "1960/.." have to sort and range-filter alongside real years, so an
+ * unknown end is stored as one of these. They are machinery, NOT dates: anything
+ * that presents a stored year to a human or to another library must recognise them
+ * and say "unknown" rather than "1000". Exported because the MARC 008 builder read
+ * them as authored dates and published "before 1960" as a work of the year 1000.
+ */
+export const EDTF_SENTINEL_MIN = 1000;
+export const EDTF_SENTINEL_MAX = 3000;
+const EDTF_MIN_YEAR = EDTF_SENTINEL_MIN;
+const EDTF_MAX_YEAR = EDTF_SENTINEL_MAX;
 
 function edtfYear(token: string): number | null {
   if (!/^\d{4}$/.test(token)) return null;

@@ -2692,6 +2692,35 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 60. REGRESSION: EDTF sort sentinels are not dates ===")
+uniq = uuid.uuid4().hex[:8]
+
+# parseEdtf stores 1000 for an unknown start and 3000 for an unknown end so that
+# "../1960" and "1960/.." sort and range-filter with real years. marc008 read them
+# as authored dates, so "before 1960" was published to partner libraries as a work
+# OF THE YEAR 1000, and "1960 onwards" as ceasing in 3000. MARC has codes for both
+# cases; the module's own docstring says a wrong code here is worse than no code.
+for _edtf, _want1, _want2, _label in (
+        ("../1960", "uuuu", "1960", "unknown start, known end"),
+        ("1960/..", "1960", "9999", "known start, open end")):
+    st, made = call("POST", "/api/books", {"title": f"ZZEDTF {_label} {uniq}", "author": "ZZ",
+                                           "dateEdtf": _edtf})
+    _id = (made or {}).get("id")
+    if not _id:
+        check(f"a record can carry the EDTF interval {_edtf}", False, f"{st} {str(made)[:120]}")
+        continue
+    CREATED.append(_id)
+    st, xml = call_text("GET", f"/api/books/{_id}/marc?format=marcxml")
+    m = re.search(r'<controlfield tag="008">(.*?)</controlfield>', xml or "")
+    f008 = m.group(1) if m else ""
+    # 008/06 type, 008/07-10 date1, 008/11-14 date2
+    check(f"{_edtf} exports date1 as {_want1}, not a sentinel year",
+          len(f008) >= 15 and f008[7:11] == _want1, f"008={f008[:20]!r}")
+    check(f"and date2 as {_want2}",
+          len(f008) >= 15 and f008[11:15] == _want2, f"008={f008[:20]!r}")
+    check(f"and never states the sentinel 1000/3000 as a date for {_edtf}",
+          "1000" not in f008[7:15] and "3000" not in f008[7:15], f"008={f008[:20]!r}")
+
 print("=== 59. REGRESSION: a merge carries the hold queue with it ===")
 uniq = uuid.uuid4().hex[:8]
 
