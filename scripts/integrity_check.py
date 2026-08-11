@@ -12,7 +12,7 @@ Usage:
 
 Exit code 0 = everything held. Non-zero = at least one assertion failed.
 """
-import csv, datetime, io, json, os, re, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
+import atexit, csv, datetime, io, json, os, re, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
 
 BASE = os.environ.get("API", "http://127.0.0.1:8787").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -78,18 +78,50 @@ def login(user=ADMIN_USER, pw=ADMIN_PW):
 LOCAL = BASE.startswith("http://127.0.0.1") or BASE.startswith("http://localhost")
 
 
+# The repo root, so nothing here depends on the caller's working directory: the
+# --config path below is relative, and running the gate from anywhere but the root
+# turned EVERY direct D1 probe into a None that read like an empty result.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+# Probes that could not run at all, asserted on at the end of the run.
+LOCAL_SQL_FAILURES = []
+
+
 def local_sql(query):
-    """Run one statement against the LOCAL D1 and return its rows."""
+    """Run one statement against the LOCAL D1 and return its rows, or None.
+
+    A None means the statement DID NOT RUN — not that it matched nothing. That
+    distinction is the whole point of recording the failure: this used to swallow
+    every exception and return None, and three purge/erase cascade assertions read
+    that None through `int((rows or [{}])[0].get("n") or 0) == 0` and reported that
+    purging a record had cleaned up its authority links, its serial run and its
+    audit trail when the query had never executed. A renamed table, a dropped
+    column or the wrong working directory all produced that PASS. Read counts
+    through sql_count() below, which refuses to turn a dead probe into a zero.
+    """
     import subprocess
     out = subprocess.run(
         ["npx", "wrangler", "d1", "execute", "ok_library", "--local",
          "--config", "apps/api-worker/wrangler.toml", "--command", query, "--json"],
-        capture_output=True, text=True
+        capture_output=True, text=True, cwd=REPO_ROOT
     )
     try:
         return json.loads(out.stdout)[0]["results"]
-    except Exception:
+    except Exception as exc:
+        LOCAL_SQL_FAILURES.append((" ".join(query.split())[:110],
+                                   (out.stderr or out.stdout or str(exc)).strip()[:200]))
         return None
+
+
+def sql_count(rows, column="n"):
+    """The number a COUNT(*) probe returned, or None if the probe did not run.
+
+    None is deliberately not 0, so a caller comparing `== 0` fails on a dead probe
+    instead of being told what it hoped to hear.
+    """
+    if not rows:
+        return None
+    return int(rows[0].get(column) or 0)
 
 
 def mkbook(**over):
@@ -459,7 +491,14 @@ for bid_ in bulk_ids:
                      "customFieldsPatch": {"series": "New", "signature_notes": "bulk"},
                      "tagsAdd": ["bulkA"], "shelfCode": "ZZ-BULK"}}})
 st, r = call("POST", "/api/sync/push", {"mutations": muts})
-check("bulk patch push succeeded", all(x["status"] == "success" for x in (r or {}).get("results", [])), r)
+# The status and a non-empty results array, exactly as the sibling assertion in §4
+# does it. Without them the condition was `all(... for ... in [])` whenever the
+# response had no `results` key — so a 400 that rejected the WHOLE batch, or a
+# None body, satisfied the assertion named after the request, and the failure
+# resurfaced later under the names of its effects ("patched attribute set").
+check("bulk patch push succeeded",
+      st == 200 and bool((r or {}).get("results"))
+      and all(x["status"] == "success" for x in r["results"]), f"{st} {r}")
 g = get(bulk_ids[0])
 check("patched attribute set", g["customFields"].get("series") == "New", g["customFields"])
 check("new attribute added", g["customFields"].get("signature_notes") == "bulk", g["customFields"])
@@ -712,10 +751,11 @@ check("a trashed book is not suggested",
 
 print("=== 29. REGRESSION: facet counts reproduce exactly as filtered lists ===")
 # The librarian counts a shelf by hand and compares it with the rail. A count
-# that doesn't open a list of the same size is worse than no count, so EVERY
-# bucket — including "(not filled in)" — has to round-trip. This is also what
-# catches a missing `isFullyUnfiltered` entry: without it a filtered view would
-# serve the memoized unfiltered total instead of its own.
+# that doesn't open a list of the same size is worse than no count, so every kind
+# of bucket — including "(not filled in)" — has to round-trip. Three buckets per
+# field are sampled, named below; the comment used to say EVERY bucket while the
+# loop took one. This is also what catches a missing `isFullyUnfiltered` entry:
+# without it a filtered view would serve the memoized unfiltered total.
 st, unfiltered = call("GET", "/api/books?pageSize=1")
 library_total = (unfiltered or {}).get("total", 0)
 for fld in ["shelfCode", "language", "publicationYear", "publisher",
@@ -743,7 +783,19 @@ for fld in ["shelfCode", "language", "publicationYear", "publisher",
     elif fac.get("overlapping"):
         check(f"facet {fld} accounts for at least every book",
               fac.get("shownCount") >= library_total, f"{fac.get('shownCount')} vs {library_total}")
-    for bucket in [i for i in items if i["isEmpty"]][:1] + [i for i in items if not i["isEmpty"]][:1]:
+    # The (empty) bucket, the first value bucket and the SMALLEST one. Three per
+    # field rather than all of them — 600 buckets x 7 fields is not a per-run cost
+    # worth paying — but the smallest has to be among them: a bucket of one is
+    # where a single miscounted book is the whole answer, and the rail is sorted by
+    # count, so sampling from the top only ever looked at the buckets where a
+    # discrepancy is proportionally invisible.
+    _values = [i for i in items if not i["isEmpty"]]
+    _sample = [i for i in items if i["isEmpty"]][:1] + _values[:1]
+    if _values:
+        _smallest = min(_values, key=lambda i: i["count"])
+        if _smallest not in _sample:
+            _sample.append(_smallest)
+    for bucket in _sample:
         if bucket["isEmpty"]:
             st, r = call("GET", f"/api/books?pageSize=1&emptyField={urllib.parse.quote(fld)}")
             name = "(empty)"
@@ -1045,6 +1097,44 @@ check("subject candidates come from the existing category labels",
 if aid:
     call("DELETE", f"/api/authorities/{aid}")
 
+# ─── The library's own identity record, saved once ───────────────────────────
+#
+# Everything from here to CLEANUP is allowed to overwrite library_settings,
+# because MARC 852 $a, the OAI-PMH repository description and the two protocol
+# gates cannot be exercised any other way. What it is NOT allowed to do is leave
+# its fixtures behind — and it did. §35 and §36 set the ISIL and then NULLED it
+# rather than putting the real one back; §37's finally nulled isil, libraryName
+# and publicSharing; §46 took its own "prior" snapshot AFTER that finally had run,
+# so it faithfully restored nulls; and §51 planted isil="GR-ZZTEST" and
+# libraryName="ZZ Test Library" and restored only publicSharing. Run the way the
+# docstring documents — against the deployed Worker — that left the library named
+# ZZ Test Library, every exported MARC 852 $a and 003 carrying GR-ZZTEST, the
+# OAI-PMH repositoryIdentifier wrong and sharing switched off under any harvester
+# subscribed to it. Nothing reported it, because the gate asserted on the values
+# it had planted.
+#
+# So: ONE snapshot, taken before the first write, put back in ONE place. The
+# atexit registration matters as much as the snapshot — an AssertionError in any
+# mkbook() skips CLEANUP, and it was precisely the crash path that made the
+# damage permanent.
+st, _ls = call("GET", "/api/library-settings")
+LIBRARY_SETTINGS_BEFORE = dict((_ls or {}).get("settings") or {})
+check("the library's identity record was read before the gate starts writing it",
+      st == 200 and bool(LIBRARY_SETTINGS_BEFORE), f"{st} {_ls}")
+
+
+def restore_library_settings():
+    """Write the ORIGINAL values back — never None, never a test value."""
+    if not LIBRARY_SETTINGS_BEFORE or restore_library_settings.done:
+        return None
+    restore_library_settings.done = True
+    call("PUT", "/api/library-settings", LIBRARY_SETTINGS_BEFORE)
+    return dict((call("GET", "/api/library-settings")[1] or {}).get("settings") or {})
+
+
+restore_library_settings.done = False
+atexit.register(restore_library_settings)
+
 print("=== 35. REGRESSION: identifiers, language codes, library settings ===")
 # Check digits are validated but NEVER block. Small publishers really do print a
 # wrong one, and refusing would make the book uncatalogueable — the librarian is
@@ -1066,7 +1156,9 @@ st, r = call("GET", "/api/library-settings")
 check("a known setting is written", (r or {}).get("settings", {}).get("isil") == "ZZ-TEST", r)
 check("an unknown key is ignored rather than stored",
       "notAKey" not in (r or {}).get("settings", {}), r)
-call("PUT", "/api/library-settings", {"isil": None})
+# No `{"isil": None}` here any more. It read as cleanup and was a second edit to
+# the library's own record; the section below sets the ISIL it needs, and the real
+# one goes back in CLEANUP.
 
 print("=== 36. REGRESSION: MARC round-trip loses nothing ===")
 # Export and ingest share one field table so they cannot drift — a tag written
@@ -1135,7 +1227,8 @@ bad = '<?xml version="1.0"?><collection xmlns="http://www.loc.gov/MARC21/slim"><
 st, r = call("POST", "/api/import/marcxml", raw=bad.encode(), ctype="application/xml")
 check("a record with no 245$a is skipped and reported",
       st == 200 and (r or {}).get("skipped") == 1 and (r or {}).get("problems"), r)
-call("PUT", "/api/library-settings", {"isil": None})
+# The ISIL this section planted stays until CLEANUP puts the real one back;
+# nulling it here was never a restore.
 
 print("=== 37. REGRESSION: SRU and OAI-PMH ===")
 # The two protocols another library reads this catalogue with. Both are PUBLIC
@@ -1424,7 +1517,15 @@ call("POST", f"/api/books/{pb}/return", {})
 # retries a write four times on a 5xx, so the renewal COUNT is the precondition
 # that works. The due date alone does not: renewing a fresh loan for the same
 # period lands on the same calendar date, and a replay would still match.
-soon = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).isoformat().replace("+00:00", "Z")
+# MILLISECONDS, not microseconds. Python's isoformat() emits six fractional
+# digits; ISODateTimeSchema now normalises whatever it is handed to
+# `new Date(v).toISOString()`, which is millisecond precision — so a microsecond
+# input is stored in the app's canonical shape rather than verbatim, and the
+# echo-back comparison below has to send what a real client sends. (Before that
+# normalisation the value was stored exactly as received, which is the defect:
+# "March 3 2027" was stored as "March 3 2027" in a column compared as TEXT.)
+soon = ((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2))
+        .isoformat(timespec="milliseconds").replace("+00:00", "Z"))
 call("POST", f"/api/books/{pb}/borrow", {"borrowerName": "ZZ Policy Reader", "dueAt": soon})
 st, hist = call("GET", f"/api/books/{pb}/history")
 loan_id = ((hist or {}).get("items") or [{}])[0].get("id")
@@ -2691,6 +2792,51 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     body = _slurp(pack)
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
+
+print("=== 64. REGRESSION: OAI-PMH argument handling ===")
+
+# Sharing must be ON for these; restored below whatever it was.
+st, _cfg = call("GET", "/api/library-settings")
+_prior_sharing = (_cfg or {}).get("publicSharing")
+call("PUT", "/api/library-settings", {"publicSharing": "on"})
+try:
+    _today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    # Day granularity is REQUIRED by the spec and `until` is INCLUSIVE. Both bounds
+    # went straight into a string comparison against a millisecond timestamp, so a
+    # bare date in `until` is a strict prefix of every timestamp on that day and
+    # excluded the whole day it named: a single-day harvest returned nothing.
+    st, body = call_text("GET", f"/api/oai?verb=ListIdentifiers&metadataPrefix=oai_dc&from={_today}&until={_today}")
+    check("a single-day harvest returns the records saved that day",
+          st == 200 and "<identifier>" in body and "noRecordsMatch" not in body,
+          body[:160])
+
+    # `set` was read only as a forbidden companion to resumptionToken and otherwise
+    # ignored, so a harvester asking for one set silently received the whole
+    # catalogue — while ListSets answered noSetHierarchy. The two halves disagreed.
+    st, body = call_text("GET", "/api/oai?verb=ListRecords&metadataPrefix=oai_dc&set=theology")
+    check("asking for a set is refused, not silently ignored",
+          'code="noSetHierarchy"' in body, body[:160])
+
+    # A malformed datestamp ran as a nonsense string comparison instead of erroring.
+    st, body = call_text("GET", "/api/oai?verb=ListRecords&metadataPrefix=oai_dc&from=March%203%202027")
+    check("a malformed datestamp is a badArgument", 'code="badArgument"' in body, body[:160])
+    st, body = call_text("GET", f"/api/oai?verb=ListRecords&metadataPrefix=oai_dc&from={_today}&until=2020-01-01")
+    check("and until before from is a badArgument", 'code="badArgument"' in body, body[:160])
+    st, body = call_text("GET", f"/api/oai?verb=ListRecords&metadataPrefix=oai_dc&from={_today}&until={_today}T00:00:00Z")
+    check("and mixed granularity is a badArgument", 'code="badArgument"' in body, body[:160])
+
+    # `const echoable = code === 'badVerb' || code === 'badArgument' ? '' : ''` — both
+    # arms empty, so NO error response echoed its request. The spec wants the request
+    # attributes on every code EXCEPT those two.
+    st, body = call_text("GET", "/api/oai?verb=GetRecord&metadataPrefix=nonsense&identifier=oai:x:y")
+    check("an error echoes the request it failed",
+          'code="cannotDisseminateFormat"' in body and 'verb="GetRecord"' in body, body[:200])
+    st, body = call_text("GET", "/api/oai?verb=ListRecords&metadataPrefix=oai_dc&from=nonsense")
+    check("but badArgument carries no attributes, as the spec requires",
+          'code="badArgument"' in body and "<request>" in body, body[:200])
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": _prior_sharing or "off"})
 
 print("=== 63. REGRESSION: an expired hold advances every queue, and the promotion pins a copy ===")
 uniq = uuid.uuid4().hex[:6]

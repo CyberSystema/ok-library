@@ -15,6 +15,22 @@ const ZodQueryBoolean = z
     return z.NEVER;
   });
 
+// Attribute keys a librarian may not claim, because the import/export column
+// mapping and the query layer already spell core book fields this way. Mirrored
+// verbatim by RESERVED_ATTRIBUTE_KEYS in apps/web/src/main.tsx, which pre-checks
+// the form so the error shows inline — change one and you must change the other,
+// or the client and the server disagree about what is creatable.
+//
+// `subtitle` is the odd entry and stays anyway. Nothing standard claims it: there
+// is no BookCoreSchema field and no `books` column, so for this one key the
+// message's "standard book attribute" is a phantom. But the spelling the rest of
+// the stack uses is `subTitle` — what the MARCXML importer writes for 245 $b,
+// what the XLSX mapper writes, what marc.ts reads (with `sub_title` as its only
+// fallback) — so a lowercase `subtitle` definition would be a decoy: the sheet's
+// "Sub Title" column resolves to it through resolveImportCustomKey's fuzzy match,
+// and marc.ts, which never looks there, would silently drop the subtitle from
+// every exported record. Blocking the one spelling nothing reads is worth more
+// than the accuracy of the message.
 const ReservedBookAttributeKeys = new Set([
   'title',
   'subtitle',
@@ -41,10 +57,36 @@ export const BookStatusSchema = z.enum(['available', 'borrowed', 'lost', 'mainte
 export const BibLevelSchema = z.enum(['monograph', 'serial']);
 export const BIB_LEVELS = BibLevelSchema.options;
 
+// An ISO-8601 instant — and, because the value is re-serialised on the way
+// through, always the SAME ISO shape once parsed.
+//
+// The refinement was the whole check, and `Date.parse` accepts far more than ISO
+// 8601: "March 3 2027", "2027/03/03", "05/03/2030". Nothing downstream
+// reformatted the value, so whatever the caller sent was stored verbatim in a
+// column that is only ever compared as TEXT — the overdue test is
+// `due_at < nowIso()`, SQLite comparing strings. A loan due "05/03/2030"
+// (a Greek librarian's 3 March) therefore sorted before every real timestamp and
+// was reported overdue the moment it was created: in
+// /api/borrow/active?overdueOnly=true, in the dashboard's overdue count and in
+// the reader's overdue tally. UTC-offset forms failed the same way more quietly,
+// comparing a wall clock against instants. So the name asserted ISO 8601 and
+// only the transform below makes it true.
+//
+// NORMALIZING rather than rejecting is deliberate. The stricter reading — 400 on
+// anything not ISO — would break a live caller: the XLSX importer puts a RAW
+// spreadsheet cell into `acquisitionDate` (main.tsx reads the sheet with
+// `raw: false`, so a date column arrives as whatever it was displayed as,
+// "3/5/19" included), and /api/import/books validates the whole batch in one
+// safeParse, so a single such cell would reject all 2000 rows. The set of
+// accepted inputs is therefore exactly what it was; only the stored form
+// changed. `Date.parse` is implementation-defined for those non-ISO shapes, but
+// the web client imports no schema from this package — every parse happens in
+// the Worker — so there is one interpretation, not one per browser.
 export const ISODateTimeSchema = z
   .string()
   .min(1)
-  .refine((v) => !Number.isNaN(Date.parse(v)), 'Invalid ISO datetime');
+  .refine((v) => !Number.isNaN(Date.parse(v)), 'Invalid ISO datetime')
+  .transform((v) => new Date(v).toISOString());
 
 export const BookCoreSchema = z.object({
   // Title is optional at the schema level: the catalog legitimately contains

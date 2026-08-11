@@ -114,7 +114,9 @@ import {
 	parseOaiIdentifier,
 	sruDiagnostic,
 	sruExplain,
-	xmlEscape
+	xmlEscape,
+	normalizeOaiBound,
+	oaiGranularity
 } from './protocols';
 import type { AuthClaims, Env } from './types';
 import { deterministicUuid, generateCodeValue, newId, normalizeBookData, normalizeCode, nowIso, safeJsonParse, toCsv } from './utils';
@@ -6196,18 +6198,23 @@ app.get('/api/oai', async (c) => {
 	if (verb === 'ListSets') {
 		// No set hierarchy: sets would have to mean something stable to a
 		// harvester, and this catalogue's categories are still being reorganised.
-		return xml(oaiError(requestUrl, 'noSetHierarchy', 'This repository has no sets', responseDate));
+		return xml(oaiError(requestUrl, 'noSetHierarchy', 'This repository has no sets', responseDate,
+			{ verb }));
 	}
 
 	if (verb === 'GetRecord') {
 		const prefix = q('metadataPrefix');
+		const ident = q('identifier');
 		if (!['oai_dc', 'marcxml'].includes(prefix)) {
-			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate));
+			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate,
+				{ verb, args: { metadataPrefix: prefix, identifier: ident } }));
 		}
-		const bookId = parseOaiIdentifier(q('identifier'));
-		if (!bookId) return xml(oaiError(requestUrl, 'idDoesNotExist', 'Malformed identifier', responseDate));
+		const bookId = parseOaiIdentifier(ident);
+		if (!bookId) return xml(oaiError(requestUrl, 'idDoesNotExist', 'Malformed identifier', responseDate,
+			{ verb, args: { metadataPrefix: prefix, identifier: ident } }));
 		const row = await c.env.DB.prepare('SELECT * FROM books WHERE id = ?').bind(bookId).first();
-		if (!row) return xml(oaiError(requestUrl, 'idDoesNotExist', 'No such record', responseDate));
+		if (!row) return xml(oaiError(requestUrl, 'idDoesNotExist', 'No such record', responseDate,
+			{ verb, args: { metadataPrefix: prefix, identifier: ident } }));
 
 		const parsedRow = parseBook(row as Record<string, unknown>);
 		const identifier = oaiIdentifier(isil, host, bookId);
@@ -6251,7 +6258,8 @@ app.get('/api/oai', async (c) => {
 				}
 			}
 			const state = decodeResumptionToken(token);
-			if (!state) return xml(oaiError(requestUrl, 'badResumptionToken', 'Token is not valid', responseDate));
+			if (!state) return xml(oaiError(requestUrl, 'badResumptionToken', 'Token is not valid', responseDate,
+				{ verb, args: { resumptionToken: token } }));
 			prefix = state.prefix;
 			offset = state.delivered;
 			resumeAfter = state.lastUpdatedAt
@@ -6260,15 +6268,52 @@ app.get('/api/oai', async (c) => {
 			legacyOffset = resumeAfter ? undefined : state.offset;
 			from = state.from; until = state.until;
 		} else if (!['oai_dc', 'marcxml'].includes(prefix)) {
-			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate));
+			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate,
+				{ verb, args: { metadataPrefix: prefix, from, until } }));
+		}
+
+		// `set` was read only as a forbidden companion to resumptionToken, and
+		// otherwise ignored — so a harvester asking for one set received the whole
+		// catalogue and had no way to tell. ListSets already answers noSetHierarchy;
+		// the two halves of the repository disagreed. The spec requires this error
+		// when a repository without sets is given a `set` argument.
+		if (!token && url.searchParams.has('set')) {
+			return xml(oaiError(requestUrl, 'noSetHierarchy', 'This repository has no set hierarchy', responseDate,
+				{ verb, args: { metadataPrefix: prefix, set: url.searchParams.get('set') ?? undefined } }));
+		}
+
+		// Day granularity is REQUIRED by the spec and `until` is inclusive. Both
+		// bounds went into a string comparison against a millisecond timestamp, so a
+		// bare date in `until` excluded the whole day it named.
+		let fromBound: string | undefined;
+		let untilBound: string | undefined;
+		if (from !== undefined) {
+			const g = oaiGranularity(from);
+			const n = g ? normalizeOaiBound(from, 'from') : null;
+			if (!n) return xml(oaiError(requestUrl, 'badArgument', `"from" is not a valid UTCdatetime: ${from}`, responseDate));
+			fromBound = n;
+		}
+		if (until !== undefined) {
+			const g = oaiGranularity(until);
+			const n = g ? normalizeOaiBound(until, 'until') : null;
+			if (!n) return xml(oaiError(requestUrl, 'badArgument', `"until" is not a valid UTCdatetime: ${until}`, responseDate));
+			untilBound = n;
+		}
+		// The spec: "Both arguments must have the same granularity."
+		if (from !== undefined && until !== undefined && oaiGranularity(from) !== oaiGranularity(until)) {
+			return xml(oaiError(requestUrl, 'badArgument', '"from" and "until" must have the same granularity', responseDate));
+		}
+		if (fromBound && untilBound && untilBound < fromBound) {
+			return xml(oaiError(requestUrl, 'badArgument', '"until" must not precede "from"', responseDate));
 		}
 
 		const page = await loadOaiPage(c.env, {
-			from, until, limit: HARVEST_PAGE_SIZE,
+			from: fromBound, until: untilBound, limit: HARVEST_PAGE_SIZE,
 			after: resumeAfter, offset: legacyOffset
 		});
 		if (page.rows.length === 0) {
-			return xml(oaiError(requestUrl, 'noRecordsMatch', 'No records in that range', responseDate));
+			return xml(oaiError(requestUrl, 'noRecordsMatch', 'No records in that range', responseDate,
+				{ verb, args: { metadataPrefix: prefix, from, until } }));
 		}
 
 		const wantMetadata = verb === 'ListRecords';

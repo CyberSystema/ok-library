@@ -180,17 +180,65 @@ function oaiEnvelope(requestUrl: string, requestAttrs: string, body: string, res
 }
 
 export function oaiError(
-  requestUrl: string, code: OaiErrorCode, message: string, responseDate: string
+  requestUrl: string, code: OaiErrorCode, message: string, responseDate: string,
+  /** The verb and recognised arguments to echo, for every code except the two below. */
+  echo?: { verb?: string; args?: Record<string, string | undefined> }
 ): string {
-  // Per the spec the <request> element carries NO attributes when the verb or
-  // an argument is what was wrong — echoing bad arguments back would make the
-  // response itself invalid.
-  const echoable = code === 'badVerb' || code === 'badArgument' ? '' : '';
+  // Per the spec the <request> element carries NO attributes when the VERB or an
+  // ARGUMENT is what was wrong — echoing back the thing that was invalid would make
+  // the response itself invalid. For every other code the spec says the opposite:
+  // <request> carries the keys of the request's key=value pairs.
+  //
+  // This was `code === 'badVerb' || code === 'badArgument' ? '' : ''` — both arms
+  // the empty string, so the distinction the comment describes was never made and
+  // NO error response echoed anything. idDoesNotExist, cannotDisseminateFormat,
+  // noRecordsMatch, badResumptionToken and noSetHierarchy all arrived at the
+  // harvester stripped of the context that says which request failed.
+  const bare = code === 'badVerb' || code === 'badArgument';
+  const attrs = bare || !echo
+    ? ''
+    : (echo.verb ? ` verb="${xmlEscape(echo.verb)}"` : '')
+      + Object.entries(echo.args ?? {})
+        .filter(([, v]) => v)
+        .map(([k, v]) => ` ${k}="${xmlEscape(String(v))}"`)
+        .join('');
   return oaiEnvelope(
-    requestUrl, echoable,
+    requestUrl, attrs,
     `  <error code="${code}">${xmlEscape(message)}</error>`,
     responseDate
   );
+}
+
+/**
+ * Normalise an OAI-PMH UTCdatetime bound for comparison against `updated_at`.
+ *
+ * The spec REQUIRES day granularity to be accepted ("All repositories must support
+ * YYYY-MM-DD") and `until` to be INCLUSIVE. `updated_at` is stored with
+ * milliseconds, and these bounds went straight into a string comparison — so
+ * `updated_at <= '2026-08-09'` is false for every record saved that day, because the
+ * bare date is a strict prefix of every timestamp on it. A single-day harvest
+ * returned nothing, and every `until` silently lost its last day.
+ *
+ * Returns null for a value that is not a legal UTCdatetime, so the caller can answer
+ * badArgument instead of running a nonsense comparison.
+ */
+export function normalizeOaiBound(value: string, edge: 'from' | 'until'): string | null {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return edge === 'until' ? `${value}T23:59:59.999Z` : `${value}T00:00:00.000Z`;
+  }
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) {
+    // Second granularity, inclusive at the top: .999 keeps every millisecond
+    // inside the second the harvester named.
+    return edge === 'until' ? value.replace(/Z$/, '.999Z') : value.replace(/Z$/, '.000Z');
+  }
+  return null;
+}
+
+/** Day or second granularity, as OAI-PMH defines them. Both bounds must match. */
+export function oaiGranularity(value: string): 'day' | 'second' | null {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return 'day';
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) return 'second';
+  return null;
 }
 
 export function oaiResponse(
