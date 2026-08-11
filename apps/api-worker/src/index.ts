@@ -3693,10 +3693,33 @@ async function nextBarcodeSequence(env: Env): Promise<number> {
 	const row = await env.DB.prepare(
 		// GLOB rather than a CAST over everything: a barcode a librarian typed by
 		// hand ('REF-12') must not be read as a number and collapse the sequence.
+		//
+		// EIGHT explicit digit classes, not `'[0-9]*'`. A GLOB pattern of
+		// `[0-9]*` constrains only the FIRST character — the `*` matches anything —
+		// so every value merely BEGINNING with a digit was read as a number. One
+		// EAN or ISBN typed into the barcode box ('9789601234567') therefore became
+		// the sequence maximum, and every barcode minted afterwards was thirteen
+		// digits: twice the width of the label, and outside the 8-digit subset-C
+		// invariant the label sheet is built around. Measured on this catalogue: the
+		// next value would have jumped from 99888558 to 9789601234568.
+		//
+		// Scoped to exactly what this system MINTS, so a hand-typed value of any
+		// shape — long, short, prefixed — can never move the sequence.
 		`SELECT MAX(CAST(barcode AS INTEGER)) AS n FROM items
-		  WHERE barcode IS NOT NULL AND barcode GLOB '[0-9]*'`
+		  WHERE barcode IS NOT NULL
+		    AND LENGTH(barcode) = 8
+		    AND barcode GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'`
 	).first<{ n: number | null }>();
-	return Number(row?.n ?? 0) + 1;
+	const next = Number(row?.n ?? 0) + 1;
+	// Refuse to overflow rather than silently widening the label. 99,999,999 copies
+	// is not a number this library will reach, but a corrupted sequence could get
+	// here, and a barcode that does not fit its label is worse than an error.
+	if (next > 99999999) {
+		throw new HTTPException(409, {
+			message: 'The 8-digit barcode sequence is exhausted. Check for a mistyped barcode holding the top of the range.'
+		});
+	}
+	return next;
 }
 
 app.post('/api/items/assign-barcodes', requirePermission('books.write', { librarian: true }), async (c) => {
@@ -4391,6 +4414,34 @@ app.put('/api/books/:id/items', requirePermission('books.write', { librarian: tr
 		}
 	}
 
+	// A room must exist before a copy can be filed in it, and this was checked
+	// nowhere — with a worse outcome than a plain error. The items batch commits,
+	// and only THEN does `syncBookFromItems` copy the room onto `books.room_code`,
+	// which carries `FOREIGN KEY (room_code) REFERENCES rooms(code)`. An unknown
+	// room therefore threw AFTER the copy was already durable: the librarian saw a
+	// 500 and the copy had moved. A torn write reported as a failure is worse than
+	// either outcome alone, because the obvious response — try again — is wrong.
+	//
+	// Checked here, before anything is written, and named in the message so the
+	// answer is "create the room first" rather than "something went wrong".
+	const wantedRooms = [...new Set(
+		payload.items
+			.map((i) => (i.roomCode ? normalizeCode(i.roomCode) : null))
+			.filter((v): v is string => Boolean(v))
+	)];
+	if (wantedRooms.length > 0) {
+		const known = await c.env.DB.prepare(
+			`SELECT code FROM rooms WHERE code IN (${wantedRooms.map(() => '?').join(', ')})`
+		).bind(...wantedRooms).all<{ code: string }>();
+		const have = new Set((known.results ?? []).map((r) => r.code));
+		const missing = wantedRooms.filter((r) => !have.has(r));
+		if (missing.length > 0) {
+			throw new HTTPException(409, {
+				message: `No room with the code ${missing.join(', ')}. Create the room first, in Settings → Rooms.`
+			});
+		}
+	}
+
 	// items.barcode is UNIQUE across the whole catalogue, and neither branch below
 	// pre-checked it: a barcode already on another copy came back out of the D1
 	// batch as a raw constraint error, i.e. a 500 the client retried four times
@@ -4403,14 +4454,36 @@ app.put('/api/books/:id/items', requirePermission('books.write', { librarian: tr
 		throw new HTTPException(409, { message: `Barcode ${dupInPayload} is on two copies in this list.` });
 	}
 	if (typedBarcodes.length > 0) {
+		// The pre-check has to cover EXACTLY what the constraint covers, and it did
+		// not. `items.barcode` is declared `TEXT UNIQUE` at the table level, with no
+		// `deleted_at` predicate, so it binds every row ever written — including
+		// withdrawn copies and copies of this very record. The check looked only at
+		// `deleted_at IS NULL AND book_id <> ?`, so two ordinary cases slipped past it
+		// into the raw constraint and came back as the bare 500 the comment above
+		// says was fixed:
+		//
+		//   · a barcode still held by a WITHDRAWN copy anywhere; and
+		//   · a barcode kept while its copy is removed from this record's list and
+		//     re-added as a new one — the tombstone keeps the value, so the insert
+		//     collides, and every later save of that record collides again. Forever.
+		//
+		// Rows the payload updates IN PLACE are excluded: keeping your own barcode is
+		// not a clash. Everything else is fair game, and the message says whether the
+		// holder is withdrawn, because "it is on a withdrawn copy" is the difference
+		// between a typo and a label the librarian may legitimately want to re-use.
+		const keptIds = payload.items.map((i) => i.id).filter((v): v is string => Boolean(v));
 		const clash = await c.env.DB.prepare(
-			`SELECT barcode FROM items
-			  WHERE deleted_at IS NULL AND book_id <> ?
-			    AND barcode IN (${typedBarcodes.map(() => '?').join(', ')}) LIMIT 1`
-		).bind(id, ...typedBarcodes).first<{ barcode: string }>();
+			`SELECT barcode, book_id, (deleted_at IS NOT NULL) AS withdrawn FROM items
+			  WHERE barcode IN (${typedBarcodes.map(() => '?').join(', ')})
+			    ${keptIds.length ? `AND id NOT IN (${keptIds.map(() => '?').join(', ')})` : ''}
+			  LIMIT 1`
+		).bind(...typedBarcodes, ...keptIds).first<{ barcode: string; book_id: string; withdrawn: number }>();
 		if (clash) {
+			const where = Number(clash.withdrawn) === 1
+				? 'a withdrawn copy'
+				: (clash.book_id === id ? 'another copy of this record' : 'a copy of another record');
 			throw new HTTPException(409, {
-				message: `Barcode ${clash.barcode} is already on a copy of another record.`
+				message: `Barcode ${clash.barcode} is already on ${where}.`
 			});
 		}
 	}
@@ -6891,10 +6964,34 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				// left a book borrowed with no ledger row, and the revert could
 				// itself fail. A queued offline borrow may arrive hours late, which
 				// is precisely when that window matters.
+				// The guard has to be the SAME guard the direct endpoint uses, and it
+				// was not. The comment above says "same rule as the direct endpoint",
+				// and `lendable` and `loanDays` are indeed applied — but this guard was
+				// missing two of the three refusals, so a mutation queued offline
+				// bypassed them entirely:
+				//
+				//   · the LOAN CAP. maxConcurrentLoans was resolved and never used, so
+				//     an offline borrow lent past the reader's limit.
+				//   · the READY-HOLD check. A copy set aside on the hold shelf for a
+				//     named reader could be lent to whoever queued a borrow offline.
+				//
+				// And it read `syncBorrow[1]` — the copy UPDATE — to decide whether a
+				// loan happened, while that UPDATE carried none of the guard. That is
+				// the same half-apply the direct endpoint had: refused borrow, copy
+				// marked 'borrowed', no ledger row, 201 to the client. Fixed the same
+				// way: the UPDATE fires only if the INSERT landed, and the INSERT's own
+				// row count is what decides.
+				const syncCapClause = syncPolicy.maxConcurrentLoans != null && borrowerId
+					? ` AND (SELECT COUNT(*) FROM borrow_transactions t2
+					          WHERE t2.borrower_id = ? AND t2.returned_at IS NULL) < ?`
+					: '';
 				const syncGuard = `(SELECT 1 FROM items i
 					 WHERE i.id = ? AND i.deleted_at IS NULL AND i.status = 'available'
 					   AND NOT EXISTS (SELECT 1 FROM borrow_transactions t
-					                    WHERE t.item_id = i.id AND t.returned_at IS NULL))`;
+					                    WHERE t.item_id = i.id AND t.returned_at IS NULL)
+					   AND NOT EXISTS (SELECT 1 FROM holds h
+					                    WHERE h.item_id = i.id AND h.status = 'ready'
+					                      AND (h.borrower_id IS NULL OR h.borrower_id <> ?))${syncCapClause})`;
 				const syncBorrow = await runAtomic(c.env, [
 					c.env.DB.prepare(
 						`INSERT INTO borrow_transactions (
@@ -6904,12 +7001,15 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						 WHERE EXISTS ${syncGuard}`
 					).bind(
 						txId, row.id, syncItem.id, borrowerId, borrowerName, borrowerContact,
-						now, syncDueAt, row.data.notes ?? null, actor.sub, now, syncItem.id
+						now, syncDueAt, row.data.notes ?? null, actor.sub, now,
+						syncItem.id, borrowerId,
+						...(syncCapClause ? [borrowerId, syncPolicy.maxConcurrentLoans] : [])
 					),
 					c.env.DB.prepare(
 						`UPDATE items SET status = 'borrowed', version = version + 1, updated_at = ?
-						 WHERE id = ? AND deleted_at IS NULL AND status = 'available'`
-					).bind(now, syncItem.id),
+						 WHERE id = ? AND deleted_at IS NULL AND status = 'available'
+						   AND EXISTS (SELECT 1 FROM borrow_transactions WHERE id = ?)`
+					).bind(now, syncItem.id, txId),
 					c.env.DB.prepare(
 						`UPDATE books SET status = CASE
 						   WHEN EXISTS (SELECT 1 FROM items i WHERE i.book_id = books.id AND i.deleted_at IS NULL
@@ -6921,7 +7021,16 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						 WHERE id = ? AND deleted_at IS NULL`
 					).bind(now, row.id)
 				]);
-				if ((syncBorrow[1]?.meta?.changes ?? 0) === 0) {
+				// The INSERT, not the UPDATE: it is the statement carrying the guard.
+				if ((syncBorrow[0]?.meta?.changes ?? 0) === 0) {
+					if (syncPolicy.maxConcurrentLoans != null && borrowerId) {
+						const openNow = await countOpenLoansFor(c.env, borrowerId);
+						if (openNow >= syncPolicy.maxConcurrentLoans) {
+							throw new HTTPException(409, {
+								message: `${borrowerName} already has ${openNow} item(s) on loan (limit ${syncPolicy.maxConcurrentLoans}).`
+							});
+						}
+					}
 					throw new HTTPException(409, { message: 'That copy is not available' });
 				}
 
