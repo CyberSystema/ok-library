@@ -47,6 +47,24 @@ def call(method, path, body=None, raw=None, ctype=None, token=None):
     return 429, {"error": "rate limited after retries"}
 
 
+def call_raw_json(method, path, raw_body, token=None):
+    """POST a body VERBATIM, bypassing json.dumps — the only way to send a body that
+    is not valid JSON, which is the case an app.onError branch has to handle."""
+    req = urllib.request.Request(
+        BASE + path, data=raw_body.encode(), method=method,
+        headers={"Authorization": f"Bearer {token or TOKEN}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            t = r.read().decode()
+            return r.status, (json.loads(t) if t.strip() else None)
+    except urllib.error.HTTPError as e:
+        t = e.read().decode()
+        try:
+            return e.code, json.loads(t)
+        except Exception:
+            return e.code, {"raw": t[:200]}
+
+
 def call_text(method, path, token=None):
     """Like call(), but returns the raw response body — for CSV and other
     non-JSON endpoints."""
@@ -2891,6 +2909,78 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     body = _slurp(pack)
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
+
+print("=== 66. REGRESSION: numbers a librarian acts on ===")
+uniq = uuid.uuid4().hex[:6]
+
+# (a) A malformed body threw SyntaxError out of c.req.json() and escaped the ZodError
+# branch into the generic 500 — which is exactly what that branch exists to prevent:
+# the web client treats a 5xx write as transient and retries it four times, so one
+# malformed body became four failures and an opaque requestId.
+st, body = call_raw_json("POST", "/api/books", '{"title": "unclosed')
+check("a malformed JSON body is a 400, not a retried 500",
+      st == 400 and "JSON" in str(body), f"{st} {str(body)[:110]}")
+
+# (b) An authority's use count is stated to the librarian immediately before an
+# IRREVERSIBLE unlink, so it is the one number that has to be right. Two ways it was
+# not: the list counted links from TRASHED records, and the detail reported the LENGTH
+# of a sample capped at LIMIT 100 — so any heading on more than a hundred records said
+# exactly 100 beside a button that would unlink all of them.
+st, made = call("POST", "/api/authorities",
+                {"kind": "person", "preferredForm": f"ZZCOUNT {uniq}", "source": "local"})
+_aid = (made or {}).get("id")
+if _aid and LOCAL:
+    _bookids = []
+    for i in range(104):
+        st, b = call("POST", "/api/books", {"title": f"ZZCOUNTBK {uniq} {i:03d}", "author": "ZZ"})
+        _bid = (b or {}).get("id")
+        if _bid:
+            _bookids.append(_bid)
+            CREATED.append(_bid)
+    if len(_bookids) >= 104:
+        _vals = ",".join(f"('{b}','{_aid}','aut',0,datetime('now'))" for b in _bookids)
+        local_sql("INSERT OR IGNORE INTO book_authorities (book_id,authority_id,role,seq,created_at) "
+                  f"VALUES {_vals}")
+        st, det = call("GET", f"/api/authorities/{_aid}")
+        check("an authority's use count is not capped at the sample size",
+              (det or {}).get("useCount") == 104, f"useCount={(det or {}).get('useCount')} of 104")
+        check("while the sample it shows stays a sample",
+              len((det or {}).get("usedBy") or []) == 100, len((det or {}).get("usedBy") or []))
+        # Now trash a quarter of them: the count must fall, on BOTH endpoints.
+        for _bid in _bookids[:24]:
+            call("DELETE", f"/api/books/{_bid}")
+        st, det2 = call("GET", f"/api/authorities/{_aid}")
+        check("and trashing a record lowers it", (det2 or {}).get("useCount") == 80,
+              f"useCount={(det2 or {}).get('useCount')} of 80")
+        _seen = None
+        for _off in (0, 200, 400, 600, 800):
+            st, lst = call("GET", f"/api/authorities?limit=200&offset={_off}")
+            for x in (lst or {}).get("items", (lst or {}).get("authorities", [])):
+                if x.get("id") == _aid:
+                    _seen = x.get("useCount")
+            if _seen is not None:
+                break
+        check("the LIST agrees with the detail, counting no trashed links",
+              _seen == 80, f"list={_seen}, detail=80")
+        local_sql(f"DELETE FROM book_authorities WHERE authority_id = '{_aid}'")
+    call("DELETE", f"/api/authorities/{_aid}")
+
+# (c) The ISO 2789 withdrawals figure excluded every withdrawal on a record that had
+# ever been merged away — a predicate meant to skip merge tombstones, which merges do
+# not create: they re-parent live copies and soft-delete the BOOK. Measured: zero
+# deleted items across every merged record, so the predicate only ever removed real
+# withdrawals from a return filed with a national library.
+if LOCAL:
+    _mergedeleted = local_sql("""SELECT COUNT(*) AS n FROM items i JOIN books b ON b.id = i.book_id
+                                  WHERE i.deleted_at IS NOT NULL AND b.merged_into IS NOT NULL
+                                    AND i.deleted_at = b.deleted_at""")
+    check("a merge still creates no item tombstone to over-report",
+          _mergedeleted is not None, "query failed")
+    _worker66 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+    check("the withdrawals figure no longer drops a withdrawal for an unrelated merge",
+          "AND NOT (b.merged_into IS NOT NULL AND i.deleted_at = b.deleted_at)" in _worker66
+          and "AND b.merged_into IS NULL\n" not in _worker66.split("B.2.4 withdrawals")[1][:900],
+          None)
 
 print("=== 65. REGRESSION: the public endpoints publish no barcodes ===")
 

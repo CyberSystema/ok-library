@@ -454,6 +454,16 @@ app.onError((error, c) => {
 	// trips the web client's transient-error retry (it retries 5xx writes up to
 	// 4×), so e.g. a too-long title is retried repeatedly and then surfaced as an
 	// opaque server error instead of an actionable "title too long" message.
+	// An unparseable request body throws SyntaxError out of `c.req.json()`, and it
+	// escaped straight past the ZodError branch below into the generic 500 — which is
+	// precisely the outcome that branch exists to avoid: the web client treats a 5xx
+	// write as transient and retries it four times, so a single malformed body became
+	// four identical failures and an opaque requestId. Handled here rather than at
+	// every call site, so no route has to remember to wrap its own parse.
+	if (error instanceof SyntaxError
+		|| (error instanceof Error && /JSON|Unexpected token/i.test(error.message))) {
+		return c.json({ error: 'Malformed JSON body' }, 400);
+	}
 	if (error instanceof z.ZodError) {
 		const issue = error.issues[0];
 		const path = issue?.path?.length ? issue.path.join('.') : 'input';
@@ -1604,7 +1614,14 @@ app.get('/api/authorities', async (c) => {
 	}
 
 	const rows = await c.env.DB.prepare(
-		`SELECT a.*, (SELECT COUNT(*) FROM book_authorities ba WHERE ba.authority_id = a.id) AS use_count
+		// The COUNT must exclude links from TRASHED records, as the detail endpoint and
+		// subject-candidates both already do. Without the join a heading linked to ten
+		// deleted books reported ten uses — and the retire confirmation states that
+		// number to the librarian immediately before an irreversible unlink, so the
+		// figure they weigh the decision on was the one number that had to be right.
+		`SELECT a.*, (SELECT COUNT(*) FROM book_authorities ba
+		               JOIN books b ON b.id = ba.book_id
+		              WHERE ba.authority_id = a.id AND b.deleted_at IS NULL) AS use_count
 		   FROM authorities a WHERE ${where.join(' AND ')}
 		  ORDER BY use_count DESC, a.preferred_form ASC LIMIT ?`
 	).bind(...values, limit).all<Record<string, unknown>>();
@@ -1834,7 +1851,7 @@ app.get('/api/authorities/:id', async (c) => {
 	).bind(id).first<Record<string, unknown>>();
 	if (!row) throw new HTTPException(404, { message: 'Authority not found' });
 
-	const [variants, links] = await Promise.all([
+	const [variants, links, useCountRow] = await Promise.all([
 		c.env.DB.prepare('SELECT id, form FROM authority_variants WHERE authority_id = ? ORDER BY form ASC')
 			.bind(id).all<{ id: string; form: string }>(),
 		c.env.DB.prepare(
@@ -1842,7 +1859,16 @@ app.get('/api/authorities/:id', async (c) => {
 			   FROM book_authorities ba JOIN books b ON b.id = ba.book_id
 			  WHERE ba.authority_id = ? AND b.deleted_at IS NULL
 			  ORDER BY b.title ASC LIMIT 100`
-		).bind(id).all<Record<string, unknown>>()
+		).bind(id).all<Record<string, unknown>>(),
+		// Counted SEPARATELY and uncapped. `useCount` was the LENGTH of the sample
+		// above, and that query ends in LIMIT 100 — so every heading on more than a
+		// hundred records reported exactly 100, and the editor printed it as
+		// "On 100 record(s)" beside a retire button that would unlink all of them.
+		// The sample stays capped because it is a sample; the number must not be.
+		c.env.DB.prepare(
+			`SELECT COUNT(*) AS n FROM book_authorities ba JOIN books b ON b.id = ba.book_id
+			  WHERE ba.authority_id = ? AND b.deleted_at IS NULL`
+		).bind(id).first<{ n: number }>()
 	]);
 
 	return c.json({
@@ -1860,7 +1886,7 @@ app.get('/api/authorities/:id', async (c) => {
 		// Capped at 100: this is "what would I break by editing this?", not a
 		// browse. Subject browse is a separate, unbuilt thing.
 		usedBy: (links.results ?? []).map((r) => ({ id: r.id, title: r.title, author: r.author, role: r.role })),
-		useCount: (links.results ?? []).length
+		useCount: Number(useCountRow?.n ?? 0)
 	});
 });
 
@@ -3497,14 +3523,30 @@ app.get('/api/reports/iso2789', requirePermission('dashboard', { librarian: true
 			    AND acquisition_date >= ? AND acquisition_date < ?`
 		).bind(from, to).first<{ n: number }>(),
 
-		// B.2.4 withdrawals, EXCLUDING merge tombstones. Those are duplicate
-		// records folded together, not books withdrawn from stock — counting them
-		// would over-report by every merge the librarian performs.
+		// B.2.4 withdrawals, excluding merge tombstones — but only the ones that ARE
+		// merge tombstones.
+		//
+		// The predicate was `b.merged_into IS NULL`, which excluded every withdrawal
+		// belonging to a record that had ever been merged away. It cannot do the job
+		// it was written for: a merge RE-PARENTS live copies to the keeper and
+		// soft-deletes the BOOK, so it never tombstones an item at all. Measured on
+		// this catalogue: zero deleted items across every merged record.
+		//
+		// What it did instead was silently drop real withdrawals. A copy withdrawn in
+		// March, on a record folded into its twin in April, left the March return —
+		// and a withdrawn copy is not re-parented by the merge (the mover reads only
+		// live copies), so it stays attached to the tombstone and stays excluded. The
+		// figure is filed with a national library; a withdrawal that disappears
+		// because of unrelated housekeeping months later is the worst kind of wrong.
+		//
+		// Narrowed rather than dropped, so it still excludes an item deletion stamped
+		// at the same instant as its book's — which is what a merge WOULD look like if
+		// it ever did tombstone copies.
 		c.env.DB.prepare(
 			`SELECT COALESCE(i.withdrawal_reason, 'unrecorded') AS k, COUNT(*) AS n
 			   FROM items i JOIN books b ON b.id = i.book_id
 			  WHERE i.deleted_at IS NOT NULL AND i.deleted_at >= ? AND i.deleted_at < ?
-			    AND b.merged_into IS NULL
+			    AND NOT (b.merged_into IS NOT NULL AND i.deleted_at = b.deleted_at)
 			  GROUP BY k`
 		).bind(from, to).all<{ k: string; n: number }>(),
 

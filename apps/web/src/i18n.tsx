@@ -1292,13 +1292,17 @@ const ko: Dict = {
   'authorities.notes': '메모',
   'authorities.needForm': '채택형은 반드시 필요합니다.',
   'authorities.saved': '표목을 저장했습니다.',
-  'authorities.retire': '폐기',
-  'authorities.retireTitle': '이 표목을 폐기할까요?',
-  'authorities.retireBody': '“{form}”은 어떤 레코드에도 쓰이지 않았으며 폐기됩니다.',
-  'authorities.retireBodyUsed': '“{form}”은 {n}건의 레코드에 있습니다. 폐기하면 모든 연결이 끊어집니다 — 책의 자체 텍스트는 남지만 표목은 사라집니다. 표기를 고치려면 수정하세요. 수정은 모든 연결을 유지합니다.',
-  'authorities.retired': '표목을 폐기했습니다.',
+  // 폐기 is banned pack-wide (GLOSSARY-ko.md:35) precisely because it would name
+  // both withdrawing a volume (제적) and retiring a heading; the approved term is
+  // 폐지 — abolishing something that was in use, which cannot read as discarding
+  // an object. Sweep item §5.2.4 names these five keys.
+  'authorities.retire': '폐지',
+  'authorities.retireTitle': '이 표목을 폐지할까요?',
+  'authorities.retireBody': '“{form}”은 어떤 레코드에도 쓰이지 않았으며 폐지됩니다.',
+  'authorities.retireBodyUsed': '“{form}”은 {n}건의 레코드에 있습니다. 폐지하면 모든 연결이 끊어집니다 — 책의 자체 텍스트는 남지만 표목은 사라집니다. 표기를 고치려면 수정하세요. 수정은 모든 연결을 유지합니다.',
+  'authorities.retired': '표목을 폐지했습니다.',
   'authorities.usedByList': '{n}건의 레코드에 사용',
-  'authorities.editKeepsLinks': '저장해도 이 연결은 모두 유지됩니다. 그것이 수정 기능의 목적입니다 — 폐기 후 재생성하면 연결을 잃습니다.',
+  'authorities.editKeepsLinks': '저장해도 이 연결은 모두 유지됩니다. 그것이 수정 기능의 목적입니다 — 폐지 후 재생성하면 연결을 잃습니다.',
   'authorities.onBook': '전거 표목',
   'authorities.noLinks': '연결된 표목이 없습니다',
   'authorities.addLink': '표목 연결',
@@ -2327,10 +2331,14 @@ const ru: Dict = {
   'copies.withdrawalReasonHelp': 'Записывается у списанных экземпляров и отражается в статистике ISO 2789.',
   'copies.saveAll': 'Сохранить экземпляры',
   'serials.heading': 'Имеющиеся выпуски',
-  'serials.editHeading': 'Описать комплект',
-  'serials.editorTitle': 'Комплект этого периодического издания',
-  'serials.editorIntro': 'По одной строке на каждый непрерывный отрезок, который есть в фонде. «Т. 1-10 (1880-1889)» говорит одной фразой больше, чем 47 отдельных записей, и именно её другая библиотека получает в MARC 866. Лакуны указываются в отдельном поле, чтобы читались как оговорка, а не как часть комплекта.',
-  'serials.none': 'Комплект пока не описан',
+  // Bare «комплект» named both a periodical's run and a multi-part set, so the
+  // one distinction the series-and-sets chapter exists to draw was invisible at
+  // the point of use. REVIEW-ru.md settled it for the prose — «комплект
+  // выпусков» for the run, «многотомник» for the set (see `library.sets.*`).
+  'serials.editHeading': 'Описать комплект выпусков',
+  'serials.editorTitle': 'Комплект выпусков этого периодического издания',
+  'serials.editorIntro': 'По одной строке на каждый непрерывный отрезок, который есть в фонде. «Т. 1-10 (1880-1889)» говорит одной фразой больше, чем 47 отдельных записей, и именно её другая библиотека получает в MARC 866. Лакуны указываются в отдельном поле, чтобы читались как оговорка, а не как часть комплекта выпусков.',
+  'serials.none': 'Комплект выпусков пока не описан',
   'serials.noneBody': 'Добавьте строку для каждого отрезка, стоящего на полке.',
   'serials.nth': 'Запись {n}',
   'serials.caption': 'Как называется нумерация',
@@ -2350,8 +2358,8 @@ const ru: Dict = {
   'serials.addOne': '+ Добавить запись',
   'serials.moveUp': 'Переместить выше',
   'serials.moveDown': 'Переместить ниже',
-  'serials.saveAll': 'Сохранить комплект',
-  'serials.saved': 'Комплект сохранён.',
+  'serials.saveAll': 'Сохранить комплект выпусков',
+  'serials.saved': 'Комплект выпусков сохранён.',
   'serials.unspecified': '(не указано)',
   'authorities.heading': 'Авторитетные заголовки',
   'authorities.intro': 'По одной записи на человека, организацию, издательство или предмет, с другими написаниями при ней. Свободный текст в каждой книге остаётся точно таким, как его занесли: заголовок — это ссылка, а не переписывание. Из этого строятся MARC 100, 700 и 650.',
@@ -2458,7 +2466,7 @@ const ru: Dict = {
   'borrowers.erased': 'Обезличено. Теперь читатель отображается как {name}.',
   'library.sets.groupCount': 'Групп: {n}.',
   'library.sets.showingOf': 'Показано {shown} из {matched} групп.',
-  'library.sets.suppressed': 'Ещё {n} скрыто: у всех название совпадает с названием группы и ни у одной нет номера тома — признаков комплекта нет.',
+  'library.sets.suppressed': 'Ещё {n} скрыто: у всех название совпадает с названием группы и ни у одной нет номера тома — признаков многотомника нет.',
   'tab.handbook': 'Справочник',
   'handbook.title': 'Справочник библиотекаря',
   'handbook.description': 'Справочная часть руководства: для чего нужно каждое поле, как описывать неудобные случаи и какой стандарт это предписывает.',
@@ -2728,8 +2736,8 @@ const ru: Dict = {
   'library.cats.filter': 'Фильтр категорий…',
   'library.cats.all': 'Все категории',
   'library.facets.empty': '(не заполнено)',
-  'library.sets.mode': '◫ Многотомные комплекты',
-  'library.sets.gapsOnly': 'Только комплекты с пропущенным томом',
+  'library.sets.mode': '◫ Многотомники',
+  'library.sets.gapsOnly': 'Только многотомники с пропущенным томом',
   'library.sets.missingN': 'нет: {n}',
   'library.sets.missingTitle': 'Отсутствуют тома: {list}',
   'library.sets.unnumbered': 'без нумерации',
@@ -3417,16 +3425,28 @@ const el: Dict = {
   'copies.withdrawTitle': 'Απόσυρση αυτού του αντιτύπου;',
   'copies.withdrawBody': 'Το αντίτυπο {n} φεύγει από τη συλλογή με την αποθήκευση. Η εγγραφή και τα άλλα αντίτυπα παραμένουν. Οι αποσύρσεις καταγράφονται στη στατιστική ISO 2789.',
   'copies.lastCopy': 'Κάθε εγγραφή πρέπει να διατηρεί τουλάχιστον ένα αντίτυπο. Για να αφαιρέσετε ολόκληρη την εγγραφή, διαγράψτε την — πηγαίνει στον κάδο και μπορεί να επανέλθει.',
-  'copies.onLoan': 'Το αντίτυπο είναι δανεισμένο. Παραλάβετέ το πρώτα.',
+  // παραλαμβάνω is what the *reader* does when collecting a hold (see
+  // `holds.intro`), so «Παραλάβετέ το πρώτα» told the librarian to perform the
+  // other half of the transaction — and no Greek control is called παραλαβή;
+  // the button is «📥 Επιστροφή». REVIEW-el.md fixed the same sentence in the
+  // prose («Δεχθείτε πρώτα την επιστροφή του», el.ts:841); the screen now agrees.
+  'copies.onLoan': 'Το αντίτυπο είναι δανεισμένο. Δεχθείτε πρώτα την επιστροφή του (📥 Επιστροφή).',
   'copies.withdrawalReason': 'Αιτία απόσυρσης ({n})',
   'copies.withdrawalReasonPh': 'π.χ. φθορά, απώλεια, δωρεά',
   'copies.withdrawalReasonHelp': 'Καταγράφεται στα αποσυρόμενα αντίτυπα και αναφέρεται στη στατιστική ISO 2789.',
   'copies.saveAll': 'Αποθήκευση αντιτύπων',
+  // «σειρά» is the ordinary Greek word for a bibliographic *series* — and the
+  // set rail is keyed on the `series` field — so «Καταγραφή της σειράς» read as
+  // "record the series" and invited the librarian to type a series title into
+  // the holdings statement, which is exported verbatim as MARC 866 $a. Same
+  // reversal REVIEW-el.md fixed in the prose (el.ts:509, «τα τεύχη που
+  // κατέχουμε»); the run is «τεύχη» on screen too now. σειρά is left to mean
+  // the bibliographic series, and «σειρά αναμονής» the hold queue.
   'serials.heading': 'Τι κατέχουμε',
-  'serials.editHeading': 'Καταγραφή της σειράς',
-  'serials.editorTitle': 'Η σειρά αυτού του περιοδικού',
-  'serials.editorIntro': 'Μία γραμμή για κάθε αδιάσπαστο τμήμα που κατέχετε. Το «τόμος 1-10 (1880-1889)» λέει σε μία δήλωση όσα δεν λένε 47 ξεχωριστές εγγραφές, και είναι αυτό που παραλαμβάνει μια άλλη βιβλιοθήκη στο MARC 866. Τα κενά μπαίνουν σε δικό τους πεδίο, ώστε να διαβάζονται ως επιφύλαξη και όχι ως μέρος της σειράς.',
-  'serials.none': 'Δεν έχει καταγραφεί σειρά ακόμη',
+  'serials.editHeading': 'Καταγραφή των τευχών που κατέχουμε',
+  'serials.editorTitle': 'Τα τεύχη αυτού του περιοδικού',
+  'serials.editorIntro': 'Μία γραμμή για κάθε αδιάσπαστο τμήμα που κατέχετε. Το «τόμος 1-10 (1880-1889)» λέει σε μία δήλωση όσα δεν λένε 47 ξεχωριστές εγγραφές, και είναι αυτό που λαμβάνει μια άλλη βιβλιοθήκη στο MARC 866. Τα κενά μπαίνουν σε δικό τους πεδίο, ώστε να διαβάζονται ως επιφύλαξη και όχι ως μέρος όσων κατέχετε.',
+  'serials.none': 'Δεν έχουν καταγραφεί τεύχη ακόμη',
   'serials.noneBody': 'Προσθέστε μία γραμμή για κάθε τμήμα τόμων που βρίσκεται στο ράφι.',
   'serials.nth': 'Δήλωση {n}',
   'serials.caption': 'Πώς ονομάζεται η αρίθμηση',
@@ -3446,8 +3466,8 @@ const el: Dict = {
   'serials.addOne': '+ Προσθήκη δήλωσης',
   'serials.moveUp': 'Μετακίνηση πιο πάνω',
   'serials.moveDown': 'Μετακίνηση πιο κάτω',
-  'serials.saveAll': 'Αποθήκευση σειράς',
-  'serials.saved': 'Η σειρά αποθηκεύτηκε.',
+  'serials.saveAll': 'Αποθήκευση των τευχών',
+  'serials.saved': 'Τα τεύχη αποθηκεύτηκαν.',
   'serials.unspecified': '(απροσδιόριστο)',
   'authorities.heading': 'Καθιερωμένες αποδόσεις',
   'authorities.intro': 'Μία καταχώριση για κάθε πρόσωπο, φορέα, εκδότη ή θέμα, με τις άλλες γραφές καταγεγραμμένες κάτω από αυτήν. Το ελεύθερο κείμενο κάθε βιβλίου παραμένει ακριβώς όπως καταλογογραφήθηκε· η καθιερωμένη απόδοση δείχνει, δεν ξαναγράφει. Από εδώ βγαίνουν τα MARC 100, 700 και 650.',
@@ -3484,13 +3504,18 @@ const el: Dict = {
   'authorities.notes': 'Σημείωση',
   'authorities.needForm': 'Ο καθιερωμένος τύπος είναι υποχρεωτικός.',
   'authorities.saved': 'Η απόδοση αποθηκεύτηκε.',
-  'authorities.retire': 'Απόσυρση',
-  'authorities.retireTitle': 'Απόσυρση αυτής της απόδοσης;',
-  'authorities.retireBody': 'Η «{form}» δεν χρησιμοποιείται σε καμία εγγραφή και θα αποσυρθεί.',
-  'authorities.retireBodyUsed': 'Η «{form}» βρίσκεται σε {n} εγγραφές. Η απόσυρση αποσυνδέει όλες — τα βιβλία κρατούν το δικό τους κείμενο, αλλά η απόδοση χάνεται. Για να διορθώσετε μια γραφή, επεξεργαστείτε την: η επεξεργασία κρατά όλες τις συνδέσεις.',
-  'authorities.retired': 'Η απόδοση αποσύρθηκε.',
+  // «Απόσυρση» is reserved for a physical copy leaving the collection — an
+  // irreversible, ISO 2789-reportable act (`copies.withdraw`, and the Handbook
+  // glossary at el.ts:916 defines it as exactly that). Using the same label on a
+  // heading made two different irreversible acts on two different objects look
+  // like one; the Greek prose already calls this one «κατάργηση» (el.ts:431,433).
+  'authorities.retire': 'Κατάργηση',
+  'authorities.retireTitle': 'Κατάργηση αυτής της απόδοσης;',
+  'authorities.retireBody': 'Η «{form}» δεν χρησιμοποιείται σε καμία εγγραφή και θα καταργηθεί.',
+  'authorities.retireBodyUsed': 'Η «{form}» βρίσκεται σε {n} εγγραφές. Η κατάργηση αποσυνδέει όλες — τα βιβλία κρατούν το δικό τους κείμενο, αλλά η απόδοση χάνεται. Για να διορθώσετε μια γραφή, επεξεργαστείτε την: η επεξεργασία κρατά όλες τις συνδέσεις.',
+  'authorities.retired': 'Η απόδοση καταργήθηκε.',
   'authorities.usedByList': 'Σε {n} εγγραφές',
-  'authorities.editKeepsLinks': 'Η αποθήκευση κρατά όλες αυτές τις συνδέσεις. Γι’ αυτό υπάρχει η επεξεργασία — η απόσυρση και εκ νέου δημιουργία θα τις έχανε.',
+  'authorities.editKeepsLinks': 'Η αποθήκευση κρατά όλες αυτές τις συνδέσεις. Γι’ αυτό υπάρχει η επεξεργασία — η κατάργηση και εκ νέου δημιουργία θα τις έχανε.',
   'authorities.onBook': 'Καθιερωμένες αποδόσεις',
   'authorities.noLinks': 'Δεν έχουν συνδεθεί αποδόσεις ακόμη',
   'authorities.addLink': 'Σύνδεση απόδοσης',
@@ -3545,16 +3570,22 @@ const el: Dict = {
   'borrowers.deleteTitle': 'Διαγραφή αυτού του αναγνώστη;',
   'borrowers.deleteBody': 'Ο «{name}» και οι {n} εγγραφές δανεισμού του θα αφαιρεθούν. Αν θέλετε μόνο να σβήσετε τα προσωπικά του στοιχεία, χρησιμοποιήστε την Ανωνυμοποίηση — το ιστορικό μένει ως ανώνυμα στοιχεία.',
   'borrowers.deleted': 'Ο αναγνώστης διαγράφηκε.',
-  'borrowers.hasOpenLoans': 'Ο αναγνώστης έχει ακόμη {n} βιβλία. Παραλάβετέ τα πρώτα.',
+  // Same reversal as `copies.onLoan`: «Παραλάβετέ τα» named the reader's action.
+  'borrowers.hasOpenLoans': 'Ο αναγνώστης έχει ακόμη βιβλία σε δανεισμό: {n}. Δεχθείτε πρώτα την επιστροφή τους (📥 Επιστροφή).',
   'borrowers.export': 'Εξαγωγή των δεδομένων του',
   'borrowers.exported': 'Τα δεδομένα κατέβηκαν.',
   'borrowers.erase': 'Ανωνυμοποίηση',
   'borrowers.eraseTitle': 'Ανωνυμοποίηση των προσωπικών δεδομένων;',
-  'borrowers.eraseBody': 'Το «{name}» αντικαθίσταται από ψευδώνυμο όπου κι αν εμφανίζεται — στην εγγραφή του αναγνώστη, σε κάθε δανεισμό, σε κάθε κράτηση στη σειρά και στο ημερολόγιο ενεργειών. Τα αριθμητικά στοιχεία δανεισμού μένουν ως ανώνυμη στατιστική. Δεν αναιρείται.',
+  // «στη σειρά» alone could be read as a bibliographic series; the Handbook says
+  // «στη σειρά αναμονής» in this very sentence (el.ts:876).
+  'borrowers.eraseBody': 'Το «{name}» αντικαθίσταται από ψευδώνυμο όπου κι αν εμφανίζεται — στην εγγραφή του αναγνώστη, σε κάθε δανεισμό, σε κάθε κράτηση στη σειρά αναμονής και στο ημερολόγιο ενεργειών. Τα αριθμητικά στοιχεία δανεισμού μένουν ως ανώνυμη στατιστική. Δεν αναιρείται.',
   'borrowers.erased': 'Ανωνυμοποιήθηκε. Ο αναγνώστης εμφανίζεται τώρα ως {name}.',
   'library.sets.groupCount': '{n} ομάδες.',
   'library.sets.showingOf': 'Εμφανίζονται {shown} από {matched} ομάδες.',
-  'library.sets.suppressed': 'Άλλες {n} είναι κρυμμένες: κάθε τίτλος ίδιος με το όνομα της ομάδας και κανένας αριθμός τόμου — καμία ένδειξη σειράς.',
+  // «καμία ένδειξη σειράς» named the multi-part set with the word this file
+  // reserves for the bibliographic series; the toggle for the same feature
+  // (`library.sets.mode`) already said «σύνολα», as does the Handbook.
+  'library.sets.suppressed': 'Άλλες {n} είναι κρυμμένες: κάθε τίτλος ίδιος με το όνομα της ομάδας και κανένας αριθμός τόμου — καμία ένδειξη πολύτομου συνόλου.',
   'tab.handbook': 'Εγχειρίδιο',
   'handbook.title': 'Εγχειρίδιο του βιβλιοθηκονόμου',
   'handbook.description': 'Το μέρος αναφοράς του οδηγού: σε τι χρησιμεύει κάθε πεδίο, πώς καταγράφονται οι δύσκολες περιπτώσεις και ποιο πρότυπο το ορίζει.',
@@ -4199,7 +4230,7 @@ const el: Dict = {
   'loans.dueOverride': 'Παράκαμψη του κανόνα για αυτόν τον δανεισμό.',
   'loans.useRule': 'Με τον κανόνα',
   'holds.heading': 'Ράφι κρατήσεων ({n})',
-  'holds.intro': 'Αντίτυπα που περιμένουν πίσω από το γραφείο, και αναγνώστες που είναι ακόμη στη σειρά. Ένα αντίτυπο που επιστρέφει πηγαίνει σε όποιον είναι πρώτος.',
+  'holds.intro': 'Αντίτυπα που περιμένουν πίσω από το γραφείο, και αναγνώστες που είναι ακόμη στη σειρά αναμονής. Ένα αντίτυπο που επιστρέφει πηγαίνει σε όποιον είναι πρώτος.',
   'holds.forReader': 'Για {name}',
   'holds.ready': 'Έτοιμο',
   'holds.until': 'κρατείται έως {date}',
@@ -4207,8 +4238,8 @@ const el: Dict = {
   'holds.cancel': 'Ακύρωση',
   'holds.place': 'Κράτηση',
   'holds.promptBorrower': 'Για ποιον είναι η κράτηση; (όνομα αναγνώστη)',
-  'holds.queueHeading': 'Σειρά κρατήσεων ({n})',
-  'toast.holdPlaced': 'Ο/Η {name} είναι νούμερο {n} στη σειρά.',
+  'holds.queueHeading': 'Σειρά αναμονής κρατήσεων ({n})',
+  'toast.holdPlaced': 'Ο/Η {name} είναι νούμερο {n} στη σειρά αναμονής.',
   'toast.holdReady': 'Ένα αντίτυπο κρατείται για {name}.',
   'toast.holdCancelled': 'Η κράτηση ακυρώθηκε.',
   'toast.holdCancelledPassed': 'Η κράτηση ακυρώθηκε — το αντίτυπο περνά στον/στην {name}.',
