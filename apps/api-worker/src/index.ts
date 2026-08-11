@@ -2974,6 +2974,15 @@ app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) 
 		// purged record left rows in `book_authorities` pointing at an id that no
 		// longer exists, which then inflated every heading's use count.
 		c.env.DB.prepare('DELETE FROM book_authorities WHERE book_id = ?').bind(id),
+		// The hold queue. Missed the same way `book_authorities` was, and with a
+		// harsher symptom: `holds.book_id` is `NOT NULL REFERENCES books(id)` with no
+		// cascade (migration 0029) and `holds.item_id REFERENCES items(id)`, so a
+		// record that had EVER been held — including holds long since fulfilled or
+		// cancelled — tripped the foreign key on the items delete below and again on
+		// the book delete. Purge answered 500 every time, for good: the record could
+		// not be removed from the trash by any route, while the Trash screen kept
+		// offering a button that could only fail. Must precede `items`.
+		c.env.DB.prepare('DELETE FROM holds WHERE book_id = ?').bind(id),
 		c.env.DB.prepare('DELETE FROM items WHERE book_id = ?').bind(id),
 		// A record that absorbed a merge is pointed at by its tombstones, and
 		// `merged_into` is a real foreign key — without this the DELETE below
@@ -8543,8 +8552,27 @@ app.delete('/api/borrowers/:id', requirePermission('circulation', { librarian: t
 	if (inUse && inUse.n > 0) {
 		throw new HTTPException(409, { message: `Cannot delete: borrower has ${inUse.n} loan(s) on record. Use /erase to anonymize.` });
 	}
-	const result = await c.env.DB.prepare('DELETE FROM borrowers WHERE id = ?').bind(id).run();
-	if ((result.meta?.changes ?? 0) === 0) {
+	// Holds need the same consideration, and did not get it. `holds.borrower_id`
+	// references borrowers(id) with no cascade, so a reader who had ever placed a
+	// hold could not be deleted at all: the DELETE tripped the foreign key and the
+	// route answered an opaque 500 — no 409 explaining the problem, no way through.
+	//
+	// A LIVE hold is refused, like a loan, because it is a place in a queue that
+	// someone is still waiting on. A CLOSED one is not history the way a loan is —
+	// it records a wait that ended — so it goes with the reader.
+	const liveHolds = await c.env.DB.prepare(
+		`SELECT COUNT(*) AS n FROM holds WHERE borrower_id = ? AND status IN ('waiting', 'ready')`
+	).bind(id).first<{ n: number }>();
+	if (liveHolds && liveHolds.n > 0) {
+		throw new HTTPException(409, {
+			message: `Cannot delete: borrower has ${liveHolds.n} active hold(s). Cancel them first, or use /erase to anonymize.`
+		});
+	}
+	const [, result] = await runAtomic(c.env, [
+		c.env.DB.prepare('DELETE FROM holds WHERE borrower_id = ?').bind(id),
+		c.env.DB.prepare('DELETE FROM borrowers WHERE id = ?').bind(id)
+	]);
+	if ((result?.meta?.changes ?? 0) === 0) {
 		throw new HTTPException(404, { message: 'Borrower not found' });
 	}
 	await insertAuditLog(c.env, c.get('user').sub, 'borrower.delete', 'borrower', id, {});

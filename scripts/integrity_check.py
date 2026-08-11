@@ -2692,6 +2692,103 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 58. REGRESSION: a hold must not make a record or a reader undeletable ===")
+# STRUCTURAL, not behavioural: every table that points at books(id) or items(id)
+# WITHOUT a declared cascade must be named in the purge handler, or purging trips a
+# foreign key and the record is stuck in the trash for good. Two tables have now
+# been missed this way — `book_authorities` and `holds` — so the next one should be
+# caught by the build rather than by a librarian pressing a button that only fails.
+if LOCAL:
+    _tables = local_sql("SELECT name, sql FROM sqlite_master WHERE type='table'") or []
+    _wsrc = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+    _purge_src = _wsrc[_wsrc.index("app.delete('/api/books/:id/purge'"):]
+    _purge_src = _purge_src[:_purge_src.index("bumpBooksCacheVersion")]
+    _missing = []
+    for _t in _tables:
+        _sql = (_t.get("sql") or "")
+        for _m in re.finditer(r'REFERENCES\s+(books|items)\s*\(\s*id\s*\)([^,\n)]*)', _sql, re.I):
+            _parent, _tail = _m.group(1), _m.group(2)
+            if re.search(r'ON\s+DELETE\s+(CASCADE|SET\s+NULL)', _tail, re.I):
+                continue
+            _child = _t["name"]
+            if _child == "books":
+                continue  # books.merged_into is handled by an UPDATE, not a DELETE
+            if f"FROM {_child} WHERE" not in _purge_src:
+                _missing.append(f"{_child} -> {_parent} (ON DELETE NO ACTION)")
+    check("the purge cascade names every table that blocks a hard delete",
+          not _missing, sorted(set(_missing)))
+
+
+uniq = uuid.uuid4().hex[:8]
+
+# `holds.book_id` is NOT NULL REFERENCES books(id) with no cascade, and
+# `holds.item_id` references items(id) (migration 0029). The purge batch named eight
+# child tables and not `holds`, so a record that had EVER been held — including
+# holds long since fulfilled or cancelled — tripped the foreign key twice over.
+# Purge answered 500 for good: the record could not leave the trash by any route,
+# while the Trash screen kept offering a button that could only fail.
+st, mk = call("POST", "/api/books", {"title": f"ZZHOLDFK {uniq}", "author": "ZZ"})
+bid = (mk or {}).get("id")
+st, br = call("POST", "/api/borrowers", {"name": f"ZZHOLDFK reader {uniq}"})
+brid = (br or {}).get("borrower", br or {}).get("id")
+if bid and brid:
+    st, _ = call("POST", f"/api/books/{bid}/holds", {"borrowerId": brid})
+    check("a hold can be placed on the probe record", st in (200, 201), st)
+    # Cancel it, so what remains is only hold HISTORY — the case that used to 500.
+    rows = local_sql(f"SELECT id FROM holds WHERE book_id = '{bid}'") if LOCAL else None
+    if rows:
+        call("DELETE", f"/api/holds/{rows[0]['id']}")
+    st, _ = call("DELETE", f"/api/books/{bid}")
+    st, body = call("DELETE", f"/api/books/{bid}/purge")
+    check("a record that was once held can still be purged", st == 204, f"{st} {str(body)[:120]}")
+    # NOT via GET: a soft-deleted record 404s too, so a purge that failed and left
+    # the book sitting in the trash satisfied that form of the check. Ask the table.
+    _left = local_sql(f"SELECT COUNT(*) AS n FROM books WHERE id = '{bid}'") if LOCAL else None
+    if LOCAL:
+        check("and the row is really gone, not just hidden",
+              _left and int(_left[0]["n"]) == 0, _left[0]["n"] if _left else "query failed")
+    else:
+        st, _ = call("GET", f"/api/books/{bid}")
+        check("and the row is really gone, not just hidden", st == 404, st)
+
+    # The same foreign key from the other side. The route already refused a borrower
+    # with loan history via a helpful 409; a borrower with hold history got an opaque
+    # 500 instead of either outcome.
+    st, mk2 = call("POST", "/api/books", {"title": f"ZZHOLDFK2 {uniq}", "author": "ZZ"})
+    bid2 = (mk2 or {}).get("id")
+    st, br2 = call("POST", "/api/borrowers", {"name": f"ZZHOLDFK reader2 {uniq}"})
+    brid2 = (br2 or {}).get("borrower", br2 or {}).get("id")
+    if bid2 and brid2:
+        CREATED.append(bid2)
+        call("POST", f"/api/books/{bid2}/holds", {"borrowerId": brid2})
+        st, body = call("DELETE", f"/api/borrowers/{brid2}")
+        check("deleting a reader with a LIVE hold is refused, and says why",
+              st == 409 and "hold" in str(body).lower(), f"{st} {str(body)[:140]}")
+        rows2 = local_sql(f"SELECT id FROM holds WHERE borrower_id = '{brid2}'") if LOCAL else None
+        if rows2:
+            call("DELETE", f"/api/holds/{rows2[0]['id']}")
+        st, body = call("DELETE", f"/api/borrowers/{brid2}")
+        check("and once it is cancelled the reader can be deleted",
+              st == 204, f"{st} {str(body)[:120]}")
+        if LOCAL:
+            left = local_sql(f"SELECT COUNT(*) AS n FROM holds WHERE borrower_id = '{brid2}'")
+            check("leaving no hold row pointing at a reader who no longer exists",
+                  left and int(left[0]["n"]) == 0, left[0]["n"] if left else "query failed")
+
+# The general form, over the whole table: no hold may reference a book, item or
+# borrower that is gone. This is what both bugs above would have produced had the
+# foreign keys not been enforced.
+if LOCAL:
+    dangling = local_sql("""SELECT
+          (SELECT COUNT(*) FROM holds h WHERE NOT EXISTS (SELECT 1 FROM books b WHERE b.id = h.book_id)) AS no_book,
+          (SELECT COUNT(*) FROM holds h WHERE h.item_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM items i WHERE i.id = h.item_id)) AS no_item,
+          (SELECT COUNT(*) FROM holds h WHERE h.borrower_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM borrowers b WHERE b.id = h.borrower_id)) AS no_borrower""")
+    check("no hold points at a book, copy or reader that is gone",
+          dangling and all(int(dangling[0][k]) == 0 for k in ("no_book", "no_item", "no_borrower")),
+          dangling[0] if dangling else "query failed")
+
 print("=== 57. REGRESSION: refusals must not half-apply, and cursors must not skip ===")
 uniq = uuid.uuid4().hex[:8]
 
