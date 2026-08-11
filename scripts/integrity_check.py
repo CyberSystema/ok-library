@@ -2692,6 +2692,71 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 63. REGRESSION: an expired hold advances every queue, and the promotion pins a copy ===")
+uniq = uuid.uuid4().hex[:6]
+
+# Expiry is only evaluated on READ — there is no scheduled handler — so two titles
+# whose pickup windows lapse together is the normal state after a weekend. Two
+# defects turned that into readers stranded rather than delayed:
+#
+#   * the promotion subquery ended in a bare LIMIT 1 across every affected title,
+#     so exactly ONE queue advanced per sweep; and because the outer match is
+#     `closed_at = <this sweep's now>`, no later sweep could ever repair the rest.
+#   * the promotion set only `status`, leaving item_id and expires_at NULL. Such a
+#     hold pins no copy, is invisible to fillNextHold (which looks for 'waiting'),
+#     and can never lapse — so a walk-in could borrow the copy, the next return
+#     would skip that reader for the person behind them, and the unique index
+#     would refuse them a fresh hold. Promoted for good, served never.
+if LOCAL:
+    def _mkbook63(title):
+        st, r = call("POST", "/api/books", {"title": title, "author": "ZZ"})
+        return (r or {}).get("id")
+
+    def _mkreader63(name):
+        st, r = call("POST", "/api/borrowers", {"name": name})
+        return (r or {}).get("borrower", r or {}).get("id")
+
+    _b1, _b2 = _mkbook63("ZZHOLD1 " + uniq), _mkbook63("ZZHOLD2 " + uniq)
+    _rr = [_mkreader63("ZZHOLD r%d %s" % (i, uniq)) for i in range(4)]
+    if _b1 and _b2 and all(_rr):
+        CREATED.extend([_b1, _b2])
+        # Each title: one reader takes the free copy (goes 'ready'), one queues behind.
+        for _b, _head, _next in ((_b1, _rr[0], _rr[1]), (_b2, _rr[2], _rr[3])):
+            call("POST", "/api/books/%s/holds" % _b, {"borrowerId": _head})
+            call("POST", "/api/books/%s/holds" % _b, {"borrowerId": _next})
+        # Force both pickup windows to have lapsed.
+        local_sql(
+            "UPDATE holds SET expires_at = '2020-01-01T00:00:00.000Z' "
+            "WHERE book_id IN ('%s', '%s') AND status = 'ready'" % (_b1, _b2))
+        # ONE read of the hold shelf must repair BOTH queues.
+        call("GET", "/api/holds")
+        rows = local_sql(
+            "SELECT book_id, status, (item_id IS NOT NULL) AS pins, "
+            "(expires_at IS NOT NULL) AS clock FROM holds "
+            "WHERE book_id IN ('%s', '%s')" % (_b1, _b2)) or []
+        ready = [r for r in rows if r["status"] == "ready"]
+        check("one sweep advances the queue of EVERY title whose hold lapsed",
+              len(set(r["book_id"] for r in ready)) == 2, rows)
+        check("and each promoted hold actually pins a copy",
+              bool(ready) and all(int(r["pins"]) == 1 for r in ready), ready)
+        check("and carries a pickup deadline, so it can lapse in its turn",
+              bool(ready) and all(int(r["clock"]) == 1 for r in ready), ready)
+        # The invariant behind all of it, stated over the whole table.
+        bad = local_sql("SELECT COUNT(*) AS n FROM holds WHERE status = 'ready' "
+                        "AND (item_id IS NULL OR expires_at IS NULL)")
+        check("no ready hold anywhere lacks a copy or a deadline",
+              bool(bad) and int(bad[0]["n"]) == 0,
+              bad[0]["n"] if bad else "query failed")
+        _nowz = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        # Close this section's own holds. The two probe books are purged with
+        # CREATED, but a hold outlives a soft-delete, and the invariant above is
+        # global — so residue from THIS section would fail the NEXT run and read as
+        # a live defect. (Which is how it was found: a run against deliberately
+        # reverted code left exactly such a row behind.)
+        local_sql("UPDATE holds SET status = 'cancelled', closed_at = '%s', updated_at = '%s' "
+                  "WHERE book_id IN ('%s', '%s') AND status IN ('waiting', 'ready')"
+                  % (_nowz, _nowz, _b1, _b2))
+
 print("=== 62. REGRESSION: D1's 100-parameter ceiling ===")
 uniq = uuid.uuid4().hex[:8]
 

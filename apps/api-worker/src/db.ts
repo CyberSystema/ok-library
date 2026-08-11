@@ -883,7 +883,16 @@ export async function countOpenLoansFor(env: Env, borrowerId: string): Promise<n
  * copy held for someone who stopped coming three weeks ago. A hold that has
  * expired stops holding its copy immediately; the next return re-offers it.
  */
-export async function expireStaleHolds(env: Env, now: string): Promise<number> {
+export async function expireStaleHolds(
+  env: Env,
+  now: string,
+  /**
+   * When the copy freed by an expiry is put aside for the next reader, this is
+   * when THEIR pickup window closes. Passed in because the shelf period is
+   * circulation policy and belongs with the rest of it, not in this module.
+   */
+  shelfExpiresAt?: string
+): Promise<number> {
   const res = await env.DB.prepare(
     `UPDATE holds SET status = 'expired', closed_at = ?, updated_at = ?
       WHERE status = 'ready' AND expires_at IS NOT NULL AND expires_at < ?`
@@ -895,22 +904,53 @@ export async function expireStaleHolds(env: Env, now: string): Promise<number> {
   // available, and nothing promoted the next 'waiting' hold until someone
   // borrowed and returned the book again.
   //
-  // Promotion is deliberately just 'waiting' -> 'ready' with no expiry set here.
-  // The pickup clock belongs to the desk — it starts when the copy is put aside
-  // for a named reader, which is what `fillNextHold` does on a real return, and
-  // this sweep runs on any read of the queue.
+  // Two things were then wrong with the promotion itself, and both stranded a
+  // reader rather than merely delaying them.
+  //
+  // ONE PER BOOK, not one per sweep. The subquery ended in a bare `LIMIT 1` over
+  // every affected title, so when two titles' pickup windows lapsed together —
+  // the normal state after a weekend, since expiry is only evaluated on read —
+  // exactly one queue advanced. And because the outer match is
+  // `closed_at = <this sweep's now>`, no later sweep could repair the other: its
+  // own `now` differs, so those expired rows never match again. The correlated
+  // `h.rowid = (head of THIS book's queue)` promotes the head of each affected
+  // title instead.
+  //
+  // AND IT MUST PIN THE COPY. The promotion set only `status`, leaving item_id
+  // and expires_at NULL. A 'ready' hold with no item_id pins nothing (a copy is
+  // considered free unless a ready hold NAMES it), is invisible to
+  // `fillNextHold` (which looks for 'waiting'), and can never lapse (expiry
+  // requires expires_at IS NOT NULL) — so a walk-in could borrow the copy that
+  // reader was promoted to, the next return would skip them for the person
+  // behind them, and the unique index would refuse them a fresh hold. Promoted
+  // for good, served never. It now carries over the freed copy and starts the
+  // pickup clock, exactly as `fillNextHold` does, and promotes only when there
+  // is a copy to carry — otherwise the reader stays 'waiting', which is the
+  // state `fillNextHold` can still serve.
   if (expired > 0) {
     await env.DB.prepare(
-      `UPDATE holds SET status = 'ready', updated_at = ?
+      `UPDATE holds
+          SET status = 'ready',
+              item_id = (SELECT x.item_id FROM holds x
+                          WHERE x.book_id = holds.book_id AND x.status = 'expired'
+                            AND x.closed_at = ? AND x.item_id IS NOT NULL
+                          LIMIT 1),
+              ready_at = ?,
+              expires_at = ?,
+              updated_at = ?
         WHERE id IN (
           SELECT h.id FROM holds h
            WHERE h.status = 'waiting'
-             AND h.book_id IN (SELECT book_id FROM holds WHERE status = 'expired' AND closed_at = ?)
-             AND NOT EXISTS (SELECT 1 FROM holds r WHERE r.book_id = h.book_id AND r.status = 'ready')
-           ORDER BY h.placed_at ASC, h.rowid ASC
-           LIMIT 1
+             AND h.book_id IN (SELECT book_id FROM holds
+                                WHERE status = 'expired' AND closed_at = ? AND item_id IS NOT NULL)
+             AND NOT EXISTS (SELECT 1 FROM holds r
+                              WHERE r.book_id = h.book_id AND r.status = 'ready')
+             AND h.rowid = (SELECT h2.rowid FROM holds h2
+                             WHERE h2.book_id = h.book_id AND h2.status = 'waiting'
+                             ORDER BY h2.placed_at ASC, h2.rowid ASC
+                             LIMIT 1)
         )`
-    ).bind(now, now).run();
+    ).bind(now, now, shelfExpiresAt ?? null, now, now).run();
   }
   return expired;
 }

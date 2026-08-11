@@ -3809,7 +3809,7 @@ async function fillNextHold(
 	now: string
 ): Promise<{ id: string; borrowerName: string; expiresAt: string } | null> {
 	if (!itemId) return null;
-	await expireStaleHolds(c.env, now);
+	await expireStaleHolds(c.env, now, dueDateFromPolicy(HOLD_SHELF_DAYS, new Date(now)));
 
 	const next = await c.env.DB.prepare(
 		`SELECT id, borrower_name FROM holds
@@ -3832,7 +3832,8 @@ async function fillNextHold(
 
 app.get('/api/books/:id/holds', requirePermission('circulation', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id') ?? '';
-	await expireStaleHolds(c.env, nowIso());
+	const _hnow = nowIso();
+	await expireStaleHolds(c.env, _hnow, dueDateFromPolicy(HOLD_SHELF_DAYS, new Date(_hnow)));
 	const rows = await c.env.DB.prepare(
 		`SELECT h.*, i.copy_number, i.shelf_code FROM holds h
 		   LEFT JOIN items i ON i.id = h.item_id
@@ -3875,7 +3876,7 @@ app.post('/api/books/:id/holds', requirePermission('circulation', { librarian: t
 
 	const { borrowerId, borrowerName, borrowerContact } = await resolveBorrower(c.env, payload);
 	const now = nowIso();
-	await expireStaleHolds(c.env, now);
+	await expireStaleHolds(c.env, now, dueDateFromPolicy(HOLD_SHELF_DAYS, new Date(now)));
 
 	// A reader already holding a copy does not need to queue for it.
 	const alreadyOut = borrowerId
@@ -3959,7 +3960,8 @@ app.delete('/api/holds/:id', requirePermission('circulation', { librarian: true 
 // Every copy waiting behind the desk, across the catalogue — the shelf the
 // librarian actually has to walk past.
 app.get('/api/holds', requirePermission('circulation', { librarian: true }), async (c) => {
-	await expireStaleHolds(c.env, nowIso());
+	const _shelfNow = nowIso();
+	await expireStaleHolds(c.env, _shelfNow, dueDateFromPolicy(HOLD_SHELF_DAYS, new Date(_shelfNow)));
 	const rows = await c.env.DB.prepare(
 		`SELECT h.id, h.book_id, h.borrower_name, h.borrower_contact, h.status,
 		        h.placed_at, h.ready_at, h.expires_at, h.item_id,
