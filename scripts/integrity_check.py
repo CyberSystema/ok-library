@@ -1324,7 +1324,14 @@ try:
     for leaked in ["borrower", "ZZ Borrower", "@example", "password"]:
         check(f"SRU does not expose {leaked!r}", leaked.lower() not in body.lower(), leaked)
 finally:
-    call("PUT", "/api/library-settings", {"publicSharing": None, "isil": None, "libraryName": None})
+    # Shut the door this section opened, whatever happened above — the catalogue
+    # must not be left publicly harvestable by a failed assertion. It shuts rather
+    # than restores on purpose: §46 below proves the doors are closed before it
+    # opens them, and failing closed is the safe direction for a switch. The
+    # ORIGINAL sharing value — which may legitimately be "on" — goes back with the
+    # rest of the identity record in CLEANUP. This used to null isil and
+    # libraryName here too, which is what §46's snapshot then read as "prior".
+    call("PUT", "/api/library-settings", {"publicSharing": "off"})
 
 print("=== 38. REGRESSION: merging duplicate records ===")
 # The cleanup the holdings layer exists for: a book catalogued once per shelf
@@ -1890,7 +1897,11 @@ print("=== 46. REGRESSION: library identity and the sharing switch ===")
 # only thing keeping SRU and OAI shut, could not be switched on at all.
 st, before = call("GET", "/api/library-settings")
 check("library settings are readable", st == 200 and "settings" in (before or {}), st)
-prior = (before or {}).get("settings", {})
+# This section used to take its own `prior` snapshot HERE and restore it at the
+# end. Here is after §37 has run, and §37's finally had just nulled isil,
+# libraryName and publicSharing — so the "restore" wrote nulls over the library's
+# real identity and reported nothing. The one snapshot that matters was taken
+# before §35, and LIBRARY_SETTINGS_BEFORE goes back in CLEANUP.
 
 check("SRU is shut before sharing is enabled", anon("/api/sru?operation=explain")[0] == 503)
 check("OAI is shut before sharing is enabled", anon("/api/oai?verb=Identify")[0] == 503)
@@ -1919,9 +1930,6 @@ check("an unwhitelisted setting is refused", "zzBogusKey" not in (after or {}).g
 call("PUT", "/api/library-settings", {"publicSharing": "off"})
 check("SRU shuts again when sharing is turned off", anon("/api/sru?operation=explain")[0] == 503)
 check("OAI shuts again when sharing is turned off", anon("/api/oai?verb=Identify")[0] == 503)
-# Restore whatever the database had before this section ran.
-call("PUT", "/api/library-settings", {k: prior.get(k) for k in
-     ("isil", "libraryName", "libraryPlace", "catalogueLanguage", "publicSharing")})
 
 print("=== 47. REGRESSION: rooms and the trash ===")
 uniq = uuid.uuid4().hex[:6]
@@ -1951,6 +1959,29 @@ check("a book can actually be filed in the room it was given", get(rb).get("room
 st, listed = call("GET", "/api/rooms")
 mine = next((r for r in (listed or {}).get("items", []) if r["id"] == rid), None)
 check("the count follows the books", (mine or {}).get("bookCount") == 1, mine)
+
+# The two room buckets must be a true partition of the catalogue, or the Library
+# tab's tiles silently under- or double-count.
+#
+# This ran at the END of the section — five lines after the fixture room had been
+# deleted, and this catalogue has no other room holding a book — so `per_room` was
+# a sum over an empty list and the assertion degenerated to `unassigned == total`:
+# the residual bucket compared against itself, with the LEFT JOIN half it exists
+# to check never exercised. It runs here instead, while the room holds its one
+# book, and asserts both halves: the per-room count, and the partition.
+st, summary = call("GET", "/api/rooms/summary")
+per_room = sum(int(r.get("total_books") or 0) for r in (summary or {}).get("items", []))
+unassigned = int(((summary or {}).get("unassigned") or {}).get("totalBooks") or 0)
+st, all_books = call("GET", "/api/books?pageSize=1")
+_fixture = next((r for r in (summary or {}).get("items", []) if r.get("id") == rid), None)
+# `>= 1`, not `== 1`: the summary sums every room, and a real catalogue running
+# this gate has rooms of its own with books in them.
+check("the room's own book reaches the per-room half of the summary",
+      _fixture is not None and int(_fixture.get("total_books") or 0) == 1 and per_room >= 1,
+      f"fixture={_fixture}, per_room={per_room}")
+check("per-room plus unassigned equals the whole catalogue",
+      per_room + unassigned == (all_books or {}).get("total"),
+      f'{per_room} + {unassigned} vs {(all_books or {}).get("total")}')
 
 # Renaming carries the books. SQLite's foreign keys are immediate, so the naive
 # ordering cannot work and used to 500.
@@ -1983,16 +2014,6 @@ st, _ = call("DELETE", f"/api/books/{rb}/purge")
 check("purge destroys it", st == 204 and get(rb) is None, st)
 st, gone = call("DELETE", f"/api/rooms/{rid}")
 check("the room deletes once nothing references it", st == 204, f"{st} {gone}")
-
-# The two room buckets must be a true partition of the catalogue, or the Library
-# tab's tiles silently under-count.
-st, summary = call("GET", "/api/rooms/summary")
-per_room = sum(int(r.get("total_books") or 0) for r in (summary or {}).get("items", []))
-unassigned = int(((summary or {}).get("unassigned") or {}).get("totalBooks") or 0)
-st, all_books = call("GET", "/api/books?pageSize=1")
-check("per-room plus unassigned equals the whole catalogue",
-      per_room + unassigned == (all_books or {}).get("total"),
-      f'{per_room} + {unassigned} vs {(all_books or {}).get("total")}')
 
 print("=== 48. REGRESSION: MARC 21 exchange speaks the standard's language ===")
 uniq = uuid.uuid4().hex[:8]
@@ -2353,7 +2374,12 @@ try:
     check("SRU carries the run too", 'tag="866"' in sru, sru[:220])
 finally:
     call("PUT", "/api/library-settings", {"publicSharing": "off"})
-exported, distinct, tail, size = count_records("/api/export/books.marcxml")
+# ONE fetch of the bulk export, not two. There used to be a
+# `count_records("/api/export/books.marcxml")` on the line above whose four return
+# values were never read again — §48 has already counted its own copy — so every
+# run rendered all ~12,500 records to MARCXML three times and used one of them.
+# Against the deployed Worker that is ~25,000 wasted D1 row reads and ~42 MB of
+# egress on a free tier where the budgets are the documented constraint.
 st, bulk = call_text("GET", "/api/export/books.marcxml")
 check("and so does the bulk export", bulk.count('tag="866"') >= 2, bulk.count('tag="866"'))
 
@@ -2374,12 +2400,14 @@ if LOCAL:
     call("PUT", f"/api/books/{pb}/serial-holdings",
          {"expectedVersion": get(pb)["version"], "holdings": [{"caption": "τόμος", "fromVolume": "1"}]})
     rows = local_sql(f"SELECT COUNT(*) AS n FROM serial_holdings WHERE book_id = '{pb}'")
-    check("the run is stored against the record", int((rows or [{}])[0].get("n") or 0) == 1, rows)
+    check("the run is stored against the record", sql_count(rows) == 1, rows)
     call("DELETE", f"/api/books/{pb}")
     call("DELETE", f"/api/books/{pb}/purge")
     rows = local_sql(f"SELECT COUNT(*) AS n FROM serial_holdings WHERE book_id = '{pb}'")
-    check("and purging the record takes the run with it",
-          int((rows or [{}])[0].get("n") or 0) == 0, rows)
+    # sql_count, not `int((rows or [{}])[0].get("n") or 0)`: that form read a probe
+    # that never ran as "no rows left" and passed. Renaming serial_holdings in a
+    # migration would have reported this cascade as working.
+    check("and purging the record takes the run with it", sql_count(rows) == 0, rows)
 else:
     print("  SKIP  2 cascade checks need direct D1 access (local runs only)")
 
@@ -2513,8 +2541,11 @@ if LOCAL:
     call("DELETE", f"/api/books/{pb2}")
     call("DELETE", f"/api/books/{pb2}/purge")
     rows = local_sql(f"SELECT COUNT(*) AS n FROM book_authorities WHERE book_id = '{pb2}'")
-    check("purging a record takes its authority links with it",
-          int((rows or [{}])[0].get("n") or 0) == 0, rows)
+    # A probe that did not run is not an empty result: sql_count returns None for
+    # it, and None == 0 is False. This is the assertion a migration renaming
+    # book_authorities would otherwise have reported as green while orphan rows
+    # accumulated and inflated every heading's use count.
+    check("purging a record takes its authority links with it", sql_count(rows) == 0, rows)
 else:
     print("  SKIP  1 purge-cascade check needs direct D1 access (local runs only)")
 
@@ -2625,8 +2656,10 @@ check("and the category is reset — it is personal data too", one.get("category
 if LOCAL:
     left = local_sql(
         "SELECT COUNT(*) AS n FROM audit_logs WHERE metadata LIKE '%ΖΖ Φοιτητής " + uniq + "%'")
-    check("and the activity log stops naming them",
-          int((left or [{}])[0].get("n") or 0) == 0, left)
+    # Through sql_count, so dropping the `metadata` column — or running the gate
+    # from another directory — fails here instead of certifying that a GDPR-erased
+    # reader is no longer named in the audit trail.
+    check("and the activity log stops naming them", sql_count(left) == 0, left)
 else:
     print("  SKIP  1 audit-log sweep check needs direct D1 access (local runs only)")
 call("DELETE", f"/api/holds/{(h or {}).get('id')}") if (h or {}).get("id") else None
@@ -2647,15 +2680,47 @@ check("and reports how many it matched before the limit",
 check("and how many groups it suppressed", isinstance((sets or {}).get("suppressed"), int),
       (sets or {}).get("suppressed"))
 
-# Every count, not a sample: this is the contract, and it is cheap to check in
-# full because the rail is a few hundred rows.
+# EVERY cluster the rail hands out, not a sample of it.
+#
+# This loop used to be `sorted(items, key=lambda x: -x["bookCount"])[:60]` — 60 of
+# the 500 rows, under a comment claiming it checked them all — and sorted
+# DESCENDING, so it looked only where a one-book discrepancy is proportionally
+# smallest. Measured on this catalogue: 449 of the 500 clusters hold five books or
+# fewer and exactly 9 of them were ever checked, while the defect this section
+# exists for ("ΤΑ ΠΟΙΗΜΑΤΑ showed 2 and opened 13") lives in clusters of two. All
+# 500 click-throughs take about 25 seconds and no KV writes — cheap GETs skip the
+# rate limiter — which is what the old comment claimed and the old loop did not do.
 mismatched = []
-for it in sorted(items, key=lambda x: -x["bookCount"])[:60]:
+for it in items:
     q = urllib.parse.urlencode({"facetField": "custom:series", "facetValue": it["title"], "pageSize": 1})
     st, listed = call("GET", "/api/books?" + q)
     if (listed or {}).get("total") != it["bookCount"]:
-        mismatched.append((it["title"][:30], it["bookCount"], (listed or {}).get("total")))
-check("every set count reproduces as a filtered list", not mismatched, mismatched[:6])
+        mismatched.append((it["title"], it["bookCount"], (listed or {}).get("total")))
+# A disagreement is re-read against a FRESH rail before it is believed. The rail's
+# counts come from a version-keyed cache read once above, and a record created
+# while the loop runs — by a later section of this suite, or by a librarian on a
+# live catalogue — moves the list total without moving that cached count. §48
+# handles the same race the same way, with a window rather than a retry. (Observed:
+# two clusters mismatched by exactly one book mid-loop and reconciled on re-read.)
+if mismatched:
+    st, fresh = call("GET", "/api/books/sets?minBooks=2&limit=500")
+    railed_now = {i["title"]: i["bookCount"] for i in (fresh or {}).get("items", [])}
+    confirmed = []
+    for title, was, opened in mismatched:
+        q = urllib.parse.urlencode({"facetField": "custom:series", "facetValue": title, "pageSize": 1})
+        st, listed = call("GET", "/api/books?" + q)
+        if (listed or {}).get("total") != railed_now.get(title):
+            confirmed.append((title[:30], railed_now.get(title), (listed or {}).get("total")))
+    mismatched = confirmed
+_matched = int((sets or {}).get("matched") or 0)
+check(f"every set count reproduces as a filtered list ({len(items)} of {_matched} clusters)",
+      not mismatched, mismatched[:6])
+# Said out loud rather than left to be inferred from the number above: the rail has
+# no offset, so the clusters past its limit cannot be fetched at all and this
+# section cannot speak for them.
+if _matched > len(items):
+    print(f"  SKIP  {_matched - len(items)} clusters are past /api/books/sets's own "
+          f"limit of 500 and unreachable (the endpoint takes no offset)")
 
 # A book whose series equals its title AND carries a volume number is volume N of
 # a work where every volume shares one title — the commonest shape of a multi-part
@@ -2714,13 +2779,43 @@ css_all = _slurp(_REPO, "apps", "web", "src", "styles.css")
 
 # The provider has to be above App, or a "?" inside the edit dialog cannot reach
 # the Handbook without a prop threaded through every form between them.
-check("the Handbook provider wraps App", "<HandbookProvider>" in main_tsx and "<App />" in main_tsx, None)
+#
+# The NESTING is the property, so the nesting is what is matched. Testing that both
+# tags appear somewhere in main.tsx said nothing: `<HandbookProvider></HandbookProvider>`
+# followed by a sibling `<App />` satisfied it, and every HelpLink in the app would
+# throw the moment a librarian pressed "?".
+check("the Handbook provider wraps App",
+      re.search(r"<HandbookProvider>\s*<App />\s*</HandbookProvider>", main_tsx) is not None,
+      main_tsx[main_tsx.find("<HandbookProvider"):][:120] if "<HandbookProvider" in main_tsx else "absent")
 
 # The "?" opens a DRAWER and never switches tab. Switching would unmount the edit
 # form and lose every keystroke the librarian typed — which is what they opened
 # the Handbook to finish.
-check("the help link never changes the current section",
-      "setCurrentSection" not in hb_ctx and "setCurrentSection" not in hb_idx, None)
+#
+# Stated as a POSITIVE property of these two modules, because the negative one was
+# unfalsifiable: `"setCurrentSection" not in hb_ctx` named a useState binding local
+# to App() in main.tsx, which is not in scope here and never could be, so the
+# condition held no matter what the drawer did. Any real tab-switch would be spelled
+# some other way — a callback on the context, or a call inside open(). So: the
+# context hands out exactly these members, and open() touches exactly these three
+# things. Adding a navigation callback, or a navigate call, now fails here.
+_ctx_type = re.search(r"type HandbookValue = \{(.*?)\n\};", hb_ctx, re.S)
+_ctx_members = sorted(set(re.findall(r"^  (\w+)\??:", _ctx_type.group(1) if _ctx_type else "", re.M)))
+check("the Handbook context hands out nothing that can move the app",
+      _ctx_members == ["close", "drawerOpen", "ensure", "fallback", "loading",
+                       "open", "openAt", "pack", "target"],
+      _ctx_members or "no HandbookValue type found")
+_open_body = (hb_ctx.split("const open = useCallback(", 1)[1].split("}, [", 1)[0]
+              if "const open = useCallback(" in hb_ctx else "")
+check("opening the drawer moves the reader and nothing else",
+      sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _open_body)))
+      == ["ensurePack", "setDrawerOpen", "setTarget"],
+      sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _open_body))) or "no open() body found")
+_help_body = (hb_ctx.split("export function HelpLink(", 1)[1]
+              if "export function HelpLink(" in hb_ctx else "")
+check("and the '?' button does nothing but open it",
+      sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _help_body))) == ["open", "return", "useHandbook"],
+      sorted(set(re.findall(r"\b([a-zA-Z_]\w*)\s*\(", _help_body))) or "no HelpLink body found")
 check("and it opens the drawer", "setDrawerOpen(true)" in hb_ctx, None)
 
 # A bare "?" is not an accessible name.
@@ -2765,7 +2860,11 @@ check("and erasing personal data is held apart from deleting a record",
 _ko = _slurp(_HB, "content", "ko.ts")
 _ko_chapters = len(re.findall(r"^  '?[a-z][a-z0-9-]*'?: \{$", _ko, re.M))
 _chapter_ids = re.findall(r"^  '([a-z0-9-]+)',?$", hb_reg, re.M)
-check("the Korean pack carries every chapter", _ko_chapters == len(_chapter_ids),
+# The lower bound is not decoration: both sides of this equality are regex counts
+# over source layout, and reformatting the registry's chapter list would make it
+# `0 == 0` — a pack with no chapters certified as carrying every chapter. 31 today.
+check("the Korean pack carries every chapter",
+      len(_chapter_ids) >= 20 and _ko_chapters == len(_chapter_ids),
       f"{_ko_chapters} of {len(_chapter_ids)}")
 check("Korean is claimed as complete and loads its own pack",
       "'ko'" in hb_reg.split("TRANSLATED_LANGS")[1][:120]
@@ -3041,8 +3140,12 @@ _erase_code = "\n".join(l for l in _erase.split("\n") if not l.strip().startswit
 check("erasure targets audit metadata by key, not by substring",
       "REPLACE(metadata" not in _erase_code and "json_set(metadata" in _erase_code,
       "an unanchored REPLACE over audit_logs is still present")
+# Over the code, not the raw text: the sibling assertion above exists because a
+# comment satisfied it once, and this one was still reading `_erase` — so deleting
+# the three UPDATEs while leaving a comment that names the actions would have passed.
+# All three names live in SQL today, so nothing changes but the hole.
 check("and it names the actions that actually carry a reader name",
-      all(a in _erase for a in ("book.return", "hold.place", "borrower.create")), None)
+      all(a in _erase_code for a in ("book.return", "hold.place", "borrower.create")), None)
 
 # (e) OAI-PMH paged on a row OFFSET over an ordering whose rows move when a record
 # is saved, so a harvest of a live catalogue skipped a record for every edit made
@@ -3393,8 +3496,19 @@ check("finishing always records completion, replay included",
 
 # The replay lived in Settings, which needs the `settings` permission — so the one
 # person the course is FOR could not re-read it.
-check("the replay is not behind the settings permission",
-      "'profile.replayCourse'" in main_tsx and "settings.training.start" not in main_tsx, None)
+#
+# The old form was `'profile.replayCourse' in main_tsx and "settings.training.start"
+# not in main_tsx`. That second string appears NOWHERE in this repository — grep it
+# — so half the conjunction had no possible subject and the assertion reduced to
+# "the button's label exists". Assert the ancestry instead: everything between the
+# profile dialog that holds the button and the button itself must mention no
+# permission at all, which is what "behind nothing" means.
+_replay_ancestry = main_tsx.split("PROFILE MODAL", 1)[-1].split("'profile.replayCourse'", 1)[0]
+_replay_guards = sorted(set(re.findall(r"\bcan[A-Z]\w*|\bperms\.\w+|\bpermissions\.\w+|\bhasPerm\w*",
+                                      _replay_ancestry)))
+check("the replay is not behind a permission guard",
+      "'profile.replayCourse'" in main_tsx and "PROFILE MODAL" in main_tsx and not _replay_guards,
+      _replay_guards or "the profile modal or its replay button is gone")
 
 # The Handbook prose is a lazy chunk, and the mandatory course is the one screen a
 # librarian cannot get past. Without a fallback it would show an empty panel.
@@ -3445,7 +3559,25 @@ try:
     # and friends into ui.tsx and this section failed — correctly, but for the
     # wrong reason: these are assertions about the APP, and pinning them to a
     # filename makes a refactor look like a regression.
-    tsx = "\n".join(_read(n) for n in ("main.tsx", "ui.tsx", "api.ts", "types.ts"))
+    #
+    # WALKED, not hand-listed. The list used to be exactly ("main.tsx", "ui.tsx",
+    # "api.ts", "types.ts"), so the eight screens under screens/, onboarding.tsx
+    # and the handbook were invisible to it — 2,500-odd lines of UI, five of the
+    # eleven Dialogs in the app, all of it imported by main.tsx. Four assertions
+    # below therefore certified accessibility for files they had never read:
+    # planting a hand-rolled backdrop, an aria-label on a roleless <span> and an
+    # unnamed Dialog in screens/copies.tsx left every one of them PASSING.
+    # scripts/check_i18n.mjs walks the tree for exactly this reason and its comment
+    # names this section as having had the same blind spot. It no longer has it.
+    _sources = []
+    for _dir, _subdirs, _files in os.walk(_WEB):
+        _sources += [os.path.join(_dir, f) for f in sorted(_files)
+                     if f.endswith((".ts", ".tsx")) and not f.endswith(".d.ts")]
+    _sources.sort()
+    tsx = "\n".join(open(p, encoding="utf-8").read() for p in _sources)
+    check("the corpus these assertions read is the whole app",
+          len(_sources) >= 20 and any(os.sep + "screens" + os.sep in p for p in _sources),
+          [os.path.relpath(p, _WEB) for p in _sources])
 
     # `outline: none` without a measured replacement is how focus disappears.
     # One global :focus-visible rule replaced six sites; if a new one appears,
@@ -3473,11 +3605,25 @@ try:
 
     def _tokens(block):
         m = re.search(block + r"\s*\{(.*?)\}", css, re.S)
-        return dict(re.findall(r"--([a-z-]+):\s*(#[0-9a-fA-F]{6})", m.group(1))) if m else {}
+        # `[a-z0-9-]`, not `[a-z-]`. --surface-2 is a real token in both themes and
+        # the digit put it outside the old character class, so it never reached this
+        # dict — and the `if toks.get(bg)` filter below then dropped it silently.
+        # "reaches 4.5:1 on every surface" was measured on two of the three surfaces
+        # named in the very same line. (It holds on --surface-2 too: 4.89 light,
+        # 5.30 dark. So this widens the coverage without moving the verdict.)
+        return dict(re.findall(r"--([a-z0-9-]+):\s*(#[0-9a-fA-F]{6})", m.group(1))) if m else {}
 
+    _CONTRAST_TOKENS = ("text-light", "text-muted", "field-border", "on-accent",
+                        "accent", "surface", "surface-2", "bg")
     light = _tokens(r":root")
     dark = _tokens(r'\[data-theme="dark"\]')
     for name, toks in (("light", light), ("dark", dark)):
+        # An assertion, not a `continue`. Renaming a token or the dark-theme
+        # selector used to make every contrast check below VANISH from the run —
+        # 8 assertions quietly reduced to none, with the gate still all-green.
+        check(f"{name}: the colour tokens the contrast checks read are all present",
+              all(toks.get(t) for t in _CONTRAST_TOKENS),
+              sorted(t for t in _CONTRAST_TOKENS if not toks.get(t)))
         if not toks.get("text-light"):
             continue
         # --text-light is the worst offender historically: eight consumers, and
@@ -3525,9 +3671,38 @@ try:
     check("no overlay claims the dialog role on its backdrop",
           'className="modal-overlay" onClick' not in tsx and 'modal-overlay" role=' not in tsx,
           "an overlay still does")
-    main_only = _read("main.tsx")
-    check("every Dialog is named", main_only.count("<Dialog onClose") == main_only.count("labelledBy="),
-          f'{main_only.count("<Dialog onClose")} dialogs, {main_only.count("labelledBy=")} named')
+    # Every Dialog in the app, each one examined, rather than two totals from one
+    # file compared against each other. `main_only.count("<Dialog onClose") ==
+    # main_only.count("labelledBy=")` could not see the five Dialogs in screens/,
+    # missed any tag whose props were reordered or wrapped onto the next line, and
+    # was satisfied by two mistakes that cancelled — one Dialog unnamed, one
+    # labelledBy on something else.
+    #
+    # A regex cannot find the end of a JSX tag: `onClose={() => close(false)}` holds
+    # both `>` and `}`, so `<Dialog[^>]*>` stops inside the arrow function. This
+    # walks each tag counting brace/paren depth and stops at the first `>` outside
+    # them. Tags with no attributes at all are the prose mentions of "<Dialog>" in
+    # comments, and are skipped.
+    def _jsx_open_tags(src, name):
+        found = []
+        for m in re.finditer(r"<" + name + r"\b", src):
+            i, depth = m.end(), 0
+            while i < len(src):
+                ch = src[i]
+                if ch in "{(":
+                    depth += 1
+                elif ch in "})":
+                    depth -= 1
+                elif ch == ">" and depth == 0:
+                    break
+                i += 1
+            found.append(src[m.end():i])
+        return found
+
+    _dialogs = [d for d in _jsx_open_tags(tsx, "Dialog") if d.strip()]
+    _unnamed = [" ".join(d.split())[:70] for d in _dialogs if "labelledBy" not in d]
+    check("every Dialog is named", len(_dialogs) >= 11 and not _unnamed,
+          f"{len(_dialogs)} dialogs found, unnamed: {_unnamed}")
 
     # Error toasts are the only channel for validation failures, so a timeout
     # on them is a time limit on reading them — SC 2.2.1.
@@ -3562,6 +3737,28 @@ for uname_ in USERS:
         call("PUT", f"/api/users/{row_['id']}", {"active": False})
 if USERS:
     print(f"  deactivated {len(USERS)} test user(s)")
+
+# The library's own identity record goes back exactly as the run found it — the one
+# restore, writing the ORIGINAL values. Asserted rather than assumed: this table is
+# the institution's name and ISIL, it reaches every MARC 852 $a, 003 and OAI-PMH
+# Identify the catalogue emits, and the gate is documented as running against
+# production. A restore nobody checks is how "ZZ Test Library" became the library's
+# name in the first place.
+_settings_after = restore_library_settings()
+if LIBRARY_SETTINGS_BEFORE:
+    check("the library's own identity record is exactly as the run found it",
+          _settings_after == LIBRARY_SETTINGS_BEFORE,
+          {k: (LIBRARY_SETTINGS_BEFORE.get(k), (_settings_after or {}).get(k))
+           for k in set(LIBRARY_SETTINGS_BEFORE) | set(_settings_after or {})
+           if LIBRARY_SETTINGS_BEFORE.get(k) != (_settings_after or {}).get(k)})
+
+# A probe that could not run answers nothing, so it must not be able to pass for an
+# answer. Every local_sql failure of the whole run is reported here by name: a
+# renamed table, a dropped column or an invocation from the wrong directory used to
+# be indistinguishable from a clean empty result.
+if LOCAL:
+    check("every direct D1 probe in the run actually executed", not LOCAL_SQL_FAILURES,
+          LOCAL_SQL_FAILURES[:3])
 
 print("\n" + "=" * 62)
 print(f"PASSED: {len(PASSES)}   FAILED: {len(FAILURES)}")
