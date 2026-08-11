@@ -2297,6 +2297,36 @@ app.post('/api/books/merge', requirePermission('books.write', { librarian: true 
 		// Serial run statements ("vol. 1–10, 12 missing") describe the title, so
 		// they belong to whichever record survives it.
 		c.env.DB.prepare(`UPDATE serial_holdings SET book_id = ? WHERE book_id IN (${mergePh})`).bind(payload.keepId, ...mergeIds),
+		// The hold queue moves too, and did not.
+		//
+		// A reader waiting for the merged-away record was left holding a place in a
+		// queue on a tombstone: the copies moved to the keeper, so returns were
+		// processed against the keeper and the hold was never filled — the reader
+		// waited forever, and the queue was invisible from the surviving record. It
+		// also made the keeper unpurgeable, because the orphaned row still pointed at
+		// `item_id` through a foreign key that the purge's delete-by-book could not
+		// see.
+		//
+		// `placed_at` is carried across unchanged, so a reader who waited longer keeps
+		// their precedence in the keeper's queue.
+		//
+		// Cancel first, move second. `idx_holds_one_per_borrower` is UNIQUE over
+		// (book_id, borrower_id) for live holds, so a reader queued on BOTH records
+		// would otherwise collide on the way in and fail the whole merge. Their place
+		// on the keeper is the one that survives — they are already in that queue and
+		// two places in it were never what they asked for.
+		c.env.DB.prepare(
+			`UPDATE holds SET status = 'cancelled', closed_at = ?, updated_at = ?
+			  WHERE book_id IN (${mergePh})
+			    AND status IN ('waiting', 'ready')
+			    AND borrower_id IS NOT NULL
+			    AND EXISTS (SELECT 1 FROM holds keep
+			                 WHERE keep.book_id = ? AND keep.borrower_id = holds.borrower_id
+			                   AND keep.status IN ('waiting', 'ready'))`
+		).bind(now, now, ...mergeIds, payload.keepId),
+		c.env.DB.prepare(
+			`UPDATE holds SET book_id = ?, updated_at = ? WHERE book_id IN (${mergePh})`
+		).bind(payload.keepId, now, ...mergeIds),
 		// A bound-with link says "this work is also in that physical volume". If
 		// the keeper is already linked to the same item the row is redundant.
 		c.env.DB.prepare(
@@ -2982,7 +3012,17 @@ app.delete('/api/books/:id/purge', requirePermission('books.delete'), async (c) 
 		// the book delete. Purge answered 500 every time, for good: the record could
 		// not be removed from the trash by any route, while the Trash screen kept
 		// offering a button that could only fail. Must precede `items`.
-		c.env.DB.prepare('DELETE FROM holds WHERE book_id = ?').bind(id),
+		// By ITEM as well as by book. Merge now carries holds across, so the
+		// by-book clause should be sufficient — but `holds.item_id` is its own
+		// foreign key, and any row that names one of this record's copies while
+		// naming a different book blocks the delete below in a way delete-by-book
+		// cannot see. Belt and braces on the statement that has already been
+		// wrong twice.
+		c.env.DB.prepare(
+			`DELETE FROM holds
+			  WHERE book_id = ?
+			     OR item_id IN (SELECT id FROM items WHERE book_id = ?)`
+		).bind(id, id),
 		c.env.DB.prepare('DELETE FROM items WHERE book_id = ?').bind(id),
 		// A record that absorbed a merge is pointed at by its tombstones, and
 		// `merged_into` is a real foreign key — without this the DELETE below

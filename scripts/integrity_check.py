@@ -2692,6 +2692,62 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 59. REGRESSION: a merge carries the hold queue with it ===")
+uniq = uuid.uuid4().hex[:8]
+
+# Merge re-parented items, loans, codes and serial runs to the keeper and left the
+# HOLDS behind, pointing at a record that no longer exists. Two consequences, and
+# the second hid the first: a reader waiting for the merged-away title kept a place
+# in a queue on a tombstone — the copies had moved, so returns were processed
+# against the keeper and the hold could never be filled — and the orphan row still
+# referenced `item_id`, so the keeper could never be purged either. The purge fix
+# committed one commit earlier deletes holds BY BOOK, which cannot see this row.
+def _mkbook(t):
+    st, r = call("POST", "/api/books", {"title": t, "author": "ZZ"})
+    return (r or {}).get("id")
+
+a_id, b_id = _mkbook(f"ZZMH A {uniq}"), _mkbook(f"ZZMH B {uniq}")
+st, r1 = call("POST", "/api/borrowers", {"name": f"ZZMH both {uniq}"})
+st, r2 = call("POST", "/api/borrowers", {"name": f"ZZMH onlyB {uniq}"})
+r1id = (r1 or {}).get("borrower", r1 or {}).get("id")
+r2id = (r2 or {}).get("borrower", r2 or {}).get("id")
+
+if a_id and b_id and r1id and r2id:
+    CREATED.append(a_id)
+    # r1 queues on BOTH records — the case that collides with
+    # idx_holds_one_per_borrower if the merge moves rows without thinking.
+    call("POST", f"/api/books/{a_id}/holds", {"borrowerId": r1id})
+    call("POST", f"/api/books/{b_id}/holds", {"borrowerId": r1id})
+    call("POST", f"/api/books/{b_id}/holds", {"borrowerId": r2id})
+    st, body = call("POST", "/api/books/merge", {"keepId": a_id, "mergeIds": [b_id], "dryRun": False})
+    check("a merge survives a reader queued on both records", st == 200, f"{st} {str(body)[:130]}")
+
+    if LOCAL:
+        rows = local_sql(f"""SELECT status, (book_id = '{a_id}') AS on_keeper,
+                                    (borrower_id = '{r1id}') AS is_dup_reader
+                               FROM holds
+                              WHERE borrower_id IN ('{r1id}', '{r2id}')""") or []
+        check("no hold is left pointing at the record that was merged away",
+              rows and all(int(r["on_keeper"]) == 1 for r in rows),
+              [r for r in rows if int(r["on_keeper"]) != 1])
+        # ON THE KEEPER, not merely alive: before the fix this reader's hold survived
+        # perfectly well — on a record that no longer existed — so a check that only
+        # counted live holds passed while the reader waited forever.
+        live_other = [r for r in rows if int(r["is_dup_reader"]) == 0
+                      and r["status"] in ("waiting", "ready") and int(r["on_keeper"]) == 1]
+        check("a reader who was only in the merged-away queue keeps their place",
+              len(live_other) == 1, rows)
+        live_dup = [r for r in rows if int(r["is_dup_reader"]) == 1
+                    and r["status"] in ("waiting", "ready") and int(r["on_keeper"]) == 1]
+        check("and a reader queued on both ends up with exactly one live hold",
+              len(live_dup) == 1, rows)
+
+    # The purge that used to be impossible. Delete-by-book could not see the orphan;
+    # the keeper is the record that inherited the copies it pointed at.
+    call("DELETE", f"/api/books/{a_id}")
+    st, body = call("DELETE", f"/api/books/{a_id}/purge")
+    check("and the keeper can still be purged afterwards", st == 204, f"{st} {str(body)[:130]}")
+
 print("=== 58. REGRESSION: a hold must not make a record or a reader undeletable ===")
 # STRUCTURAL, not behavioural: every table that points at books(id) or items(id)
 # WITHOUT a declared cascade must be named in the purge handler, or purging trips a
@@ -2713,7 +2769,10 @@ if LOCAL:
             _child = _t["name"]
             if _child == "books":
                 continue  # books.merged_into is handled by an UPDATE, not a DELETE
-            if f"FROM {_child} WHERE" not in _purge_src:
+            # Whitespace-insensitive: the SQL is formatted across lines, and a check
+            # that only matches one layout reports a false positive the moment the
+            # statement is reformatted — which it was, one commit after this landed.
+            if f"DELETE FROM {_child} WHERE" not in re.sub(r"\s+", " ", _purge_src):
                 _missing.append(f"{_child} -> {_parent} (ON DELETE NO ACTION)")
     check("the purge cascade names every table that blocks a hard delete",
           not _missing, sorted(set(_missing)))
