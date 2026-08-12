@@ -53,6 +53,28 @@ const ReservedBookAttributeKeys = new Set([
   'deletedAt'
 ]);
 
+/**
+ * The widest value the facet rail can carry, on BOTH sides of the round trip.
+ *
+ * A rail bucket advertises a count and promises the list it opens will reproduce
+ * it. That promise silently failed for long values: `facetValue` was capped at 200
+ * characters while the values it selects were not. 40 live records have a title
+ * over 200 characters (the longest is 289), so faceting on title produced 40
+ * buckets whose click-through answered
+ * `400 facetValue: Too big: expected string to have <=200 characters` — the
+ * librarian clicks a number and the screen does not move.
+ *
+ * 500 because that is the widest title the catalogue can store (the catalogue
+ * import row schema allows 500; the direct form allows 300), and custom attribute
+ * values are capped at the same number below — they had no cap at all, which made
+ * "the rail can always be opened" true only by luck. Longest live attribute value
+ * is 247, and 8 exceed 200, so the cap is a guardrail rather than a narrowing.
+ *
+ * Raising either end without the other reopens exactly this bug, which is why
+ * there is one constant and not two literals.
+ */
+export const FACET_VALUE_MAX = 500;
+
 export const BookStatusSchema = z.enum(['available', 'borrowed', 'lost', 'maintenance']);
 export const BibLevelSchema = z.enum(['monograph', 'serial']);
 export const BIB_LEVELS = BibLevelSchema.options;
@@ -141,7 +163,7 @@ export const BookCoreSchema = z.object({
   roomCode: z.string().max(64).optional().nullable(),
   shelfCode: z.string().max(64).optional().nullable(),
   legacyId: z.string().min(1).max(64).optional().nullable(),
-  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).default({})
+  customFields: z.record(z.string(), z.union([z.string().max(FACET_VALUE_MAX), z.number(), z.boolean(), z.null()])).default({})
 });
 
 export const CreateBookSchema = BookCoreSchema.extend({
@@ -167,7 +189,7 @@ export const UpdateBookSchema = CreateBookSchema.partial().extend({
   author: z.string().max(200).optional(),
   tags: z.array(z.string().max(50)).max(30).optional(),
   status: BookStatusSchema.optional(),
-  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
+  customFields: z.record(z.string(), z.union([z.string().max(FACET_VALUE_MAX), z.number(), z.boolean(), z.null()])).optional(),
 
   // PATCH forms, for setting one attribute across many books.
   //
@@ -921,7 +943,7 @@ export const RoomSchema = z.object({
   code: z.string().min(1).max(64),
   name: z.string().min(1).max(200),
   description: z.string().max(2000).optional().nullable(),
-  mapMetadata: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).default({}),
+  mapMetadata: z.record(z.string(), z.union([z.string().max(FACET_VALUE_MAX), z.number(), z.boolean(), z.null()])).default({}),
   createdAt: ISODateTimeSchema,
   updatedAt: ISODateTimeSchema
 });
@@ -1050,7 +1072,7 @@ export const BookFilterQuerySchema = z.object({
   // that exact pair to reconcile the catalogue against a physical shelf, so a
   // count that doesn't reproduce is worse than no count at all.
   facetField: z.string().max(80).optional(),
-  facetValue: z.string().max(200).optional(),
+  facetValue: z.string().max(FACET_VALUE_MAX).optional(),
   emptyField: z.string().max(80).optional(),
   includeDeleted: ZodQueryBoolean.optional(),
   sortBy: z.enum(['title', 'author', 'updatedAt', 'publicationYear', 'status']).default('updatedAt'),
@@ -1092,7 +1114,7 @@ export const CatalogImportRowSchema = z.object({
   description: z.string().max(8000).optional().nullable(),
   shelfCode: z.string().max(64).optional().nullable(),
   needsReview: z.boolean().optional(),
-  customFields: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).default({})
+  customFields: z.record(z.string(), z.union([z.string().max(FACET_VALUE_MAX), z.number(), z.boolean(), z.null()])).default({})
 });
 
 export const ImportCatalogSchema = z.object({

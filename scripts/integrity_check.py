@@ -2913,6 +2913,56 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 78. REGRESSION: every rail bucket can be opened ===")
+
+# A rail bucket advertises a count and promises the list it opens reproduces it.
+# `facetValue` was capped at 200 characters while the values it selects were not:
+# 40 live records carry a title over 200 characters, so faceting on title produced
+# 40 buckets whose click-through answered 400 and the screen did not move.
+_shared78 = _slurp(_REPO, "packages", "shared", "src", "index.ts")
+check("the facet value cap is one named constant",
+      "export const FACET_VALUE_MAX" in _shared78
+      and "facetValue: z.string().max(FACET_VALUE_MAX)" in _shared78, None)
+_capped78 = _shared78.count("z.string().max(FACET_VALUE_MAX), z.number()")
+check("and custom attribute values are capped by the same constant", _capped78 >= 3, _capped78)
+
+# The round trip on a title longer than the old cap.
+_long78 = ("ZZ Facet Long Title " + ("\u03b1\u03b2\u03b3\u03b4\u03b5 " * 40))[:260].strip()
+check("the probe title is longer than the cap that used to reject it", len(_long78) > 200, len(_long78))
+st, _bk78 = call("POST", "/api/books", {"title": _long78, "author": "Gate",
+                                        "tags": [], "customFields": {}, "status": "available"})
+check("a book with a 200+ character title is accepted", st == 201, st)
+_b78 = (_bk78 or {}).get("id")
+if _b78:
+    CREATED.append(_b78)
+    st, r = call("GET", "/api/books?" + urllib.parse.urlencode(
+        {"facetField": "title", "facetValue": _long78, "pageSize": 5}))
+    check("its facet bucket opens instead of answering 400", st == 200, (st, r))
+    check("and the list it opens contains the record",
+          any(b.get("id") == _b78 for b in (r or {}).get("items", [])), (r or {}).get("total"))
+
+# The other half: an attribute value longer than the cap is refused on the way IN,
+# rather than stored and then advertised as a bucket that cannot be opened.
+_key78 = f"zzfacet_{uuid.uuid4().hex[:8]}"
+st, _cf78 = call("POST", "/api/custom-fields",
+                 {"key": _key78, "label": "Facet probe", "type": "text",
+                  "required": False, "enumOptions": []})
+if st == 201:
+    st, _ = call("POST", "/api/books", {"title": "ZZ Facet Overlong Value", "author": "Gate",
+                                        "tags": [], "customFields": {_key78: "x" * 501},
+                                        "status": "available"})
+    check("an attribute value past the cap is refused, not silently unclickable", st == 400, st)
+    st, _bk = call("POST", "/api/books", {"title": "ZZ Facet Value At Cap", "author": "Gate",
+                                          "tags": [], "customFields": {_key78: "y" * 500},
+                                          "status": "available"})
+    check("a value exactly at the cap is still accepted", st == 201, st)
+    if (_bk or {}).get("id"):
+        CREATED.append(_bk["id"])
+        st, r = call("GET", "/api/books?" + urllib.parse.urlencode(
+            {"facetField": "custom:" + _key78, "facetValue": "y" * 500, "pageSize": 5}))
+        check("and its bucket opens at full length", st == 200, st)
+    local_sql("DELETE FROM custom_field_definitions WHERE field_key = '" + _key78 + "'")
+
 print("=== 77. REGRESSION: a re-import cannot split a book\'s date in two ===")
 
 # `reconcileBookDates` states the invariant outright — "the two representations can
