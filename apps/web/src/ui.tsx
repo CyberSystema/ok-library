@@ -453,6 +453,12 @@ export function Combobox<T>(props: {
         value={props.value}
         onChange={(e) => props.onChange(e.target.value)}
         onFocus={props.onFocus}
+        /* Close on blur. Without this the panel stayed open after the field lost focus and
+           sat on top of the control the librarian had just Tabbed into — it is absolutely
+           positioned over the following field. Picking a row cannot race this: the list
+           commits on mousedown with preventDefault (see the note above), so the pick lands
+           before blur would fire. */
+        onBlur={() => setDismissed(true)}
         onKeyDown={(e) => {
           if (!open) return;
           if (e.key === 'ArrowDown') {
@@ -467,6 +473,13 @@ export function Combobox<T>(props: {
             if (picked !== undefined) onPick(picked);
           } else if (e.key === 'Escape') {
             e.preventDefault();
+            // stopPropagation, or this Escape keeps travelling to Dialog's handler on
+            // `.modal-overlay` and closes the whole book record — losing every edit in the
+            // form — when all the librarian wanted was to dismiss an autocomplete list
+            // that had appeared over the field they were typing in. The guard at the top
+            // of this handler returns early when no list is open, so Escape still closes
+            // the dialog in every other case.
+            e.stopPropagation();
             setDismissed(true);
             setHighlight(-1);
           }

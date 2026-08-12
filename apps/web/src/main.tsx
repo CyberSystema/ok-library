@@ -11,7 +11,10 @@ import {
   useConfirm,
   useToast,
   StatCard, SectionHeader, EdtfHint, Combobox, Dialog,
-  endOfLocalDayIso, isoToLocalDateInput
+  endOfLocalDayIso, isoToLocalDateInput,
+  // The cover lightbox is a role="dialog" that cannot use <Dialog>'s markup, so it borrows
+  // Dialog's behaviour from the same two primitives instead of going without.
+  useModalFocus, trapTab
 } from './ui';
 import { I18nProvider, LanguageSwitcher, useI18n, useT, type Lang } from './i18n';
 import { csvCell, formatEdtfRange, formatHoldingStatement, ITEM_TYPES, parseEdtf } from '@ok-library/shared';
@@ -1092,6 +1095,12 @@ function App() {
   // Full-screen cover zoom (lightbox). Holds the resolved cover URL while open,
   // null while closed. Opened by clicking the large cover in the detail view.
   const [coverZoom, setCoverZoom] = useState<string | null>(null);
+  // The lightbox is a dialog, so it gets a dialog's focus handling: focus moves in on
+  // mount, is restored to the opener on unmount, and the page behind is locked. Passing
+  // 'container' because the overlay's only control is its ✕ and focusing the container
+  // keeps the Escape/Tab handler on the element that owns them.
+  const lightboxRef = useRef<HTMLDivElement | null>(null);
+  useModalFocus(lightboxRef, 'container');
   // Custom right-click menu: null when closed, else its screen position + items.
   const [contextMenu, setContextMenu] = useState<CtxMenuState | null>(null);
   // A hidden file input reused by the "Replace/Add cover" menu item — the book
@@ -6343,11 +6352,28 @@ function App() {
       {/* ═══ COVER ZOOM LIGHTBOX ═══ */}
       {coverZoom && (
         <div
+          ref={lightboxRef}
           className="lightbox-overlay"
           role="dialog"
           aria-modal="true"
           aria-label={t('detail.coverZoomAria')}
           onClick={() => setCoverZoom(null)}
+          /*
+           * It DECLARED aria-modal and then managed nothing: focus stayed behind it on the
+           * detail dialog, so Tab walked the page underneath, its own ✕ could never be
+           * reached, Escape did nothing, and on close focus did not come back. It was the
+           * only role="dialog" in the app that skipped useModalFocus — the very helper
+           * that exists, in its own words, "so an overlay that cannot use Dialog's markup
+           * can still get Dialog's behaviour from the same lines".
+           */
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.stopPropagation();
+              setCoverZoom(null);
+              return;
+            }
+            trapTab(lightboxRef.current, e);
+          }}
         >
           <button
             type="button"
@@ -6810,11 +6836,20 @@ function App() {
                   <button
                     type="button"
                     className={`chip${needsReviewFilter ? ' is-active' : ''}`}
+                    /* aria-pressed, because this chip is a toggle whose only signal was its
+                       fill colour: the label, the count and the accessible name were
+                       byte-identical in both states, so a screen reader announced no
+                       difference and a sighted librarian had nothing but a hue to go on. The
+                       facet-rail buttons and the selection-mode toggle already carry it, so
+                       this was an omission rather than house style. The ✕ below is the
+                       non-colour cue, matching the smart-list chips exactly. */
+                    aria-pressed={needsReviewFilter}
                     onClick={() => setNeedsReviewFilter((v) => !v)}
                     title={t('library.needsReviewTitle')}
                   >
                     {t('library.needsReview')}
                     {needsReviewCount > 0 && <span className="chip-count">{fmt(needsReviewCount)}</span>}
+                    {needsReviewFilter && <span className="chip-x" aria-hidden="true">✕</span>}
                   </button>
                   {SMART_LISTS.map((list) => {
                     const active = smartListKey === list.key;
