@@ -7821,7 +7821,23 @@ function App() {
                                         : col.key === 'author'
                                           ? displayAuthor(book, t('common.unknownAuthor'))
                                           : value;
-                                      const empty = value.trim() === '';
+                                      /*
+                                       * The gap test has to use the SAME predicate the cell
+                                       * renders with. `value.trim() === ''` is tested against
+                                       * the raw getter, while the cell displays through
+                                       * displayTitle/displayAuthor — so inside one filtered
+                                       * list of author-less books, rows stored as '' got the
+                                       * amber wash and a centred em-dash while rows stored as
+                                       * the legacy '(Unknown)' sentinel showed the words
+                                       * "(Άγνωστος συγγραφέας)" in ordinary body colour with no
+                                       * wash at all. The view whose stated purpose is spotting
+                                       * omissions was blind to half of them, and to exactly the
+                                       * half that came from the legacy import. `isPlaceholder`
+                                       * already existed for this.
+                                       */
+                                      const empty = (col.key === 'title' || col.key === 'author')
+                                        ? isPlaceholder(value, col.key)
+                                        : value.trim() === '';
                                       return (
                                         <td
                                           key={col.key}
@@ -7894,6 +7910,21 @@ function App() {
                                       : <span className="meta-chip">ISBN</span>
                                   )}
                                   {book.legacyId && <span className="meta-chip mono">{book.legacyId}</span>}
+                                  {/*
+                                    * HOW MANY COPIES. A record held in ten places looked exactly
+                                    * like a record held in one: a single shelf badge, a single
+                                    * status pill, no count. So the 29 volumes that also sit on
+                                    * "19-000 πίσω" advertised only "19-000" and the librarian
+                                    * walked to one shelf; and nothing warned that printing labels
+                                    * for that row yields ten stickers, not one. The data is
+                                    * already on the record — `items` is loaded for every row in
+                                    * the list — it was simply never shown.
+                                    */}
+                                  {(book.items?.length ?? 0) > 1 && (
+                                    <span className="meta-chip" title={t('library.copiesTitle', { n: book.items?.length ?? 0 })}>
+                                      ×{book.items?.length}
+                                    </span>
+                                  )}
                                 </div>
                               </div>
                               <div className="book-card-side">
