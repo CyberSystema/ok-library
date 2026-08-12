@@ -3455,8 +3455,17 @@ mark.hl {
      username, Sign out) and the six-tab bar, and an open dialog's backdrop
      printed over everything. The shell's real classes are `.simple-navbar`,
      `.simple-tabs`, `.minibar-row` and `.modal-overlay`. */
+  /* `.offline-banner` and `.splash-overlay` join the list. The banner is
+     `background: var(--warning)` with `color: var(--on-warning)`, and the print token
+     override below resets --warning to a paper-friendly value while leaving --on-warning
+     white — so page one of a printed Handbook carried a blank white band with a stray rule
+     under it. Bad connectivity is exactly when somebody prints the Handbook, which is
+     exactly when the banner is up. The controls beside them are hidden for the same reason
+     the navbar is: they are ways to change the screen, and paper has no state. */
   .simple-navbar, .simple-tabs, .toast-stack, .minibar-row, .section-header-actions,
-  .hb-contents, .hb-chapter-nav, .help-link, .modal-overlay {
+  .hb-contents, .hb-chapter-nav, .help-link, .modal-overlay,
+  .offline-banner, .splash-overlay,
+  .search-bar, .filter-chips, .bulk-bar, .pagination {
     display: none !important;
   }
   .hb-print-only { display: block !important; }

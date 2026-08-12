@@ -179,6 +179,18 @@ export async function openPrintLabels(
          needs ~26mm plus a 10-module quiet zone at each end; at 2-up the tile
          is ~91mm and the symbol has room to stay scannable. */
       grid-template-columns: repeat(2, 1fr);
+      /*
+       * A FIXED row height, so the sheet has one pitch.
+       *
+       * The tiles were sized by their content, and the content varies: a title clamped to
+       * one line or two, a meta line present or absent, a legacy-id line, and a 36px
+       * barcode versus a single line of "no barcode assigned". So the vertical pitch
+       * drifted down the page — which makes the sheet scissors-only, since die-cut A4
+       * sticker stock has a fixed pitch — and it drifted differently per LANGUAGE, because
+       * Greek and Russian titles at ~1.3-1.4x hit the two-line clamp far more often than
+       * English. The same six records produced a different sheet in each language.
+       */
+      grid-auto-rows: 37mm;
       gap: 0.75rem;
     }
     .tile {
@@ -187,6 +199,13 @@ export async function openPrintLabels(
       padding: 0.6rem;
       display: flex;
       flex-direction: column;
+      /* space-between pins the barcode to the bottom of every tile, so two stickers side
+         by side have their symbols at the same height — the grid row stretched to the
+         taller tile but nothing inside the shorter one grew, which left neighbouring
+         barcodes 20-35px out of line. */
+      justify-content: space-between;
+      height: 37mm;
+      overflow: hidden;
       gap: 0.4rem;
       page-break-inside: avoid;
       break-inside: avoid;
@@ -196,7 +215,20 @@ export async function openPrintLabels(
     /* The barcode gets its own full-width row. Squeezing it beside the QR was
        the constraint that made a 24-character payload impossible. */
     .barcode { display: flex; justify-content: center; }
-    .barcode svg { max-width: 100%; height: auto; }
+    /*
+ * A PHYSICAL width, because a barcode is a physical object.
+ *
+ * max-width:100% let the symbol be laid out at whatever the tile happened to be, which
+ * measured ~0.265mm per module — about 20% under the 0.33mm the encoder is designed
+ * around, and under what a cheap desk scanner reliably reads. The module count is fixed
+ * (8 digits pack to 99 modules in Code 128 subset C), so pinning the width pins the module
+ * size: 33mm / 99 modules = 0.333mm.
+ *
+ * The viewBox stays in module units and moduleWidth stays at 1 — the gate asserts
+ * viewBox="0 0 99", and it is right to: the SVG should describe the symbol and the
+ * stylesheet should decide how big it is printed.
+ */
+.barcode svg { width: 33mm; max-width: 100%; height: auto; }
     .barcode.nobc { font-size: 0.6rem; color: #94a3b8; font-style: italic; }
     .text { flex: 1; min-width: 0; }
     .title {
