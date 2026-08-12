@@ -552,6 +552,19 @@ app.get('/api/health', async (c) => {
 // for everyone who acknowledged only version 1.
 const ONBOARDING_VERSION = 2;
 
+/**
+ * The account's current token epoch.
+ *
+ * Read back rather than remembered, because a request may bump it (a password
+ * change) before reissuing a token in the same handler — stamping the value read at
+ * the top would mint a token that fails on its very next use.
+ */
+async function currentTokenEpoch(env: Env, userId: string): Promise<number> {
+	const row = await env.DB.prepare('SELECT token_epoch FROM staff_users WHERE id = ? LIMIT 1')
+		.bind(userId).first<{ token_epoch: number }>();
+	return Number(row?.token_epoch ?? 0);
+}
+
 app.post('/api/auth/login', async (c) => {
 	await ensureBootstrapAdmin(c.env);
 
@@ -560,7 +573,8 @@ app.post('/api/auth/login', async (c) => {
 	const parsed = schema.parse(body);
 
 	const user = await c.env.DB.prepare(
-		`SELECT id, username, role, password_hash, password_salt, password_iterations, active, onboarding_completed_version
+		`SELECT id, username, role, password_hash, password_salt, password_iterations, active,
+		        onboarding_completed_version, token_epoch
 		 FROM staff_users WHERE username = ? LIMIT 1`
 	)
 		.bind(parsed.username)
@@ -616,7 +630,10 @@ app.post('/api/auth/login', async (c) => {
 	const token = await createAccessToken(c.env, {
 		sub: user.id,
 		username: user.username,
-		role: user.role
+		role: user.role,
+		// Stamped so a later password change can invalidate exactly the tokens
+		// issued before it — see authMiddleware and migration 0033.
+		epoch: Number((user as { token_epoch?: number }).token_epoch ?? 0)
 	});
 
 	const ttl = Number(c.env.ACCESS_TOKEN_TTL_SECONDS ?? '43200');
@@ -849,6 +866,10 @@ app.patch('/api/me', async (c) => {
 		const newHash = await hashPasswordPbkdf2(parsed.newPassword, salt, iterations);
 		updates.push('password_hash = ?', 'password_salt = ?', 'password_iterations = ?');
 		binds.push(newHash, salt, iterations);
+		// Ends every session the OLD password opened. Without this a token taken from
+		// a shared machine kept full write access for the rest of its 12-hour life
+		// after the librarian changed the password precisely to stop it.
+		updates.push('token_epoch = token_epoch + 1');
 		changes.password = true;
 	}
 
@@ -878,7 +899,11 @@ app.patch('/api/me', async (c) => {
 		const token = await createAccessToken(c.env, {
 			sub: me.id,
 			username: finalUsername,
-			role: me.role
+			role: me.role,
+			// The CURRENT epoch, read back after any password change in this same
+			// request — a reissued token stamped with the old one would fail the very
+			// next request, locking the user out of the change they just made.
+			epoch: await currentTokenEpoch(c.env, me.id)
 		});
 		refreshedToken = token;
 		const ttl = Number(c.env.ACCESS_TOKEN_TTL_SECONDS ?? '43200');
@@ -8264,6 +8289,9 @@ app.put('/api/users/:id', requireRole(['admin']), async (c) => {
 		const passwordHash = await hashPasswordPbkdf2(parsed.password, salt, iterations);
 		updates.push('password_hash = ?', 'password_salt = ?', 'password_iterations = ?');
 		binds.push(passwordHash, salt, iterations);
+		// An admin resetting someone's password is usually a RESPONSE to that account
+		// being compromised, so it is the case where a surviving session matters most.
+		updates.push('token_epoch = token_epoch + 1');
 	}
 
 	if (updates.length === 0) {

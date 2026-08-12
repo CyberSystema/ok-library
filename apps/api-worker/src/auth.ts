@@ -274,13 +274,28 @@ export async function authMiddleware(c: Context<{ Bindings: Env; Variables: { us
   // The ROLE is taken from the row, not the token, so a demotion applies at
   // once and a stale "admin" claim cannot outlive the change.
   const account = await c.env.DB.prepare(
-    'SELECT role, active FROM staff_users WHERE id = ? LIMIT 1'
+    'SELECT role, active, token_epoch FROM staff_users WHERE id = ? LIMIT 1'
   )
     .bind(claims.sub)
-    .first<{ role: 'admin' | 'librarian' | 'viewer'; active: number }>();
+    .first<{ role: 'admin' | 'librarian' | 'viewer'; active: number; token_epoch: number }>();
 
   if (!account || account.active !== 1) {
     throw new HTTPException(401, { message: 'Account is no longer active. Please sign in again.' });
+  }
+
+  // A CREDENTIAL change ends the sessions that credential opened.
+  //
+  // Deactivation and demotion were already immediate, because both are read from
+  // the row above. A password change was not: nothing the middleware read changed
+  // when the password did, so a token taken from a shared machine kept full write
+  // access for the rest of its 12-hour life AFTER the librarian changed the password
+  // specifically to stop it. The epoch is carried in the token and compared here, in
+  // the SELECT this function already makes — immediate revocation at no extra read.
+  //
+  // A token issued before migration 0033 has no epoch; absent is read as 0, which is
+  // the column's default, so upgrading does not sign everyone out.
+  if (Number(account.token_epoch ?? 0) !== Number(claims.epoch ?? 0)) {
+    throw new HTTPException(401, { message: 'Your password was changed. Please sign in again.' });
   }
 
   c.set('user', { ...claims, role: account.role });

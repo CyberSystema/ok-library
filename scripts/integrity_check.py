@@ -2910,6 +2910,60 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 70. REGRESSION: changing a password ends the sessions it opened ===")
+uniq = uuid.uuid4().hex[:6]
+
+# authMiddleware re-reads the account on every request and its comment states the
+# aim: "one indexed primary-key read is a cheap price for making revocation
+# immediate". That covered deactivation and demotion. It did NOT cover a credential
+# change, because nothing the middleware read changed when the password did — so a
+# token taken from a shared machine kept full write access for the rest of its
+# 12-hour life AFTER the password was changed precisely to stop it.
+_un = f"zzrevoke{uniq}"
+st, made = call("POST", "/api/users",
+                {"username": _un, "password": "ZZoldpass!2026", "role": "librarian"})
+_uid = (made or {}).get("user", made or {}).get("id")
+if st in (200, 201) and _uid:
+    USERS.append(_un)
+    _stolen = login(_un, "ZZoldpass!2026")
+    st, _ = call("GET", "/api/auth/session", token=_stolen)
+    check("a signed-in token works before the change", st == 200, st)
+
+    st, _ = call("PUT", f"/api/users/{_uid}", {"password": "ZZnewpass!2026"})
+    check("an admin can reset the password", st == 200, st)
+
+    st, body = call("GET", "/api/auth/session", token=_stolen)
+    check("and the token issued under the OLD password stops working",
+          st == 401, f"{st} {str(body)[:110]}")
+    st, _ = call("POST", "/api/books", {"title": f"ZZREVOKE {uniq}", "author": "ZZ"}, token=_stolen)
+    check("including for writes", st == 401, st)
+
+    _fresh = login(_un, "ZZnewpass!2026")
+    st, _ = call("GET", "/api/auth/session", token=_fresh)
+    check("while the new password signs in normally", st == 200, st)
+
+    # The self-service path must revoke too, and must NOT lock the user out of the
+    # change they just made — a username change reissues a token, and stamping it
+    # with the pre-change epoch would fail on its very next use.
+    st, _ = call("PATCH", "/api/me",
+                 {"currentPassword": "ZZnewpass!2026", "newPassword": "ZZthirdpass!2026"},
+                 token=_fresh)
+    check("a librarian can change their own password", st == 200, st)
+    st, _ = call("GET", "/api/auth/session", token=_fresh)
+    check("and that also ends the session it was made from", st == 401, st)
+    _third = login(_un, "ZZthirdpass!2026")
+    st, _ = call("GET", "/api/auth/session", token=_third)
+    check("and the newest password works", st == 200, st)
+
+# Existing sessions must survive the DEPLOY: a token issued before migration 0033
+# carries no epoch, and absent must read as 0 — the column's default — or upgrading
+# would sign every librarian out.
+_auth70 = _slurp(_REPO, "apps", "api-worker", "src", "auth.ts")
+check("a token with no epoch claim is treated as epoch 0",
+      "claims.epoch ?? 0" in _auth70, None)
+check("and the epoch is read in the SELECT the middleware already makes",
+      "SELECT role, active, token_epoch FROM staff_users" in _auth70, None)
+
 print("=== 69. REGRESSION: what the free tier is spent on ===")
 
 # The hold shelf read the whole catalogue to show a list of about a hundred. The only

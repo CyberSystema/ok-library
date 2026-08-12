@@ -1,0 +1,23 @@
+-- Changing a password did not end the sessions that password had opened.
+--
+-- `authMiddleware` re-reads `role, active` from staff_users on every request, and
+-- its comment states the aim: "one indexed primary-key read is a cheap price for
+-- making revocation immediate". That covers deactivation and demotion. It does not
+-- cover a CREDENTIAL change, because nothing the middleware reads changes when the
+-- password does — so a token taken from a shared machine, or from a browser left
+-- open, kept full write access for the whole 12-hour token lifetime AFTER the
+-- librarian had changed the password specifically to stop it.
+--
+-- The username change immediately below the self-service password change already
+-- reissues the token deliberately, which is the same reasoning applied to a lesser
+-- risk.
+--
+-- `token_epoch` is stamped into the JWT at sign-in and compared against this column
+-- on every request, inside the SELECT the middleware ALREADY makes — so revocation
+-- becomes immediate at no extra read. Bumping it invalidates every token issued
+-- before the bump and nothing else.
+--
+-- Default 0: every token issued before this migration carries no epoch, and the
+-- middleware treats a missing claim as 0, so existing sessions survive the deploy
+-- rather than every librarian being signed out by an upgrade.
+ALTER TABLE staff_users ADD COLUMN token_epoch INTEGER NOT NULL DEFAULT 0;

@@ -33,6 +33,15 @@ export interface AuthClaims {
   sub: string;
   username: string;
   role: 'admin' | 'librarian' | 'viewer';
+  /**
+   * The account's `token_epoch` when this token was issued.
+   *
+   * Compared against the stored column on every request, so changing a password
+   * ends the sessions that password opened. Optional because a token issued before
+   * migration 0033 carries no epoch and must keep working until it expires — absent
+   * is read as 0, which is the default the column was created with.
+   */
+  epoch?: number;
   iat: number;
   exp: number;
   iss: string;
