@@ -106,18 +106,30 @@ intended: a quoted label is evidence of what the screen says. Do not "correct" i
 
 ### Numbers and spacing
 
-- Comma as thousands separator: **12,675**. Not the Russian 12 700 spacing, not
-  1만 2675. The exact figure is used wherever the claim is exact — the Greek
+- Comma as thousands separator: **12,528**. Not the Russian 12 500 spacing, not
+  1만 2528. The exact figure is used wherever the claim is exact — the Greek
   review caught a rounded 12.700 standing in for it.
 - **A translator does not correct a figure the English states.** Where the English
-  block itself hedges (`about 12,700 records`), the Korean renders the hedge
-  (「약 12,700건」) and the correction is raised against the English source, which is
-  where all four languages read it from. The foundations review proposed
-  「약 12,675건」 in Korean alone; that was declined, because a per-language repair of
-  a shared fact desynchronises the pack and teaches every later translator to
-  overrule the source. Exact figures in the Korean are exact only because the
-  English is.
-- No space before a counter: 12,675종 · 3,768건 · 3쇄 · 2책 · 21cm.
+  block itself hedges (`about 12,500 records`), the Korean renders the hedge
+  (「약 12,500건」) and the correction is raised against the English source, which is
+  where all four languages read it from. The foundations review proposed a
+  corrected figure in Korean alone; that was declined, because a per-language
+  repair of a shared fact desynchronises the pack and teaches every later
+  translator to overrule the source. Exact figures in the Korean are exact only
+  because the English is.
+- **And the source itself has to be measured, not remembered.** The figure this
+  section taught as exact was 12,675, and it was never the size of this
+  collection: it counted soft-deleted test rows alongside the real ones. The
+  catalogue holds 12,528 records — the April import, every one of them still live
+  — which is the number the rest of the repository had all along. Nine counts
+  moved with it (ISBNs 602→559, series 12,597→12,513, category labels
+  4,216→4,097, records with no author 3,768→3,690, no publisher 2,962→2,957,
+  extent statements 11,717→11,571, author strings 5,427→5,395, editors
+  1,195→1,156 in 623→607 spellings, failing check digits twenty→eighteen). The
+  figures that reproduced exactly — 8,117 · 13 · 73 · 492 · 398 — were the ones
+  no test row could contribute to, which is how the cause was identified. A
+  count is quoted only from a query that excludes what the audit wrote.
+- No space before a counter: 12,528종 · 3,690건 · 3쇄 · 2책 · 21cm.
 - Every number states its unit: 건 (records/transactions), 종 (titles),
   책 (volumes, statistics **only** — see §4k), 권 (volumes, prose), 명 (readers),
   호 (issues). A record is counted in 건, never in 개: 「별개의 두 레코드」,
@@ -223,7 +235,7 @@ values, so the pack is continuous with the screen.
 | parallel title (the other-script title) | 대등표제 | KCR4 대등표제; the Phase B parallel-script fields, MARC 880. A 대등표제 is printed on the 표제면 by the publisher — it is not a 로마자 표기 the library produced. Rejected: 병렬표제, 병기 표제. |
 | title page | 표제면 | KCR4's term, and the source of 전사: 「표제면에서 본표제를 그대로 전사하십시오」 is one consistent family. Rejected: 표제지 (also current, but 면 matches the KCR4 wording), 속표지 (a physical part). |
 | non-filing characters | 배열 제외 문자 (수치는 배열 제외 문자수) | MARC 245 second indicator: the leading article that must not sort. For this catalogue that is Greek “Η ”, “Ο ”, “ΤΟ ”. The term says what it does, which matters because the librarian is typing a digit. Rejected: 비배열 문자, 불용문자 (reads as "forbidden"), 관사 (names only one cause). |
-| title as a COUNTING unit (ISO 2789) | 종 (집계는 종수) | 「12,675종」. A counter, never the word for the title text, so there is no route back into 표제. Also the clean way to say two publications: 두 종. Rejected: 서명 수 (the current statistics label — it reads as "number of signatures"), 제목 수, 표제 수. |
+| title as a COUNTING unit (ISO 2789) | 종 (집계는 종수) | 「12,528종」. A counter, never the word for the title text, so there is no route back into 표제. Also the clean way to say two publications: 두 종. Rejected: 서명 수 (the current statistics label — it reads as "number of signatures"), 제목 수, 표제 수. |
 | volume as a COUNTING unit (ISO 2789) | 책 (집계는 책수) | 「N책」 **in a statistics context only**. Rule that protects it, corrected after the foundations review: 책 appears only in a statistics row or a sentence about one (소장 책수, 「12,675종 · N책」), never as the ordinary word for a book (that is 도서, or 소장본 for the object) — and never as a prose counter of volumes, which is 권. The earlier wording ("only with a numeral or as 책수") licensed 「161책을 차지하는 Patrologia Graeca」 and 「163책 가운데 154책」 in the consistency chapter, where the sentence is prose and the unit must be 권. If the sentence is not reporting a statistic, count in 권. Rejected: 권수 — it reads as "which volume number". |
 
 ### 3.4 Headings, authorities, subjects, classification
@@ -525,7 +537,7 @@ is the 발행 부수 concept — the number of copies printed — so it cannot c
 
 ### k. 종 vs 책 — the two ISO 2789 counting units
 
-- **종** counts titles: 「12,675종」. Statistics row 소장 종수.
+- **종** counts titles: 「12,528종」. Statistics row 소장 종수.
 - **책** counts physical volumes: 「N책」. Statistics row 소장 책수.
 
 Both appear in the statistics chapter because ISO 2789 counts them separately, as
@@ -648,7 +660,7 @@ term in the surrounding prose.
    (본서명 / 부서명), signature = 자필 only, 서명본 still banned — not recommended,
    because 서명 사항 and 서명본 are too close for a reader skimming the notes chapter.
 2. **서가실 for room.** It is this system's coinage, not standard Korean library
-   vocabulary, and no rooms are defined yet — all 12,675 copies are unassigned. If
+   vocabulary, and no rooms are defined yet — all 12,528 copies are unassigned. If
    the monastery names its spaces 자료실 or 서고, that word should win for the label,
    with 소장처 kept for the concept.
 3. **면장수 for extent.** Right register and it covers 권책수, which 쪽수 cannot,

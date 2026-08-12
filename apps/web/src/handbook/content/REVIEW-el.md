@@ -91,7 +91,7 @@ already says `Απόσυρση`. Flagging it because *απόσυρση* can also
 
 ---
 
-## Two things I did not translate, and why
+## Three things I did not translate, and why
 
 **Quoted catalogue values are left exactly as stored**, including the upper case
 and the `<<>>` that the import made of Greek quotation marks. They are evidence,
@@ -99,9 +99,37 @@ not prose — `ΑΔΕΛΦΟΤΗΣ ΘΕΟΛΟΓΩΝ <<Ο ΣΩΤΗΡ>>` is quoted 
 import artefact, so tidying it would remove the point.
 
 **Standard names and MARC tags stay in Latin script**: `ISBD`, `MARC 21`,
-`Dublin Core`, `EDTF`, `ISO 843`. The tags themselves are not in the prose at all
-— they live in `facts.ts`, once, untranslated, and `check_handbook.mjs` fails the
-build if a tag appears in any content pack.
+`Dublin Core`, `EDTF`, `ISO 843`. A tag with its subfield never appears in the
+prose — those live in `facts.ts`, once, untranslated, and `check_handbook.mjs`
+fails the build if one appears in any content pack. A *bare* tag number is the
+exception this review itself argued for below: `880` stands in the
+transliteration chapter of all four packs. The check knows that, and holds it to
+account — the tag must still be declared in `facts.ts`, and every pack must name
+it as often as the English does, so it cannot be dropped from one translation
+again. (This paragraph said the tags were "not in the prose at all", which the
+correction two sections down contradicts.)
+
+**Field labels in the tables are in English, and I could not change that.** A
+`fields` row is `{ fact, note }`: the pack supplies the note and nothing else, and
+the renderer prints `FIELD_FACTS.label` raw. So the Greek reader meets
+`Publisher`, `Kind of publication`, `Shelf mark` against a form that says
+Εκδότης, Είδος τεκμηρίου, Ταξιθετικός δείκτης — in a drawer they may have opened
+by pressing "?" precisely because they did not recognise the field. `facts.ts`
+claimed the label was "translated per pack"; nothing has ever done that, and the
+comment has been corrected rather than left to imply otherwise.
+
+It bites on the CORE fields only, which is worth knowing before anyone sizes the
+repair: a custom attribute's label comes from `custom_field_definitions` and the
+form renders it as stored, so `Place of Publication` and `Edition` are English on
+the Greek screen too. For those rows the Handbook and the form already agree —
+they agree in the wrong language, which is a second problem and not this one.
+
+The decision, until a `labelKey` and a `t()` in the renderer make it moot: the
+two columns this table exists FOR — the API field key and the MARC tag — are
+identifiers and are language-independent, and the label is a gloss on them. What
+translators must do meanwhile is name the field in Greek **inside the note**,
+which is the part of the row a pack owns, so that a reader who cannot use the
+first column still reads the Greek name of the field in the third.
 
 ---
 
@@ -145,8 +173,13 @@ approved, colliding with the subject category of the classification chapter;
 print-out) where *ανατύπωση* (a printing) was meant.
 
 **Two factual slips**: an exact "all of them" claim used the rounded 12.700 instead
-of 12.675, and the tag number *880* — the one token a librarian can quote to a
-partner library — had been dropped from the transliteration chapter.
+of the exact total, and the tag number *880* — the one token a librarian can quote
+to a partner library — had been dropped from the transliteration chapter. (Both
+findings stand; the exact total does not. It was written as 12.675 here and in the
+three other packs, and the catalogue holds **12.528** — the earlier count had
+included soft-deleted test rows. Every total now reads 12.528, in all four
+languages, and the review rule this correction established is unchanged: a shared
+figure is repaired at the English source and in every pack at once.)
 
 **Register**: *ώς* for *ως* twice, the archaic *αντικατασταθέν* and
 *καταγεγραμμένον*, and two colloquialisms («σε μία καθισιά», «Κατεβείτε τη

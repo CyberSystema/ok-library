@@ -23,7 +23,16 @@ const src = readFileSync(join(root, 'apps/web/src/i18n.tsx'), 'utf8');
 // Every locale dictionary is a top-level `const <lang> = { 'a.b': '…', … }`.
 // Counting occurrences per key is enough: each dict declares a key at most once
 // (a duplicate would be a TS error), so a key present in all four appears 4×.
-const keyLines = [...src.matchAll(/^ {2}'([a-zA-Z0-9_.]+)':/gm)].map((m) => m[1]);
+//
+// `-` is IN the character class. Without it this regex could not see a key whose
+// name contains a hyphen, and three of them exist: the course chapter labels
+// `course.chapter.what-a-catalogue-is-for`, `.copies-and-shelves` and
+// `.daily-work`, whose ids come from the Handbook's chapter slugs. The file holds
+// 1,080 keys per locale and this saw 1,077 — so any of those three could be
+// dropped from a locale and the check still printed "no drift", which is exactly
+// the omission it exists to catch. Verified by deleting the Greek `daily-work`:
+// green before, drift after.
+const keyLines = [...src.matchAll(/^ {2}'([a-zA-Z0-9_.-]+)':/gm)].map((m) => m[1]);
 const counts = new Map();
 for (const k of keyLines) counts.set(k, (counts.get(k) ?? 0) + 1);
 
@@ -46,11 +55,14 @@ function walk(dir) {
 }
 const consumers = walk(join(root, 'apps/web/src'));
 // The negative lookbehind avoids matching `.t('…')` or any other method call
-// that merely ends in `t`.
+// that merely ends in `t`. The character class carries the hyphen for the same
+// reason the one above does: without it a reference to a hyphenated key that
+// exists in NO locale could not be flagged either, so the blind spot ran both
+// ways.
 const referenced = new Set();
 for (const abs of consumers) {
   const text = readFileSync(abs, 'utf8');
-  for (const m of text.matchAll(/(?<![A-Za-z0-9_.])t\('([a-zA-Z0-9_.]+)'/g)) referenced.add(m[1]);
+  for (const m of text.matchAll(/(?<![A-Za-z0-9_.])t\('([a-zA-Z0-9_.-]+)'/g)) referenced.add(m[1]);
 }
 // Template keys like t(`status.${x}`) cannot be resolved statically; they are
 // not checked here rather than guessed at.

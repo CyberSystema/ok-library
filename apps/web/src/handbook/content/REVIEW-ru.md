@@ -67,7 +67,7 @@ its spaces something else, that is the word to use.
 **Register.** Russian follows the same register as the approved Greek: precise, a
 little dry, plural imperative, no idiom. Two colloquialisms were removed.
 
-**Numbers** are carried across with Russian spacing — `12 700`, not `12,700`.
+**Numbers** are carried across with Russian spacing — `12 500`, not `12,500`.
 
 **Greek stays Greek.** Quoted catalogue values — `ΑΡΧΙΜ. ΝΙΚΟΔΗΜΟΥ Γ. ΑΕΡΑΚΗ`,
 `<<Ο ΣΩΤΗΡ>>`, `Η ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ` — are left in Greek script in the Russian pack,
@@ -75,4 +75,17 @@ because they are quoted as evidence of what is in this catalogue. A Russian read
 who cannot read them still learns the point being made about them.
 
 **Standard names stay Latin**: MARC 21, ISBD, Dublin Core, EDTF, ISO 843, SRU,
-OAI-PMH, Code 128.
+OAI-PMH, Code 128. A MARC tag *with its subfield* never appears in the prose —
+those live in `facts.ts` once, and the build fails if one is copied into a pack.
+The bare `880` in the transliteration chapter is the deliberate exception, and the
+build check holds it to `facts.ts` and to the other three packs rather than
+ignoring it.
+
+**Field labels in the tables stay English, and the pack cannot change it.** A
+`fields` row is `{ fact, note }` — the pack owns the note and nothing else — so
+the Russian reader sees `Publisher`, `Kind of publication` and `Shelf mark`
+beside a form that says Издатель, Вид издания, Полочный индекс. Core fields only:
+a custom attribute's label is stored in the database and rendered as stored, so
+`Edition` is English on the Russian screen too. Until the renderer takes a
+translation key, name the field in Russian **inside the note**, which is the part
+of the row this pack does own.

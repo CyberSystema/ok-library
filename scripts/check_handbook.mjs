@@ -14,10 +14,17 @@
  *    fallback for all four languages, so a chapter missing THERE is missing
  *    everywhere.
  *
- * 3. No content pack states a MARC tag of its own. Tags live in `facts.ts`, once.
- *    Four translations each carrying "245 $a" is four copies of one fact in files
- *    edited months apart, and being wrong in exactly one of them is both the
- *    likeliest outcome and the hardest to notice.
+ * 3. No content pack states a MARC tag TOGETHER WITH ITS SUBFIELD. Tags live in
+ *    `facts.ts`, once. Four translations each carrying "245 $a" is four copies of
+ *    one fact in files edited months apart, and being wrong in exactly one of them
+ *    is both the likeliest outcome and the hardest to notice.
+ *
+ *    A BARE tag number is a different thing and is allowed: "880" is the one token
+ *    a librarian can quote to a partner library, so the transliteration chapter
+ *    names it in all four languages on purpose. Allowed, not unchecked — see (3d),
+ *    which holds those mentions to facts.ts and to each other. This check used to
+ *    report "no MARC tag in the prose" while 880 stood in eight places, because its
+ *    regex required a `$`; the sentence it printed was false.
  *
  * 4. No content pack is reachable from the main bundle. The packs are the largest
  *    thing in the app and they are lazy on purpose; a single static import would
@@ -63,6 +70,19 @@ const packs = existsSync(contentDir)
   : [];
 if (!packs.includes('en.ts')) fail('there is no English content pack; English is the fallback for every language');
 
+// The bare tag numbers the prose may name, with no subfield. One today.
+//
+// "880" is in the transliteration chapter of all four packs deliberately: it is
+// the token a librarian quotes when a partner library asks how the script pair
+// travels. Two failures are possible and both have precedent, so both are checked
+// below. If facts.ts stopped declaring the tag — the exporter's linking tag
+// changed — these eight mentions would be a fact that outlived its source, and
+// the run would still have said the prose was clean. And the Greek review found
+// the other one by hand: the translation had silently DROPPED the tag, which no
+// structural check saw because a missing number is not a missing block.
+const PROSE_TAGS = ['880'];
+const bareTagUse = new Map();
+
 for (const file of packs) {
   const src = read(join(contentDir, file));
   const lang = file.replace(/\.ts$/, '');
@@ -87,18 +107,55 @@ for (const file of packs) {
     }
   }
 
-  // (3) no bare MARC tags in the prose.
-  const tagLike = [...src.matchAll(/(?:MARC\s+)?\b(\d{3})\s*\$[a-z0-9]/g)]
+  // (3) no tag-and-subfield in the prose — that is the shape a copy of a fact
+  // takes. Both delimiters: facts.ts writes the linking tag as `880 ‡6 245`, so a
+  // translator copying a value out of it would have walked straight past a check
+  // that only knew `$`.
+  const tagLike = [...src.matchAll(/(?:MARC\s+)?\b(\d{3})\s*[$‡][a-z0-9]/gi)]
     .map((m) => m[0].trim())
     .filter((v, i, a) => a.indexOf(v) === i);
   if (tagLike.length > 0) {
     fail(`${lang}: MARC tags appear in the prose; put them in facts.ts so they are stated once`, tagLike);
   }
 
+  // (3d) the bare tags the prose is allowed to name, counted.
+  //
+  // The digit guards matter: "1880-1889" is a periodical's run, not tag 880.
+  for (const tag of PROSE_TAGS) {
+    const n = [...src.matchAll(new RegExp(`(?<!\\d)${tag}(?!\\d)`, 'g'))].length;
+    bareTagUse.set(tag, (bareTagUse.get(tag) ?? new Map()).set(lang, n));
+  }
+
   // Chapter ids in a pack must be real.
   for (const m of src.matchAll(/^\s{2}'?([a-z][a-z0-9-]+)'?:\s*\{$/gm)) {
     if (!chapterIds.includes(m[1])) {
       fail(`${lang}: '${m[1]}' is not a chapter in the registry`);
+    }
+  }
+}
+
+// (3d) …and what must hold of them: the tag is still a fact, and every pack says
+// it as often as the English does. A tag the prose names is a fact restated in
+// four files, which is precisely what facts.ts exists to prevent — it is tolerated
+// here only because it is checked here.
+const factTags = new Set(
+  [...read(join(hb, 'facts.ts')).matchAll(/marc:\s*'([^']*)'/g)]
+    .flatMap((m) => [...m[1].matchAll(/(?<!\d)\d{3}(?!\d)/g)].map((x) => x[0]))
+);
+for (const tag of PROSE_TAGS) {
+  if (!factTags.has(tag)) {
+    fail(`the prose names MARC tag ${tag}, which facts.ts no longer declares`,
+      [`either the tag changed and the packs were not corrected, or ${tag} may be dropped from PROSE_TAGS`]);
+  }
+  const perLang = bareTagUse.get(tag) ?? new Map();
+  const inEnglish = perLang.get('en') ?? 0;
+  if (inEnglish === 0) {
+    fail(`PROSE_TAGS lists ${tag}, but the English pack never names it — the allowance has outlived its use`);
+  }
+  for (const [lang, n] of perLang) {
+    if (n !== inEnglish) {
+      fail(`${lang}: MARC tag ${tag} appears ${n} time(s), the English ${inEnglish}`,
+        ['a translation that drops the tag leaves its reader unable to quote it; this is the Greek pack\'s own bug']);
     }
   }
 }
@@ -125,6 +182,26 @@ function chapterBody(src, id) {
 }
 const kindsOf = (body) => [...body.matchAll(/kind:\s*'([a-z]+)'/g)].map((x) => x[1]).join(',');
 
+// (1c) …and the same CATALOGUE COUNTS inside them.
+//
+// The block-sequence check above compares block KINDS, so the numbers inside a
+// block are invisible to it — which is how the transliteration tip came to say
+// "all 12,700 records" in three languages and "και στις 12.675" in the Greek,
+// with every check passing. A count is one fact written into four files; the
+// Handbook's whole method is that such a fact is stated once, and prose counts
+// are the one place that cannot be honoured, so they are compared instead.
+//
+// Only values of 1,000 and up, and as a SET rather than a multiset. Below that
+// the packs legitimately disagree: English spells small numbers as words where
+// the Korean writes digits ("Seventy-three copies" against 「73권」). And the
+// Korean repeats a year in a `why` where the English does not — how often a
+// number is said is a translator's choice, WHICH numbers are said is a fact.
+// Separators are stripped first, so 12,528 · 12.528 · 12 528 are one value.
+const countsIn = (body) => [...new Set(
+  [...body.replace(/(\d)[.,\s ](?=\d{3}\b)/g, '$1').matchAll(/\d+/g)]
+    .map((m) => m[0]).filter((n) => Number(n) >= 1000)
+)].sort().join(' ');
+
 if (packs.includes('en.ts')) {
   const enSrc = read(join(contentDir, 'en.ts'));
   for (const file of packs.filter((f) => f !== 'en.ts')) {
@@ -138,6 +215,11 @@ if (packs.includes('en.ts')) {
       if (kindsOf(mine) !== kindsOf(theirs)) {
         fail(`${lang}: chapter '${id}' has a different block sequence from the English`,
           [`en:  ${kindsOf(theirs)}`, `${lang}: ${kindsOf(mine)}`]);
+      }
+      if (countsIn(mine) !== countsIn(theirs)) {
+        fail(`${lang}: chapter '${id}' states different catalogue counts from the English`,
+          [`en:  ${countsIn(theirs)}`, `${lang}: ${countsIn(mine)}`,
+            'one count, four files: correct it in the English and in every pack together']);
       }
     }
   }
@@ -320,5 +402,7 @@ if (existsSync(dist)) {
 if (failed) process.exit(1);
 console.log(
   `✓ handbook: ${chapterIds.length} chapters, ${anchorOwners.size} anchors, ${packs.length} pack(s); `
-  + 'every anchor resolves, no MARC tag in the prose.'
+  + 'every anchor resolves, no tag-and-subfield in the prose, '
+  + `bare tag(s) ${PROSE_TAGS.join(', ')} still declared in facts.ts and named alike in every pack, `
+  + 'and every chapter states the same catalogue counts in all four languages.'
 );

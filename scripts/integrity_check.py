@@ -3786,7 +3786,13 @@ try:
     # Dialog primitive — and it must not carry the dialog role itself. Searching
     # the whole corpus is what found the confirm dialog, which had rolled its
     # own overlay and was missed while this only read main.tsx.
-    overlays = re.findall(r'className="modal-overlay"', tsx)
+    # Comments stripped first. The count is of RENDERERS, and a comment that quotes
+    # the class name — ui.tsx now carries one explaining why exactly one element may
+    # have it — is documentation, not a second backdrop. Counting the raw text made
+    # the check fail the moment someone wrote down the rule it enforces.
+    tsx_code = re.sub(r'/\*.*?\*/', '', tsx, flags=re.S)
+    tsx_code = "\n".join(l for l in tsx_code.split("\n") if not l.strip().startswith("//"))
+    overlays = re.findall(r'className="modal-overlay"', tsx_code)
     check("only the Dialog primitive renders a backdrop", len(overlays) == 1, len(overlays))
     check("no overlay claims the dialog role on its backdrop",
           'className="modal-overlay" onClick' not in tsx and 'modal-overlay" role=' not in tsx,

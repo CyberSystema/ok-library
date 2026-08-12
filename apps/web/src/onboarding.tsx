@@ -17,8 +17,9 @@
 // What stays here is the frame, and the frame is what makes it a course rather
 // than a document: a welcome, a fixed order, visible progress, and an end. The
 // warmth lives in those, in the four languages the interface already speaks.
-import React, { Suspense, lazy, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { Suspense, lazy, useLayoutEffect, useRef, useState } from 'react';
 import { useI18n, useT, type Lang } from './i18n';
+import { ChunkBoundary, trapTab, useModalFocus } from './ui';
 import type { ChapterId } from './handbook/registry';
 
 const HandbookChapter = lazy(() =>
@@ -57,16 +58,31 @@ export function OnboardingCourse({ mandatory, onFinish, onClose }: {
   // Step 0 is the welcome; then one step per chapter; then the closing step.
   const [step, setStep] = useState(0);
   const bodyRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const total = COURSE_CHAPTERS.length + 2;
   const isWelcome = step === 0;
   const isEnd = step === total - 1;
   const chapterIndex = step - 1;
 
-  useEffect(() => {
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => { document.body.style.overflow = prev; };
-  }, []);
+  /**
+   * The same focus behaviour every other overlay in the app gets from <Dialog>:
+   * focus moves in on mount, the page behind is scroll-locked, and focus goes
+   * back to whatever opened this when it closes.
+   *
+   * This screen had NONE of it while declaring `role="dialog" aria-modal="true"`.
+   * On the mandatory first run focus stayed on <body>, so a screen reader
+   * announced no dialog at all and a keyboard user had to tab in from the top of
+   * the document; on a replay from the profile dialog focus was left on the
+   * navbar button BEHIND the overlay, and three Tabs from there walked into the
+   * application — 283 focusable controls behind the modal against 11 inside,
+   * with aria-modal telling assistive tech the opposite.
+   *
+   * The panel, not the backdrop, is the dialog — a backdrop that claims the role
+   * is the exact shape ui.tsx forbids. 'container' focus is what a long scrolling
+   * panel wants: the reader is told which dialog they are in before being put on
+   * a control.
+   */
+  useModalFocus(panelRef, 'container');
   useLayoutEffect(() => { bodyRef.current?.scrollTo({ top: 0 }); }, [step]);
 
   /**
@@ -85,13 +101,31 @@ export function OnboardingCourse({ mandatory, onFinish, onClose }: {
   }
 
   return (
-    <div className="ob-overlay" role="dialog" aria-modal="true" aria-label={t('course.title')}>
-      <div className="ob-panel">
+    <div
+      className="ob-overlay"
+      onKeyDown={(e) => {
+        // Escape closes a REPLAY only. The first run is mandatory and has no
+        // close path at all, so there is nothing for Escape to do there.
+        if (e.key === 'Escape' && !mandatory && onClose) {
+          e.stopPropagation();
+          onClose();
+          return;
+        }
+        trapTab(panelRef.current, e);
+      }}
+    >
+      <div
+        className="ob-panel"
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="course-title"
+      >
         <header className="ob-header">
           <div className="ob-header-title">
             <span className="ob-logo">📚</span>
             <div>
-              <strong>{t('course.title')}</strong>
+              <strong id="course-title">{t('course.title')}</strong>
               <span className="ob-progress-text">
                 {isWelcome ? t('course.welcomeStep')
                   : isEnd ? t('course.endStep')
@@ -164,9 +198,38 @@ export function OnboardingCourse({ mandatory, onFinish, onClose }: {
               // The splash matters: the Handbook prose is a lazily-loaded chunk, so
               // on a first run the course would otherwise show an empty panel while
               // it arrives — on the one screen a librarian cannot get past.
-              <Suspense fallback={<p className="muted">{t('common.loading')}</p>}>
-                <HandbookChapter id={COURSE_CHAPTERS[chapterIndex]} />
-              </Suspense>
+              //
+              // And the chunk can also FAIL: pending was handled, rejected was not.
+              // A stale index.html after a deploy or one bad moment on the line made
+              // the lazy import reject, React had no boundary to hand it to and
+              // unmounted the root — a blank page on the mandatory screen, with no
+              // navbar and no sign-out, that a reload re-requests. The boundary keeps
+              // the course FRAME alive, so the chapter can be skipped and the last
+              // step still records completion and clears the gate.
+              //
+              // Keyed by chapter so moving on re-attempts the load rather than
+              // staying broken for the rest of the course.
+              <ChunkBoundary
+                key={COURSE_CHAPTERS[chapterIndex]}
+                fallback={
+                  <div>
+                    {/* The same thing a failed CONTENT PACK already shows — see
+                        ensurePack's catch, which degrades to an empty Handbook. */}
+                    <p className="muted">{t('handbook.notWritten')}</p>
+                    {/* A reload, not a re-render: React.lazy caches the rejection,
+                        so re-rendering it throws the same error for the life of
+                        the page. A fresh document re-fetches index.html, which is
+                        what makes the stale-deploy case recoverable. */}
+                    <button className="secondary small" onClick={() => window.location.reload()}>
+                      {t('library.error.retry')}
+                    </button>
+                  </div>
+                }
+              >
+                <Suspense fallback={<p className="muted">{t('common.loading')}</p>}>
+                  <HandbookChapter id={COURSE_CHAPTERS[chapterIndex]} />
+                </Suspense>
+              </ChunkBoundary>
             )}
           </div>
         </div>

@@ -521,6 +521,12 @@ export function Combobox<T>(props: {
  * `ContextMenuView` already had a correct focus-restore implementation; this
  * lifts that approach so the next overlay inherits it instead of the gaps.
  *
+ * The behaviour itself lives in `useModalFocus` + `trapTab` below, because one
+ * overlay in the app cannot BE a Dialog: the course has its own full-screen
+ * backdrop and its own stacking level, and exactly one element in this app may
+ * carry `className="modal-overlay"`. Sharing the hook rather than the markup is
+ * what stops the two from drifting apart again.
+ *
  * WCAG 2.4.3 (focus order), 4.1.2 (name, role, value), 2.1.2 (no keyboard trap
  * — Tab cycles WITHIN the dialog, which is what aria-modal already promises AT
  * users and what Tab did not honour).
@@ -536,29 +542,7 @@ export function Dialog({ onClose, labelledBy, label, className, style, children,
   initialFocus?: 'first' | 'container';
 }) {
   const boxRef = useRef<HTMLDivElement | null>(null);
-  // Captured on mount, before focus moves: this is what focus goes back to.
-  const returnToRef = useRef<HTMLElement | null>(null);
-
-  useEffect(() => {
-    returnToRef.current = document.activeElement as HTMLElement | null;
-    const box = boxRef.current;
-    if (box) {
-      const focusable = box.querySelectorAll<HTMLElement>(FOCUSABLE);
-      const target = initialFocus === 'container' ? box : (focusable[0] ?? box);
-      // The container itself needs a tabindex to be focusable at all; -1 keeps
-      // it out of the tab sequence while allowing programmatic focus.
-      if (target === box) box.setAttribute('tabindex', '-1');
-      target.focus();
-    }
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      // Only restore if focus is still inside the dialog being torn down —
-      // otherwise a dialog that opened another one would yank focus back.
-      returnToRef.current?.focus?.();
-    };
-  }, [initialFocus]);
+  useModalFocus(boxRef, initialFocus);
 
   function onKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Escape') {
@@ -566,21 +550,7 @@ export function Dialog({ onClose, labelledBy, label, className, style, children,
       onClose();
       return;
     }
-    if (e.key !== 'Tab') return;
-    const box = boxRef.current;
-    if (!box) return;
-    const items = [...box.querySelectorAll<HTMLElement>(FOCUSABLE)]
-      .filter((el) => el.offsetParent !== null || el === document.activeElement);
-    if (items.length === 0) return;
-    const first = items[0];
-    const last = items[items.length - 1];
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
+    trapTab(boxRef.current, e);
   }
 
   return (
@@ -614,6 +584,122 @@ export const FOCUSABLE = [
   'select:not([disabled])', 'textarea:not([disabled])', 'summary',
   '[tabindex]:not([tabindex="-1"])'
 ].join(',');
+
+/**
+ * Move focus in on mount, put it back on unmount, and lock the page behind.
+ *
+ * Separate from <Dialog> only so an overlay that cannot use Dialog's markup can
+ * still get Dialog's behaviour from the same lines: the mandatory course is a
+ * `role="dialog"` of its own and had NONE of this — no initial focus, no
+ * restore, nothing — on the one screen a librarian cannot leave.
+ *
+ * `initialFocus: 'container'` focuses the box itself, which is what a long
+ * scrolling panel wants: a screen reader then announces the dialog and its name
+ * instead of starting the reader on whatever control happens to come first.
+ */
+export function useModalFocus(
+  boxRef: React.RefObject<HTMLElement | null>,
+  initialFocus: 'first' | 'container' = 'first'
+) {
+  // Captured on mount, before focus moves: this is what focus goes back to.
+  const returnToRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    returnToRef.current = document.activeElement as HTMLElement | null;
+    const box = boxRef.current;
+    if (box) {
+      const focusable = box.querySelectorAll<HTMLElement>(FOCUSABLE);
+      const target = initialFocus === 'container' ? box : (focusable[0] ?? box);
+      // The container itself needs a tabindex to be focusable at all; -1 keeps
+      // it out of the tab sequence while allowing programmatic focus.
+      if (target === box) box.setAttribute('tabindex', '-1');
+      target.focus();
+    }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      // The restore had a comment describing two guards and neither guard was in
+      // the code — it was a bare `returnToRef.current?.focus?.()`. Both failures
+      // are real:
+      //  • A dialog that opens another one — the profile dialog's "Read the
+      //    course again", the only such pair in the app — yanked focus back to
+      //    the navbar button that opened IT, i.e. to a control behind the modal
+      //    that had just appeared.
+      //  • focus() on an opener that has since been removed (row deleted, list
+      //    re-filtered) silently does nothing and leaves the keyboard at <body>.
+      //    That containment check is the half of ContextMenuView's implementation
+      //    this file claims to have lifted and did not.
+      //
+      // "Focus is still inside the dialog" has to be written as "nothing else has
+      // taken focus". By the time a passive cleanup runs, React has already
+      // detached this subtree and nulled boxRef, and focus has fallen to <body> —
+      // measured, not assumed — so a literal `box.contains(document.activeElement)`
+      // test would be false on every ordinary close and would disable the restore
+      // completely. `box` is the element captured above, not the ref.
+      const active = document.activeElement;
+      const takenElsewhere = !!active && active !== document.body && !box?.contains(active);
+      const back = returnToRef.current;
+      if (!takenElsewhere && back && document.body.contains(back)) back.focus();
+    };
+  }, [boxRef, initialFocus]);
+}
+
+/**
+ * Tab cycles WITHIN the box — what `aria-modal="true"` already promises to
+ * assistive technology, and what Tab did not honour.
+ *
+ * Call it from the container's onKeyDown. Focus sitting ON the box (the
+ * 'container' initial focus) counts as the first stop, or Shift+Tab from the
+ * opening position would walk straight out into the page behind.
+ */
+export function trapTab(box: HTMLElement | null, e: React.KeyboardEvent) {
+  if (e.key !== 'Tab' || !box) return;
+  const items = [...box.querySelectorAll<HTMLElement>(FOCUSABLE)]
+    .filter((el) => el.offsetParent !== null || el === document.activeElement);
+  if (items.length === 0) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (e.shiftKey && (document.activeElement === first || document.activeElement === box)) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+/**
+ * A boundary around a lazily-loaded chunk.
+ *
+ * `React.lazy` REJECTS when its chunk cannot be fetched — a stale index.html
+ * after a deploy, a 404 on a hashed filename, an offline moment — and React
+ * hands that to the nearest error boundary. There was none anywhere in this app,
+ * so the root unmounted and the page went blank; on the MANDATORY course that is
+ * a blank page with no navbar, no sign-out and no other tab to fall back to, and
+ * the librarian cannot get past it.
+ *
+ * HandbookProvider.ensurePack() already catches exactly this for the content
+ * pack — "A failed chunk must not take the app down" — and degrades to an empty
+ * Handbook. This is the same degradation for the RENDERER, which is a component
+ * and so could not be caught by that try/catch.
+ *
+ * A fallback should offer a reload rather than a re-render: React.lazy caches the
+ * rejection, so rendering the same lazy component again throws the same error for
+ * the life of the page.
+ */
+export class ChunkBoundary extends React.Component<
+  { children: React.ReactNode; fallback: React.ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
+}
 
 // ─── Local-date helpers ─────────────────────────────────────────────────────
 //

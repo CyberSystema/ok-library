@@ -9,13 +9,33 @@
 //
 // So every tag, subfield and internal field name lives here once. The prose
 // supplies sentences; this supplies the spine. `check_handbook.mjs` asserts that
-// no content pack contains a bare MARC tag of its own.
+// no content pack states a tag TOGETHER WITH ITS SUBFIELD — that is the shape a
+// copy of a fact takes. A bare tag number with no subfield is deliberately
+// allowed and one is deliberately used: the transliteration chapter writes "880"
+// in all four languages because it is the token a librarian quotes to a partner
+// library. The check holds those to facts.ts too — a bare tag named in the prose
+// must still be declared here — so the eight mentions cannot outlive the fact.
 //
 // `field` is the name the API and the forms use, so a reader can move between the
 // Handbook and the screen without guessing.
 
 export type FieldFact = {
-  /** What the librarian sees on the form, in English. Translated per pack. */
+  /**
+   * The field's name as the ENGLISH form labels it — "Kind of publication",
+   * "Shelf mark". Not translated, and it cannot be: a `fields` row is
+   * `{ fact, note }`, so a pack can translate the note beside a row and nothing
+   * else, and the table prints this string raw. The comment here used to say
+   * "translated per pack", which promised a mechanism that has never existed and
+   * hid the consequence — a Greek reader sees "Publisher" beside a form that says
+   * Εκδότης, in a drawer they opened because they did not recognise the field.
+   *
+   * Left in English deliberately for now, and the packs' review docs record why:
+   * the two columns this table is FOR — the `field` key and the MARC tag — are
+   * language-independent identifiers, and the per-pack `note` is where a
+   * translation names the field in the reader's own words. Translating the label
+   * itself needs a key here and a `t()` in the renderer; that is a code change,
+   * not a prose one, and until it is made this comment must not claim it.
+   */
   label: string;
   /** The key the API uses. Deliberately the real one. */
   field: string;
@@ -32,7 +52,13 @@ export const FIELD_FACTS = {
   subtitle: { label: 'Other title information', field: 'customFields.subTitle', marc: '245 $b', dc: null, standard: 'ISBD Area 1' },
   titleRomanized: { label: 'Title, romanized', field: 'titleRomanized', marc: '880 ‡6 245', dc: 'dc:title', standard: 'ISO 843' },
   author: { label: 'Author', field: 'author', marc: '100 $a', dc: 'dc:creator', standard: 'ISBD Area 1' },
-  authorRomanized: { label: 'Author, romanized', field: 'authorRomanized', marc: '880 ‡6 100', dc: 'dc:creator', standard: 'ISO 843' },
+  // `dc` is null, and not for want of an element to map to: `toDublinCoreXml`
+  // emits the romanized TITLE as a second dc:title and never emits the romanized
+  // author at all, so a harvester taking oai_dc receives the vernacular author
+  // only. This said `dc:creator` and was therefore a promise about what leaves
+  // the building that the exporter does not keep. It goes back to `dc:creator`
+  // the moment marc.ts emits it.
+  authorRomanized: { label: 'Author, romanized', field: 'authorRomanized', marc: '880 ‡6 100', dc: null, standard: 'ISO 843' },
   authorDates: { label: 'Author dates', field: 'authorities.dates', marc: '100 $d', dc: null },
   contributor: { label: 'Other contributor', field: 'authorities (role)', marc: '700 $a $4', dc: 'dc:contributor', standard: 'MARC relators' },
   subject: { label: 'Subject', field: 'authorities (kind=subject)', marc: '650 $a', dc: 'dc:subject' },
@@ -47,7 +73,15 @@ export const FIELD_FACTS = {
   ddc: { label: 'Dewey number', field: 'ddc', marc: '082 $a', dc: null, standard: 'DDC 23' },
   localClass: { label: 'Shelf classification', field: 'customFields.category_code', marc: '090 $a', dc: null },
   series: { label: 'Series', field: 'customFields.series', marc: '490 $a', dc: 'dc:relation', standard: 'ISBD Area 6' },
-  volume: { label: 'Volume', field: 'volumeDesignation', marc: '490 $v', dc: null },
+  // Not `volumeDesignation`, which is what this said. `books.volume_designation`
+  // (migration 0024) is READ everywhere — the exporter prefers it for 490 $v, set
+  // gap detection prefers it — and can be written by nothing: it is absent from
+  // BookCoreSchema, so the API drops it silently, and the form and the MARCXML
+  // import both write `volume_num`. It is NULL on every row in the catalogue. The
+  // same failure the code already documents for `bib_level`, one column over, and
+  // the Handbook was stating it as the field to fill. `volume_num` is what the
+  // screen writes and what the exporter falls back to, so 490 $v still holds.
+  volume: { label: 'Volume number', field: 'customFields.volume_num', marc: '490 $v', dc: null },
   bibLevel: { label: 'Kind of publication', field: 'bibLevel', marc: 'leader/07, 008/06', dc: 'dc:type', standard: 'IFLA LRM' },
   description: { label: 'Note', field: 'description', marc: '520 $a', dc: 'dc:description' },
   shelfCode: { label: 'Shelf mark', field: 'items[].shelfCode', marc: '852 $c', dc: null },

@@ -20,7 +20,7 @@ const pack: ContentPack = {
       'A catalogue is not a list of books. It is a set of promises about where they are and what they are.',
     blocks: [
       { kind: 'p', text:
-        'This library holds about 12,700 records. A shelf list would tell you that much. What a catalogue adds is that every one of those records answers the same questions in the same way, so a question asked once can be answered for the whole collection: what do we hold by this author, is this the edition we already have, which volume of this set is missing, where is our second copy.' },
+        'This library holds about 12,500 records. A shelf list would tell you that much. What a catalogue adds is that every one of those records answers the same questions in the same way, so a question asked once can be answered for the whole collection: what do we hold by this author, is this the edition we already have, which volume of this set is missing, where is our second copy.' },
       { kind: 'p', text:
         'Everything in this Handbook follows from that. A field is worth filling when it makes one of those answers possible, and worth filling *the same way every time* for the same reason. A field filled inconsistently is often worse than a field left empty, because an empty field is visibly empty and an inconsistent one looks answered.' },
 
@@ -126,7 +126,7 @@ const pack: ContentPack = {
         { fact: 'title', note: 'What the title page says. The one field with no good reason ever to be empty.' }
       ] },
       { kind: 'tip', text:
-        'A record may legitimately have no author, no publisher and no date — 3,768 records here have no author and 2,962 no publisher. It should always have a title.' },
+        'A record may legitimately have no author, no publisher and no date — 3,690 records here have no author and 2,957 no publisher. It should always have a title.' },
 
       { kind: 'h', text: 'Other title information', anchor: 'subtitle' },
       { kind: 'p', text:
@@ -137,7 +137,7 @@ const pack: ContentPack = {
       { kind: 'auto', text:
         'The punctuation that separates the two on an exported record — the space-colon-space of ISBD — is added when the record leaves. Do not type it.' },
       { kind: 'p', text:
-        'Nothing in this catalogue currently uses the field: all 12,675 records have an empty subtitle, because the import had nowhere to put one. Where you know the subtitle, adding it costs nothing and makes the record findable by it.' },
+        'Nothing in this catalogue currently uses the field: all 12,528 records have an empty subtitle, because the import had nowhere to put one. Where you know the subtitle, adding it costs nothing and makes the record findable by it.' },
 
       { kind: 'h', text: 'Articles at the front', anchor: 'non-filing' },
       { kind: 'p', text:
@@ -190,7 +190,7 @@ const pack: ContentPack = {
 
       { kind: 'h', text: 'When there is no publisher or no date', anchor: 'no-publisher' },
       { kind: 'p', text:
-        'Old and privately printed books frequently have neither, and 2,962 records here have no publisher. Leave the field empty rather than writing “χ.ε.” or “n.p.”: an empty field is a fact the catalogue can count, and a placeholder is a string it cannot.' },
+        'Old and privately printed books frequently have neither, and 2,957 records here have no publisher. Leave the field empty rather than writing “χ.ε.” or “n.p.”: an empty field is a fact the catalogue can count, and a placeholder is a string it cannot.' },
       { kind: 'see', chapter: 'consistency', anchor: 'empty-vs-unknown', text:
         'Why a placeholder is worse than a blank.' },
       { kind: 'see', chapter: 'dates', anchor: 'uncertain-dates', text:
@@ -210,11 +210,11 @@ const pack: ContentPack = {
         { fact: 'extent', note: 'Free text, in the standard order: pages, illustrations, size.' }
       ] },
       { kind: 'compare', good: '156, [3] σ. : εικ. ; 21 εκ.', bad: '156',
-        why: 'The catalogue holds 11,717 extent statements and most are a bare number like “31” or “159”. A number alone does not say whether it counts pages, leaves or volumes, and it cannot be printed in a description.' },
+        why: 'The catalogue holds 11,571 extent statements and most are a bare number like “31” or “159”. A number alone does not say whether it counts pages, leaves or volumes, and it cannot be printed in a description.' },
       { kind: 'p', text:
         'The square brackets in the good example are not decoration: they mark pages that are physically there but not numbered, which is how you record a book with three unpaginated pages at the end without inventing numbers for them.' },
       { kind: 'tip', text:
-        'You are not expected to go back and rewrite 11,717 statements. Write the full form on new records, and improve an old one when you have the book in your hands for another reason.' },
+        'You are not expected to go back and rewrite 11,571 statements. Write the full form on new records, and improve an old one when you have the book in your hands for another reason.' },
 
       { kind: 'h', text: 'Size', anchor: 'dimensions' },
       { kind: 'p', text:
@@ -232,7 +232,7 @@ const pack: ContentPack = {
     blocks: [
       { kind: 'h', text: 'The shelf classification', anchor: 'shelf-classification' },
       { kind: 'p', text:
-        'The shelf marks in this library are a classification: 19-000 is a subject area, not just a location. 8,117 records carry such a code. It works, the spines are labelled with it, and nothing in this Handbook suggests changing it — re-labelling 12,675 spines to gain conformance nobody asked for would be a bad trade.' },
+        'The shelf marks in this library are a classification: 19-000 is a subject area, not just a location. 8,117 records carry such a code. It works, the spines are labelled with it, and nothing in this Handbook suggests changing it — re-labelling 12,528 spines to gain conformance nobody asked for would be a bad trade.' },
       { kind: 'fields', rows: [
         { fact: 'localClass', note: 'The local class number. Exported in the slot MARC keeps for exactly this.' },
         { fact: 'shelfCode', note: 'Where the copy physically stands. Usually the same code, written as a shelf mark.' }
@@ -253,8 +253,8 @@ const pack: ContentPack = {
 
       { kind: 'h', text: 'Code or label — never both', anchor: 'code-vs-label' },
       { kind: 'p', text:
-        'The import left the collection split down the middle: 8,117 records carry a category CODE and 4,216 carry a category LABEL, and not one record carries both. They came from different source sheets.' },
-      { kind: 'quote', text: '8,117 with a code · 4,216 with a label · 0 with both',
+        'The import left the collection split down the middle: 8,117 records carry a category CODE and 4,097 carry a category LABEL, and not one record carries both. They came from different source sheets.' },
+      { kind: 'quote', text: '8,117 with a code · 4,097 with a label · 0 with both',
         source: 'measured on the live catalogue' },
       { kind: 'p', text:
         'This is worth knowing because it explains something that otherwise looks like a bug: a subject list built from labels covers a third of the collection, and one built from codes covers two thirds, and neither covers all of it. When you are reconciling a shelf, check which of the two that part of the collection uses.' },
@@ -277,13 +277,13 @@ const pack: ContentPack = {
         { fact: 'isbn', note: 'Type it as printed; the formatting is stripped for you. 10 or 13 digits.' }
       ] },
       { kind: 'p', text:
-        'Only 602 of 12,675 records have one, and that is expected rather than a gap: ISBNs began in the 1970s and most of this collection is older. An absent ISBN is not a record that needs fixing.' },
+        'Only 559 of 12,528 records have one, and that is expected rather than a gap: ISBNs began in the 1970s and most of this collection is older. An absent ISBN is not a record that needs fixing.' },
       { kind: 'auto', text:
-        'Hyphens and spaces are removed on save, so “978-960-315-733-5” and “9789603157335” are stored identically and match each other. A ten-digit ISBN is also converted to its thirteen-digit form for MATCHING only — the number you typed is what stays on the record.' },
+        'Hyphens and spaces are removed on save, so “978-960-315-733-5” and “9789603157335” are stored identically and match each other. The number you typed is what stays on the record. What is NOT done yet: a ten-digit ISBN is not converted to its thirteen-digit twin, so the same book carrying the old number here and the modern one in an arriving record counts as two different books. Compare the two forms yourself before concluding that an import was right to create a new record.' },
 
       { kind: 'h', text: 'When an ISBN is refused', anchor: 'bad-isbn' },
       { kind: 'p', text:
-        'The last digit of an ISBN is a check digit computed from the others, so most typing mistakes can be detected without looking anything up. Twenty records here have an ISBN whose check digit does not match.' },
+        'The last digit of an ISBN is a check digit computed from the others, so most typing mistakes can be detected without looking anything up. Eighteen records here have an ISBN whose check digit does not match.' },
       { kind: 'rule', text:
         'A failed check digit is a warning, never a refusal. The record saves. You are transcribing what is printed in a book, and a book with a wrong ISBN printed in it still exists.' },
       { kind: 'steps', items: [
@@ -292,7 +292,7 @@ const pack: ContentPack = {
         'If you cannot check the book right now, leave it and move on; the smart list will bring it back to you.'
       ] },
       { kind: 'tip', text:
-        'The “Bad ISBN” smart list collects all twenty in one place, which makes them a half-hour job rather than a background worry.' },
+        'The “Bad ISBN” smart list collects all eighteen in one place, which makes them a half-hour job rather than a background worry.' },
 
       { kind: 'h', text: 'ISSN', anchor: 'issn' },
       { kind: 'p', text:
@@ -405,7 +405,7 @@ const pack: ContentPack = {
       { kind: 'rule', text:
         'A heading POINTS. It never rewrites what is on the record. The book keeps saying what its title page said.' },
       { kind: 'p', text:
-        'That is the whole difference from the spelling-consistency tool, and it is why both exist. This catalogue has 5,427 distinct author strings and no headings at all yet, so every one of those 5,427 is currently its own island.' },
+        'That is the whole difference from the spelling-consistency tool, and it is why both exist. This catalogue has 5,395 distinct author strings and no headings at all yet, so every one of those 5,395 is currently its own island.' },
       { kind: 'see', chapter: 'consistency', anchor: 'consolidate-or-authority', text:
         'Which of the two tools a given problem wants.' },
 
@@ -451,7 +451,7 @@ const pack: ContentPack = {
       'Everyone involved in a book who is not its author, and the code that says what they did.',
     blocks: [
       { kind: 'p', text:
-        'A great deal of this collection is edited, translated or introduced rather than written: 1,195 records name an editor and 492 name a translator. Those people are how a reader finds the book — someone looking for Ιωήλ Γιαννακόπουλος as a translator will not find him in the author field.' },
+        'A great deal of this collection is edited, translated or introduced rather than written: 1,156 records name an editor and 492 name a translator. Those people are how a reader finds the book — someone looking for Ιωήλ Γιαννακόπουλος as a translator will not find him in the author field.' },
 
       { kind: 'h', text: 'The role codes', anchor: 'relators' },
       { kind: 'p', text:
@@ -473,8 +473,8 @@ const pack: ContentPack = {
 
       { kind: 'h', text: 'Editor and translator today', anchor: 'editor-and-translator' },
       { kind: 'p', text:
-        'Both are currently free-text attributes: 623 distinct editor strings and 398 distinct translator strings, none of them linked to anything. They are searchable as text and invisible as people — the same name spelled two ways is two editors, and none of them reaches a MARC record as an added entry.' },
-      { kind: 'quote', text: '1,195 records name an editor, in 623 different strings · 492 name a translator, in 398',
+        'Both are currently free-text attributes: 607 distinct editor strings and 398 distinct translator strings, none of them linked to anything. They are searchable as text and invisible as people — the same name spelled two ways is two editors, and none of them reaches a MARC record as an added entry.' },
+      { kind: 'quote', text: '1,156 records name an editor, in 607 different strings · 492 name a translator, in 398',
         source: 'measured on the live catalogue' },
       { kind: 'p', text:
         'Converting them is worth doing gradually and in order of frequency. An editor who appears on forty records is worth a heading this week; one who appears once can wait indefinitely.' },
@@ -508,7 +508,7 @@ const pack: ContentPack = {
 
       { kind: 'h', text: 'Starting from what you already wrote', anchor: 'seeding-subjects' },
       { kind: 'p', text:
-        'The catalogue already contains a subject vocabulary: the category labels, 4,216 records’ worth. They were written by the people who know this collection, which makes them a far better starting point than any imported list.' },
+        'The catalogue already contains a subject vocabulary: the category labels, 4,097 records’ worth. They were written by the people who know this collection, which makes them a far better starting point than any imported list.' },
       { kind: 'steps', items: [
         'Open the subject seeding tool from the headings card.',
         'It lists the labels with the number of records carrying each — “TRIBUTE TO PERSON · on 178 records”. Read down the list.',
@@ -544,7 +544,7 @@ const pack: ContentPack = {
         { fact: 'volume', note: 'Which volume of it this is.' }
       ] },
       { kind: 'p', text:
-        'Nearly every record has a series value — 12,597 of 12,675 — but that number is misleading. The import copied the title into the series field where it had nothing else to put, so more than half of those are a book’s own title repeated rather than a series it belongs to.' },
+        'Nearly every record has a series value — 12,513 of 12,528 — but that number is misleading. The import copied the title into the series field where it had nothing else to put, so more than half of those are a book’s own title repeated rather than a series it belongs to.' },
       { kind: 'tip', text:
         'When you open a record whose series is identical to its title, and it is not part of anything, clear the series. It costs one keystroke and removes one false group from the browser.' },
 
@@ -601,7 +601,7 @@ const pack: ContentPack = {
       { kind: 'p', text:
         'The smart lists are saved questions about the catalogue’s own condition rather than about its subject: records with no author, no shelf mark, no year, a failed ISBN check digit, or flagged as needing review. They are the practical form of “what is left to do”.' },
       { kind: 'p', text:
-        'Each of them is finite and shrinks as you work. Twenty bad ISBNs is a half-hour; 3,768 records with no author is a fact about the collection rather than a task, because most of them genuinely have no author.' },
+        'Each of them is finite and shrinks as you work. Eighteen bad ISBNs is a half-hour; 3,690 records with no author is a fact about the collection rather than a task, because most of them genuinely have no author.' },
       { kind: 'see', chapter: 'consistency', anchor: 'empty-vs-unknown', text:
         'This is why a placeholder in an empty field is harmful: it removes the record from the list that would have brought it back to you.' }
     ]
@@ -625,7 +625,7 @@ const pack: ContentPack = {
       { kind: 'p', text:
         'ISO 843 is the standard for turning Greek into Latin letters. Use its transliteration scheme — letter for letter, reversibly — rather than writing the name the way an English speaker would pronounce it. “Θεοδώρου” becomes “Theodorou”, not “Thedhorou”.' },
       { kind: 'tip', text:
-        'You do not need to romanize everything, and today nothing in this catalogue is romanized at all — the fields are empty on all 12,700 records. Start with the authors and titles most likely to be looked for from outside: the Fathers, the standard series, anything you would send to another library.' },
+        'You do not need to romanize everything, and today nothing in this catalogue is romanized at all — the fields are empty on all 12,528 records. Start with the authors and titles most likely to be looked for from outside: the Fathers, the standard series, anything you would send to another library.' },
 
       { kind: 'h', text: 'The parallel fields', anchor: 'parallel-fields' },
       { kind: 'p', text:
@@ -699,7 +699,7 @@ const pack: ContentPack = {
       'The physical volumes. One record, as many copies as the library owns — and ten things each of them can say.',
     blocks: [
       { kind: 'p', text:
-        'There are 12,675 copies in this catalogue and 12,675 records, which means nobody has ever recorded a second copy of anything. Where the library owns a book twice, one of the two is either uncatalogued or catalogued again as its own record.' },
+        'There are 12,528 copies in this catalogue and 12,528 records, which means nobody has ever recorded a second copy of anything. Where the library owns a book twice, one of the two is either uncatalogued or catalogued again as its own record.' },
       { kind: 'see', chapter: 'what-a-catalogue-is-for', anchor: 'record-vs-copy', text:
         'Why the second of those is the expensive mistake.' },
 
@@ -756,8 +756,8 @@ const pack: ContentPack = {
       { kind: 'h', text: 'The shelf mark', anchor: 'shelf-mark-form' },
       { kind: 'p', text:
         'The shelf marks here take the form 15-003: a subject area and a position within it. They are a classification as much as a location, which is why the same code appears as both a shelf mark on the copy and a class number on the record.' },
-      { kind: 'quote', text: '15-003 · 28-003 · 25-003 · 14-005 · 30-000',
-        source: 'the busiest shelf marks, 185 to 123 volumes each' },
+      { kind: 'quote', text: '15-003 · 28-003 · 25-003 · 28-002 · 14-005',
+        source: 'the busiest shelf marks, 185 to 124 volumes each' },
       { kind: 'auto', text:
         'Shelf marks are stored upper-cased, and Greek ones are upper-cased the Greek way — so “πισω” and “ΠΙΣΩ” are the same shelf and a search for either finds both.' },
       { kind: 'p', text:
@@ -769,7 +769,7 @@ const pack: ContentPack = {
       { kind: 'p', text:
         'A room is the space the shelves are in — a reading room, a back store, a chapel library. It is worth recording when the library occupies more than one space, because a shelf mark alone then does not say which building to walk to.' },
       { kind: 'p', text:
-        'There are no rooms defined here yet, and all 12,675 copies are unassigned. If everything is in one space, that is the correct state and there is nothing to do.' },
+        'There are no rooms defined here yet, and all 12,528 copies are unassigned. If everything is in one space, that is the correct state and there is nothing to do.' },
       { kind: 'rule', text:
         'Renaming a room moves every book in it. Deleting one is refused while any book is still there, including a book in the trash — the trash still points at the room.' },
 
@@ -996,7 +996,7 @@ const pack: ContentPack = {
       { kind: 'rule', text:
         'Records are matched on ISBN. A record with no ISBN always arrives as a NEW record, even if the library already holds the book — so importing a file of pre-1970 material twice creates duplicates.' },
       { kind: 'p', text:
-        'That is worth reading twice, because only 602 of the records here have an ISBN. For most of this collection the matching cannot work, and the import will add rather than update.' },
+        'That is worth reading twice, because only 559 of the records here have an ISBN. For most of this collection the matching cannot work, and the import will add rather than update.' },
       { kind: 'see', chapter: 'trash-and-merge', anchor: 'merging-duplicates', text:
         'If it does duplicate something, this is the way back.' },
 
@@ -1197,7 +1197,7 @@ const pack: ContentPack = {
 
       { kind: 'h', text: 'Correcting the import', anchor: 'correcting-the-import' },
       { kind: 'p', text:
-        'The largest job, and the one with the clearest finish line, because the smart lists count it down for you. Work a list rather than a shelf: twenty bad ISBNs is a session, and it is over when the list is empty.' },
+        'The largest job, and the one with the clearest finish line, because the smart lists count it down for you. Work a list rather than a shelf: eighteen bad ISBNs is a session, and it is over when the list is empty.' },
       { kind: 'steps', items: [
         'Pick one list — bad ISBNs, no shelf mark, needs review.',
         'Work down it with the book in hand where you need it.',

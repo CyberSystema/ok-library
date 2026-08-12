@@ -64,7 +64,7 @@ appears in five Korean UI strings meaning *title*. See the sweep below.
 ### 2. `서가실` for room
 
 This is the system's own coinage, not standard Korean library vocabulary. No rooms
-are defined yet — all 12,675 copies are unassigned — so nothing depends on it. If
+are defined yet — all 12,528 copies are unassigned — so nothing depends on it. If
 the monastery calls its spaces `자료실` or `서고`, that word should win for the
 label, with `소장처` kept for the concept.
 
@@ -142,9 +142,9 @@ objects, `『 』` for a cited publication or standard. `« »` is *not* used, b
 the catalogue's own data contains `« »` and `<<>>` that must stay distinguishable
 from the Handbook's own punctuation.
 
-Numbers keep the comma as thousands separator (`12,675`), take no space before a
-counter (`12,675종`, `3쇄`, `21cm`), and always state their unit — `건 · 종 · 책 ·
-권 · 명 · 호`. Exact counts stay exact: `12,675`, never `12,700`.
+Numbers keep the comma as thousands separator (`12,528`), take no space before a
+counter (`12,528종`, `3쇄`, `21cm`), and always state their unit — `건 · 종 · 책 ·
+권 · 명 · 호`. Exact counts stay exact: `12,528`, never `12,500`.
 
 ---
 
@@ -184,5 +184,31 @@ them, never instead of them.
 **Standard names stay in Latin script**: MARC 21, KORMARC, KCR4, ISBD, Dublin
 Core, EDTF, ISO 843, ISO 2789, ISO 15511, SRU, OAI-PMH, Code 128, DDC.
 
-**MARC tags are not in the prose at all** — they live in `facts.ts`, once,
-untranslated, and the build fails if a tag appears in any content pack.
+**A MARC tag with its subfield is not in the prose at all** — those live in
+`facts.ts`, once, untranslated, and the build fails if one appears in any content
+pack. A *bare* tag is the deliberate exception: `880` stands in the
+transliteration chapter of every pack, because it is the token a librarian quotes
+to a partner library, and 표시기호 is in the glossary for exactly that moment. The
+build check covers it rather than ignoring it — the tag must still be declared in
+`facts.ts`, and every pack must name it as often as the English does, so no
+translation can quietly drop it as the Greek one did.
+
+**Field labels in the tables are in English, and no pack can change that.** A
+`fields` row is `{ fact, note }`, so a pack translates the note and nothing else,
+and the renderer prints `FIELD_FACTS.label` raw: the Korean reader sees
+`Kind of publication` where the screen says 자료 유형, and `Shelf mark` where the
+screen says 「서가 기호」 (spaced, as §Numbers-and-spacing notes the interface does).
+`facts.ts` used to describe the label as "translated per pack", which no mechanism
+has ever done; that comment is corrected.
+
+Core fields only: a custom attribute's label is stored in
+`custom_field_definitions` and rendered as stored, so `Editor` and `Volume Number`
+are English on the Korean screen as well. Those rows already match the screen —
+in the wrong language, which is a different problem from this one.
+
+The decision, until a `labelKey` and a `t()` in the renderer make it moot: the
+columns this table exists FOR — the API field key and the MARC tag — are
+identifiers and language-independent, and the label is a gloss. The translator's
+job meanwhile is to name the field in Korean **inside the note**, the one part of
+the row a pack owns, so the reader meets 자료 유형 in the third column even when
+the first is in English.

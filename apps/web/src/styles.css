@@ -2983,8 +2983,15 @@ mark.hl {
    printed copy sits next to the desk where the laptop is not. On paper there is
    no navigation, no chrome, and every chapter rather than the one on screen. */
 @media print {
-  .app-header, .app-nav, .toast-stack, .mini-bar, .section-header-actions,
-  .hb-contents, .hb-chapter-nav, .help-link, .modal-backdrop {
+  /* Every selector here names a class that is in the markup. Four of the nine did
+     not: `.app-header`, `.app-nav`, `.mini-bar` and `.modal-backdrop` are in no
+     component in this repository, so page one of a printed Handbook still carried
+     the navbar (brand, download button, language switcher, theme toggle,
+     username, Sign out) and the six-tab bar, and an open dialog's backdrop
+     printed over everything. The shell's real classes are `.simple-navbar`,
+     `.simple-tabs`, `.minibar-row` and `.modal-overlay`. */
+  .simple-navbar, .simple-tabs, .toast-stack, .minibar-row, .section-header-actions,
+  .hb-contents, .hb-chapter-nav, .help-link, .modal-overlay {
     display: none !important;
   }
   .hb-print-only { display: block !important; }
@@ -3003,7 +3010,34 @@ mark.hl {
   .hb-h { break-after: avoid; }
   .hb-print-chapter { break-before: page; }
   .hb-print-chapter:first-child { break-before: auto; }
-  /* Black on white, whatever theme the screen was in. */
-  :root { --text-light: #000; --text-muted: #333; --border: #999; }
+  /* Black on white, whatever theme the screen was in.
+     The three text tokens alone did not deliver that. Every surfaced element in
+     the Handbook draws its own background from --surface-2 (callouts, quoted
+     examples, comparison rationales, field-table headers) or --surface, and
+     those kept their DARK values: printing from the dark theme put black ink on
+     #1a2438 at 1.35:1 — measured, and 1.23:1 for the muted rationale — while the
+     prose around them was fine. A right-and-wrong pair half-invisible on paper is
+     the failure this block's own comment warns about.
+     Both selectors are listed because `:root` and `[data-theme="dark"]` have the
+     SAME specificity: naming only :root would leave the outcome to source order. */
+  :root, [data-theme="dark"] {
+    --bg: #fff;
+    --surface: #fff;
+    --surface-2: #f5f5f5;
+    --accent-light: #f0f0f0;
+    --text: #000;
+    --text-light: #000;
+    --text-muted: #333;
+    --border: #999;
+  }
   body { background: #fff !important; color: #000 !important; }
+  /* The "→ see also" cross-reference is a real <button> with no colour rule of
+     its own, so it fell through to the UA's button colours — white on grey from
+     the dark theme's color-scheme. On paper it is not a control, it is a
+     sentence. */
+  .hb-see .link-button {
+    background: transparent !important;
+    color: #000 !important;
+    padding: 0;
+  }
 }

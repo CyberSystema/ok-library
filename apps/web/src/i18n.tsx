@@ -153,7 +153,12 @@ const en: Dict = {
   'serials.unspecified': '(unspecified)',
   'authorities.heading': 'Controlled headings',
   'authorities.intro': 'One entry per person, body, publisher or subject, with the other spellings recorded against it. The free text on each book is left exactly as catalogued; a heading is a pointer, not a rewrite. This is what MARC 100, 700 and 650 export from.',
-  'authorities.vsConsistency': 'Use a heading when every spelling is legitimate — “Επιφάνιος Σαλαμίνος”, “Epiphanius of Salamis” and “Ἐπιφάνιος Κύπρου” are one person under three real names. Use “Spelling consistency” below when one of the spellings is simply wrong, because that tool overwrites the others.',
+  // The quoted name MUST be `settings.vc.heading` verbatim: this is the one string
+  // that routes a librarian between two tools that do opposite things — one points,
+  // one destructively overwrites — and it used to send them looking for “Spelling
+  // consistency”, a caption no locale defines. Approved direction is to follow the
+  // heading (GLOSSARY-ko.md §5.2.12).
+  'authorities.vsConsistency': 'Use a heading when every spelling is legitimate — “Επιφάνιος Σαλαμίνος”, “Epiphanius of Salamis” and “Ἐπιφάνιος Κύπρου” are one person under three real names. Use “Value consistency” below when one of the spellings is simply wrong, because that tool overwrites the others.',
   'authorities.kindLabel': 'Kind',
   'authorities.kind.person': 'Person',
   'authorities.kind.corporate': 'Body or institution',
@@ -1259,7 +1264,7 @@ const ko: Dict = {
   'serials.unspecified': '(미기재)',
   'authorities.heading': '전거 표목',
   'authorities.intro': '인물·단체·발행처·주제마다 하나의 표목을 두고, 다른 표기들을 그 아래에 기록합니다. 각 레코드의 원래 텍스트는 그대로 남습니다 — 표목은 가리키는 것이며 고쳐 쓰는 것이 아닙니다. MARC 100, 700, 650이 여기서 만들어집니다.',
-  'authorities.vsConsistency': '모든 표기가 정당할 때 표목을 쓰세요 — “Επιφάνιος Σαλαμίνος”, “Epiphanius of Salamis”, “Ἐπιφάνιος Κύπρου”는 한 사람의 세 가지 실제 이름입니다. 어느 한 표기가 그냥 틀린 것이라면 아래의 “표기 일관성”을 쓰세요. 그 도구는 나머지를 덮어씁니다.',
+  'authorities.vsConsistency': '모든 표기가 정당할 때 표목을 쓰세요 — “Επιφάνιος Σαλαμίνος”, “Epiphanius of Salamis”, “Ἐπιφάνιος Κύπρου”는 한 사람의 세 가지 실제 이름입니다. 어느 한 표기가 그냥 틀린 것이라면 아래의 “값 일관성”을 쓰세요. 그 도구는 나머지를 덮어씁니다.',
   'authorities.kindLabel': '종류',
   'authorities.kind.person': '개인',
   'authorities.kind.corporate': '단체·기관',
@@ -1519,7 +1524,7 @@ const ko: Dict = {
   'toast.normalizedAll': '정규화 완료. {total}권 중 {updated}권이 업데이트되었습니다.',
   'toast.rebuiltSearchIndex': '검색 색인을 다시 작성했습니다. {total}권 중 {rebuilt}권을 다시 색인했습니다.',
   'toast.bulkSelectAtLeastOne': '일괄 업데이트할 도서를 1권 이상 선택하세요.',
-  'toast.bulkRequireValue': '하나 이상의 일괄 값(상태, 방, 서가)을 설정하세요.',
+  'toast.bulkRequireValue': '하나 이상의 일괄 값(상태, 서가실, 서가)을 설정하세요.',
   'toast.bulkPartial': '일괄 업데이트 결과: {success}권 성공, {failed}권 실패 (버전 충돌 가능).',
   'toast.bulkAll': '{n}권의 일괄 업데이트가 완료되었습니다.',
   'toast.deletedAll': '{n}권 삭제됨.',
@@ -1792,7 +1797,9 @@ const ko: Dict = {
   'library.bulk.applyN': '{books}권에 {fields}개 항목 적용',
   'library.bulk.applyNShort': '{fields}개 항목 적용',
   'library.bulk.field.shelfCode': '서가',
-  'library.bulk.field.roomCode': '방',
+  // 「방」 is a room in a house and is banned pack-wide (GLOSSARY-ko.md:47) for
+  // this entity; `rooms.*` and `copies.room` already say 「서가실」. Sweep §5.2.7.
+  'library.bulk.field.roomCode': '서가실',
   'library.bulk.field.publisher': '출판사',
   'library.bulk.field.language': '언어',
   'library.bulk.field.publicationYear': '출판 연도',
@@ -1880,7 +1887,7 @@ const ko: Dict = {
   'detail.yearPublished': '출판 연도',
   'detail.publisher': '출판사',
   'detail.language': '언어',
-  'detail.room': '방',
+  'detail.room': '서가실',
   'detail.shelfRow': '서가',
   'detail.statusRow': '상태',
   'detail.attributes': '속성',
@@ -2363,7 +2370,7 @@ const ru: Dict = {
   'serials.unspecified': '(не указано)',
   'authorities.heading': 'Авторитетные заголовки',
   'authorities.intro': 'По одной записи на человека, организацию, издательство или предмет, с другими написаниями при ней. Свободный текст в каждой книге остаётся точно таким, как его занесли: заголовок — это ссылка, а не переписывание. Из этого строятся MARC 100, 700 и 650.',
-  'authorities.vsConsistency': 'Заголовок нужен, когда все написания законны — «Επιφάνιος Σαλαμίνος», «Epiphanius of Salamis» и «Ἐπιφάνιος Κύπρου» — это один человек под тремя настоящими именами. Если же одно написание просто неверно, используйте «Единообразие написаний» ниже: тот инструмент перезаписывает остальные.',
+  'authorities.vsConsistency': 'Заголовок нужен, когда все написания законны — «Επιφάνιος Σαλαμίνος», «Epiphanius of Salamis» и «Ἐπιφάνιος Κύπρου» — это один человек под тремя настоящими именами. Если же одно написание просто неверно, используйте «Единообразие значений» ниже: тот инструмент перезаписывает остальные.',
   'authorities.kindLabel': 'Вид',
   'authorities.kind.person': 'Лицо',
   'authorities.kind.corporate': 'Организация',
@@ -2606,7 +2613,10 @@ const ru: Dict = {
   'toast.coverRemoved': 'Обложка удалена.',
   'toast.coverTooLarge': 'Изображение обложки слишком большое (макс. 4 МБ).',
   'toast.coverInvalidType': 'Обложка должна быть в формате JPEG, PNG, WebP или GIF.',
-  'toast.printOpened': 'Открыт предварительный просмотр печати для {n} этикеток.',
+  // Count-agnostic on purpose: the English original inflects via `{s}` at the
+  // call site, which Russian cannot use — «для 1 этикеток» was the result. The
+  // count is a predicate here, so the phrasing is right for 1, 2 and 5 alike.
+  'toast.printOpened': 'Открыт предварительный просмотр печати. Этикеток: {n}.',
   'toast.borrowerRequired': 'Введите имя получателя и срок возврата.',
   'toast.scanRequired': 'Введите значение QR или штрихкода.',
   'toast.noOverdue': 'Нет просроченных выдач.',
@@ -2619,10 +2629,10 @@ const ru: Dict = {
   'toast.normalizedAll': 'Нормализация завершена. Обновлено {updated} из {total} книг.',
   'toast.rebuiltSearchIndex': 'Поисковый индекс перестроен. Переиндексировано {rebuilt} из {total} книг.',
   'toast.bulkSelectAtLeastOne': 'Выберите хотя бы одну книгу для массового обновления.',
-  'toast.bulkRequireValue': 'Установите хотя бы одно значение (статус, комната или полка).',
+  'toast.bulkRequireValue': 'Установите хотя бы одно значение (статус, помещение или полка).',
   'toast.bulkPartial': 'Массовое обновление: {success} обновлено, {failed} не удалось (вероятно, конфликты версий).',
   'toast.bulkAll': 'Массовое обновление завершено для {n} книг.',
-  'toast.deletedAll': 'Удалено {n} книг.',
+  'toast.deletedAll': 'Удалено книг: {n}.',
   'toast.deletedMixed': 'Удалено {success}, не удалось — {failed}.',
   'toast.codeCreatedCopied': 'Код {type} создан и скопирован: {value}',
   'toast.codeCreated': 'Код {type} создан: {value}',
@@ -2675,7 +2685,7 @@ const ru: Dict = {
   'confirm.removeCoverAction': 'Удалить обложку',
   'confirm.deleteBookTitle': 'Удалить «{title}»?',
   'confirm.deleteBookBody': 'Книга перемещается в Корзину — история выдач сохраняется. Восстановление удалённой книги сейчас требует администратора.',
-  'confirm.deleteBulkTitle': 'Удалить {n} книг?',
+  'confirm.deleteBulkTitle': 'Удалить книги (выбрано: {n})?',
   'confirm.deleteBulkBody': 'Книги перемещаются в Корзину — история выдач сохраняется. Восстановление удалённых книг сейчас требует администратора.',
   'confirm.deleteBulkAction': 'Удалить выбранные',
   'confirm.deleteFieldTitle': 'Удалить пользовательское поле «{key}»?',
@@ -2892,7 +2902,11 @@ const ru: Dict = {
   'library.bulk.applyN': 'Применить полей: {fields} к книгам: {books}',
   'library.bulk.applyNShort': 'Применить полей: {fields}',
   'library.bulk.field.shelfCode': 'Полка',
-  'library.bulk.field.roomCode': 'Зал',
+  // One column, `room_code`: the facet rail, this table header and the bulk field
+  // said «Зал», the detail panel «Комната» and Settings «Помещение», so nothing
+  // told the librarian they were the same field. «Помещение» is what the whole
+  // `rooms.*` section, the permissions list and the Russian Handbook use.
+  'library.bulk.field.roomCode': 'Помещение',
   'library.bulk.field.publisher': 'Издательство',
   'library.bulk.field.language': 'Язык',
   'library.bulk.field.publicationYear': 'Год издания',
@@ -2980,7 +2994,7 @@ const ru: Dict = {
   'detail.yearPublished': 'Год издания',
   'detail.publisher': 'Издатель',
   'detail.language': 'Язык',
-  'detail.room': 'Комната',
+  'detail.room': 'Помещение',
   'detail.shelfRow': 'Полка',
   'detail.statusRow': 'Статус',
   'detail.attributes': 'Атрибуты',
@@ -3231,7 +3245,7 @@ const ru: Dict = {
   'settings.system.lang': 'Язык',
   'settings.customFieldsEmpty': 'Пользовательские атрибуты ещё не определены. Откройте Импорт и Экспорт → Настройка, чтобы добавить пресет каталога.',
 
-  'labels.ready': '{n} этикеток готово к печати',
+  'labels.ready': 'Этикеток к печати: {n}',
   'labels.print': '🖨 Печать',
   'labels.close': 'Закрыть',
   'labels.toolbarHint': 'A4 · 2 колонки · по одной наклейке на экземпляр · QR + Code 128',
@@ -3471,7 +3485,7 @@ const el: Dict = {
   'serials.unspecified': '(απροσδιόριστο)',
   'authorities.heading': 'Καθιερωμένες αποδόσεις',
   'authorities.intro': 'Μία καταχώριση για κάθε πρόσωπο, φορέα, εκδότη ή θέμα, με τις άλλες γραφές καταγεγραμμένες κάτω από αυτήν. Το ελεύθερο κείμενο κάθε βιβλίου παραμένει ακριβώς όπως καταλογογραφήθηκε· η καθιερωμένη απόδοση δείχνει, δεν ξαναγράφει. Από εδώ βγαίνουν τα MARC 100, 700 και 650.',
-  'authorities.vsConsistency': 'Χρησιμοποιήστε καθιερωμένη απόδοση όταν όλες οι γραφές είναι θεμιτές — «Επιφάνιος Σαλαμίνος», «Epiphanius of Salamis» και «Ἐπιφάνιος Κύπρου» είναι ένα πρόσωπο με τρία υπαρκτά ονόματα. Χρησιμοποιήστε τη «Συνέπεια γραφής» παρακάτω όταν μία από τις γραφές είναι απλώς λάθος, γιατί εκείνο το εργαλείο σβήνει τις υπόλοιπες.',
+  'authorities.vsConsistency': 'Χρησιμοποιήστε καθιερωμένη απόδοση όταν όλες οι γραφές είναι θεμιτές — «Επιφάνιος Σαλαμίνος», «Epiphanius of Salamis» και «Ἐπιφάνιος Κύπρου» είναι ένα πρόσωπο με τρία υπαρκτά ονόματα. Χρησιμοποιήστε τη «Συνέπεια τιμών» παρακάτω όταν μία από τις γραφές είναι απλώς λάθος, γιατί εκείνο το εργαλείο σβήνει τις υπόλοιπες.',
   'authorities.kindLabel': 'Είδος',
   'authorities.kind.person': 'Πρόσωπο',
   'authorities.kind.corporate': 'Φορέας ή ίδρυμα',
@@ -3725,7 +3739,11 @@ const el: Dict = {
   'toast.coverRemoved': 'Το εξώφυλλο αφαιρέθηκε.',
   'toast.coverTooLarge': 'Η εικόνα εξωφύλλου είναι πολύ μεγάλη (μέγ. 4 MB).',
   'toast.coverInvalidType': 'Το εξώφυλλο πρέπει να είναι JPEG, PNG, WebP ή GIF.',
-  'toast.printOpened': 'Άνοιξε προεπισκόπηση εκτύπωσης για {n} ετικέτα(ες).',
+  // Count-agnostic on purpose: English inflects with `{s}` at the call site and
+  // Greek cannot, so «για 1 ετικέτα(ες)» / «Διαγράφηκαν 1 βιβλία» was what one
+  // selected record produced. The count is a predicate here, so 1 reads as well
+  // as 12 — the same construction `labels.docTitle` already uses.
+  'toast.printOpened': 'Άνοιξε προεπισκόπηση εκτύπωσης. Ετικέτες: {n}.',
   'toast.borrowerRequired': 'Συμπληρώστε όνομα δανειζομένου και ημερομηνία επιστροφής.',
   'toast.scanRequired': 'Εισαγάγετε τιμή QR ή γραμμωτού κώδικα.',
   'toast.noOverdue': 'Δεν υπάρχουν εκπρόθεσμοι δανεισμοί.',
@@ -3741,7 +3759,7 @@ const el: Dict = {
   'toast.bulkRequireValue': 'Ορίστε τουλάχιστον μία τιμή (κατάσταση, αίθουσα ή ράφι).',
   'toast.bulkPartial': 'Μαζική ενημέρωση: {success} ενημερώθηκαν, απέτυχαν {failed} (πιθανές συγκρούσεις έκδοσης).',
   'toast.bulkAll': 'Η μαζική ενημέρωση ολοκληρώθηκε για {n} βιβλία.',
-  'toast.deletedAll': 'Διαγράφηκαν {n} βιβλία.',
+  'toast.deletedAll': 'Βιβλία που διαγράφηκαν: {n}.',
   'toast.deletedMixed': 'Διαγράφηκαν {success}, απέτυχαν {failed}.',
   'toast.codeCreatedCopied': 'Δημιουργήθηκε και αντιγράφηκε ο κωδικός {type}: {value}',
   'toast.codeCreated': 'Δημιουργήθηκε ο κωδικός {type}: {value}',
@@ -3794,7 +3812,7 @@ const el: Dict = {
   'confirm.removeCoverAction': 'Αφαίρεση εξωφύλλου',
   'confirm.deleteBookTitle': 'Διαγραφή «{title}»;',
   'confirm.deleteBookBody': 'Το βιβλίο μετακινείται στον Κάδο — το ιστορικό δανεισμών διατηρείται. Η επαναφορά διαγραμμένου βιβλίου απαιτεί προς το παρόν διαχειριστή.',
-  'confirm.deleteBulkTitle': 'Διαγραφή {n} βιβλίων;',
+  'confirm.deleteBulkTitle': 'Διαγραφή των επιλεγμένων βιβλίων ({n});',
   'confirm.deleteBulkBody': 'Τα βιβλία μετακινούνται στον Κάδο — το ιστορικό δανεισμών διατηρείται. Η επαναφορά διαγραμμένων βιβλίων απαιτεί προς το παρόν διαχειριστή.',
   'confirm.deleteBulkAction': 'Διαγραφή επιλεγμένων',
   'confirm.deleteFieldTitle': 'Διαγραφή πεδίου «{key}»;',
@@ -4201,7 +4219,7 @@ const el: Dict = {
   'settings.dupHeading': '🔎 Έλεγχος διπλοτύπων',
   'settings.dupIntro': 'Βρείτε βιβλία με ίδιο τίτλο + συγγραφέα.',
   'settings.dupScan': 'Σάρωση για διπλότυπα',
-  'settings.dupGroupsFound': '⚠️ Βρέθηκαν {n} ομάδες διπλοτύπων',
+  'settings.dupGroupsFound': '⚠️ Ομάδες διπλοτύπων που βρέθηκαν: {n}',
   'settings.dupId': 'ID:',
   'settings.dupIsbn': 'ISBN:',
   'settings.auditHeading': '📜 Πρόσφατη δραστηριότητα (audit log)',
@@ -4350,7 +4368,7 @@ const el: Dict = {
   'settings.system.lang': 'Γλώσσα',
   'settings.customFieldsEmpty': 'Δεν έχουν οριστεί προσαρμοσμένα γνωρίσματα ακόμη. Ανοίξτε Εισαγωγή & Εξαγωγή → Ρύθμιση για να προσθέσετε το πρότυπο καταλόγου.',
 
-  'labels.ready': '{n} ετικέτα(ες) έτοιμες προς εκτύπωση',
+  'labels.ready': 'Ετικέτες προς εκτύπωση: {n}',
   'labels.print': '🖨 Εκτύπωση',
   'labels.close': 'Κλείσιμο',
   'labels.toolbarHint': 'A4 · 2 στήλες · μία ετικέτα ανά αντίτυπο · QR + Code 128',
@@ -4458,25 +4476,22 @@ const DICTS: Record<Lang, Dict> = { en, ko, ru, el };
 
 export type TFn = (key: string, vars?: Record<string, string | number>) => string;
 
-// Plural-aware translator: picks `${key}.${category}` if the locale's CLDR
-// plural rule for `count` produces a variant key that exists in the dict,
-// otherwise falls back to the base key. Always passes `count` as a `{count}`
-// variable so strings can write "{count} item(s)" naturally.
+// How counts are handled here, since there is no plural engine.
 //
-// Example dictionary entries:
-//   'library.cats.totalCount.one':   '{count} category'
-//   'library.cats.totalCount.other': '{count} categories'
-//   // Russian needs one/few/many/other:
-//   'library.cats.totalCount.one':   '{count} категория'
-//   'library.cats.totalCount.few':   '{count} категории'
-//   'library.cats.totalCount.many':  '{count} категорий'
-//   'library.cats.totalCount.other': '{count} категории'
+// This file used to export a plural-aware `tn` built on `Intl.PluralRules`,
+// documented with a worked Russian one/few/many/other example. No call site ever
+// used it and no `.one`/`.few`/`.many` variant key was ever written, so it
+// promised agreement the app did not have: the five interpolating count strings
+// inflected through an English-only `{s}` the call site fills in, and ru/el
+// carried a single hard-coded plural — «Удалено 1 книг», «Διαγράφηκαν 1 βιβλία».
+// A helper that silently returns the base key when the variants are missing is
+// worse than none, because it reads at the call site as if plurals worked.
 //
-// Korean has only `other`, English has `one`/`other`, Greek has `one`/`other`,
-// Russian uses the full one/few/many/other set. The helper resolves the right
-// one via `Intl.PluralRules`.
-export type TnFn = (key: string, count: number, vars?: Record<string, string | number>) => string;
-
+// The rule now: English may inflect via `{s}` at the call site; Greek, Russian
+// and Korean strings are phrased so the count is a predicate and no agreement is
+// required — «Удалено книг: {n}», «Ετικέτες προς εκτύπωση: {n}» — which is right
+// for 1, 2 and 5 alike. Add a plural selector only together with the variant keys
+// and the call sites that use it.
 function format(template: string, vars?: Record<string, string | number>): string {
   if (!vars) return template;
   return template.replace(/\{(\w+)\}/g, (_, k) => {
@@ -4485,32 +4500,16 @@ function format(template: string, vars?: Record<string, string | number>): strin
   });
 }
 
-// Map our app-language code to a BCP 47 tag understood by Intl.PluralRules.
-const PLURAL_LOCALE: Record<Lang, string> = {
+// The app language as a BCP 47 tag, for the `Intl` formatters. Exported because
+// `Intl` otherwise falls back to `navigator.language`, which is independent of
+// the language the librarian chose: pass this to `toLocaleDateString` and the
+// like rather than calling them with no locale.
+export const LOCALE_TAG: Record<Lang, string> = {
   en: 'en',
   ko: 'ko',
   ru: 'ru',
   el: 'el'
 };
-
-// Cache PluralRules instances per language. They're cheap to construct but
-// not free, and `t`/`tn` are called many times per render.
-const PLURAL_RULES_CACHE = new Map<Lang, Intl.PluralRules>();
-function pluralRulesFor(lang: Lang): Intl.PluralRules | null {
-  if (typeof Intl === 'undefined' || typeof Intl.PluralRules === 'undefined') {
-    return null;
-  }
-  let r = PLURAL_RULES_CACHE.get(lang);
-  if (!r) {
-    try {
-      r = new Intl.PluralRules(PLURAL_LOCALE[lang] ?? 'en');
-      PLURAL_RULES_CACHE.set(lang, r);
-    } catch {
-      return null;
-    }
-  }
-  return r;
-}
 
 export function makeT(lang: Lang): TFn {
   const dict = DICTS[lang] ?? DICTS.en;
@@ -4521,32 +4520,10 @@ export function makeT(lang: Lang): TFn {
   };
 }
 
-export function makeTn(lang: Lang): TnFn {
-  const dict = DICTS[lang] ?? DICTS.en;
-  const fallback = DICTS.en;
-  const rules = pluralRulesFor(lang);
-  return (key, count, vars) => {
-    const merged = { count, ...(vars ?? {}) };
-    const category = rules ? rules.select(count) : (count === 1 ? 'one' : 'other');
-    const variantKey = `${key}.${category}`;
-    const otherKey = `${key}.other`;
-    const template =
-      dict[variantKey] ??
-      dict[otherKey] ??
-      dict[key] ??
-      fallback[variantKey] ??
-      fallback[otherKey] ??
-      fallback[key] ??
-      key;
-    return format(template, merged);
-  };
-}
-
 type I18nContextValue = {
   lang: Lang;
   setLang: (lang: Lang) => void;
   t: TFn;
-  tn: TnFn;
 };
 
 const I18nContext = createContext<I18nContextValue | null>(null);
@@ -4582,7 +4559,7 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
   }, [lang]);
 
   const value = useMemo<I18nContextValue>(
-    () => ({ lang, setLang, t: makeT(lang), tn: makeTn(lang) }),
+    () => ({ lang, setLang, t: makeT(lang) }),
     [lang, setLang]
   );
 
