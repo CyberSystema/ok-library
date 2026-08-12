@@ -1233,6 +1233,18 @@ export async function queryBooksWithFilters(
     sortDir: 'asc' | 'desc';
     page: number;
     pageSize: number;
+    /**
+     * An ABSOLUTE row offset, overriding `page` when given.
+     *
+     * SRU's `startRecord` is an arbitrary 1-based position in the result set, not a
+     * page number — "the position within the sequence of matched records of the
+     * first record to be returned". Converting it to a page threw away the
+     * remainder, so any startRecord that was not 1 + k*maximumRecords silently
+     * snapped back to the start of its page while the response's recordPosition and
+     * nextRecordPosition still claimed the requested offsets. The caller was handed
+     * a different window from the one it asked for, with no way to tell.
+     */
+    offset?: number;
     customFilters: Array<{ key: string; value: string }>;
     // Callers that don't need the total (e.g. the full-catalogue CSV export,
     // which walks every page and discards `total`) set this to skip the
@@ -1269,7 +1281,9 @@ export async function queryBooksWithFilters(
     ? `CASE WHEN b.${sortColumn} IS NULL OR TRIM(b.${sortColumn}) = '' OR b.${sortColumn} IN ('(Unknown)', '(Untitled)') THEN 1 ELSE 0 END, `
     : '';
   const limit = Math.max(1, Math.min(100, opts.pageSize));
-  const offset = (Math.max(1, opts.page) - 1) * limit;
+  const offset = opts.offset != null
+    ? Math.max(0, Math.floor(opts.offset))
+    : (Math.max(1, opts.page) - 1) * limit;
 
   const where: string[] = [];
   if (!opts.includeDeleted) {

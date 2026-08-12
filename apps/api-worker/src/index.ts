@@ -27,7 +27,8 @@ import {
 	UpdateBookSchema,
 	UpsertBorrowerSchema,
 	UpsertCustomFieldSchema,
-	UpsertRoomSchema
+	UpsertRoomSchema,
+	fromIso639_2
 } from '@ok-library/shared';
 import type { Context } from 'hono';
 import { Hono } from 'hono';
@@ -6171,9 +6172,49 @@ app.get('/api/sru', async (c) => {
 	const words: string[] = [];
 	let year: number | undefined;
 	let language: string | undefined;
+	// A RELATION THIS SERVER DOES NOT IMPLEMENT IS REFUSED, not silently downgraded.
+	//
+	// parseCql accepts =, ==, any, all and exact and records `term.relation`, and the
+	// handler never read it: every query ran as qMode 'all' with partial words. So
+	// `dc.title exact "Η ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ"` returned every partial match and called it
+	// an exact search. protocols.ts states the governing rule — implementing a
+	// fraction and ignoring the rest is worse than not accepting it, because the
+	// caller gets results that do not answer their query and cannot tell. Diagnostic
+	// 19 is "unsupported relation".
+	const SUPPORTED_RELATIONS = new Set(['=', '==', 'all']);
+	const badRelation = parsed.terms.find((t) => t.relation && !SUPPORTED_RELATIONS.has(t.relation));
+	if (badRelation) {
+		return c.body(
+			sruDiagnostic('19', badRelation.relation ?? '', 'Unsupported relation'),
+			200, { 'Content-Type': 'application/xml; charset=utf-8' });
+	}
+	// Same rule for recordPacking: the response hard-codes <recordPacking>xml</>, so
+	// a caller asking for `string` was answered in a packing it did not request.
+	const wantPacking = q('recordPacking');
+	if (wantPacking && wantPacking !== 'xml') {
+		return c.body(
+			sruDiagnostic('71', wantPacking, 'Unsupported record packing'),
+			200, { 'Content-Type': 'application/xml; charset=utf-8' });
+	}
+
 	for (const term of parsed.terms) {
 		if (term.index === 'date') { const n = Number(term.value); if (Number.isInteger(n)) year = n; continue; }
-		if (term.index === 'language') { language = term.value; continue; }
+		if (term.index === 'language') {
+			// The explain record advertises dc.language, and the DC output maps the
+			// stored value through toIso639_2 ("EL" -> "gre"). The filter matched the
+			// raw stored column, so a caller searching for the value this server
+			// PUBLISHED found nothing. Accept either vocabulary.
+			language = fromIso639_2([term.value]) || term.value;
+			continue;
+		}
+		if (term.index === 'identifier') {
+			// Likewise: identifiers go out as urn:isbn:… / urn:issn:… / the record
+			// UUID, and came in matched against the bare `isbn` field. Strip the URN
+			// the server itself minted before searching for it.
+			words.push(term.value.replace(/^urn:(isbn|issn):/i, ''));
+			searchFields.add('isbn');
+			continue;
+		}
 		words.push(term.value);
 		if (term.index !== 'any') searchFields.add(term.index);
 	}
@@ -6193,7 +6234,14 @@ app.get('/api/sru', async (c) => {
 		language,
 		customFilters: [],
 		sortBy: 'title', sortDir: 'asc',
-		page: Math.floor((startRecord - 1) / Math.max(1, maximumRecords)) + 1,
+		// The ABSOLUTE offset SRU asked for. `startRecord` is a position in the result
+		// set, not a page: converting it to a page number discarded the remainder, so
+		// startRecord=7 with maximumRecords=10 returned records 1-10 while the
+		// response's <recordPosition> elements counted 7, 8, 9… The window and its
+		// labels disagreed, and a harvester paging by an arbitrary offset silently
+		// re-read the same records.
+		page: 1,
+		offset: startRecord - 1,
 		pageSize: Math.max(1, maximumRecords)
 	});
 

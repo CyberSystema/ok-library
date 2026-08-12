@@ -2910,6 +2910,57 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 67. REGRESSION: SRU answers the query it was asked ===")
+
+st, _cfg67 = call("GET", "/api/library-settings")
+_prior67 = (_cfg67 or {}).get("publicSharing")
+call("PUT", "/api/library-settings", {"publicSharing": "on"})
+try:
+    def _sru(qs):
+        return call_text("GET", "/api/sru?version=1.2&operation=searchRetrieve&" + qs)
+
+    # startRecord is an ABSOLUTE position, not a page number. It was divided into a
+    # page and the remainder discarded, so any value not 1 + k*maximumRecords snapped
+    # back to the start of its page while <recordPosition> still counted from the
+    # value asked for: the window and its own labels disagreed.
+    st, base = _sru("query=%CE%9F&maximumRecords=9&startRecord=1&recordSchema=dc")
+    _ids = re.findall(r"<dc:identifier>([0-9a-f-]{36})</dc:identifier>", base or "")
+    check("a baseline SRU window returns records", len(_ids) >= 7, len(_ids))
+    if len(_ids) >= 7:
+        for _sr in (4, 7):
+            st, page = _sru(f"query=%CE%9F&maximumRecords=3&startRecord={_sr}&recordSchema=dc")
+            got = re.findall(r"<dc:identifier>([0-9a-f-]{36})</dc:identifier>", page or "")
+            want = _ids[_sr - 1:_sr - 1 + 3]
+            check(f"startRecord={_sr} returns the window it names", got == want,
+                  f"got {[g[:8] for g in got]} want {[w[:8] for w in want]}")
+            pos = re.findall(r"<recordPosition>(\d+)</recordPosition>", page or "")
+            check(f"and labels it {_sr}..{_sr + 2}", pos == [str(_sr), str(_sr + 1), str(_sr + 2)], pos)
+
+    # The explain record advertises dc.language, and the DC output publishes ISO
+    # 639-2/B ("gre"). The filter matched the raw stored column ("EL"), so a caller
+    # searching for the value this server had just published found nothing.
+    st, a = _sru("query=dc.language%3Dgre&maximumRecords=1&recordSchema=dc")
+    st, b = _sru("query=dc.language%3DEL&maximumRecords=1&recordSchema=dc")
+    _n = lambda x: (re.search(r"<numberOfRecords>(\d+)", x or "") or [0, "0"])[1]
+    check("dc.language accepts the code the server itself publishes",
+          int(_n(a)) > 0, f"gre={_n(a)}")
+    check("and still accepts the stored form", _n(a) == _n(b), f"gre={_n(a)} EL={_n(b)}")
+
+    # A relation the server does not implement was accepted and silently downgraded
+    # to a partial-word AND search, so `exact` returned partial matches and called
+    # them exact. protocols.ts states the rule: implementing a fraction and ignoring
+    # the rest is worse than not accepting it.
+    st, ex = _sru("query=dc.title+exact+%22X%22&maximumRecords=1")
+    check("an unimplemented CQL relation is refused with diagnostic 19",
+          "diagnostic/1/19" in (ex or ""), (ex or "")[:180])
+    st, rp = _sru("query=%CE%9F&recordPacking=string&maximumRecords=1")
+    check("and an unsupported recordPacking with diagnostic 71",
+          "diagnostic/1/71" in (rp or ""), (rp or "")[:180])
+    st, ok = _sru("query=%CE%9F&maximumRecords=1&recordSchema=dc")
+    check("while a supported relation still searches", "<record>" in (ok or ""), (ok or "")[:140])
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": _prior67 or "off"})
+
 print("=== 66. REGRESSION: numbers a librarian acts on ===")
 uniq = uuid.uuid4().hex[:6]
 
