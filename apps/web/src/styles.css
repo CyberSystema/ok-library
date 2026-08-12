@@ -1799,9 +1799,27 @@ label {
   margin-bottom: 1rem;
 }
 .completeness-list { display: flex; flex-direction: column; gap: 0.625rem; }
+/*
+ * A PROGRESS BAR THAT COULD NEVER SHOW A PERCENTAGE.
+ *
+ * The tracks were `130px 1fr 50px 70px` with three 8px gaps — 274px this row can never
+ * give up — inside a `.dashboard-grid` card whose floor is a 290px track. Do the
+ * arithmetic at a 1000px window: the auto-fit track is (952-32)/3 = 306.7px, the card's
+ * inner width 306.7-44-2 = 260.7px, so the `1fr` bar gets max(0, 260.7-274) = ZERO. The
+ * four bars (ISBN / shelf code / publisher / publication year) were invisible, and the
+ * "100%" and "12.700" cells were painted past the card's right border, over the gap and
+ * onto the next card.
+ *
+ * It never worked properly at ANY width either: at the widest the app gets — content
+ * capped at 1100px, so a 340px track and 294px inside the card — the bar was 20px long.
+ *
+ * `minmax(0, 130px)` lets the label shrink and wrap instead of pinning 130px;
+ * `minmax(2.5rem, 1fr)` gives the bar a floor so it can never vanish; and the two
+ * numeric cells size to their content (~30px and ~45px) rather than reserving 50 and 70.
+ */
 .completeness-row {
   display: grid;
-  grid-template-columns: 130px 1fr 50px 70px;
+  grid-template-columns: minmax(0, 130px) minmax(2.5rem, 1fr) auto auto;
   align-items: center;
   gap: 0.5rem;
   font-size: 0.8125rem;
@@ -1922,6 +1940,35 @@ label {
   text-decoration: underline;
   font-size: 0.8125rem;
   padding: 0.1rem 0.3rem;
+}
+/*
+ * NOTHING ON AN ACCENT BAR MAY BE DRAWN IN THE ACCENT COLOUR.
+ *
+ * `.bulk-bar` is `background: var(--accent)`, and two things elsewhere in the sheet are
+ * also `var(--accent)`: `button.primary`'s fill and the global focus ring. Both landed at
+ * 1:1 against the bar.
+ *
+ * The Apply button therefore had no button shape at all — just white label text sitting
+ * between the underlined "Select all" and "Clear" links — and tabbing through the bar
+ * showed no focus anywhere, including on "Select all matching 12.700", which is the
+ * control with the largest consequence in the application. A keyboard librarian could not
+ * tell what Enter was about to do.
+ *
+ * The two fields in the bar already carried `box-shadow: 0 0 0 2px rgba(255,255,255,0.5)`
+ * for exactly this reason, so the problem was known and the patch was applied to the
+ * inputs and not to the buttons. This does it for everything in the bar: the primary
+ * button inverts (which is what `.secondary` already does correctly here), and the ring
+ * switches to the bar's foreground colour.
+ */
+.bulk-bar button.primary {
+  background: var(--surface);
+  color: var(--accent);
+}
+.bulk-bar button.primary:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+.bulk-bar :focus-visible {
+  outline-color: var(--on-accent);
 }
 .bulk-bar-actions { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
 .bulk-bar-actions select, .bulk-bar-actions input {

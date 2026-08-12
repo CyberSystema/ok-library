@@ -8,12 +8,40 @@
     <meta name="theme-color" content="#0f172a" media="(prefers-color-scheme: dark)" />
     <title>OK Library</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>" />
+    <!--
+      FONTS DO NOT BLOCK FIRST PAINT, and Space Grotesk is not requested at all.
+
+      This was one render-blocking stylesheet for five font weights: three of Space
+      Grotesk and two of IBM Plex Mono. Space Grotesk appears ZERO times in styles.css —
+      the interface runs on the system stack (`-apple-system, BlinkMacSystemFont, …`) —
+      so three of the five weights were fetched, parsed and never used by any rule.
+
+      Blocking on it was the real cost. The catalogue is used in a library whose
+      connectivity is not assumed to be good, and the Electron shell serves the app from
+      `app://ok-library`, where a request to fonts.googleapis.com may not resolve at all —
+      so the first paint of the whole application waited on a third party it did not need.
+
+      IBM Plex Mono IS used (shelf codes, barcodes, quoted MARC), so it is still fetched,
+      but asynchronously: `media="print"` keeps it out of the critical path and the onload
+      handler promotes it once it arrives. The mono stack in styles.css already falls back
+      to `ui-monospace, SFMono-Regular, Menlo, monospace`, so a shelf code is set in a
+      local monospace face immediately and swaps when — or if — Plex arrives. The
+      <noscript> covers the case where scripts are off, where blocking is the only option.
+    -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap"
       rel="stylesheet"
+      media="print"
+      onload="this.media='all'; this.onload=null;"
     />
+    <noscript>
+      <link
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap"
+        rel="stylesheet"
+      />
+    </noscript>
   </head>
   <body>
     <div id="root"></div>
