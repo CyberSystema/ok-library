@@ -2910,6 +2910,75 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 71. REGRESSION: MARC that another library can file ===")
+uniq = uuid.uuid4().hex[:6]
+
+def _marc71(title, author, romanized=None):
+    body = {"title": title, "author": author}
+    if romanized:
+        body["titleRomanized"] = romanized
+    st, made = call("POST", "/api/books", body)
+    _id = (made or {}).get("id")
+    if _id:
+        CREATED.append(_id)
+    st, xml = call_text("GET", f"/api/books/{_id}/marc?format=marcxml")
+    return xml or ""
+
+# ind2 counts the characters a filing system must SKIP, and it was hard-coded to 0
+# on the strength of a comment claiming the catalogue stores titles without leading
+# articles. It does not — 3,042 of 12,670 titles begin with one. Declaring 0 files
+# THE DIVINE LITURGY under T at every library that respects the indicator.
+_x = _marc71(f"The Divine Liturgy {uniq}", "ZZ Author")
+_m = re.search(r'tag="245"[^>]*ind2="(\d)"', _x)
+check("an English leading article is counted as non-filing", _m and _m.group(1) == "4",
+      _m.group(0) if _m else _x[:140])
+_x = _marc71(f"Η ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ {uniq}", "")
+_m = re.search(r'tag="245"[^>]*ind2="(\d)"', _x)
+check("and a Greek one is too", _m and _m.group(1) == "2", _m.group(0) if _m else _x[:140])
+# The other direction matters more: a count that eats a real word misfiles the record
+# just as badly, so anything not an unambiguous article must stay 0.
+_x = _marc71(f"ΘΕΟΛΟΓΙΑ ΚΑΙ ΖΩΗ {uniq}", "ZZ Author")
+_m = re.search(r'tag="245"[^>]*ind2="(\d)"', _x)
+check("while a title that merely starts with a letter is left at 0",
+      _m and _m.group(1) == "0", _m.group(0) if _m else _x[:140])
+
+# ISBD punctuation INTRODUCES the element after it. It was appended unconditionally,
+# so 3,722 records exported a title ending " /" with no statement of responsibility
+# behind it — a mark pointing at nothing.
+_x = _marc71(f"ZZNOAUTHOR {uniq}", "")
+_a = re.search(r'tag="245".*?code="a">([^<]*)<', _x, re.S)
+check("a title with no author does not end in the mark that introduces one",
+      _a and not _a.group(1).rstrip().endswith("/"), _a.group(1) if _a else _x[:140])
+check("and emits no statement of responsibility either",
+      'code="c"' not in (re.search(r'tag="245".*?</datafield>', _x, re.S) or [""])[0], None)
+_x = _marc71(f"ZZWITHAUTHOR {uniq}", "ZZ Author")
+_a = re.search(r'tag="245".*?code="a">([^<]*)<', _x, re.S)
+check("while a title that HAS one still introduces it",
+      _a and _a.group(1).rstrip().endswith("/"), _a.group(1) if _a else _x[:140])
+
+# MARC 21: "Subfield $6 in the associated field ALSO links that field to field 880."
+# Only the 880 half was emitted, so a receiving system had a romanized title it could
+# not attach to anything. Our own importer reads only the 880 side, which is why a
+# round trip through this system never showed it.
+_x = _marc71(f"ΚΛΗΜΗΣ ΡΩΜΗΣ {uniq}", "ZZ Author", romanized=f"Klemes Romes {uniq}")
+_f880 = re.search(r'tag="880".*?code="6">([^<]*)<', _x, re.S)
+_f245 = re.search(r'tag="245".*?</datafield>', _x, re.S)
+check("an 880 is emitted for the romanized title", bool(_f880), _x[:160])
+check("and its partner field carries the reciprocal $6",
+      _f245 and 'code="6">880-' in _f245.group(0), _f245.group(0)[:200] if _f245 else None)
+
+# The inverse language map was built from a table containing BOTH `ka` and `ge` for
+# Georgian, and fromEntries lets the last key win — so `geo` inverted to `ge`, which
+# is not an ISO 639-1 code, and a Georgian record changed language on a round trip.
+_shared71 = _slurp(_REPO, "packages", "shared", "src", "index.ts")
+_fwd71 = _shared71[_shared71.index("const ISO639_1_TO_2B"):]
+_fwd71 = _fwd71[:_fwd71.index("};")]
+_pairs71 = re.findall(r"([A-Za-z]{2,3}):\s*'([a-z]{3})'", _fwd71)
+_dupes71 = [t for t in set(v for _, v in _pairs71)
+            if len([1 for _, v in _pairs71 if v == t]) > 1]
+check("the language table the inverse is derived from is injective",
+      not _dupes71, f"three-letter codes reached by more than one key: {_dupes71}")
+
 print("=== 70. REGRESSION: changing a password ends the sessions it opened ===")
 uniq = uuid.uuid4().hex[:6]
 

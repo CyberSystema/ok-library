@@ -99,6 +99,20 @@ function isbd(value: string, trailing: string): string {
 }
 
 /**
+ * ISBD punctuation that INTRODUCES the next element — emitted only when that element
+ * is actually there.
+ *
+ * In ISBD the mark belongs to what follows it, so " /" announces a statement of
+ * responsibility and "," announces a date. They were appended unconditionally, so
+ * 3,722 records exported a title ending " /" with no $c after it and 1,224 a
+ * publisher ending "," with no date: punctuation pointing at nothing, which a
+ * receiving system either displays verbatim or has to strip back out.
+ */
+function isbdBefore(value: string, trailing: string, nextExists: boolean): string {
+  return isbd(value, nextExists ? trailing : '');
+}
+
+/**
  * Build the MARC field list for one record.
  *
  * Parallel script forms become 880 fields linked with $6, which is how MARC
@@ -250,11 +264,37 @@ export function toMarcFields(book: MarcRecordInput): MarcField[] {
   }
 
   // 245: title proper $a, other title info $b, statement of responsibility $c.
-  // ind2 counts non-filing characters; 0 because the catalogue stores titles
-  // without leading articles.
-  df('245', book.author ? '1' : '0', '0', [
-    ['a', isbd(book.title, book.subtitle ? ' :' : ' /')],
-    ['b', book.subtitle ? isbd(book.subtitle, ' /') : null],
+  //
+  // ind2 counts the characters a filing system must SKIP, and it was hard-coded to
+  // 0 on the strength of a comment saying "the catalogue stores titles without
+  // leading articles". The catalogue does not: 3,042 of 12,670 titles begin with
+  // one — 798 "THE ", 1,089 "Η ", 616 "Ο ", 428 "ΤΟ ". Declaring 0 tells a partner
+  // library to file THE DIVINE LITURGY under T, and ΤΟ ΣΥΝΑΞΑΡΙ under Τ.
+  //
+  // Only unambiguous leading articles are skipped, and the list is here so a
+  // cataloguer can amend it in one place. Greek is restricted to the nominative and
+  // accusative definite forms that actually open a title; the oblique cases are
+  // deliberately absent, because "ΤΟΥ ΑΒΒΑ ΙΣΑΑΚ" opens with a genitive that belongs
+  // in the filing, not before it. Getting this wrong in the other direction — a
+  // count that eats a real word — is worse than 0, so anything doubtful stays 0.
+  const NON_FILING: string[] = [
+    'THE ', 'A ', 'AN ',
+    'Ο ', 'Η ', 'ΤΟ ', 'ΟΙ ', 'ΤΑ ', 'ΤΗΝ ', 'ΤΟΝ ', 'ΤΟΥΣ ', 'ΤΙΣ '
+  ];
+  const titleForFiling = (book.title ?? '').trimStart();
+  const upperTitle = titleForFiling.toLocaleUpperCase('el');
+  const article = NON_FILING.find((a) => upperTitle.startsWith(a));
+  // Measured from the ORIGINAL string: the count is in characters of $a as emitted,
+  // and upper-casing Greek can change length (final sigma, accents).
+  const nonFiling = article ? String(Math.min(9, article.length)) : '0';
+  df('245', book.author ? '1' : '0', nonFiling, [
+    // " :" introduces $b, " /" introduces $c — each emitted only if that element
+    // follows. A title ending " /" with no statement of responsibility after it is
+    // punctuation pointing at nothing, and 3,722 records exported exactly that.
+    ['a', book.subtitle
+      ? isbd(book.title, ' :')
+      : isbdBefore(book.title, ' /', Boolean(book.author))],
+    ['b', book.subtitle ? isbdBefore(book.subtitle, ' /', Boolean(book.author)) : null],
     ['c', book.author || null]
   ]);
 
@@ -264,13 +304,13 @@ export function toMarcFields(book: MarcRecordInput): MarcField[] {
   // because plenty of systems still only read that one.
   const dateForImprint = book.dateEdtf ?? (book.publicationYear ? String(book.publicationYear) : null);
   df('264', ' ', '1', [
-    ['a', book.placeOfPublication ? isbd(book.placeOfPublication, ' :') : null],
-    ['b', book.publisher ? isbd(book.publisher, ',') : null],
+    ['a', book.placeOfPublication ? isbdBefore(book.placeOfPublication, ' :', Boolean(book.publisher)) : null],
+    ['b', book.publisher ? isbdBefore(book.publisher, ',', Boolean(dateForImprint)) : null],
     ['c', dateForImprint]
   ]);
   df('260', ' ', ' ', [
-    ['a', book.placeOfPublication ? isbd(book.placeOfPublication, ' :') : null],
-    ['b', book.publisher ? isbd(book.publisher, ',') : null],
+    ['a', book.placeOfPublication ? isbdBefore(book.placeOfPublication, ' :', Boolean(book.publisher)) : null],
+    ['b', book.publisher ? isbdBefore(book.publisher, ',', Boolean(dateForImprint)) : null],
     ['c', dateForImprint]
   ]);
 
@@ -318,6 +358,18 @@ export function toMarcFields(book: MarcRecordInput): MarcField[] {
   }
 
   // 880: the vernacular/romanized pairs, linked back by $6 occurrence number.
+  //
+  // The link is RECIPROCAL, and only one half of it was emitted. MARC 21 is explicit:
+  // "Field 880 is linked to the associated regular field by subfield $6. Subfield $6
+  // in the associated field also links that field to field 880" — and occurrence 00
+  // is what says a field is NOT linked. So an 880 carrying `245-01` beside a 245 with
+  // no $6 at all was neither a linked pair nor a valid unlinked field: the receiving
+  // system had a romanized title it could not attach to anything. That pairing is,
+  // per the note at the top of this module, the whole reason the romanized columns
+  // exist. Our own importer reads only the 880 side, which is why a round trip
+  // through this system never showed it.
+  //
+  // $6 must be the FIRST subfield of its field, so the partner's is spliced in front.
   let occ = 0;
   const linked = (tag: string, value: string | null | undefined, code = 'a'): void => {
     if (!value || !value.trim()) return;
@@ -327,6 +379,14 @@ export function toMarcFields(book: MarcRecordInput): MarcField[] {
       tag: '880', ind1: ' ', ind2: ' ',
       subfields: [{ code: '6', value: `${tag}-${seq}` }, { code, value: value.trim() }]
     });
+    // The reciprocal half, on the regular field this 880 names.
+    const partner = fields.find(
+      (f): f is Extract<MarcField, { subfields: MarcSubfield[] }> =>
+        f.tag === tag && 'subfields' in f
+    );
+    if (partner) {
+      partner.subfields.unshift({ code: '6', value: `880-${seq}` });
+    }
   };
   linked('245', book.titleRomanized);
   linked('100', book.authorRomanized);

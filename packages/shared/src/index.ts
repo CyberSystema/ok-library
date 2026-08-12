@@ -402,7 +402,24 @@ const ISO639_1_TO_2B: Record<string, string> = {
   cu: 'chu', sq: 'alb', mk: 'mac', sl: 'slv', sk: 'slo', hr: 'hrv',
   no: 'nor', da: 'dan', et: 'est', lv: 'lav', lt: 'lit', be: 'bel',
   sw: 'swa', hi: 'hin', fa: 'per', am: 'amh', syr: 'syr', cop: 'cop',
-  ge: 'geo', grc: 'grc'
+  grc: 'grc'
+};
+
+/**
+ * Codes accepted on the way IN and never chosen on the way OUT.
+ *
+ * `ge` was in the table above, alongside the correct `ka`, and the inverse map is
+ * built with `Object.fromEntries` — where the LAST key wins. So `geo` inverted to
+ * `ge`, which is not an ISO 639-1 code at all (Georgian is `ka`), and a Georgian
+ * record survived one MARCXML round trip as `KA` -> `geo` -> `GE`. The comment on
+ * that inverse says it is derived rather than rewritten because "a second hand-kept
+ * map would drift" — and deriving it from a map that is not injective is exactly
+ * where it drifted.
+ *
+ * An input leniency belongs here, where it cannot reach the inverse.
+ */
+const ISO639_1_ALIASES: Record<string, string> = {
+  ge: 'geo'
 };
 
 /** Split a stored language value into ISO 639-2/B codes: "EL,EN" → ["gre","eng"]. */
@@ -411,13 +428,15 @@ export function toIso639_2(raw: string | null | undefined): string[] {
     .split(/[,;/|]+/)
     .map((part) => part.trim().toLowerCase())
     .filter(Boolean)
-    .map((part) => ISO639_1_TO_2B[part] ?? (part.length === 3 ? part : part))
+    .map((part) => ISO639_1_TO_2B[part] ?? ISO639_1_ALIASES[part] ?? part)
     .filter((v, i, arr) => arr.indexOf(v) === i);
 }
 
-// Derived from the table above rather than written out again: a second hand-kept
-// map would drift, and a language that exports as `gre` but imports as anything
-// else breaks the round trip silently.
+// Derived from the CANONICAL table above rather than written out again: a second
+// hand-kept map would drift, and a language that exports as `gre` but imports as
+// anything else breaks the round trip silently. The aliases are deliberately not in
+// that table — an alias in it makes the inversion ambiguous, and `fromEntries` then
+// resolves the ambiguity by taking whichever line happens to come last.
 const ISO639_2B_TO_1: Record<string, string> = Object.fromEntries(
   Object.entries(ISO639_1_TO_2B).map(([two, three]) => [three, two])
 );
