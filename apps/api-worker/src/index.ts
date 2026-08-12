@@ -6497,13 +6497,31 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 					.run();
 			}
 
-			// `customDefs` is the list this handler already loaded before the row loop,
-			// under a comment that says it did so to stop the N round-trips — which
-			// this call then made anyway, once per row.
-			await replaceBookAttributeValues(c.env, bookId, customFields, {
-				defs: customDefs,
-				isNewBook: !existing
-			});
+			/*
+			 * SKIPPED ENTIRELY when the sheet said nothing about attributes.
+			 *
+			 * Custom attributes live in two places: the `books.custom_fields` JSON column and
+			 * the `book_attribute_values` mirror table that the facets and attribute filters
+			 * read. COALESCEing the JSON column above protected one of them and left the other
+			 * exposed — `replaceBookAttributeValues` runs its DELETE whenever the incoming map
+			 * is empty and the book is not new, so a corrective sheet still emptied the mirror.
+			 *
+			 * That is WORSE than the original bug in one respect: the two representations then
+			 * disagree. Measured: the JSON column kept {"condition":"good","pages":"420"} while
+			 * the mirror table went to 0 rows, so the record still showed its attributes and
+			 * every facet and filter had lost them.
+			 *
+			 * If the sheet carried no attribute columns there is nothing to write, so the right
+			 * move is to touch neither place. `customDefs` is the list this handler already
+			 * loaded before the row loop — passing it stops the writer re-reading the
+			 * definitions once per row, which is what its own comment claimed it had stopped.
+			 */
+			if (sheetGaveCustomFields || !existing) {
+				await replaceBookAttributeValues(c.env, bookId, customFields, {
+					defs: customDefs,
+					isNewBook: !existing
+				});
+			}
 			// A NEW record needs a copy to exist at all.
 			//
 			// Every other creation path calls this — POST /api/books, the offline

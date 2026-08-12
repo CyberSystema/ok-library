@@ -3583,6 +3583,17 @@ if LOCAL:
           "πατερικά" in (_k.get("tags") or ""), _k.get("tags"))
     check("an omitted attribute column does not wipe the attributes",
           "420" in (_k.get("cf") or ""), _k.get("cf"))
+    # BOTH representations. Custom attributes live in the books.custom_fields JSON column AND
+    # in the book_attribute_values mirror that the facets and attribute filters read.
+    # Protecting only the column produced a SPLIT: measured, the JSON kept
+    # {"condition":"good","pages":"420"} while the mirror went to 0 rows, so the record still
+    # showed its attributes and every facet had lost them — worse than the original bug,
+    # because the two then disagree.
+    _mirror = local_sql(
+        "SELECT COUNT(*) AS n FROM book_attribute_values v JOIN books b ON b.id = v.book_id "
+        f"WHERE b.legacy_id = '{_lid77b}'")
+    check("and the attribute MIRROR table keeps its rows too",
+          _mirror and int(_mirror[0]["n"]) >= 1, _mirror[0] if _mirror else "query failed")
     # isbn_valid is derived from isbn, so preserving one must preserve the other.
     check("and isbn_valid still agrees with the preserved ISBN", _k.get("iv") == 1, _k.get("iv"))
     local_sql(f"DELETE FROM book_attribute_values WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid77b}')")
