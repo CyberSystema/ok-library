@@ -82,6 +82,22 @@ export function LibraryIdentityCard({ canEdit }: { canEdit: boolean }) {
 
   async function toggleSharing() {
     if (!sharingOn) {
+      // THE PRECONDITION IS CHECKED FIRST.
+      //
+      // OAI-PMH identifies a repository by its ISIL and SRU's explain response carries the
+      // library's name. Publishing anonymously is not useful to a harvester and cannot be
+      // corrected retroactively in their caches.
+      //
+      // This used to run AFTER the confirmation, so a librarian was asked to weigh
+      // publishing the entire catalogue to the world — the gravest, least reversible
+      // decision in the application — clicked through it, and was then told it could not
+      // happen anyway. Asking somebody to consent to something you already know you will
+      // refuse teaches them to click past the dialog, which is the one dialog here that
+      // must not become reflex.
+      if (!form.isil.trim() || !form.libraryName.trim()) {
+        toast.push('error', t('identity.shareNeedsIsil'));
+        return;
+      }
       // Turning this ON publishes every bibliographic record to anyone who asks,
       // and a harvester that has cached them cannot be made to forget. That is a
       // decision, not a setting, so it gets a confirm and names what leaves.
@@ -92,13 +108,6 @@ export function LibraryIdentityCard({ canEdit }: { canEdit: boolean }) {
         danger: true
       });
       if (!ok) return;
-      if (!form.isil.trim() || !form.libraryName.trim()) {
-        // OAI-PMH identifies a repository by its ISIL and SRU's explain response
-        // carries the library's name. Publishing anonymously is not useful to a
-        // harvester and cannot be corrected retroactively in their caches.
-        toast.push('error', t('identity.shareNeedsIsil'));
-        return;
-      }
     }
     await save({ publicSharing: sharingOn ? 'off' : 'on' });
   }

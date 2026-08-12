@@ -1238,7 +1238,12 @@ function App() {
       if (!loggedInRef.current) return; // ignore the anonymous session probe
       setCurrentUser(null);
       setDidBootstrapData(false);
-      setMessage(t('login.sessionExpired'));
+      // setError, not setMessage. `setMessage` is pushAppToast('success', …): being thrown
+      // out of the application was announced as a GREEN success toast that auto-dismissed
+      // after four seconds, so a librarian who looked away came back to a login screen
+      // with no explanation of why. Error toasts are red, carry role="alert" and never
+      // time out.
+      setError(t('login.sessionExpired'));
     });
     return () => setUnauthorizedHandler(null);
   }, [t]);
@@ -4447,13 +4452,20 @@ function App() {
       // definition row is only written on the final page, so an interrupted loop
       // is resumable rather than corrupting.
       let sweepOffset = 0;
+      let restored = false;
       for (let guard = 0; guard < 500; guard += 1) {
         const query = sweepOffset > 0 ? `?sweepOffset=${sweepOffset}` : '';
         const res = await runAction(() => apiRequest<{
           id: string;
+          /* The server answers `restored: true` when the key belonged to a DELETED
+             attribute and it revived that definition instead of creating one. The values
+             those books still hold come back with it, which is a materially different
+             outcome from adding a new attribute and has to be reported as one. */
+          restored?: boolean;
           sweepComplete?: boolean;
           nextSweepOffset?: number;
         }>(`${path}${query}`, { method, body }));
+        restored = Boolean(res?.restored);
         if (res?.sweepComplete !== false) break;
         sweepOffset = res.nextSweepOffset ?? sweepOffset;
         setMessage(t('toast.customFieldMigrating', { n: fmt(sweepOffset) }));
@@ -4462,7 +4474,11 @@ function App() {
       resetCustomFieldForm();
       await loadCustomFields();
       await loadBooks();
-      setMessage(editingCustomFieldId ? t('toast.customFieldUpdated') : t('toast.customFieldAdded'));
+      setMessage(
+        editingCustomFieldId ? t('toast.customFieldUpdated')
+        : restored ? t('toast.customFieldRestored')
+        : t('toast.customFieldAdded')
+      );
     } catch (e) {
       setError((e as Error).message);
     }
