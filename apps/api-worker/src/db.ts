@@ -2089,16 +2089,34 @@ export function validateCustomFieldsAgainst(
   return normalized;
 }
 
+/**
+ * Write a book's attribute values, replacing whatever was there.
+ *
+ * `opts.defs` exists for the import loops. Both of them load the definitions once
+ * before their row loop and say so in a comment — "Load custom field definitions
+ * once for the whole import — was N round-trips" — and then called this, which read
+ * the same table again for every single row. So the round-trips came back: the
+ * comment described the validation path and not this one, and a 500-row chunk spent
+ * 500 D1 subrequests re-answering a question already answered.
+ *
+ * `opts.isNewBook` skips the DELETE. A row inserted a moment ago has no attribute
+ * values to clear, and on the import's create path that DELETE was a second wasted
+ * subrequest per row — the one that made a row with no attributes at all cost a
+ * database call.
+ */
 export async function replaceBookAttributeValues(
   env: Env,
   bookId: string,
-  attributeValues: Record<string, unknown>
+  attributeValues: Record<string, unknown>,
+  opts: { defs?: Array<{ id: string; field_key: string }>; isNewBook?: boolean } = {}
 ): Promise<void> {
-  const defsResult = await env.DB.prepare(
-    `SELECT id, field_key FROM custom_field_definitions WHERE deleted_at IS NULL`
-  ).all<{ id: string; field_key: string }>();
-
-  const defs = defsResult.results ?? [];
+  let defs = opts.defs;
+  if (!defs) {
+    const defsResult = await env.DB.prepare(
+      `SELECT id, field_key FROM custom_field_definitions WHERE deleted_at IS NULL`
+    ).all<{ id: string; field_key: string }>();
+    defs = defsResult.results ?? [];
+  }
   const keyToDef = new Map(defs.map((d) => [d.field_key, d.id]));
 
   const deleteStmt = env.DB.prepare('DELETE FROM book_attribute_values WHERE book_id = ?').bind(bookId);
@@ -2120,7 +2138,9 @@ export async function replaceBookAttributeValues(
     );
   }
   if (inserts.length === 0) {
-    await deleteStmt.run();
+    // Nothing to write. A brand-new row has nothing to clear either, so this is
+    // where the import's zero-attribute rows stop touching the database at all.
+    if (!opts.isNewBook) await deleteStmt.run();
     return;
   }
   // D1 caps batch() at 50 statements per call. The DELETE goes in the first
@@ -2129,8 +2149,9 @@ export async function replaceBookAttributeValues(
   // batches — non-atomic, but safe because each insert is idempotent on
   // (book_id, attribute_definition_id) thanks to `INSERT OR REPLACE`.
   const BATCH_SIZE = 50;
-  const firstChunkSize = Math.min(inserts.length, BATCH_SIZE - 1);
-  await env.DB.batch([deleteStmt, ...inserts.slice(0, firstChunkSize)]);
+  const head = opts.isNewBook ? [] : [deleteStmt];
+  const firstChunkSize = Math.min(inserts.length, BATCH_SIZE - head.length);
+  await env.DB.batch([...head, ...inserts.slice(0, firstChunkSize)]);
   for (let i = firstChunkSize; i < inserts.length; i += BATCH_SIZE) {
     await env.DB.batch(inserts.slice(i, i + BATCH_SIZE));
   }

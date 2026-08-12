@@ -2923,6 +2923,69 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 81. REGRESSION: an import row does not re-ask what the handler already knows ===")
+
+# Both imports load the custom-field definitions once before their row loop, under a
+# comment saying they do it to stop the N round-trips — and then called
+# `replaceBookAttributeValues`, which read the same table again for every row. The
+# comment described the validation path, not the write path, so the round-trips came
+# back. The handler walks rows sequentially, so a 500-row chunk was 500 D1
+# subrequests spent re-answering one question, on top of the lookup, the write, and
+# ensurePrimaryItem's three.
+_db81 = _slurp(_REPO, "apps", "api-worker", "src", "db.ts")
+_idx81 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+check("the attribute writer can be handed the definitions",
+      "opts: { defs?: Array<{ id: string; field_key: string }>; isNewBook?: boolean }" in _db81, None)
+_calls81 = re.findall(r"replaceBookAttributeValues\(c\.env,[^;]*?\);", _idx81, re.S)
+check("every bulk loop passes them", sum(1 for c81 in _calls81 if "defs" in c81) >= 4,
+      [c81[:60] for c81 in _calls81])
+
+# `isNewBook` skips the DELETE, which is only sound where a retry cannot land on the
+# same row. The two paths with a deterministic id and INSERT OR IGNORE must NOT use
+# it: on the retry the first attempt's values are already there and the DELETE is
+# what clears them.
+_det81 = [c81 for c81 in _calls81 if "isNewBook" in c81]
+check("only the fresh-uuid paths skip the delete", len(_det81) == 2, len(_det81))
+check("and neither of them asserts it unconditionally",
+      all("isNewBook: !" in c81 for c81 in _det81), [c81[:80] for c81 in _det81])
+
+_api81 = _slurp(_REPO, "apps", "web", "src", "api.ts")
+_chunk81 = re.search(r"export const IMPORT_CHUNK_SIZE = (\d+);", _api81)
+check("the client's chunk size is in the same neighbourhood as the rest of the system",
+      _chunk81 and int(_chunk81.group(1)) <= 200, _chunk81.group(1) if _chunk81 else None)
+
+# The behaviour the optimisation must not break: an update still REPLACES.
+_lid81 = f"ZZ-ATTR-{uuid.uuid4().hex[:10].upper()}"
+st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [
+    {"title": "ZZ Attr Replace Probe", "author": "Gate", "legacyId": _lid81,
+     "tags": [], "customFields": {"pages": "120"}}]})
+check("a row with an attribute imports", st == 201 and (r or {}).get("importedRows") == 1, (st, r))
+if LOCAL:
+    _rows = local_sql(
+        "SELECT d.field_key AS k FROM book_attribute_values v "
+        "JOIN custom_field_definitions d ON d.id = v.attribute_definition_id "
+        f"JOIN books b ON b.id = v.book_id WHERE b.legacy_id = '{_lid81}'")
+    check("and the attribute lands", sorted(x["k"] for x in (_rows or [])) == ["pages"], _rows)
+    # A new row skips the DELETE; it must still get its copy.
+    _cp = local_sql("SELECT COUNT(*) AS n FROM items i JOIN books b ON b.id = i.book_id "
+                    f"WHERE b.legacy_id = '{_lid81}' AND i.deleted_at IS NULL")
+    check("and its copy exists", _cp and int(_cp[0]["n"]) == 1, _cp)
+
+st, _ = call("POST", "/api/import/books", {"dryRun": False, "rows": [
+    {"title": "ZZ Attr Replace Probe", "author": "Gate", "legacyId": _lid81,
+     "tags": [], "customFields": {"edition": "2nd"}}]})
+if LOCAL:
+    _rows = local_sql(
+        "SELECT d.field_key AS k FROM book_attribute_values v "
+        "JOIN custom_field_definitions d ON d.id = v.attribute_definition_id "
+        f"JOIN books b ON b.id = v.book_id WHERE b.legacy_id = '{_lid81}'")
+    # If the update path had skipped its DELETE, `pages` would still be here.
+    check("a re-import REPLACES the attributes rather than adding to them",
+          sorted(x["k"] for x in (_rows or [])) == ["edition"], _rows)
+    local_sql(f"DELETE FROM book_attribute_values WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid81}')")
+    local_sql(f"DELETE FROM items WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid81}')")
+    local_sql(f"DELETE FROM books WHERE legacy_id = '{_lid81}'")
+
 print("=== 80. REGRESSION: no caller can mint a cache key, and a burst writes none ===")
 
 # KV allows 1,000 WRITES a day and every read-through cache spent one per miss. The

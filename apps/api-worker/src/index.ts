@@ -2742,6 +2742,10 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 		)
 		.run();
 
+	// NOT `isNewBook` — the id here is derived from the client mutation id and the
+	// INSERT is OR IGNORE, precisely so a retry lands on the same row. On that retry
+	// the first attempt's attribute values are already there and the DELETE is what
+	// clears them, so skipping it would leave a stale value behind.
 	await replaceBookAttributeValues(c.env, id, customFields);
 	// Every record needs a copy from the moment it exists, or it is invisible to
 	// every location filter and facet — those read holdings now, not the record.
@@ -6411,7 +6415,13 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 					.run();
 			}
 
-			await replaceBookAttributeValues(c.env, bookId, customFields);
+			// `customDefs` is the list this handler already loaded before the row loop,
+			// under a comment that says it did so to stop the N round-trips — which
+			// this call then made anyway, once per row.
+			await replaceBookAttributeValues(c.env, bookId, customFields, {
+				defs: customDefs,
+				isNewBook: !existing
+			});
 			// A NEW record needs a copy to exist at all.
 			//
 			// Every other creation path calls this — POST /api/books, the offline
@@ -7210,6 +7220,11 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 	const embedUpsertIds = new Set<string>();
 	const embedDeleteIds = new Set<string>();
 
+	// Once for up to 200 mutations, for the same reason both imports do it: the
+	// attribute writer read this table per book, so a full offline queue spent 200
+	// D1 subrequests re-answering one question.
+	const syncCustomDefs = await loadCustomFieldDefs(c.env);
+
 	for (const mutation of payload.mutations) {
 		let status: 'success' | 'error' = 'success';
 		let resultData: Record<string, unknown> = {};
@@ -7239,7 +7254,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 				const row = normalizeBookData(CreateBookSchema.parse(mutation.payload));
 				// A newly-created book can't be on loan yet — never create it 'borrowed'.
 				if (row.status === 'borrowed') row.status = 'available';
-				const customFields = await validateCustomFields(c.env, row.customFields);
+				const customFields = validateCustomFieldsAgainst(syncCustomDefs, row.customFields);
 				const now = nowIso();
 				// Deterministic id from the client mutation id: if a prior attempt
 				// committed the INSERT but its response (or the sync_mutations log)
@@ -7313,7 +7328,10 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						folds.isbn_valid
 					)
 					.run();
-				await replaceBookAttributeValues(c.env, id, customFields);
+				// Definitions passed, but NOT `isNewBook`: the id is deterministic from
+				// the client mutation id with an INSERT OR IGNORE behind it, so a
+				// retry writes to a row that may already carry attribute values.
+				await replaceBookAttributeValues(c.env, id, customFields, { defs: syncCustomDefs });
 				await ensurePrimaryItem(c.env, id, row);
 				resultData = { id };
 			} else if (mutation.operation === 'delete_book') {
@@ -7498,7 +7516,9 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					throw new HTTPException(409, { message: 'Version conflict' });
 				}
 
-				await replaceBookAttributeValues(c.env, row.id, merged.customFields as Record<string, unknown>);
+				await replaceBookAttributeValues(c.env, row.id, merged.customFields as Record<string, unknown>, {
+					defs: syncCustomDefs
+				});
 				await ensurePrimaryItem(c.env, row.id, merged as { shelfCode?: string | null; roomCode?: string | null });
 				resultData = { id: row.id, version: merged.version };
 			} else if (mutation.operation === 'borrow_book') {
@@ -9205,7 +9225,12 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 			}
 
 			try {
-				await replaceBookAttributeValues(c.env, bookId, effectiveCf);
+				// `defs` is loaded once above this loop for validation; passing it here
+				// stops the writer reloading the same table per row.
+				await replaceBookAttributeValues(c.env, bookId, effectiveCf, {
+					defs,
+					isNewBook: !didUpdate
+				});
 			} catch {
 				attributeFailures += 1;
 			}

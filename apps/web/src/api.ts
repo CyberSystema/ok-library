@@ -10,7 +10,26 @@ import { cacheGet, cacheSet, cacheBustPrefixes } from './cache';
 
 const RAW_API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8787';
 export const API_BASE = RAW_API_BASE.replace(/\/+$/, '');
-export const IMPORT_CHUNK_SIZE = 500;
+// Rows per POST to /api/import/books.
+//
+// 500 was chosen against a per-row cost that has since grown. The handler walks the
+// rows SEQUENTIALLY and each one costs several D1 subrequests: the legacy_id lookup,
+// the INSERT or UPDATE, the attribute write, and `ensurePrimaryItem` — which is three
+// on its own, and was added after this number was picked. At four to six per row, 500
+// rows is 2,000-3,000 subrequests in one invocation, and the worker's own note on the
+// add-copies batch size says the per-invocation budget is "unconfirmed" and stays well
+// under it deliberately. `SWEEP_WRITE_CAP = 500 // 10 D1 batches` is the other
+// precedent, an order of magnitude below this.
+//
+// 150 keeps a chunk to roughly 600-900 subrequests, in the same neighbourhood as the
+// rest of the system. The cost is more HTTP requests — 12,675 rows becomes 85 calls,
+// comfortably inside the 180/minute mutation limiter — and the benefit is that an
+// import of a real catalogue does not depend on a number nobody has confirmed.
+//
+// The client halves this on a 413, which is a payload problem; a subrequest overflow
+// arrives as a 500 and gets retried four times instead. Fewer rows per call is the
+// only lever that addresses that from here.
+export const IMPORT_CHUNK_SIZE = 150;
 export const IMPORT_MIN_CHUNK_SIZE = 1;
 export const PAGE_SIZE = 50;
 export const DEBOUNCE_MS = 350;
