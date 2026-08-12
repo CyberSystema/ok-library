@@ -1054,6 +1054,10 @@ label {
   padding: 1.5rem;
   animation: fadeIn 0.2s ease;
 }
+/* A dialog opened from another dialog. 300 sits above the 200 every overlay shares and
+   below the cover lightbox at 500, which is opened from the detail panel too and should
+   still come out on top of everything. */
+.modal-overlay-stacked { z-index: 300; }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
 .modal {

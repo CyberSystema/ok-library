@@ -130,7 +130,7 @@ export function SerialHoldingsEditor({ book, holdings, onClose, onSaved }: {
   }
 
   return (
-    <Dialog onClose={onClose} labelledBy="serials-editor-title" className="modal wide">
+    <Dialog stacked onClose={onClose} labelledBy="serials-editor-title" className="modal wide">
       <div className="modal-header">
         <h3 id="serials-editor-title">
           {t('serials.editorTitle')}

@@ -2952,6 +2952,63 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 83. REGRESSION: a scroll lock lives as long as the thing it locks for ===")
+
+# `useModalFocus` sets `document.body.style.overflow = 'hidden'` for as long as it is
+# mounted — that is how it locks the page behind a dialog. Called from a component that is
+# ALWAYS mounted, it locks the page forever: I hoisted it into App() to give the cover
+# lightbox its focus handling, and the entire application became unscrollable, on every
+# screen, whether or not a cover was open. Nothing in the build, the typecheck or 883
+# assertions noticed, because every one of them is blind to "the page cannot scroll".
+_web83 = os.path.join(_REPO, "apps", "web", "src")
+_files83 = []
+for _root, _dirs, _fs in os.walk(_web83):
+    for _f in _fs:
+        if _f.endswith((".ts", ".tsx")):
+            with open(os.path.join(_root, _f), encoding="utf-8") as _fh:
+                _files83.append((os.path.join(_root, _f), _fh.read()))
+
+# Which component does each useModalFocus call sit in? Walk back to the nearest
+# `function Name(` above the call.
+_calls83 = []
+for _path, _body in _files83:
+    for _m in re.finditer(r"useModalFocus\s*\(", _body):
+        _before = _body[:_m.start()]
+        _fn = re.findall(r"function\s+([A-Za-z0-9_]+)\s*\(", _before)
+        _calls83.append((os.path.basename(_path), _fn[-1] if _fn else "(top level)"))
+check("useModalFocus is called at least once", len(_calls83) >= 1, _calls83)
+
+# App() is the one component that is always mounted, so it must never hold the lock.
+_inApp83 = [c for c in _calls83 if c[1] == "App"]
+check("no scroll lock is mounted from App(), which never unmounts", not _inApp83, _inApp83)
+
+# The same rule for the raw property: only the helper may touch body overflow, so there is
+# exactly one lifetime to reason about.
+def _decomment83(text):
+    """Drop // lines and /* */ blocks. The first version of the check below matched the
+    phrase inside its OWN fix's explanatory comment and reported main.tsx as an offender —
+    the same trap this gate has fallen into twice today, so it is worth removing rather
+    than tightening the pattern around."""
+    text = re.sub(r"/\*[\s\S]*?\*/", "", text)
+    return "\n".join(l.split("//")[0] if "//" in l else l for l in text.split("\n"))
+
+
+_rawOverflow83 = []
+for _path, _body in _files83:
+    _code83 = _decomment83(_body)
+    for _m in re.finditer(r"document\.body\.style\.overflow\s*=", _code83):
+        if os.path.basename(_path) != "ui.tsx":
+            _rawOverflow83.append(f"{os.path.basename(_path)}:{_code83[:_m.start()].count(chr(10)) + 1}")
+check("only ui.tsx's modal helper writes body overflow", not _rawOverflow83, _rawOverflow83)
+
+# And the lightbox specifically, since that is what the regression was reaching for: it has
+# to be a component so the lock mounts with the overlay rather than with the app.
+_main83 = _slurp(_web83, "main.tsx")
+check("the cover lightbox is a component, not inline JSX in App",
+      re.search(r"function CoverLightbox\s*\(", _main83) is not None, None)
+check("and it is rendered conditionally on there being a cover to show",
+      re.search(r"\{coverZoom && \(\s*<CoverLightbox", _main83) is not None, None)
+
 print("=== 82. REGRESSION: a style that is referenced is a style that exists ===")
 
 # A UI audit found five defects that were all the same shape: something referenced a
@@ -4880,7 +4937,13 @@ try:
     # the check fail the moment someone wrote down the rule it enforces.
     tsx_code = re.sub(r'/\*.*?\*/', '', tsx, flags=re.S)
     tsx_code = "\n".join(l for l in tsx_code.split("\n") if not l.strip().startswith("//"))
-    overlays = re.findall(r'className="modal-overlay"', tsx_code)
+    # Matched as a className EXPRESSION, not as a literal string. The Dialog primitive now
+    # writes `className={stacked ? 'modal-overlay modal-overlay-stacked' : 'modal-overlay'}`
+    # — a dialog opened from another dialog has to outrank it — and the old pattern, which
+    # looked for the exact literal `className="modal-overlay"`, silently counted ZERO the
+    # moment that became conditional. A check whose count can go from 1 to 0 because the
+    # code got more correct is measuring the wrong thing.
+    overlays = re.findall(r'className=(?:"modal-overlay"|\{[^}]*modal-overlay[^}]*\})', tsx_code)
     check("only the Dialog primitive renders a backdrop", len(overlays) == 1, len(overlays))
     check("no overlay claims the dialog role on its backdrop",
           'className="modal-overlay" onClick' not in tsx and 'modal-overlay" role=' not in tsx,

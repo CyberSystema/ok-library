@@ -230,7 +230,7 @@ export function CopiesEditor({ book, onClose, onSaved }: {
   }
 
   return (
-    <Dialog onClose={onClose} onDismissAttempt={requestDismiss} labelledBy="copies-editor-title" className="modal wide">
+    <Dialog stacked onClose={onClose} onDismissAttempt={requestDismiss} labelledBy="copies-editor-title" className="modal wide">
       <div className="modal-header">
         <h3 id="copies-editor-title">
           {t('copies.editorTitle', { n: drafts.length })}

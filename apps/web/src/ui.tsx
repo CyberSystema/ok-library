@@ -544,8 +544,22 @@ export function Combobox<T>(props: {
  * — Tab cycles WITHIN the dialog, which is what aria-modal already promises AT
  * users and what Tab did not honour).
  */
-export function Dialog({ onClose, onDismissAttempt, labelledBy, label, className, style, children, initialFocus }: {
+export function Dialog({ onClose, onDismissAttempt, labelledBy, label, className, style, children, initialFocus, stacked }: {
   onClose: () => void;
+  /**
+   * Set on a dialog that is opened FROM another dialog.
+   *
+   * All overlays share `z-index: 200`, so between two of them the DOM order decides — and
+   * the copies editor and the serial-holdings editor are both rendered EARLIER in App than
+   * the record detail dialog they are opened from. The result: clicking "Edit copy details"
+   * mounted the editor behind the detail panel, where it could not be seen or reached, and
+   * because it holds the modal scroll lock the page then froze with no way out. Two
+   * symptoms, one stacking order.
+   *
+   * Raising the child rather than reordering the JSX, because the order of these blocks in
+   * a 9,000-line component is not something the next edit should have to preserve.
+   */
+  stacked?: boolean;
   /**
    * Called INSTEAD of `onClose` for the two ways a dialog closes by accident:
    * Escape, and a click that starts on the backdrop. A dialog holding typed work passes
@@ -582,7 +596,7 @@ export function Dialog({ onClose, onDismissAttempt, labelledBy, label, className
     // role. Click-away stays, but only when the click started on the backdrop
     // itself, so a drag that ends outside the box does not close it.
     <div
-      className="modal-overlay"
+      className={stacked ? 'modal-overlay modal-overlay-stacked' : 'modal-overlay'}
       onMouseDown={(e) => { if (e.target === e.currentTarget) dismiss(); }}
       onKeyDown={onKeyDown}
     >
