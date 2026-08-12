@@ -1466,8 +1466,22 @@ app.get('/api/books/duplicates', requirePermission('books.write', { librarian: t
 	// to '' so a re-catalogued blank-author book and its legacy '(Unknown)' twin
 	// land in the SAME duplicate group. Must be identical in the GROUP BY, the
 	// match predicates, and the details projection or the buckets won't line up.
-	const TITLE_KEY = "CASE WHEN LOWER(TRIM(title)) = '(untitled)' THEN '' ELSE LOWER(TRIM(title)) END";
-	const AUTHOR_KEY = "CASE WHEN LOWER(TRIM(author)) = '(unknown)' THEN '' ELSE LOWER(TRIM(author)) END";
+	// KEYED ON THE FOLD COLUMNS, not on LOWER() of the raw text.
+	//
+	// SQLite's LOWER() is ASCII-only — `LOWER('ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ')` returns the string
+	// unchanged — which is why migration 0012 exists and why migration 0018 added
+	// idx_books_title_author_fold "so the duplicate check could stop using a function
+	// of the column". The post-create duplicate WARNING was moved to the folds; this
+	// report, the one that drives the merge tool, was not. So the two detectors
+	// answered different questions about the same catalogue: 373 groups here against
+	// 374 by the fold, and every accent or case difference in a Greek title was
+	// invisible to the tool built to find exactly that.
+	//
+	// The sentinels still fold to '': `fold('')` is NULL (author-less records) and
+	// '(Unknown)' folds to '(unknown)', so both spellings of "no author" group
+	// together, which is what the CASE was always for.
+	const TITLE_KEY = "CASE WHEN TRIM(COALESCE(title_fold, '')) = '(untitled)' THEN '' ELSE TRIM(COALESCE(title_fold, '')) END";
+	const AUTHOR_KEY = "CASE WHEN TRIM(COALESCE(author_fold, '')) = '(unknown)' THEN '' ELSE TRIM(COALESCE(author_fold, '')) END";
 
 	// Get the global count of duplicate groups in parallel with the paged
 	// slice. The previous `total` was just the count of returned groups,
@@ -3626,6 +3640,24 @@ app.get('/api/reports/iso2789', requirePermission('dashboard', { librarian: true
 	}
 
 	const caveats: string[] = [];
+	// THE STOCK HALF IS AS-OF NOW, NOT AS-OF THE PERIOD. The report takes from/to,
+	// echoes them as `period`, and applies them to the FLOW measures — additions,
+	// withdrawals, loans, active borrowers. The STOCK measures (titles, items, serial
+	// titles, the category and language breakdowns) and the registered-user count
+	// carry no date predicate at all. ISO 2789 defines both as at the end of the
+	// reporting period, so asking for last year returns last year's flows beside
+	// today's holdings, and nothing said so.
+	//
+	// Stated rather than silently bounded, deliberately. `created_at` for the legacy
+	// catalogue is one import timestamp, so a `created_at < to` filter would report
+	// zero holdings for every period before that import — replacing a knowable
+	// imprecision with a confident falsehood. The whole point of this array is that a
+	// figure the report cannot produce is named instead of guessed at.
+	caveats.push(
+		'Holdings and registered readers are counted as they stand today, not as they '
+		+ 'stood at the end of the period. Only additions, withdrawals and loans are '
+		+ 'bounded by the dates above.'
+	);
 	const noAcq = Number(quality?.noAcquisitionDate ?? 0);
 	if (noAcq > 0) {
 		caveats.push(
@@ -5264,16 +5296,40 @@ app.delete('/api/rooms/:id', requirePermission('rooms.delete'), async (c) => {
 	// `deleted_at`, so a room whose only remaining reference is a book in the
 	// trash still cannot be dropped — filtering them out here produced a guard
 	// that passed and then let the constraint throw the 500 it exists to prevent.
+	// COPIES TOO, not just books.
+	//
+	// `books.room_code` has a foreign key to rooms(code), which is what this guard was
+	// written for. But migration 0021 moved the physical location onto `items` and
+	// declared `items.room_code` with NO foreign key — so a copy in this room does not
+	// stop the DELETE, and the room code it carries becomes a dangling reference the
+	// database will never complain about. `syncBookFromItems` derives books.room_code
+	// from the PRIMARY copy only, so a second copy shelved in this room is invisible
+	// to the books count entirely: the room vanishes and that copy keeps pointing at a
+	// code the rooms table no longer has.
+	//
+	// Both counts include soft-deleted rows, for the same reason the books count
+	// already did — a reference from the trash is still a reference.
+	// Counted as DISTINCT RECORDS, not as references. A book and its own primary copy
+	// both carry the room code, so adding the two counts told the librarian two books
+	// were in the way when they could see one on the screen. The number in a refusal
+	// has to be the number they will go and move.
 	const inUse = await c.env.DB.prepare(
-		`SELECT COUNT(*) AS n, SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS live
-		   FROM books WHERE room_code = ?`
-	).bind(room.code).first<{ n: number; live: number }>();
+		`SELECT COUNT(*) AS n,
+		        SUM(CASE WHEN live_ref = 1 THEN 1 ELSE 0 END) AS live
+		   FROM (
+		     SELECT b.id AS book_id, MAX(CASE WHEN b.deleted_at IS NULL THEN 1 ELSE 0 END) AS live_ref
+		       FROM books b
+		      WHERE b.room_code = ?
+		         OR EXISTS (SELECT 1 FROM items i WHERE i.book_id = b.id AND i.room_code = ?)
+		      GROUP BY b.id
+		   )`
+	).bind(room.code, room.code).first<{ n: number; live: number }>();
 	const total = Number(inUse?.n ?? 0);
 	const live = Number(inUse?.live ?? 0);
 	if (total > 0) {
 		throw new HTTPException(409, {
 			message: live > 0
-				? `Cannot delete: ${live} book(s) are in this room. Move them to another room first.`
+				? `Cannot delete: ${live} book(s) have a copy in this room. Move them to another room first.`
 				: `Cannot delete: ${total} deleted book(s) still reference this room. Purge them from the trash first.`
 		});
 	}

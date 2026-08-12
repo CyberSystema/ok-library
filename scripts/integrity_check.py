@@ -2910,6 +2910,76 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 72. REGRESSION: one definition of duplicate, one of in-use, one honest period ===")
+uniq = uuid.uuid4().hex[:5]
+
+# SQLite's LOWER() is ASCII-only — LOWER('ΘΕΙΑ ΛΕΙΤΟΥΡΓΙΑ') returns the string
+# unchanged — which is why the fold columns exist. The post-create duplicate WARNING
+# was moved onto them; the duplicates REPORT that drives the merge tool was not, so
+# the two detectors answered different questions about the same catalogue and every
+# accent or case difference in a Greek title was invisible to the tool built to find
+# exactly that.
+_worker72 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_dupsrc = _worker72[_worker72.index("app.get('/api/books/duplicates'"):]
+_dupsrc = _dupsrc[:_dupsrc.index("const [groupsRes")]
+check("the duplicates report keys on the fold columns, not LOWER()",
+      "title_fold" in _dupsrc and "LOWER(TRIM(title))" not in _dupsrc, _dupsrc[-260:])
+if LOCAL:
+    _cmp = local_sql("""SELECT
+      (SELECT COUNT(*) FROM (SELECT LOWER(TRIM(title)) t, LOWER(TRIM(author)) a
+         FROM books WHERE deleted_at IS NULL GROUP BY t,a HAVING COUNT(*)>1)) AS by_lower,
+      (SELECT COUNT(*) FROM (SELECT TRIM(COALESCE(title_fold,'')) t, TRIM(COALESCE(author_fold,'')) a
+         FROM books WHERE deleted_at IS NULL GROUP BY t,a HAVING COUNT(*)>1)) AS by_fold""")
+    if _cmp:
+        st, rep = call("GET", "/api/books/duplicates?limit=1")
+        check("and the endpoint reports the fold count, not the ASCII one",
+              (rep or {}).get("total") == int(_cmp[0]["by_fold"]),
+              f"endpoint={(rep or {}).get('total')} fold={_cmp[0]['by_fold']} lower={_cmp[0]['by_lower']}")
+
+# `books.room_code` has a foreign key to rooms; `items.room_code` (migration 0021)
+# has none. The delete guard counted only books — and syncBookFromItems derives
+# books.room_code from the PRIMARY copy alone, so a second copy shelved in the room
+# was invisible to it. The room went, the copy kept pointing at a code that no longer
+# existed, and no constraint objected.
+st, mkroom = call("POST", "/api/rooms", {"code": f"ZZG{uniq}", "name": f"ZZ Guard {uniq}"})
+_rid = (mkroom or {}).get("id") or (mkroom or {}).get("room", {}).get("id")
+if _rid and LOCAL:
+    _stored = (local_sql(f"SELECT code FROM rooms WHERE id = '{_rid}'") or [{}])[0].get("code")
+    st, mkb = call("POST", "/api/books", {"title": f"ZZGUARD {uniq}", "author": "ZZ"})
+    _bid = (mkb or {}).get("id")
+    st, got = call("GET", f"/api/books/{_bid}/items")
+    _iid = ((got or {}).get("items") or [{}])[0].get("id")
+    if _bid and _iid and _stored:
+        CREATED.append(_bid)
+        # Copy 1 elsewhere, copy 2 in the room: books.room_code never sees it.
+        st, _ = call("PUT", f"/api/books/{_bid}/items", {"items": [
+            {"id": _iid, "shelfCode": "01-001"},
+            {"shelfCode": "02-002", "roomCode": _stored}
+        ]})
+        check("a second copy can be filed in a room", st == 200, st)
+        _refs = local_sql(f"""SELECT (SELECT COUNT(*) FROM books WHERE room_code = '{_stored}') AS by_book,
+                                     (SELECT COUNT(*) FROM items WHERE room_code = '{_stored}') AS by_item""")
+        check("and the books table does not see it (the primary copy is elsewhere)",
+              _refs and int(_refs[0]["by_book"]) == 0 and int(_refs[0]["by_item"]) == 1, _refs)
+        st, body = call("DELETE", f"/api/rooms/{_rid}")
+        check("so deleting the room is refused on the COPY's account",
+              st == 409, f"{st} {str(body)[:120]}")
+        call("DELETE", f"/api/books/{_bid}")
+        call("DELETE", f"/api/books/{_bid}/purge")
+        st, _ = call("DELETE", f"/api/rooms/{_rid}")
+        check("and allowed once nothing references it", st in (200, 204), st)
+    else:
+        call("DELETE", f"/api/rooms/{_rid}")
+
+# The ISO 2789 return echoes a period and applies it to the FLOW measures only; the
+# stock and registered-reader counts have no date predicate at all. Stated rather
+# than silently bounded — `created_at` for the legacy catalogue is one import
+# timestamp, so filtering by it would report zero holdings for every earlier period.
+st, rep72 = call("GET", "/api/reports/iso2789?from=2020-01-01&to=2021-01-01")
+_cav = " ".join((rep72 or {}).get("caveats") or [])
+check("the statutory return says its holdings are as of today, not the period end",
+      "as they stand today" in _cav, (rep72 or {}).get("caveats"))
+
 print("=== 71. REGRESSION: MARC that another library can file ===")
 uniq = uuid.uuid4().hex[:6]
 
