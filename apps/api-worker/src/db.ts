@@ -149,6 +149,29 @@ export function browseCacheKey(
   return `${BOOKS_CACHE_PREFIX}${version}:${opts.page}:${opts.pageSize}:${opts.sortBy}:${opts.sortDir}`;
 }
 
+/**
+ * Create the first admin, if and only if the library has no way in.
+ *
+ * This runs at the top of `POST /api/auth/login`, which is UNAUTHENTICATED. It used to seed
+ * whenever no row held `BOOTSTRAP_ADMIN_USERNAME`, which made an anonymous request a privileged
+ * INSERT: delete that account and the very next login attempt — a FAILED one, by anybody —
+ * re-created it as an active admin holding the password from the deployment secrets. Measured:
+ * one anonymous 401 produced `{username: 'zzghostadmin', role: 'admin', active: 1}`.
+ *
+ * That state is reachable from the app's own screens. `DELETE /api/users/:id` tries a hard
+ * delete first and only falls back to deactivating when a foreign key blocks it, so an account
+ * with no audit trail yet — a second admin created during setup, say — disappears completely.
+ * An administrator who removed the shared bootstrap account could not keep it removed, and
+ * anyone who ever saw those setup credentials kept a way back in.
+ *
+ * The gate is now the actual purpose: seed only when there is NO active admin. First run still
+ * works, and losing every admin is still recoverable, which is what the secrets are for.
+ *
+ * If the username is already held by a row that is deactivated or not an admin, this does
+ * NOTHING and says so in the log. Reactivating an account somebody deliberately disabled would
+ * be the same surprise in a smaller costume, and inserting past a UNIQUE(username) would throw
+ * on every login. The operator's move is to set BOOTSTRAP_ADMIN_USERNAME to an unused name.
+ */
 export async function ensureBootstrapAdmin(env: Env): Promise<void> {
   const username = env.BOOTSTRAP_ADMIN_USERNAME;
   const password = env.BOOTSTRAP_ADMIN_PASSWORD;
@@ -156,8 +179,23 @@ export async function ensureBootstrapAdmin(env: Env): Promise<void> {
     return;
   }
 
-  const existing = await env.DB.prepare('SELECT id FROM staff_users WHERE username = ? LIMIT 1').bind(username).first();
-  if (existing) {
+  const anyAdmin = await env.DB.prepare(
+    "SELECT id FROM staff_users WHERE role = 'admin' AND active = 1 LIMIT 1"
+  ).first();
+  if (anyAdmin) {
+    return;
+  }
+
+  const taken = await env.DB.prepare('SELECT id, role, active FROM staff_users WHERE username = ? LIMIT 1')
+    .bind(username)
+    .first<{ id: string; role: string; active: number }>();
+  if (taken) {
+    console.warn(
+      'bootstrap admin not seeded: this library has no active admin, but the bootstrap username '
+      + 'is already taken by an account that is disabled or not an admin. Set '
+      + 'BOOTSTRAP_ADMIN_USERNAME to an unused name to recover access.',
+      { role: taken.role, active: taken.active }
+    );
     return;
   }
 
@@ -166,12 +204,20 @@ export async function ensureBootstrapAdmin(env: Env): Promise<void> {
   const iterations = defaultPbkdf2Iterations();
   const passwordHash = await hashPasswordPbkdf2(password, salt, iterations);
   const timestamp = nowIso();
+  const id = crypto.randomUUID();
   await env.DB.prepare(
     `INSERT INTO staff_users (id, username, role, password_hash, password_salt, password_iterations, active, created_at, updated_at)
      VALUES (?, ?, 'admin', ?, ?, ?, 1, ?, ?)`
   )
-    .bind(crypto.randomUUID(), username, passwordHash, salt, iterations, timestamp, timestamp)
+    .bind(id, username, passwordHash, salt, iterations, timestamp, timestamp)
     .run();
+  // An admin appearing out of nowhere must be visible afterwards. The new account is its own
+  // actor, which satisfies audit_logs' foreign key and is the truth: nobody signed in to do it.
+  await insertAuditLog(env, id, 'auth.bootstrapAdminCreated', 'user', id, {
+    username,
+    reason: 'no active admin existed'
+  });
+  console.warn('bootstrap admin created because this library had no active admin', { username });
 }
 
 // snake_case DB columns we re-emit under camelCase. Listed once to keep

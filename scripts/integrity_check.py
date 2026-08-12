@@ -5637,6 +5637,45 @@ check("the machine-readable code survives the trip to the client",
       and "export function isVersionConflict" in _api89, None)
 
 
+print()
+print("=== 90. REGRESSION: an anonymous request must not be able to mint an admin ===")
+
+# ensureBootstrapAdmin runs at the top of POST /api/auth/login, which is UNAUTHENTICATED, and it
+# used to seed whenever no row held BOOTSTRAP_ADMIN_USERNAME. That made an anonymous request a
+# privileged INSERT: with the account gone, the very next login attempt — a FAILED one, by
+# anybody — re-created it as an active admin holding the password from the deployment secrets.
+#
+# Measured: with the bootstrap username pointing at a name nothing held, one anonymous 401
+# produced {username: 'zzghostadmin', role: 'admin', active: 1}.
+#
+# The state is reachable from the app's own screens. DELETE /api/users/:id tries a hard delete
+# first and only deactivates when a foreign key blocks it, so an account with no audit trail yet
+# vanishes completely — verified: a user created and immediately deleted leaves no row. An
+# administrator who removed the shared setup account could not keep it removed.
+#
+# Both secrets ARE configured on this deployment, so this was live, not theoretical.
+_db90 = _slurp(_REPO, "apps", "api-worker", "src", "db.ts")
+_boot90 = _db90[_db90.index("export async function ensureBootstrapAdmin"):][:3400]
+check("the bootstrap seed is gated on there being no ACTIVE ADMIN, not on a free username",
+      "role = 'admin' AND active = 1" in _boot90 and "if (anyAdmin) {" in _boot90, None)
+check("a username already taken by a disabled account is left alone rather than resurrected",
+      "if (taken) {" in _boot90 and "BOOTSTRAP_ADMIN_USERNAME to an unused name" in _boot90, None)
+check("and an admin appearing from nowhere is written to the audit log",
+      "auth.bootstrapAdminCreated" in _boot90, None)
+
+if LOCAL:
+    # The live half. This library HAS active admins — the suite is signed in as one — so no
+    # anonymous request may create anything, whatever username the bootstrap secret names.
+    _before90 = sql_count(local_sql("SELECT COUNT(*) AS n FROM staff_users"))
+    _admins90 = sql_count(local_sql("SELECT COUNT(*) AS n FROM staff_users WHERE role = 'admin' AND active = 1"))
+    check("this library has at least one active admin", _admins90 >= 1, _admins90)
+    for _attempt in range(3):
+        call("POST", "/api/auth/login", {"username": f"zznobody{_attempt}", "password": "wrong"})
+    _after90 = sql_count(local_sql("SELECT COUNT(*) AS n FROM staff_users"))
+    check("three anonymous failed logins created no accounts", _after90 == _before90,
+          (_before90, _after90))
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
