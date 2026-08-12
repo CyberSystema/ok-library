@@ -899,6 +899,39 @@ function CoverLightbox({ src, onClose }: { src: string; onClose: () => void }) {
   );
 }
 
+/**
+ * The edit form's fields, read off a book.
+ *
+ * ONE mapping, because there are two ways into the editor — the Library tab's edit action and
+ * the detail panel's Edit button — and they used to carry their own copies of this 16-field
+ * snapshot. They drifted: only one of them recorded the baseline that `saveBookEdit` diffs
+ * against, so a version conflict opened from the detail panel (the button librarians actually
+ * use) still sent a whole stale record. Every opener goes through here now.
+ */
+function editFieldsFromBook(b: Book) {
+  return {
+    title: b.title,
+    author: b.author,
+    isbn: b.isbn ?? '',
+    shelfCode: b.shelfCode ?? '',
+    publicationYear: b.dateEdtf ?? b.publicationYear?.toString() ?? '',
+    titleRomanized: b.titleRomanized ?? '',
+    authorRomanized: b.authorRomanized ?? '',
+    publisherRomanized: b.publisherRomanized ?? '',
+    status: b.status,
+    publisher: b.publisher ?? '',
+    language: b.language ?? '',
+    ddc: b.ddc ?? '',
+    bibLevel: (b.bibLevel ?? 'monograph') as BibLevel,
+    description: b.description ?? ''
+  };
+}
+
+/** What the librarian was shown when the form opened — the thing a save is diffed against. */
+function editBaselineFromBook(b: Book) {
+  return { form: { ...editFieldsFromBook(b) } as Record<string, unknown>, attrs: { ...(b.customFields ?? {}) } };
+}
+
 function App() {
   const toast = useToast();
   const confirm = useConfirm();
@@ -3273,27 +3306,20 @@ function App() {
     }
   }
 
+  /*
+   * What the record looked like when the editor opened.
+   *
+   * A ref rather than state: nothing renders from it, and it must not be captured by a stale
+   * closure in saveBookEdit. Kept so the save can send only what the librarian actually
+   * changed — see the note there.
+   */
+  const editBaselineRef = useRef<{ form: Record<string, unknown>; attrs: Record<string, unknown> } | null>(null);
+
   function beginEdit(book: Book) {
-    setEditForm({
-      id: book.id,
-      title: book.title,
-      author: book.author,
-      isbn: book.isbn ?? '',
-      shelfCode: book.shelfCode ?? '',
-      publicationYear: book.dateEdtf ?? book.publicationYear?.toString() ?? '',
-      titleRomanized: book.titleRomanized ?? '',
-      authorRomanized: book.authorRomanized ?? '',
-      publisherRomanized: book.publisherRomanized ?? '',
-      status: book.status,
-      version: book.version,
-      publisher: book.publisher ?? '',
-      language: book.language ?? '',
-      ddc: book.ddc ?? '',
-      bibLevel: (book.bibLevel ?? 'monograph') as BibLevel,
-      description: book.description ?? ''
-    });
+    setEditForm({ id: book.id, version: book.version, ...editFieldsFromBook(book) });
     setCurrentSection('books');
     setAttributeEditorValues(book.customFields ?? {});
+    editBaselineRef.current = editBaselineFromBook(book);
     void loadBookHistory(book.id);
     // Only for a serial: a monograph has no run, and this would be a wasted
     // request on all 12,675 of them.
@@ -3375,29 +3401,91 @@ function App() {
     try {
       const customFieldsValue = buildCustomFieldsPayload(attributeEditorValues);
       const dateEdtf = editForm.publicationYear.trim() || null;
+      /*
+       * ONLY WHAT CHANGED, and attributes as a PATCH.
+       *
+       * This used to send a full snapshot of all fifteen fields plus the whole attribute map
+       * on every save, which is lossy the moment the form's view of the record is out of date —
+       * and the 409 handler below guaranteed that it would be. It re-fetched the record,
+       * copied the fresh VERSION into the form, and left every stale field in place, so the
+       * librarian's second click sailed past the concurrency check and wrote their old
+       * snapshot over a colleague's edit. The version guard was defeated by its own error
+       * handler, silently, on the app's main editing path.
+       *
+       * UpdateBookSchema is already built for this: every core field is optional, so an
+       * omitted field keeps its stored value, and `customFieldsPatch` MERGES instead of
+       * replacing. Its own comment explains why the wholesale form is "catastrophic for a bulk
+       * edit" — the same is true of this editor after a conflict, just for one record at a
+       * time.
+       *
+       * So two librarians editing DIFFERENT fields of the same record no longer collide at
+       * all, and after a 409 the retry applies only the fields this librarian actually touched.
+       * If both edited the same field, the retrying one wins — unavoidable without a merge UI,
+       * but now it is limited to the field they really changed rather than all fifteen.
+       */
+      const base = editBaselineRef.current;
+      const nextCore: Record<string, unknown> = {
+        title: editForm.title.trim(),
+        author: editForm.author.trim(),
+        isbn: editForm.isbn.trim() || null,
+        shelfCode: editForm.shelfCode.trim() || null,
+        publisher: editForm.publisher.trim() || null,
+        language: editForm.language.trim() || null,
+        description: editForm.description.trim() || null,
+        titleRomanized: editForm.titleRomanized.trim() || null,
+        authorRomanized: editForm.authorRomanized.trim() || null,
+        publisherRomanized: editForm.publisherRomanized.trim() || null,
+        ddc: editForm.ddc.trim() || null,
+        bibLevel: editForm.bibLevel,
+        dateEdtf,
+        status: editForm.status
+      };
+      // The baseline stores the raw record; compare on the same normalisation the payload
+      // uses, or an untouched empty field reads as a change from '' to null and gets sent.
+      const baseCore: Record<string, unknown> = base ? {
+        title: String(base.form.title ?? '').trim(),
+        author: String(base.form.author ?? '').trim(),
+        isbn: String(base.form.isbn ?? '').trim() || null,
+        shelfCode: String(base.form.shelfCode ?? '').trim() || null,
+        publisher: String(base.form.publisher ?? '').trim() || null,
+        language: String(base.form.language ?? '').trim() || null,
+        description: String(base.form.description ?? '').trim() || null,
+        titleRomanized: String(base.form.titleRomanized ?? '').trim() || null,
+        authorRomanized: String(base.form.authorRomanized ?? '').trim() || null,
+        publisherRomanized: String(base.form.publisherRomanized ?? '').trim() || null,
+        ddc: String(base.form.ddc ?? '').trim() || null,
+        bibLevel: base.form.bibLevel,
+        dateEdtf: String(base.form.publicationYear ?? '').trim() || null,
+        status: base.form.status
+      } : {};
+      const payload: Record<string, unknown> = { version: editForm.version };
+      for (const [k, v] of Object.entries(nextCore)) {
+        // With no baseline (an edit opened by a path that did not set one) fall back to
+        // sending everything, which is the previous behaviour rather than a silent no-op.
+        if (!base || v !== baseCore[k]) payload[k] = v;
+      }
+      // Attributes as a patch: only the keys that changed, with null to clear one. An
+      // attribute a colleague added while this form was open is left alone.
+      const attrPatch: Record<string, unknown> = {};
+      const attrKeys = new Set([...Object.keys(customFieldsValue), ...Object.keys(base?.attrs ?? {})]);
+      for (const k of attrKeys) {
+        const now = (customFieldsValue as Record<string, unknown>)[k] ?? null;
+        const was = (base?.attrs ?? {})[k] ?? null;
+        if (!base || now !== was) attrPatch[k] = now;
+      }
+      if (Object.keys(attrPatch).length > 0) payload.customFieldsPatch = attrPatch;
       const result = await runAction(() => apiRequest<{ id: string; version: number }>(`/api/books/${editForm.id}`, {
         method: 'PUT',
         body: JSON.stringify({
-          title: editForm.title.trim(),
-          author: editForm.author.trim(),
-          isbn: editForm.isbn.trim() || null,
-          shelfCode: editForm.shelfCode.trim() || null,
-          publisher: editForm.publisher.trim() || null,
-          language: editForm.language.trim() || null,
-          description: editForm.description.trim() || null,
-          titleRomanized: editForm.titleRomanized.trim() || null,
-          authorRomanized: editForm.authorRomanized.trim() || null,
-          publisherRomanized: editForm.publisherRomanized.trim() || null,
-          ddc: editForm.ddc.trim() || null,
-          bibLevel: editForm.bibLevel,
-          dateEdtf,
-          customFields: customFieldsValue,
-          status: editForm.status,
+          ...payload,
           version: editForm.version
         })
       }));
 
       setEditForm((prev) => ({ ...prev, version: result.version }));
+      // The save landed, so the record now equals what the form shows: re-baseline, or a
+      // second save in the same sitting would re-send the first save's diff.
+      editBaselineRef.current = { form: { ...nextCore, publicationYear: editForm.publicationYear }, attrs: { ...(customFieldsValue as Record<string, unknown>) } };
       setEditFieldErrors(new Set());
       setMessage(t('toast.bookUpdated'));
       setDetailBook((prev) =>
@@ -3426,9 +3514,16 @@ function App() {
       setDetailMode('view');
       await Promise.all([loadBooks(), loadFacet(facetField), loadNeedsReviewCount(), loadRoomSummary()]);
     } catch (e) {
-      // Version conflict: the book changed since it was opened. Re-fetch the
-      // latest and refresh the form's version + baseline so a second save
-      // succeeds, instead of dead-ending on a stale version that loops forever.
+      /*
+       * Version conflict: the book changed since it was opened. Re-fetch the latest and take
+       * its version so a second save succeeds rather than dead-ending on a stale version.
+       *
+       * The BASELINE IS DELIBERATELY NOT REFRESHED. It records what this librarian saw when
+       * they opened the form, which is exactly what makes the diff above mean "what I
+       * changed" — refresh it to the server's current row and every field the colleague just
+       * edited would suddenly differ from this form's stale copy and be sent back, which is
+       * the clobber this whole change exists to stop. Only the version moves.
+       */
       if (e instanceof ApiRequestError && e.status === 409 && editForm.id) {
         try {
           const fresh = await apiRequest<Book>(`/api/books/${editForm.id}`);
@@ -5303,25 +5398,9 @@ function App() {
       void loadBookHistory(b.id);
     }
     setDetailMode('edit');
-    setEditForm({
-      id: b.id,
-      title: b.title,
-      author: b.author,
-      isbn: b.isbn ?? '',
-      shelfCode: b.shelfCode ?? '',
-      publicationYear: b.dateEdtf ?? b.publicationYear?.toString() ?? '',
-      titleRomanized: b.titleRomanized ?? '',
-      authorRomanized: b.authorRomanized ?? '',
-      publisherRomanized: b.publisherRomanized ?? '',
-      status: b.status,
-      version: b.version,
-      publisher: b.publisher ?? '',
-      language: b.language ?? '',
-      ddc: b.ddc ?? '',
-      bibLevel: (b.bibLevel ?? 'monograph') as BibLevel,
-      description: b.description ?? ''
-    });
+    setEditForm({ id: b.id, version: b.version, ...editFieldsFromBook(b) });
     setAttributeEditorValues(b.customFields ?? {});
+    editBaselineRef.current = editBaselineFromBook(b);
   }
 
   // ── Context-menu plumbing ─────────────────────────────────────────────────

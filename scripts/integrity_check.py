@@ -5220,6 +5220,95 @@ if LOCAL:
     check("every direct D1 probe in the run actually executed", not LOCAL_SQL_FAILURES,
           LOCAL_SQL_FAILURES[:3])
 
+print()
+print("=== 86. REGRESSION: a version conflict must not overwrite the colleague's edit ===")
+
+# Two librarians open the same record. B changes the publisher and saves. A, who has been
+# typing a description on the version B just replaced, saves and is told 409. Before this
+# check, A's second click DESTROYED B's work: saveBookEdit's catch refreshed the form's
+# `version` and NOTHING ELSE, so the retry re-sent A's whole stale 16-field snapshot —
+# including the publisher A never touched, still holding the value from before B saved. The
+# guard fired, said the right thing, and then handed over the exact overwrite it exists to
+# stop. Verified in a browser against a real record before the fix, and after.
+#
+# The fix is to send a DIFF: what this librarian actually changed, measured against what they
+# were shown when the form opened. Then a field nobody touched is simply absent from the PUT.
+_main86 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+
+# There must be ONE mapping from a book to the form's fields. There were two — the Library
+# tab's opener and the detail panel's Edit button, each with its own copy — and they drifted:
+# only one recorded a baseline, so a conflict opened from the detail panel (the button
+# librarians actually use) still sent a whole record. That is what made this bug reachable.
+check("one shared mapping from a book to the edit form's fields",
+      "function editFieldsFromBook(" in _main86, None)
+check("and one for the baseline a save is diffed against",
+      "function editBaselineFromBook(" in _main86, None)
+
+# Every opener must arm the baseline. An opener that fills the form without one falls back to
+# sending everything, which is the broken behaviour wearing the fix's clothes.
+_openers86 = [_main86[m.end():m.end() + 700] for m in re.finditer(r"setEditForm\(\{\s*id:", _main86)]
+_armed86 = [t for t in _openers86 if "editBaselineRef.current =" in t]
+check("there are at least the two known ways into the edit form",
+      len(_openers86) >= 2, len(_openers86))
+check("and every one of them arms the baseline",
+      len(_openers86) > 0 and len(_armed86) == len(_openers86),
+      f"{len(_armed86)} of {len(_openers86)} armed")
+
+# The save must diff, and must send attributes as a MERGE. `customFields` REPLACES the whole
+# map, so sending it on a conflict retry would drop an attribute the colleague added.
+_save86 = _main86[_main86.index("async function saveBookEdit"):]
+_save86 = _save86[:_save86.index("\n  async function ", 10) if "\n  async function " in _save86[10:] else 20000]
+check("the save compares against the baseline rather than sending a snapshot",
+      "editBaselineRef.current" in _save86 and "baseCore" in _save86, None)
+check("changed attributes go as a patch, which merges, not as the whole map",
+      "customFieldsPatch" in _save86, None)
+
+# And the conflict branch must NOT re-baseline. This is the subtle half: refreshing the
+# baseline to the server's current row makes every field the colleague just changed differ
+# from this form's stale copy, so the diff would grow to include them and clobber exactly as
+# before. Only the version may move.
+# Anchored on the branch itself, not the digits: the word "409" appears in a comment 7,000
+# characters earlier, and slicing from there gave a window that did not contain the branch at
+# all — so the "does not refresh the baseline" check below passed on an empty string. A check
+# that cannot see the code it judges is worse than no check, because it reports PASS.
+_ci86 = _save86.find("e.status === 409")
+_conflict86 = _save86[_ci86:_ci86 + 1200] if _ci86 >= 0 else ""
+check("the conflict branch is where this check can see it",
+      "apiRequest" in _conflict86 and "fresh" in _conflict86, _ci86)
+check("the conflict branch refreshes the version",
+      "version: fresh.version" in _conflict86, None)
+check("and deliberately does NOT refresh the baseline",
+      _conflict86 != "" and "editBaselineRef.current =" not in _conflict86, None)
+
+# The invariant itself, through the API, on a real record: a diff PUT with a stale version is
+# refused, and the retry keeps the field the other librarian changed.
+_a, _ = mkbook(title=f"ZZ Conflict {uuid.uuid4().hex[:6]}", author="Α. Συγγραφέας",
+               publisher="Εκδόσεις Άλφα", description="Αρχική περιγραφή.",
+               language="EL", tags=["αρχικό"], customFields={"pages": "100"})
+if _a:
+    st, _opened = call("GET", f"/api/books/{_a}")
+    _v = (_opened or {}).get("version")
+    st, _rb = call("PUT", f"/api/books/{_a}", {"publisher": "Εκδόσεις Βήτα", "version": _v})
+    check("the colleague's change lands", st == 200, st)
+    st, _ = call("PUT", f"/api/books/{_a}", {"description": "Η περιγραφή του Α.", "version": _v})
+    check("a save on the version the form was opened at is refused", st == 409, st)
+    st, _fresh = call("GET", f"/api/books/{_a}")
+    st, _ = call("PUT", f"/api/books/{_a}",
+                 {"description": "Η περιγραφή του Α.", "version": (_fresh or {}).get("version")})
+    check("and the retry with the refreshed version succeeds", st == 200, st)
+    st, _final = call("GET", f"/api/books/{_a}")
+    _f = _final or {}
+    check("the colleague's publisher survived the retry",
+          _f.get("publisher") == "Εκδόσεις Βήτα", _f.get("publisher"))
+    check("this librarian's description landed",
+          _f.get("description") == "Η περιγραφή του Α.", _f.get("description"))
+    check("and nothing either of them left alone was touched",
+          _f.get("tags") == ["αρχικό"] and (_f.get("customFields") or {}).get("pages") == "100",
+          (_f.get("tags"), _f.get("customFields")))
+    call("DELETE", f"/api/books/{_a}")
+    call("DELETE", f"/api/books/{_a}/purge")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
