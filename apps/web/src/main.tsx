@@ -6310,7 +6310,7 @@ function App() {
               {currentUser && (
                 <button
                   type="button"
-                  className="secondary small"
+                  className="secondary small navbar-user-btn"
                   onClick={openProfile}
                   title={t('profile.open')}
                   // SC 2.5.3: the accessible name must CONTAIN the visible

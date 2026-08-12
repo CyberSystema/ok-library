@@ -286,15 +286,43 @@ label {
 .simple-navbar {
   background: var(--surface);
   border-bottom: 1px solid var(--border);
-  padding: 0 1.5rem;
+  padding: 0.375rem 1.5rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 60px;
+  /*
+   * WRAPS RATHER THAN PUSHING AN ACTION OFF THE SCREEN.
+   *
+   * This was `height: 60px` with `flex-wrap: nowrap`, so when the contents did not
+   * fit they simply kept going: measured at a 785px viewport in Greek, the header
+   * needed 817px and "Αποσύνδεση" (Sign out) was painted 32px beyond the right edge,
+   * taking the whole document's horizontal scrollbar with it. Signing out required
+   * scrolling the page sideways to find the button.
+   *
+   * A breakpoint alone cannot fix this, because two of the things in here are not
+   * fixed-width: the interface language (Greek and Russian labels run ~1.3-1.4x
+   * English) and the username, which is whatever the librarian is called. Wrapping is
+   * the only version that cannot be defeated by content — the row grows to a second
+   * line instead of hiding a control.
+   *
+   * min-height keeps the 60px bar everyone is used to when it does fit, which is
+   * almost always.
+   */
+  flex-wrap: wrap;
+  row-gap: 0.375rem;
+  min-height: 60px;
   position: sticky;
   top: 0;
   z-index: 100;
   box-shadow: var(--shadow-sm);
+}
+/* The username is user data, so it gets a ceiling and an ellipsis rather than being
+   allowed to set the width of the header. */
+.navbar-right .navbar-user-btn {
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .navbar-brand { display: flex; align-items: center; gap: 0.625rem; }
 .navbar-icon {
@@ -353,6 +381,14 @@ label {
 .desktop-download-other { font-size: 0.75rem; color: var(--text-muted); text-decoration: none; white-space: nowrap; opacity: 0.85; }
 .desktop-download-other:hover { opacity: 1; color: var(--accent); text-decoration: underline; }
 /* On narrow screens, keep the navbar tidy: hide the secondary link, keep the button. */
+/*
+ * The desktop-app call to action is the first thing to go when space is short: it is
+ * an install prompt, not part of cataloguing. It used to be hidden only below 768px,
+ * one breakpoint under the width where it stops fitting — measured in Greek, the rest
+ * of the header already needs 785px and this CTA is another 278px, so both together
+ * do not fit until about 1063px.
+ */
+@media (max-width: 1080px) { .desktop-download { display: none; } }
 @media (max-width: 640px) { .desktop-download-other { display: none; } }
 .navbar-user {
   font-size: 0.8125rem;
@@ -362,12 +398,56 @@ label {
 }
 
 /* ================== TABS ================== */
+/*
+ * The tab strip SCROLLS AT EVERY WIDTH, not only on phones.
+ *
+ * `overflow-x: auto` lived in the max-width:768px block, so between 769px and the
+ * width the six tabs actually need, the strip overflowed a nowrap flex row with
+ * `overflow-x: visible` and pushed the whole DOCUMENT sideways. Measured intrinsic
+ * width of the strip, by interface language:
+ *
+ *     Korean   689px      English  822px
+ *     Russian  918px      Greek    949px
+ *
+ * So English broke from 769px to 822px and GREEK — the language this library
+ * actually runs in — broke from 769px all the way to 949px: a laptop window at 900px,
+ * a tablet in landscape, a browser docked beside another window. Every screen in the
+ * app inherited a horizontal scrollbar from its navigation.
+ *
+ * Wrapping was the other candidate and is wrong here: `.tab-btn` marks the active tab
+ * with a `border-bottom` that is meant to sit on this element's own bottom border, so
+ * a second row would leave an underline floating in the middle of the strip. Scrolling
+ * is also what the phone breakpoint already chose; this makes that choice
+ * unconditional instead of leaving a band where it does not apply.
+ */
 .simple-tabs {
   display: flex;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   padding: 0 1.5rem;
+  overflow-x: auto;
+  /*
+   * The scrollbar is hidden and replaced by a fade at the right edge.
+   *
+   * A visible scrollbar cost 12px of height on EVERY screen in the app (measured:
+   * offsetHeight 62 against clientHeight 50) and, sitting directly under a row of
+   * tabs and above the content, read as a second divider rather than as a control.
+   *
+   * The fade is unconditional and needs no JavaScript, because it is invisible
+   * exactly when it should be: the strip is left-aligned inside `padding: 0 1.5rem`,
+   * so when the tabs fit, the right edge is empty surface and fading empty surface
+   * changes nothing. When they do not fit, the last visible tab dissolves instead of
+   * being chopped, which is the hint that the strip moves.
+   */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
 }
+.simple-tabs::-webkit-scrollbar { height: 0; width: 0; }
+/* Never let a tab be squeezed narrower than its label — the label is already nowrap,
+   so shrinking only produced sub-pixel jitter while the row overflowed anyway. */
+.simple-tabs .tab-btn { flex: 0 0 auto; }
 .tab-btn {
   background: transparent;
   border: none;
@@ -395,7 +475,10 @@ label {
 }
 .section-header-text h2 { margin-bottom: 0.25rem; }
 .section-header-text p { color: var(--text-muted); font-size: 0.875rem; }
-.section-header-actions { display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; }
+/* Wraps: three buttons whose labels are translated cannot be guaranteed to fit one
+   row on a phone. In Greek at 360px "Εξαγωγή CSV" was the third button and pushed the
+   document 3px wide, which is enough for a horizontal scrollbar across every screen. */
+.section-header-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; flex-shrink: 0; }
 
 /* ================== STATS ROW ================== */
 .stats-row {
@@ -438,7 +521,22 @@ label {
   flex-wrap: wrap;
 }
 .search-bar .search-field { flex: 2; min-width: 220px; }
-.search-bar .filter-field { flex: 1; min-width: 140px; }
+/*
+ * 200px, not 140px. These fields hold <select>s whose selected value is drawn by the
+ * UA, which clips it — a select has no text-overflow, so an option that does not fit
+ * is simply cut mid-word with no ellipsis to admit it.
+ *
+ * Measured at 140px in Greek: "Όλες οι καταστάσεις" (All statuses) needs 142px of text
+ * and had 114px, and "Τελευταία ενημέρωση" (Last updated) needs 150px — so the two
+ * controls that say WHAT THE LIST IS CURRENTLY SHOWING both read as truncated
+ * fragments. Russian is the next longest ("На обслуживании"); English fits at 140px,
+ * which is why the floor was set there.
+ *
+ * 200px = the longest option (150px) + horizontal padding (24px) + borders (3px) +
+ * room for the UA's arrow (~20px). The row already wraps, so a wider floor costs
+ * nothing but an earlier wrap.
+ */
+.search-bar .filter-field { flex: 1; min-width: 200px; }
 /* Wraps because the table view adds a fourth button (the column picker), which
    pushed this row past a phone's width. */
 .search-bar .search-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; padding-bottom: 0; }
@@ -1457,7 +1555,22 @@ label {
 }
 .is-active .cat-count { color: var(--accent); }
 
-@media (max-width: 768px) {
+/*
+ * The category rail steps aside below 900px, not 768px.
+ *
+ * `260px 1fr` plus a 20px gap plus the page's 48px of padding means the results column
+ * only starts getting usable width around 900px. At a 785px viewport it was 457px, and
+ * the search bar inside it 411px — so every filter collapsed onto its floor and the
+ * Greek labels clipped. The rail was taking a third of the screen to list categories
+ * beside a book grid that had already dropped to a single column, i.e. it cost width
+ * without buying anything.
+ *
+ * 900px is where `260px + gap + a results column wide enough for the search bar's two
+ * columns` starts to fit. Below it the rail moves above the results, which is the same
+ * arrangement the phone breakpoint already used — this widens that range rather than
+ * inventing a third layout.
+ */
+@media (max-width: 900px) {
   .library-layout { grid-template-columns: 1fr; }
   .category-rail {
     position: static;
@@ -1590,8 +1703,15 @@ label {
    so the language label is visible alongside the flag. */
 .lang-switcher {
   width: auto;
-  min-width: 0;
-  padding: 0 0.55rem;
+  /* `min-width: 0` let the header's flex row squeeze this below its own content, so
+     "🇬🇷 Ελληνικά" rendered as "Ελλην" with a half-clipped arrow. The four language
+     names are known and short; reserve the space the longest one needs and stop the
+     header from stealing it. */
+  min-width: 8.5rem;
+  flex: 0 0 auto;
+  /* Right padding holds the UA's dropdown arrow. Without it the arrow is drawn over
+     the last glyph of the value. */
+  padding: 0 1.5rem 0 0.55rem;
   font-size: 0.85rem;
   gap: 0.35rem;
 }
@@ -2331,7 +2451,8 @@ mark.hl {
   .book-grid { grid-template-columns: 1fr; }
   .modal-overlay { padding: 0; align-items: flex-end; }
   .modal { border-radius: var(--radius-lg) var(--radius-lg) 0 0; max-height: 92vh; border-radius: 16px 16px 0 0; }
-  .simple-tabs { padding: 0 0.5rem; overflow-x: auto; }
+  /* overflow-x now lives on the base rule, at every width. */
+  .simple-tabs { padding: 0 0.5rem; }
   .tab-btn { padding: 0.75rem 1rem; font-size: 0.875rem; }
   .section-header { flex-direction: column; align-items: stretch; }
   .search-bar { flex-direction: column; }
