@@ -6253,12 +6253,34 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 			// Read from the RAW row, not the normalized one: `reconcileBookDates`
 			// mirrors a bare year into `dateEdtf`, so asking the normalized row
 			// whether the sheet mentioned a date answers a different question.
-			// `!== undefined` and not a null check — CreateBookSchema declares both
-			// `.optional().nullable()` with no default, so an absent spreadsheet
-			// column leaves the key absent, and an explicit null is the librarian
-			// clearing the date rather than not mentioning it.
+			//
+			// NULL COUNTS AS "NOT MENTIONED" HERE, and the first version of this got
+			// it exactly wrong. It tested `!== undefined`, reasoning that an absent
+			// spreadsheet column leaves the key absent — but the client builds every
+			// row through an object literal that ALWAYS carries `publicationYear`,
+			// initialised to null when no `publicationyear` header was found
+			// (apps/web/src/main.tsx:1776 and :1838), and `CreateBookSchema` declares
+			// it `.optional().nullable()` with no default so the explicit null
+			// survives the parse. `!== undefined` was therefore true for every row
+			// from every shipped client, the "leave all three alone" branch was dead
+			// code, and the statement wrote NULL into all three columns.
+			//
+			// That was strictly worse than the bug it was meant to fix. Before it,
+			// only `publication_year` was blanked while `date_edtf` and
+			// `publication_year_end` were COALESCEd and survived — so the year could
+			// still be recovered from the EDTF value on the next save. After it, one
+			// re-upload of a sheet without that exact lowercase header took all three
+			// at once, unrecoverably, on any of the 12,528 live records that carry a
+			// legacy_id, 10,917 of which hold a date.
+			//
+			// So absence cannot be the signal: it is unobservable through the clients
+			// that exist. The cost is that a date cannot be CLEARED through the
+			// import, which this endpoint has never supported — clearing a wrong year
+			// is what the book edit form is for. If it is ever wanted here it needs an
+			// explicit marker in the payload, not the absence of a key.
 			const rawDates = item.row as { publicationYear?: number | null; dateEdtf?: string | null };
-			const sheetGaveDates = rawDates.publicationYear !== undefined || rawDates.dateEdtf !== undefined;
+			const sheetGaveDates = (rawDates.publicationYear ?? null) !== null
+				|| (rawDates.dateEdtf ?? null) !== null;
 			const importTagsJson = JSON.stringify(row.tags);
 			const importCustomFieldsJson = JSON.stringify(customFields);
 			const importFolds = computeBookFolds({

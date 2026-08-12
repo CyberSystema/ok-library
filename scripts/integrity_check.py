@@ -3211,14 +3211,35 @@ if _d is not None:
     check("and the span derives both years",
           (_d["y"], _d["e"], _d["d"]) == (1955, 1957, "1955/1957"), _d)
 
-# The case that broke it: a corrective sheet that mentions no date at all.
-st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(shelfCode="A1")]})
-check("a corrective sheet with no year column updates the record",
+# THE SHAPE THE CLIENT ACTUALLY SENDS. apps/web/src/main.tsx builds every import row
+# through an object literal that always carries `publicationYear`, initialised to null
+# when the sheet has no `publicationyear` header (main.tsx:1776, :1838), and
+# CreateBookSchema keeps the explicit null. The first version of this section tested
+# the key-ABSENT shape instead, which no client produces — so it passed while the
+# shipped path wrote NULL into all three columns, worse than the bug being fixed.
+st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [
+    dict(_row77(shelfCode="A1"), publicationYear=None)]})
+check("a corrective sheet carrying publicationYear=null updates the record",
       st == 201 and (r or {}).get("updatedRows") == 1, (st, r))
 _d = _dates77()
 if _d is not None:
     check("and leaves all three date columns exactly as they were",
           (_d["y"], _d["e"], _d["d"]) == (1955, 1957, "1955/1957"), _d)
+
+# The key-absent shape too, for the day a client stops sending it.
+st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(shelfCode="A2")]})
+_d = _dates77()
+if _d is not None:
+    check("and an omitted key leaves them alone as well",
+          (_d["y"], _d["e"], _d["d"]) == (1955, 1957, "1955/1957"), _d)
+
+# Tie the assertion to the client, so the two cannot drift apart again: if main.tsx
+# ever stops emitting the key unconditionally, that is the moment absence becomes an
+# observable signal and this contract can be revisited deliberately.
+_main77 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+check("the client still always emits publicationYear, which is why null means absent",
+      re.search(r"let publicationYear: number \| null = null;", _main77) is not None
+      and re.search(r"^\s+publicationYear,\s*$", _main77, re.M) is not None, None)
 
 # A sheet that DOES speak moves all three together.
 st, _ = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(publicationYear=1960)]})
@@ -3227,13 +3248,23 @@ if _d is not None:
     check("a sheet giving a bare year mirrors it into all three",
           (_d["y"], _d["e"], _d["d"]) == (1960, 1960, "1960"), _d)
 
-# And an explicit null is a clear, not an omission — the distinction the reconciler
-# documents for partial updates, which the CASE binding has to preserve.
+# Clearing a date through the import is DELIBERATELY not supported: null is how the
+# client says "this sheet has no year column", so it cannot also mean "delete the
+# year". Asserted so nobody re-adds a clear path by widening the test back to
+# `!== undefined` — the change that destroyed the data.
+# Compared against the state immediately BEFORE the call, not a hard-coded triple:
+# the case above has already moved this record to 1960, and "preserved" means
+# whatever it held, not whatever it held three assertions ago.
+_before77 = _dates77()
 st, _ = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(publicationYear=None)]})
 _d = _dates77()
-if _d is not None:
-    check("an explicit null clears all three, not one",
-          (_d["y"], _d["e"], _d["d"]) == (None, None, None), _d)
+if _d is not None and _before77 is not None:
+    check("an explicit null does NOT clear the date, it preserves it",
+          (_d["y"], _d["e"], _d["d"]) == (_before77["y"], _before77["e"], _before77["d"]),
+          {"before": _before77, "after": _d})
+_idx77 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+check("and the server does not test the date keys for undefined",
+      "rawDates.publicationYear !== undefined" not in _idx77, None)
 
 if LOCAL:
     local_sql(f"DELETE FROM items WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid77}')")
