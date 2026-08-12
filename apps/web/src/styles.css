@@ -3170,8 +3170,29 @@ mark.hl {
   padding: 0;
   counter-reset: none;
 }
+/*
+ * Chapter names WRAP. They were chopped in half.
+ *
+ * The global `button` rule sets `white-space: nowrap`, this link never overrode it, and
+ * `.hb-contents` has `overflow-y: auto` — which makes overflow-x compute to auto as well,
+ * so the name was clipped dead at the rail's right edge. Mid-word, with no ellipsis to
+ * admit it and no title attribute to hover, because the title is a bare text node in the
+ * JSX and `text-overflow` cannot apply to an anonymous flex item anyway.
+ *
+ * The rail is ~240px. Measured against it: chapter 25 in English,
+ * "Letting others search this catalogue", is 242px — already 2px over. In Greek,
+ * "Να μπορούν και άλλοι να αναζητούν σε αυτόν τον κατάλογο" is 411px, so 52% of the
+ * chapter name was gone. Eight of the 31 Greek entries lost more than a quarter.
+ *
+ * Wrapping rather than ellipsis, unlike `.ob-toc-label` which ellipsises the same kind of
+ * list: this rail is how the librarian navigates 31 chapters, the name is the only thing
+ * distinguishing one entry from the next, and the rail scrolls vertically already — so
+ * vertical space is the cheap axis here and hiding half a name is not a trade worth
+ * making. `align-items: baseline` keeps the ordinal on the first line of a wrapped name.
+ */
 .hb-contents-link {
   display: flex;
+  align-items: baseline;
   gap: 0.5rem;
   width: 100%;
   padding: 0.4rem 0.5rem;
@@ -3182,7 +3203,11 @@ mark.hl {
   font: inherit;
   text-align: start;
   cursor: pointer;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
+/* The ordinal keeps its width so wrapped names stay aligned with each other. */
+.hb-contents-n { flex: 0 0 auto; }
 .hb-contents-link:hover { background: var(--surface-2, var(--bg)); }
 .hb-contents-link.is-active {
   background: var(--accent);
