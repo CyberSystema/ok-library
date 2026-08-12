@@ -1276,7 +1276,17 @@ call("PUT", "/api/library-settings",
 try:
     st, body = anon("/api/oai?verb=Identify")
     check("OAI Identify answers without a token", st == 200 and "<Identify>" in body, f"{st} {body[:90]}")
-    check("Identify names the repository by ISIL", "<repositoryIdentifier>GR-ZZTEST<" in body, body[:300])
+    # The ISIL still NAMES the repository — in the record identifiers, which is where
+    # a harvester actually keys on it. What it must not do is appear inside the
+    # <description> block, because that block declares conformance to
+    # oai-identifier.xsd and the schema restricts repositoryIdentifier to a dotted
+    # domain-name form. `GR-ZZTEST` is a valid ISO 15511 code and a schema violation
+    # in that element, so this assertion used to require the violation.
+    check("the ISIL names the repository in the record identifiers",
+          "oai:GR-ZZTEST:" in (anon("/api/oai?verb=ListIdentifiers&metadataPrefix=oai_dc")[1] or ""), None)
+    check("and Identify makes no schema claim it cannot meet",
+          "<repositoryIdentifier>GR-ZZTEST<" not in body and "oai-identifier" not in body,
+          body[:300])
     # We soft-delete and keep the row, so withdrawals CAN be reported forever.
     # Claiming "persistent" is a promise loadOaiPage has to keep.
     check("Identify declares persistent deletions", "<deletedRecord>persistent</deletedRecord>" in body, body[:300])
@@ -2912,6 +2922,60 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     body = _slurp(pack)
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
+
+print("=== 79. REGRESSION: a report and a repository that describe themselves honestly ===")
+
+# ISO 2789 stock is measured now while the report echoes the period it was asked
+# for. A prose caveat already said so; a spreadsheet formula does not read prose,
+# and this return is filed with a national library — so the instant is a field.
+st, _r79 = call("GET", "/api/reports/iso2789?from=2024-01-01T00:00:00.000Z&to=2024-12-31T23:59:59.000Z")
+check("the report answers for a past period", st == 200, st)
+_asof = ((_r79 or {}).get("collection") or {}).get("asOf")
+check("and names the instant its holdings were counted", bool(_asof), _asof)
+check("which is NOT the end of the period it was asked for",
+      _asof and _asof != (_r79 or {}).get("period", {}).get("to"), _asof)
+check("while the caveat that says so is still there",
+      any("as they stand today" in c for c in (_r79 or {}).get("caveats", [])),
+      (_r79 or {}).get("caveats", [])[:1])
+st, _csv79 = call_text("GET", "/api/reports/iso2789.csv?from=2024-01-01T00:00:00.000Z&to=2024-12-31T23:59:59.000Z")
+check("the spreadsheet carries the same instant, not just the JSON",
+      "Holdings counted as at" in (_csv79 or ""), (_csv79 or "")[:120])
+
+# The OAI Identify response declared conformance to oai-identifier.xsd, whose
+# repositoryIdentifier is restricted to a dotted domain-name form. An ISIL never
+# has a dot, so the one element whose job is to say who we are failed validation
+# against the schema the response itself points at. The identifiers stay
+# ISIL-based; the false claim is what goes.
+# The public endpoints answer 503 while sharing is off, which is the default state
+# this section runs in — so it turns sharing on and puts the setting back, the same
+# way §67 does. Without that the assertions below test the refusal, not the fix.
+st, _cfgs79 = call("GET", "/api/library-settings")
+_prior79 = (_cfgs79 or {}).get("publicSharing")
+call("PUT", "/api/library-settings", {"publicSharing": "on"})
+try:
+    st, _ident = call_text("GET", "/api/oai?verb=Identify")
+    check("Identify still answers", st == 200 and "<Identify>" in (_ident or ""), st)
+    _repo = re.findall(r"<repositoryIdentifier>([^<]*)</repositoryIdentifier>", _ident or "")
+    if _repo:
+        check("if the oai-identifier block is present, its identifier fits the schema",
+              re.fullmatch(r"[a-zA-Z][a-zA-Z0-9-]*(\.[a-zA-Z][a-zA-Z0-9-]*)+", _repo[0]) is not None,
+              _repo[0])
+        check("and the sample identifier is built from the same value",
+              f"oai:{_repo[0]}:" in (_ident or ""), _repo[0])
+    else:
+        # Absent is only correct when the identifier genuinely could not conform.
+        _isil79 = (_cfgs79 or {}).get("isil")
+        check("the block is omitted only because the identifier cannot conform",
+              not _isil79 or re.fullmatch(r"[a-zA-Z][a-zA-Z0-9-]*(\.[a-zA-Z][a-zA-Z0-9-]*)+", _isil79) is None,
+              _isil79)
+        check("and no dangling schema declaration is left behind",
+              "oai-identifier" not in (_ident or ""), None)
+    # Either way the records themselves keep their identifiers.
+    st, _lst79 = call_text("GET", "/api/oai?verb=ListIdentifiers&metadataPrefix=oai_dc")
+    check("record identifiers are still minted",
+          "<identifier>oai:" in (_lst79 or ""), (_lst79 or "")[:160])
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": _prior79 or "off"})
 
 print("=== 78. REGRESSION: every rail bucket can be opened ===")
 

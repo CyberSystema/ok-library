@@ -258,6 +258,27 @@ export function oaiIdentify(
     earliestDatestamp: string; responseDate: string; isil: string | null;
   }
 ): string {
+  const host = new URL(opts.baseUrl).host;
+  const repositoryId = opts.isil ?? host;
+  // The <description> block DECLARES conformance to oai-identifier.xsd, and that
+  // schema constrains repositoryIdentifier to a dotted domain-name form:
+  //
+  //   [a-zA-Z][a-zA-Z0-9\-]*(\.[a-zA-Z][a-zA-Z0-9\-]*)+
+  //
+  // An ISIL never has a dot. `GR-ZZTEST` is a perfectly good ISO 15511 code and a
+  // schema violation in this element, so a harvester validating the Identify
+  // response against the schema the response itself points at got an error — from
+  // the one field whose job is to say who we are.
+  //
+  // The identifiers stay ISIL-based. An ISIL is the internationally registered
+  // name for a library, which is a better repository identity than a hostname that
+  // changes when the DNS does, and OAI-PMH itself only requires that identifiers
+  // be URIs — `oai:GR-ZZTEST:<uuid>` is one. What was wrong was not the identifier
+  // but the claim about it, so the CLAIM is what goes: the optional description is
+  // emitted only when the identifier actually satisfies the schema. Harvesters
+  // already holding `oai:<isil>:<uuid>` keep matching, which a switch to the host
+  // would have quietly broken for every record.
+  const conformsToOaiIdentifier = /^[a-zA-Z][a-zA-Z0-9-]*(\.[a-zA-Z][a-zA-Z0-9-]*)+$/.test(repositoryId);
   const body = [
     '  <Identify>',
     `    <repositoryName>${xmlEscape(opts.repositoryName)}</repositoryName>`,
@@ -269,16 +290,18 @@ export function oaiIdentify(
     // rather than a harvester silently keeping a withdrawn book.
     '    <deletedRecord>persistent</deletedRecord>',
     '    <granularity>YYYY-MM-DDThh:mm:ssZ</granularity>',
-    '    <description>',
-    '      <oai-identifier xmlns="http://www.openarchives.org/OAI/2.0/oai-identifier"',
-    '                      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
-    '                      xsi:schemaLocation="http://www.openarchives.org/OAI/2.0/oai-identifier http://www.openarchives.org/OAI/2.0/oai-identifier.xsd">',
-    '        <scheme>oai</scheme>',
-    `        <repositoryIdentifier>${xmlEscape(opts.isil ?? new URL(opts.baseUrl).host)}</repositoryIdentifier>`,
-    '        <delimiter>:</delimiter>',
-    `        <sampleIdentifier>${xmlEscape(oaiIdentifier(opts.isil, new URL(opts.baseUrl).host, '00000000-0000-0000-0000-000000000000'))}</sampleIdentifier>`,
-    '      </oai-identifier>',
-    '    </description>',
+    ...(conformsToOaiIdentifier ? [
+      '    <description>',
+      '      <oai-identifier xmlns="http://www.openarchives.org/OAI/2.0/oai-identifier"',
+      '                      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"',
+      '                      xsi:schemaLocation="http://www.openarchives.org/OAI/2.0/oai-identifier http://www.openarchives.org/OAI/2.0/oai-identifier.xsd">',
+      '        <scheme>oai</scheme>',
+      `        <repositoryIdentifier>${xmlEscape(repositoryId)}</repositoryIdentifier>`,
+      '        <delimiter>:</delimiter>',
+      `        <sampleIdentifier>${xmlEscape(oaiIdentifier(opts.isil, host, '00000000-0000-0000-0000-000000000000'))}</sampleIdentifier>`,
+      '      </oai-identifier>',
+      '    </description>'
+    ] : []),
     '  </Identify>'
   ].join('\n');
   return oaiResponse(requestUrl, 'Identify', {}, body, opts.responseDate);

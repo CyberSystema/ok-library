@@ -3810,6 +3810,12 @@ app.get('/api/reports/iso2789', requirePermission('dashboard', { librarian: true
 		library: { isil: settings.isil ?? null, name: settings.libraryName ?? null, place: settings.libraryPlace ?? null },
 		stockBaselineDate: baseline,
 		collection: {
+			// The instant the stock was measured, stated as a field rather than left
+			// to the prose caveat below. A consumer reading `collection` beside
+			// `period` would otherwise have no machine-readable way to know the two
+			// are about different moments, and this return gets filed with a
+			// national library — a spreadsheet formula does not read caveats.
+			asOf: nowIso(),
 			titles: Number(stock?.titles ?? 0),
 			items: Number(stock?.items ?? 0),
 			serialTitles: Number(serials?.n ?? 0),
@@ -3848,6 +3854,9 @@ app.get('/api/reports/iso2789.csv', requirePermission('dashboard', { librarian: 
 	const rows: Array<{ Section: string; Measure: string; Value: string | number }> = [
 		{ Section: 'Period', Measure: 'From', Value: data.period.from },
 		{ Section: 'Period', Measure: 'To', Value: data.period.to },
+		// Named in the sheet for the same reason it is named in the JSON: the
+		// holdings figures below are as at this instant, not as at 'To'.
+		{ Section: 'Period', Measure: 'Holdings counted as at', Value: data.collection.asOf },
 		{ Section: 'Library', Measure: 'ISIL', Value: data.library.isil ?? '' },
 		{ Section: 'Library', Measure: 'Name', Value: data.library.name ?? '' },
 		{ Section: 'Collection', Measure: 'Titles held', Value: data.collection.titles },
