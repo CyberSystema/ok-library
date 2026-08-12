@@ -311,6 +311,8 @@ export type OaiResumption = {
   lastId?: string;
   /** Legacy: a bare row offset. Honoured for tokens issued before the keyset. */
   offset?: number;
+  /** completeListSize, carried so the COUNT is not recomputed on every page. */
+  total?: number;
   from?: string; until?: string; prefix: string;
 };
 
@@ -351,6 +353,8 @@ export function decodeResumptionToken(token: string): OaiResumption | null {
       lastUpdatedAt,
       lastId,
       offset,
+      total: Number.isInteger(Number(parsed.total)) && Number(parsed.total) >= 0
+        ? Number(parsed.total) : undefined,
       prefix,
       from: typeof parsed.from === 'string' ? parsed.from : undefined,
       until: typeof parsed.until === 'string' ? parsed.until : undefined

@@ -402,9 +402,19 @@ app.use('/api/*', async (c, next) => {
   const isCoverWrite =
     /^\/api\/books\/[^/]+\/cover$/.test(path) && (method === 'PUT' || method === 'DELETE');
   const isMutating = method === 'POST' || method === 'PUT' || method === 'DELETE' || method === 'PATCH';
+  // The comment above lists "full-table CSV export" among the expensive GETs, and
+  // the predicate did not match one. The routes are `/api/export/books.csv` and
+  // `/api/export/books.marcxml`; `endsWith('/export.csv')` matches neither (it was
+  // written for `/api/borrowers/export.csv`), so the two heaviest reads in the
+  // system — a 12,800-row CSV and a 21 MB MARCXML stream — sat in no bucket at all
+  // while the comment said otherwise.
+  //
+  // Matched by PREFIX now, so a new export route cannot silently opt out by being
+  // named something the suffix test does not expect.
   const isExpensiveGet = method === 'GET' && (
     path === '/api/books/semantic'
     || path.startsWith('/api/lookup/isbn/')
+    || path.startsWith('/api/export/')
     || path.endsWith('/export.csv')
     || /\/export$/.test(path)
   );
@@ -6437,6 +6447,7 @@ app.get('/api/oai', async (c) => {
 		let offset = 0;
 		let resumeAfter: { updatedAt: string; id: string } | null = null;
 		let legacyOffset: number | undefined;
+		let knownTotal: number | undefined;
 		let prefix = q('metadataPrefix');
 		let from = q('from') || undefined;
 		let until = q('until') || undefined;
@@ -6459,6 +6470,7 @@ app.get('/api/oai', async (c) => {
 				? { updatedAt: state.lastUpdatedAt, id: state.lastId ?? '' }
 				: null;
 			legacyOffset = resumeAfter ? undefined : state.offset;
+			knownTotal = state.total;
 			from = state.from; until = state.until;
 		} else if (!['oai_dc', 'marcxml'].includes(prefix)) {
 			return xml(oaiError(requestUrl, 'cannotDisseminateFormat', `Unknown metadataPrefix "${prefix}"`, responseDate,
@@ -6502,7 +6514,12 @@ app.get('/api/oai', async (c) => {
 
 		const page = await loadOaiPage(c.env, {
 			from: fromBound, until: untilBound, limit: HARVEST_PAGE_SIZE,
-			after: resumeAfter, offset: legacyOffset
+			after: resumeAfter, offset: legacyOffset,
+			// Counted once per harvest, not once per page. completeListSize does not
+			// change during a walk, and recomputing it on all ~199 pages read roughly
+			// four million rows for one number — most of a day's free-tier allowance,
+			// spent by an unauthenticated endpoint on its own bookkeeping.
+			knownTotal: knownTotal
 		});
 		if (page.rows.length === 0) {
 			return xml(oaiError(requestUrl, 'noRecordsMatch', 'No records in that range', responseDate,
@@ -6545,6 +6562,7 @@ app.get('/api/oai', async (c) => {
 					delivered,
 					lastUpdatedAt: String(lastRow?.updatedAt ?? ''),
 					lastId: String(lastRow?.id ?? ''),
+					total: page.total,
 					from, until, prefix
 				}))
 				+ '</resumptionToken>'

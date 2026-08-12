@@ -1069,6 +1069,16 @@ export async function loadOaiPage(
     after?: { updatedAt: string; id: string } | null;
     /** Legacy offset, for resumption tokens issued before the keyset. */
     offset?: number;
+    /**
+     * `completeListSize` from the resumption token, so the COUNT runs ONCE per
+     * harvest instead of once per page.
+     *
+     * A full harvest is ~199 pages, and each was recomputing a count over every
+     * harvestable row — roughly 4 million rows read for a number that does not
+     * change during the walk, on a plan with a 5-million-row daily budget. One
+     * harvest could spend the day's allowance on its own bookkeeping.
+     */
+    knownTotal?: number;
   }
 ): Promise<{ rows: Array<Record<string, unknown>>; total: number }> {
   const where: string[] = ['1=1'];
@@ -1091,7 +1101,9 @@ export async function loadOaiPage(
   const whereSql = `WHERE ${where.join(' AND ')}`;
 
   const [countRes, rowsRes] = await Promise.all([
-    env.DB.prepare(`SELECT COUNT(*) AS n FROM books ${countSql}`).bind(...countValues).first<{ n: number }>(),
+    opts.knownTotal != null
+      ? Promise.resolve({ n: opts.knownTotal })
+      : env.DB.prepare(`SELECT COUNT(*) AS n FROM books ${countSql}`).bind(...countValues).first<{ n: number }>(),
     env.DB.prepare(
       `SELECT * FROM books ${whereSql} ORDER BY updated_at ASC, id ASC LIMIT ? OFFSET ?`
     ).bind(...values, opts.limit, opts.after ? 0 : (opts.offset ?? 0)).all<Record<string, unknown>>()

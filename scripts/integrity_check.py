@@ -2910,6 +2910,63 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 69. REGRESSION: what the free tier is spent on ===")
+
+# The hold shelf read the whole catalogue to show a list of about a hundred. The only
+# index mentioning `status` leads with book_id, so SQLite drove the join from books
+# and probed holds once per live record: ~12,800 rows for ~130 candidates, on a
+# screen the desk keeps open, against a daily row-read budget.
+if LOCAL:
+    _plan = local_sql("""EXPLAIN QUERY PLAN
+        SELECT h.id, b.title, i.copy_number
+          FROM holds h
+          JOIN books b ON b.id = h.book_id AND b.deleted_at IS NULL
+          LEFT JOIN items i ON i.id = h.item_id
+         WHERE h.status IN ('waiting', 'ready')
+         ORDER BY (h.status = 'ready') DESC, h.placed_at ASC, h.rowid ASC
+         LIMIT 500""") or []
+    _steps = [str(r.get("detail", "")) for r in _plan]
+    check("the hold shelf drives from holds, not from every book",
+          bool(_steps) and "holds" in _steps[0].lower() and "idx_holds_open" in _steps[0],
+          _steps[:3])
+    _idx = local_sql("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_holds_open'")
+    check("and the index it needs exists", bool(_idx), _idx)
+
+# The limiter's comment lists "full-table CSV export" among the expensive GETs it
+# meters. The predicate tested `endsWith('/export.csv')`, which neither
+# /api/export/books.csv nor /api/export/books.marcxml satisfies — so the two heaviest
+# reads in the system were in no bucket at all while the comment said otherwise.
+_worker69 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_pred = _worker69[_worker69.index("const isExpensiveGet"):]
+_pred = _pred[:_pred.index(");")]
+check("the expensive-GET bucket matches the export routes that exist",
+      "startsWith('/api/export/')" in _pred, _pred[:200])
+for _route in ("/api/export/books.csv", "/api/export/books.marcxml"):
+    check(f"so {_route} is metered", f"app.get('{_route}'" in _worker69, None)
+
+# OAI-PMH recomputed completeListSize on EVERY page of a ~199-page harvest — about
+# four million rows read for a number that cannot change during the walk, against a
+# five-million-row daily allowance, from an unauthenticated endpoint.
+st, _cfg69 = call("GET", "/api/library-settings")
+_prior69 = (_cfg69 or {}).get("publicSharing")
+call("PUT", "/api/library-settings", {"publicSharing": "on"})
+try:
+    st, p1 = call_text("GET", "/api/oai?verb=ListIdentifiers&metadataPrefix=oai_dc")
+    _tok = (re.search(r"<resumptionToken[^>]*>([^<]+)</resumptionToken>", p1 or "") or [None, ""])[1]
+    _size1 = (re.search(r'completeListSize="(\d+)"', p1 or "") or [None, "0"])[1]
+    check("a harvest reports a complete list size", int(_size1) > 0, _size1)
+    if _tok:
+        import base64 as _b64
+        _payload = json.loads(_b64.b64decode(_tok + "=" * (-len(_tok) % 4)))
+        check("and the resumption token carries it, so the count is not repeated",
+              int(_payload.get("total", 0)) == int(_size1), _payload)
+        st, p2 = call_text("GET", f"/api/oai?verb=ListIdentifiers&resumptionToken={_tok}")
+        _size2 = (re.search(r'completeListSize="(\d+)"', p2 or "") or [None, "0"])[1]
+        check("and the next page agrees without recomputing it", _size1 == _size2,
+              f"{_size1} vs {_size2}")
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": _prior69 or "off"})
+
 print("=== 68. REGRESSION: an imported record is a real record ===")
 uniq = uuid.uuid4().hex[:6]
 
