@@ -3291,6 +3291,51 @@ mark.hl {
   max-width: 46rem;
 }
 
+/* Withdrawn copies: the way back from a mistake, folded away until wanted.
+   Collapsed by default because on most records it is empty or irrelevant, and an
+   editor that opens showing a list of things that are gone reads as an error. */
+.withdrawn-copies {
+  margin-top: 1rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.withdrawn-copies > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.withdrawn-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.withdrawn-list li {
+  display: flex;
+  flex-wrap: wrap;              /* Greek reasons are long; wrap rather than leave the box. */
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--border);
+}
+.withdrawn-list li:first-child {
+  border-top: 0;
+}
+/* Takes the free space so the button stays at the end, and breaks rather than
+   pushing the row wider than the dialog — a barcode is one unbreakable token. */
+.withdrawn-what {
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.withdrawn-list li > button {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
 /* What the rail is not showing, said in the rail rather than nowhere. */
 .rail-note {
   margin: 0.35rem 0.5rem 0.5rem;

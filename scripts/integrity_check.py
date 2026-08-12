@@ -5676,6 +5676,86 @@ if LOCAL:
           (_before90, _after90))
 
 
+print()
+print("=== 91. REGRESSION: a copy withdrawn by mistake must have a way back ===")
+
+# Withdrawing a copy in the editor sets items.deleted_at, and NOTHING anywhere cleared it again.
+# restoreItemsDeletedAt is deliberately narrow — it matches the BOOK's own deletion timestamp, so
+# restoring a record brings back exactly the copies that record's deletion took down, and a copy
+# the librarian had withdrawn earlier correctly stays withdrawn. The consequence nobody had
+# followed through: a copy withdrawn ON ITS OWN, by a slip in the editor, was gone from the
+# application permanently. Records have a trash and a restore. Copies had neither.
+if LOCAL:
+    _b91, _ = mkbook(title=f"ZZ Withdraw Restore {uuid.uuid4().hex[:6]}", author="Θ. Δοκιμή")
+    call("POST", "/api/items/add-copies", {"bookIds": [_b91], "copies": 2})
+    st, _it91 = call("GET", f"/api/books/{_b91}/items")
+    _copies91 = (_it91 or {}).get("items") or []
+    check("the record has three copies", len(_copies91) == 3, len(_copies91))
+    _bk91 = get(_b91) or {}
+    _third91 = next((c for c in _copies91 if c["copyNumber"] == 3), None)
+    _barcode91 = (_third91 or {}).get("barcode")
+
+    st, _ = call("PUT", f"/api/books/{_b91}/items", {
+        "expectedVersion": _bk91.get("version"),
+        "withdrawalReason": "σφάλμα καταλογογράφησης",
+        "items": [{"id": c["id"], "copyNumber": n + 1, "status": c.get("status", "available")}
+                  for n, c in enumerate(c for c in _copies91 if c["copyNumber"] != 3)]
+    })
+    check("a copy can be withdrawn", st == 200, st)
+
+    # Without ?withdrawn=1 nothing changes for any existing caller.
+    st, _plain91 = call("GET", f"/api/books/{_b91}/items")
+    check("the ordinary items list still shows only live copies",
+          len((_plain91 or {}).get("items") or []) == 2 and "withdrawn" not in (_plain91 or {}),
+          _plain91)
+
+    st, _with91 = call("GET", f"/api/books/{_b91}/items?withdrawn=1")
+    _gone91 = (_with91 or {}).get("withdrawn") or []
+    check("and the withdrawn copy can be found", len(_gone91) == 1, len(_gone91))
+    check("with the reason it was withdrawn for",
+          (_gone91[0].get("withdrawalReason") if _gone91 else None) == "σφάλμα καταλογογράφησης",
+          _gone91[:1])
+
+    if _gone91:
+        st, _res91 = call("POST", f"/api/books/{_b91}/items/{_gone91[0]['id']}/restore")
+        check("it can be put back on the shelf", st == 200, st)
+        st, _after91 = call("GET", f"/api/books/{_b91}/items?withdrawn=1")
+        _live91 = (_after91 or {}).get("items") or []
+        check("the record has its three copies again", len(_live91) == 3, len(_live91))
+        check("and nothing is left withdrawn", not ((_after91 or {}).get("withdrawn") or []), None)
+        # The barcode is UNIQUE across the whole table with no deleted_at predicate, so a
+        # withdrawn copy never released it — it must come back on the same copy.
+        check("the copy kept its barcode, which was never free to reassign",
+              any(c.get("barcode") == _barcode91 for c in _live91) if _barcode91 else True,
+              (_barcode91, [c.get("barcode") for c in _live91]))
+        # Renumbered rather than restored to its old position: that number is very likely taken.
+        check("no two live copies share a copy number",
+              len({c["copyNumber"] for c in _live91}) == len(_live91),
+              [c["copyNumber"] for c in _live91])
+        # The restore changed the record, so a client holding the old list must be told.
+        _bk91b = get(_b91) or {}
+        check("restoring moved the record's version",
+              _bk91b.get("version") != _bk91.get("version"),
+              (_bk91.get("version"), _bk91b.get("version")))
+        st, _twice91 = call("POST", f"/api/books/{_b91}/items/{_gone91[0]['id']}/restore")
+        check("restoring the same copy twice is refused rather than duplicating it",
+              st == 409, st)
+    call("DELETE", f"/api/books/{_b91}")
+    call("DELETE", f"/api/books/{_b91}/purge")
+
+# And it has to be reachable from the screen where the mistake is made. An endpoint a librarian
+# cannot press is not a way back.
+_cop91 = _slurp(_REPO, "apps", "web", "src", "screens", "copies.tsx")
+check("the copies editor lists withdrawn copies",
+      "items?withdrawn=1" in _cop91 and "withdrawn-copies" in _cop91, None)
+check("and offers to restore one, asking first",
+      "/restore`" in _cop91 and "copies.restoreTitle" in _cop91, None)
+_css91 = _slurp(_REPO, "apps", "web", "src", "styles.css")
+for _cls in ("withdrawn-copies", "withdrawn-list", "withdrawn-what"):
+    check(f"  .{_cls} has a rule, so it is not unstyled body text",
+          f".{_cls}" in _css91, None)
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

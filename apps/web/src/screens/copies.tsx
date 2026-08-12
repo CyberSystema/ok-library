@@ -20,7 +20,7 @@
 //   · copy_number — derived from the ORDER of the list, because the endpoint
 //     renumbers by position. Reordering is therefore how you renumber.
 //   · which copy is primary — that is the first one, by the same rule.
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ITEM_TYPES } from '@ok-library/shared';
 import type { Book, Item } from '../types';
 import { apiRequest, isVersionConflict } from '../api';
@@ -122,6 +122,16 @@ export function CopiesEditor({ book, onClose, onSaved }: {
   const [serverItems, setServerItems] = useState<Book['items']>(book.items ?? []);
   const [serverVersion, setServerVersion] = useState(book.version);
   const [reloadedNote, setReloadedNote] = useState(false);
+  /*
+   * Copies that were taken off the shelf.
+   *
+   * Withdrawing set items.deleted_at and NOTHING cleared it again — restoreItemsDeletedAt is
+   * deliberately narrow, matching the book's own deletion stamp so restoring a record brings
+   * back exactly the copies that record's deletion took down. A copy withdrawn on its own, by a
+   * slip here, was gone from the app for good. Records have a trash; copies had nothing. They
+   * are listed at the bottom so the way back is where the mistake was made.
+   */
+  const [withdrawn, setWithdrawn] = useState<Item[]>([]);
   const [drafts, setDrafts] = useState<Draft[]>(() => (book.items ?? []).map(toDraft));
   const [busy, setBusy] = useState(false);
   // Removing a copy is a WITHDRAWAL in ISO 2789 terms, so the reason travels
@@ -155,6 +165,45 @@ export function CopiesEditor({ book, onClose, onSaved }: {
     const strip = (d: Draft) => { const { key, ...rest } = d; return rest; };
     return JSON.stringify(initial.map(strip)) !== JSON.stringify(drafts.map(strip));
   }, [drafts, removedIds, withdrawalReason, serverItems]);
+
+  const loadWithdrawn = useCallback(async () => {
+    try {
+      const res = await apiRequest<{ withdrawn?: Item[] }>(`/api/books/${book.id}/items?withdrawn=1`);
+      setWithdrawn(res.withdrawn ?? []);
+    } catch {
+      // A list of things that are already gone is not worth an error banner over the
+      // editor. The rest of the dialog works without it.
+    }
+  }, [book.id]);
+
+  useEffect(() => { void loadWithdrawn(); }, [loadWithdrawn]);
+
+  async function restoreCopy(item: Item) {
+    const ok = await confirm({
+      title: t('copies.restoreTitle'),
+      body: t('copies.restoreBody', { n: item.copyNumber }),
+      confirmLabel: t('copies.restore')
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const res = await apiRequest<{ items: Item[] }>(`/api/books/${book.id}/items/${item.id}/restore`, { method: 'POST' });
+      // The restore already changed the record, so the editor takes the server's list as its
+      // new starting point — including the version, or the next save would conflict with the
+      // change this very dialog just made.
+      const fresh = await apiRequest<Book>(`/api/books/${book.id}`);
+      setServerItems(res.items);
+      setServerVersion(fresh.version);
+      setDrafts([...res.items.map(toDraft), ...drafts.filter((d) => !d.id)]);
+      await loadWithdrawn();
+      toast.push('success', t('copies.restored'));
+      await onSaved();
+    } catch (e) {
+      toast.push('error', (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); };
@@ -441,6 +490,28 @@ export function CopiesEditor({ book, onClose, onSaved }: {
           />
           <p className="muted small">{t('copies.withdrawalReasonHelp')}</p>
         </div>
+      )}
+
+      {withdrawn.length > 0 && (
+        <details className="withdrawn-copies">
+          <summary>{t('copies.withdrawnHeading', { n: withdrawn.length })}</summary>
+          <p className="muted small">{t('copies.withdrawnIntro')}</p>
+          <ul className="withdrawn-list">
+            {withdrawn.map((w) => (
+              <li key={w.id}>
+                <span className="withdrawn-what">
+                  {t('library.copies.nth', { n: w.copyNumber })}
+                  {w.barcode && <span className="mono small"> · {w.barcode}</span>}
+                  {w.shelfCode && <span className="muted small"> · {w.shelfCode}</span>}
+                </span>
+                {w.withdrawalReason && <span className="muted small">{w.withdrawalReason}</span>}
+                <button className="secondary small" disabled={busy} onClick={() => void restoreCopy(w)}>
+                  {t('copies.restore')}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
 
       <div className="modal-actions">

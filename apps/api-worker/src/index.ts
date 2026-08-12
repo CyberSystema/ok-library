@@ -4542,6 +4542,68 @@ app.get('/api/books/:id/items', async (c) => {
 	const id = c.req.param('id') ?? '';
 	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL').bind(id).first();
 	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+	/*
+	 * `?withdrawn=1` also returns the copies that were taken off the shelf.
+	 *
+	 * Withdrawing a copy in the editor sets items.deleted_at, and nothing anywhere cleared it
+	 * again. restoreItemsDeletedAt looks deliberately narrow — it matches the BOOK's own deletion
+	 * timestamp, so restoring a record brings back exactly the copies that record's deletion took
+	 * down — which means a copy withdrawn on its own, by a slip in the editor, was gone from the
+	 * app permanently. Records have a trash and a restore; copies had neither.
+	 */
+	const withWithdrawn = c.req.query('withdrawn') === '1';
+	const items = await loadBookItems(c.env, id);
+	if (!withWithdrawn) return c.json({ bookId: id, items });
+	const gone = await c.env.DB.prepare(
+		`SELECT * FROM items WHERE book_id = ? AND deleted_at IS NOT NULL
+		  ORDER BY deleted_at DESC, copy_number ASC, id ASC LIMIT 200`
+	).bind(id).all<Record<string, unknown>>();
+	return c.json({ bookId: id, items, withdrawn: (gone.results ?? []).map(parseItem) });
+});
+
+/**
+ * Put a withdrawn copy back on the shelf.
+ *
+ * The copy number is REASSIGNED rather than restored. The number that copy held has very likely
+ * been taken since — the editor renumbers what is left when a copy goes — so writing the old one
+ * back would give a record two copy 2s, and the numbering is what the label on the spine says.
+ * It comes back at the end, which is also where an operator would expect a returning volume.
+ *
+ * The barcode returns untouched: `items.barcode` is UNIQUE across the whole table with no
+ * deleted_at predicate, so a withdrawn copy never released it and nothing else can be holding it.
+ */
+app.post('/api/books/:id/items/:itemId/restore', requirePermission('books.write', { librarian: true }), async (c) => {
+	const id = c.req.param('id') ?? '';
+	const itemId = c.req.param('itemId') ?? '';
+	const book = await c.env.DB.prepare('SELECT id FROM books WHERE id = ? AND deleted_at IS NULL')
+		.bind(id).first();
+	if (!book) throw new HTTPException(404, { message: 'Book not found' });
+
+	const item = await c.env.DB.prepare(
+		'SELECT id, copy_number, deleted_at FROM items WHERE id = ? AND book_id = ? LIMIT 1'
+	).bind(itemId, id).first<{ id: string; copy_number: number; deleted_at: string | null }>();
+	if (!item) throw new HTTPException(404, { message: 'Copy not found on this record' });
+	if (!item.deleted_at) {
+		throw new HTTPException(409, { message: 'That copy is already on the shelf.' });
+	}
+
+	const highest = await c.env.DB.prepare(
+		'SELECT COALESCE(MAX(copy_number), 0) AS n FROM items WHERE book_id = ? AND deleted_at IS NULL'
+	).bind(id).first<{ n: number }>();
+	const now = nowIso();
+	await c.env.DB.prepare(
+		`UPDATE items SET deleted_at = NULL, withdrawal_reason = NULL, copy_number = ?,
+		        status = CASE WHEN status = 'borrowed' THEN 'available' ELSE status END,
+		        updated_at = ?, version = version + 1
+		  WHERE id = ?`
+	).bind(Number(highest?.n ?? 0) + 1, now, itemId).run();
+
+	// Moves books.version and updated_at, so an editor holding the old list is told.
+	await syncBookFromItems(c.env, id);
+	await bumpBooksCacheVersion(c.env);
+	await insertAuditLog(c.env, c.get('user').sub, 'book.items.restore', 'book', id, {
+		itemId, wasCopyNumber: item.copy_number, withdrawnAt: item.deleted_at
+	});
 	return c.json({ bookId: id, items: await loadBookItems(c.env, id) });
 });
 
