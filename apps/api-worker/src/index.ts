@@ -1,5 +1,6 @@
 import {
 	AddCopiesSchema,
+	checkIsbn,
 	parseEdtf,
 	BookFilterQuerySchema,
 	BorrowBookSchema,
@@ -2561,7 +2562,8 @@ app.post('/api/books/merge', requirePermission('books.write', { librarian: true 
 			        tags = ?, custom_fields = ?, updated_at = ?, version = version + 1,
 			        title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?,
 			        tags_fold = ?, custom_fields_fold = ?,
-			        title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?
+			        title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?,
+			        isbn_valid = ?
 			  WHERE id = ?`
 		).bind(
 			merged.title, merged.author, merged.isbn ?? null, merged.publisher ?? null,
@@ -2572,6 +2574,7 @@ app.post('/api/books/merge', requirePermission('books.write', { librarian: true 
 			folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold, folds.description_fold,
 			folds.tags_fold, folds.custom_fields_fold,
 			folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
+			folds.isbn_valid,
 			payload.keepId
 		),
 		// The tombstone. `merged_into` is the forwarding address for an old label,
@@ -2674,8 +2677,8 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 			legacy_id, created_at, updated_at, deleted_at,
 			title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
-			title_romanized_fold, author_romanized_fold, publisher_romanized_fold
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	)
 		.bind(
 			id,
@@ -2711,7 +2714,8 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 			folds.custom_fields_fold,
 			folds.title_romanized_fold,
 			folds.author_romanized_fold,
-			folds.publisher_romanized_fold
+			folds.publisher_romanized_fold,
+			folds.isbn_valid
 		)
 		.run();
 
@@ -2932,7 +2936,7 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 			legacy_id = ?, version = ?, updated_at = ?,
 			title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?,
-			title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?
+			title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?, isbn_valid = ?
 		 WHERE id = ? AND deleted_at IS NULL AND version = ?`
 	)
 		.bind(
@@ -2971,6 +2975,7 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			mergedFolds.title_romanized_fold,
 			mergedFolds.author_romanized_fold,
 			mergedFolds.publisher_romanized_fold,
+			mergedFolds.isbn_valid,
 			id,
 			// Concurrency guard lives in the WHERE clause, not just the earlier
 			// read: comparing the version and THEN updating is check-then-act, so
@@ -6082,8 +6087,9 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 					                    tags, custom_fields, status, version, created_at, updated_at,
 					                    title_fold, author_fold, isbn_fold, publisher_fold, description_fold,
 					                    tags_fold, custom_fields_fold,
-					                    title_romanized_fold, author_romanized_fold, publisher_romanized_fold)
-					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 'available', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					                    title_romanized_fold, author_romanized_fold, publisher_romanized_fold,
+					                    isbn_valid)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 'available', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				).bind(
 					id, payload.title, payload.author, payload.isbn ?? null,
 					payload.publicationYear ?? null, payload.publicationYearEnd ?? null, payload.dateEdtf ?? null,
@@ -6093,7 +6099,8 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 					cfJson, now, now,
 					folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
 					folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
-					folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold
+					folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
+					folds.isbn_valid
 				).run();
 				// A new record needs a copy to exist at all, or it is invisible to
 				// every location filter. Unshelved until someone places it.
@@ -6241,7 +6248,8 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						description_fold = ?, tags_fold = ?, custom_fields_fold = ?,
 						title_romanized_fold = COALESCE(?, title_romanized_fold),
 						author_romanized_fold = COALESCE(?, author_romanized_fold),
-						publisher_romanized_fold = COALESCE(?, publisher_romanized_fold)
+						publisher_romanized_fold = COALESCE(?, publisher_romanized_fold),
+						isbn_valid = ?
 					 WHERE id = ? AND deleted_at IS NULL`
 				)
 					.bind(
@@ -6275,6 +6283,7 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						importFolds.title_romanized_fold,
 						importFolds.author_romanized_fold,
 						importFolds.publisher_romanized_fold,
+						importFolds.isbn_valid,
 						bookId
 					)
 					.run();
@@ -6293,8 +6302,8 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						tags, custom_fields, status, version,
 						legacy_id, created_at, updated_at, deleted_at,
 						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
-						title_romanized_fold, author_romanized_fold, publisher_romanized_fold
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+						title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						bookId,
@@ -6334,7 +6343,8 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						importFolds.custom_fields_fold,
 						importFolds.title_romanized_fold,
 						importFolds.author_romanized_fold,
-						importFolds.publisher_romanized_fold
+						importFolds.publisher_romanized_fold,
+						importFolds.isbn_valid
 					)
 					.run();
 			}
@@ -7202,8 +7212,8 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 						created_at, updated_at, deleted_at,
 						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
-						title_romanized_fold, author_romanized_fold, publisher_romanized_fold
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+						title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						id,
@@ -7237,7 +7247,8 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						folds.custom_fields_fold,
 						folds.title_romanized_fold,
 						folds.author_romanized_fold,
-						folds.publisher_romanized_fold
+						folds.publisher_romanized_fold,
+						folds.isbn_valid
 					)
 					.run();
 				await replaceBookAttributeValues(c.env, id, customFields);
@@ -7379,7 +7390,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						 room_code = ?, shelf_code = ?, acquisition_date = ?, tags = ?, custom_fields = ?, status = ?,
 						 version = ?, updated_at = ?,
 						 title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?, description_fold = ?, tags_fold = ?, custom_fields_fold = ?,
-						 title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?
+						 title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?, isbn_valid = ?
 					 WHERE id = ? AND deleted_at IS NULL AND version = ?`
 				)
 					.bind(
@@ -7414,6 +7425,7 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						mergedFolds.title_romanized_fold,
 						mergedFolds.author_romanized_fold,
 						mergedFolds.publisher_romanized_fold,
+						mergedFolds.isbn_valid,
 						row.id,
 						// Same check-then-act guard as the direct PUT: the write only
 						// lands if the row is still at the version we read.
@@ -7764,7 +7776,7 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 		        title_romanized, author_romanized, publisher_romanized,
 		        title_fold, author_fold, isbn_fold, publisher_fold,
 		        description_fold, tags_fold, custom_fields_fold,
-		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold
+		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
 		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
 	).bind(limit, offset).all<Record<string, unknown>>();
 
@@ -7832,7 +7844,21 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 			(row.author_romanized_fold == null && (n.authorRomanized ?? '') !== '') ||
 			(row.publisher_romanized_fold == null && (n.publisherRomanized ?? '') !== '');
 
-		if (!textChanged && !needsFoldBackfill) continue;
+		// `isbn_valid` gets the same treatment, and needs it more: migration 0034
+		// replaced a GENERATED column with a stored one and could not compute the
+		// value in SQL — that impossibility is why the column changed — so it
+		// marked every row that has an ISBN as 0 and left the answer to this pass.
+		// Without its own trigger, a row whose text is already clean is never
+		// rewritten, and 563 perfectly good ISBNs would sit in the broken-ISBN
+		// list forever.
+		//
+		// Compared against the recomputed value rather than tested for NULL,
+		// because the wrong answer here is 0, not absent.
+		const isbnValidStale = row.isbn_valid !== (
+			(n.isbn ?? '').trim() === '' ? null : (checkIsbn(n.isbn).valid ? 1 : 0)
+		);
+
+		if (!textChanged && !needsFoldBackfill && !isbnValidStale) continue;
 		if (needsFoldBackfill) foldsBackfilled++;
 
 		const tagsJson = JSON.stringify(n.tags);
@@ -7861,7 +7887,7 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 				   updated_at=?, version=version+1,
 				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
 				   description_fold=?, tags_fold=?, custom_fields_fold=?,
-				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?
+				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?, isbn_valid=?
 				 WHERE id=?`
 			).bind(
 				n.title, n.author, n.isbn ?? null, n.publisher ?? null, n.language ?? null, n.description ?? null,
@@ -7872,6 +7898,7 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 				folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
 				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
 				folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
+				folds.isbn_valid,
 				row.id as string
 			)
 		);
@@ -7974,7 +8001,7 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 		`SELECT id, title, author, isbn, publisher, description, tags, custom_fields,
 		        title_romanized, author_romanized, publisher_romanized,
 		        title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
-		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold
+		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
 		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
 	).bind(limit, offset).all<Record<string, unknown>>();
 
@@ -8009,12 +8036,13 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 				`UPDATE books SET
 				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
 				   description_fold=?, tags_fold=?, custom_fields_fold=?,
-				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?
+				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?, isbn_valid=?
 				 WHERE id=?`
 			).bind(
 				folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
 				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
 				folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
+				folds.isbn_valid,
 				row.id as string
 			)
 		);
@@ -9025,7 +9053,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 						description = ?, shelf_code = ?, custom_fields = ?, updated_at = ?,
 						version = version + 1,
 						title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?,
-						description_fold = ?, custom_fields_fold = ?
+						description_fold = ?, custom_fields_fold = ?, isbn_valid = ?
 					 WHERE id = ? AND deleted_at IS NULL`
 				)
 					.bind(
@@ -9045,6 +9073,7 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 						folds.publisher_fold,
 						folds.description_fold,
 						folds.custom_fields_fold,
+						folds.isbn_valid,
 						bookId
 					)
 					.run();
@@ -9061,8 +9090,9 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 						id, title, author, isbn, publication_year, publisher, language, description,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
 						legacy_id, created_at, updated_at, deleted_at,
-						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, 'available', 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`
+						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
+						isbn_valid
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, 'available', 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						bookId,
@@ -9085,7 +9115,8 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 						folds.publisher_fold,
 						folds.description_fold,
 						folds.tags_fold,
-						folds.custom_fields_fold
+						folds.custom_fields_fold,
+						folds.isbn_valid
 					)
 					.run();
 			}

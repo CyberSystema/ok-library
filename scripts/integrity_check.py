@@ -1843,8 +1843,11 @@ try:
     # The fold columns are whatever computeBookFolds returns — derived, never
     # a hand-maintained list that can drift from the thing it describes.
     ret = db_src.split("export function computeBookFolds(", 1)[1].split("): {", 1)[1].split("} {", 1)[0]
-    fold_columns = re.findall(r"(\w+_fold):", ret)
-    check("computeBookFolds declares every fold column", len(fold_columns) >= 10, fold_columns)
+    # `isbn_valid` is not a fold and rides in the same return for the same reason
+    # (migration 0034), so the pattern has to admit it — a derived column this
+    # guard cannot see is a derived column a healing pass may quietly forget.
+    fold_columns = re.findall(r"(\w+_fold|isbn_valid):", ret)
+    check("computeBookFolds declares every derived column", len(fold_columns) >= 11, fold_columns)
 
     for route in ("/api/admin/normalize-books", "/api/admin/rebuild-search-index"):
         i = idx_src.index(f"app.post('{route}'")
@@ -2910,6 +2913,68 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 76. REGRESSION: one check digit, one answer ===")
+
+# The badge on a record and the smart list built to find broken ISBNs disagreed on
+# 33 records, because `isbn_valid` was a GENERATED column — a second implementation
+# of `checkIsbn` written in SQLite CASE arithmetic. Migration 0034 replaced it with
+# a stored column written by `computeBookFolds`, so the two now share one function.
+#
+# The direct proof, over the WHOLE table rather than a sample: every record the list
+# returns must carry the badge, and every record with a badge must be in the list.
+if LOCAL:
+    _iv = local_sql(
+        "SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL "
+        "AND isbn IS NOT NULL AND TRIM(isbn) <> '' AND isbn_valid IS NULL")
+    check("no live record with an ISBN is left unjudged",
+          _iv and int(_iv[0]["n"]) == 0, _iv[0] if _iv else "query failed")
+    _gen = local_sql("SELECT COUNT(*) AS n FROM pragma_table_xinfo('books') "
+                     "WHERE name = 'isbn_valid' AND hidden = 2")
+    check("and it is a stored column, not a generated one",
+          _gen and int(_gen[0]["n"]) == 0, _gen[0] if _gen else "query failed")
+
+# Walk the list and the badge against each other through the API.
+st, _inv = call("GET", "/api/books?invalidIsbn=1&limit=100")
+_items = (_inv or {}).get("items", [])
+check("the broken-ISBN list is not empty on this catalogue", len(_items) > 0, len(_items))
+check("every record it returns carries the broken badge",
+      all(b.get("isbnValid") is False for b in _items),
+      [b.get("isbn") for b in _items if b.get("isbnValid") is not False][:5])
+
+# A hyphenated ISBN is how every book on the shelf prints it, and the generated
+# column tested LENGTH() on the raw value — so 978-0-19-826170-3 matched neither
+# branch and a hyphenated ISBN with a bad check digit was invisible to this list.
+# 9+21+8+0+1+27+8+6+6+3+7+0 = 96, so (10 - 96 % 10) % 10 = 4 is the RIGHT digit.
+# Written the other way round first, and the gate said the badge disagreed — which
+# was the assertion being wrong about the arithmetic, not the code.
+_hyph_bad = "978-0-19-826170-1"
+st, _bk76 = call("POST", "/api/books", {"title": "ZZ Hyphen ISBN Probe", "author": "Gate",
+                                        "isbn": _hyph_bad, "tags": [], "customFields": {},
+                                        "status": "available"})
+check("a book with a hyphenated ISBN is accepted", st == 201, st)
+_b76 = (_bk76 or {}).get("id")
+if _b76:
+    CREATED.append(_b76)
+    st, _rec = call("GET", f"/api/books/{_b76}")
+    check("its badge says the check digit is wrong", (_rec or {}).get("isbnValid") is False,
+          (_rec or {}).get("isbnValid"))
+    st, _list = call("GET", "/api/books?invalidIsbn=1&search=ZZ%20Hyphen%20ISBN%20Probe")
+    check("and the smart list finds it, separators and all",
+          any(b.get("id") == _b76 for b in (_list or {}).get("items", [])),
+          (_list or {}).get("total"))
+    # The same number with the RIGHT check digit must leave the list, which proves
+    # the column is rewritten on update and not merely on insert.
+    st, _cur = call("GET", f"/api/books/{_b76}")
+    st, _ = call("PUT", f"/api/books/{_b76}",
+                 {"isbn": "978-0-19-826170-4", "version": (_cur or {}).get("version", 0)})
+    check("correcting the digit is accepted", st == 200, st)
+    st, _rec2 = call("GET", f"/api/books/{_b76}")
+    check("the badge clears", (_rec2 or {}).get("isbnValid") is True, (_rec2 or {}).get("isbnValid"))
+    st, _list2 = call("GET", "/api/books?invalidIsbn=1&search=ZZ%20Hyphen%20ISBN%20Probe")
+    check("and it leaves the list, so the column follows an UPDATE too",
+          not any(b.get("id") == _b76 for b in (_list2 or {}).get("items", [])),
+          (_list2 or {}).get("total"))
+
 print("=== 75. REGRESSION: every permission in the matrix governs something ===")
 
 # `labels.print` and `settings` were toggles in the admin matrix that no route
@@ -3401,6 +3466,22 @@ _missing68 = [
 ]
 check("every books UPDATE that writes text writes its folds too",
       not _missing68, f"lines missing folds: {_missing68}")
+
+# Same sweep, same reasoning, for the column migration 0034 moved out of SQL: the
+# whole point of storing it is that the write paths carry it, and there are twelve.
+_missing_iv = [
+    _worker68[:pos].count("\n") + 1
+    for pos, seg in _updates68
+    if ("isbn = ?" in seg or "isbn=?" in seg) and "isbn_valid" not in seg
+]
+check("every books UPDATE that writes an isbn writes isbn_valid",
+      not _missing_iv, f"lines missing isbn_valid: {_missing_iv}")
+_inserts_iv = [
+    _worker68[:m.start()].count("\n") + 1
+    for m in _re68.finditer(r"INSERT (?:OR IGNORE )?INTO books\s*\(([^)]*)\)", _worker68, _re68.S)
+    if "isbn_valid" not in m.group(1)
+]
+check("and every books INSERT does too", not _inserts_iv, f"lines: {_inserts_iv}")
 
 print("=== 67. REGRESSION: SRU answers the query it was asked ===")
 

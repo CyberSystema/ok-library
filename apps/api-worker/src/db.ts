@@ -1778,6 +1778,14 @@ export function computeBookFolds(input: {
   title_romanized_fold: string | null;
   author_romanized_fold: string | null;
   publisher_romanized_fold: string | null;
+  // Not a fold, and it rides here anyway. `isbn_valid` was a GENERATED column
+  // until migration 0034, which is a second implementation of `checkIsbn` in
+  // SQL, and it drifted: 33 records where the smart list and the record's own
+  // badge disagreed. This function is already spread into every books INSERT and
+  // UPDATE, healed by both admin sweeps and guarded by the gate's two static
+  // checks — so it is the one place a derived book column can be added without
+  // asking ten write paths to remember it.
+  isbn_valid: number | null;
 } {
   const fold = (v: string | null | undefined): string | null => {
     if (v == null) return null;
@@ -1795,7 +1803,11 @@ export function computeBookFolds(input: {
     custom_fields_fold: fold(input.customFieldsJson),
     title_romanized_fold: fold(input.titleRomanized),
     author_romanized_fold: fold(input.authorRomanized),
-    publisher_romanized_fold: fold(input.publisherRomanized)
+    publisher_romanized_fold: fold(input.publisherRomanized),
+    // NULL only when there is no ISBN. `checkIsbn` answers false for anything
+    // that is not 10 or 13 characters once the separators come off, and that is
+    // the answer the badge shows, so it is the answer the list must filter on.
+    isbn_valid: (input.isbn ?? '').trim() === '' ? null : (checkIsbn(input.isbn).valid ? 1 : 0)
   };
 }
 
