@@ -45,6 +45,20 @@
   --success-bg: #ecfdf5;
   --warning: #b45309;
   --warning-bg: #fffbeb;
+  /* Referenced by `.meta-chip.warn`, `.hb-rule` and `.badge.warn` since they were
+     written, and never declared — every one of them silently took its `var()` fallback,
+     so a warning border rendered as a plain grey one and the distinction the author was
+     drawing never appeared on screen. */
+  /* The header's measured height, republished by main.tsx whenever it changes. Declared
+     here so the value exists before that effect runs and so `var(--navbar-h)` is never a
+     read of something undefined — the 60px matches the header's min-height. */
+  --navbar-h: 60px;
+  --warn-border: #fdba74;
+  --danger-border: #fca5a5;
+  /* `.hb-quote blockquote` asked for the app's monospace stack and got the generic
+     `ui-monospace, monospace` fallback, i.e. a different face from every other code-ish
+     thing in the app. One declaration, used everywhere mono is wanted. */
+  --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   /* On the amber/ochre fill, not on a page surface: 5.02:1. */
   --on-warning: #ffffff;
   --danger: #c81e1e;
@@ -80,6 +94,9 @@
   --success-bg: #064e3b;
   --warning: #fbbf24;
   --warning-bg: #422006;
+  /* Dimmer than the light theme's: on #0b1220 the light-theme border reads as a stripe. */
+  --warn-border: #92400e;
+  --danger-border: #7f1d1d;
   /* Bright amber fill, so the readable foreground is the page background:
      11.22:1, where the light theme's #1f2937 would have been 1.01:1. */
   --on-warning: #0b1220;
@@ -2375,6 +2392,24 @@ mark.hl {
 .ob-toc-icon { width: 1.2rem; text-align: center; flex-shrink: 0; }
 .ob-toc-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ob-body { flex: 1; overflow-y: auto; padding: 2rem 2.25rem; min-width: 0; }
+/*
+ * The welcome and completion screens of the mandatory course had NO rule.
+ *
+ * Their children were all styled — `.ob-chapter-icon`, `.ob-chapter-title`, `.ob-lead` —
+ * so the omission was invisible in review: the screens rendered, just as a plain
+ * top-left block inside a 980px panel, with the icon and heading hard against the left
+ * edge while every chapter screen after them is a measured column. These are the first
+ * and the last thing a new librarian sees, and the only two screens in the course that
+ * are pure welcome rather than instruction, which is exactly why they want centring.
+ */
+.ob-welcome {
+  max-width: 34rem;
+  margin: 0 auto;
+  text-align: center;
+  padding-top: 1.5rem;
+}
+.ob-welcome .ob-lead { margin-bottom: 1rem; }
+
 .ob-chapter-icon { font-size: 2.75rem; line-height: 1; margin-bottom: 0.5rem; }
 .ob-chapter-title { font-size: 1.5rem; margin-bottom: 0.4rem; }
 .ob-lead { font-size: 1.02rem; color: var(--text-muted); margin-bottom: 1.4rem; line-height: 1.55; }
@@ -2408,6 +2443,36 @@ mark.hl {
 }
 .button-like:hover { background: var(--accent-light); border-color: var(--accent); }
 
+/*
+ * `.icon-button` — six call sites, no rule until now.
+ *
+ * These are the dialog close buttons (the Dialog component's ✕, the cover lightbox, the
+ * Handbook drawer). With no rule they fell back to the UA button: a grey bevelled box
+ * with the browser's own font and padding, sitting in the corner of otherwise styled
+ * dialogs. They keep the global :focus-visible ring, so this is presentation only.
+ */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.icon-button:hover {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text);
+}
+
 /* ================== COMBOBOX (borrower autocomplete) ================== */
 .combobox { position: relative; }
 .combobox-list {
@@ -2438,6 +2503,17 @@ mark.hl {
   font-size: 0.8125rem;
 }
 .combobox-list li:hover { background: var(--surface-2); }
+/*
+ * The ARROW-KEY highlight. `Combobox` tracks a `highlight` index and puts `is-active` on
+ * that row (ui.tsx), and no rule for it existed anywhere in this file — so ArrowDown
+ * moved a selection nobody could see, and Enter committed a row the librarian had no way
+ * to identify. Distinguished from :hover deliberately: with a mouse near the list, hover
+ * and keyboard position can disagree, and the keyboard one is the one Enter will take.
+ */
+.combobox-list li.is-active {
+  background: var(--accent-light);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 .combo-name { font-weight: 600; }
 .combo-stats { margin-left: auto; }
 
@@ -2699,14 +2775,36 @@ mark.hl {
    behind the desk with somebody's name on it — so it gets the accent edge the
    overdue rows use for the same reason. */
 .loan-item.is-ready { border-left: 3px solid var(--accent); }
-.badge.ready {
+/*
+ * A BASE rule for `.badge`, which never had one.
+ *
+ * Every badge style in the sheet was scoped — `.sharing-state .badge`,
+ * `.merge-table .badge.warn`, `.badge.ready` — so a bare `className="badge"` or
+ * `"badge warn"` anywhere else inherited nothing at all and rendered as ordinary body
+ * text: no pill, no background, no size change. The JSX uses `badge`, `badge ready` and
+ * `badge warn`, and only two of those three had a home.
+ *
+ * The geometry here is lifted from `.badge.ready` so the two cannot drift, and the
+ * default colours are the neutral pair the sharing block already used.
+ */
+.badge {
   display: inline-block;
   padding: 0.05rem 0.45rem;
   border-radius: 100px;
   font-size: 0.6875rem;
   font-weight: 700;
+  background: var(--border-strong);
+  color: var(--text);
+}
+.badge.ready {
   color: var(--on-accent);
   background: var(--accent);
+}
+/* Was reachable only inside .merge-table. */
+.badge.warn {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border: 1px solid var(--warn-border);
 }
 .copies-list .badge.ready { margin-left: 0.4rem; }
 

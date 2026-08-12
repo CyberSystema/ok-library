@@ -7199,7 +7199,14 @@ function App() {
 
                 {/* Duplicate warning after creating a book */}
                 {duplicateWarning.length > 0 && (
-                  <div className="card" style={{ borderLeft: '3px solid var(--warning, #f59e0b)', background: 'var(--bg-warning, #fffbeb)' }}>
+                  <div className="card" /* `--warning-bg`, not `--bg-warning`. The token name was wrong, so this always
+                          took the inline fallback `#fffbeb` — a light cream — including in the dark theme,
+                          where the card's own text inherits `--text` (#e2e8f0) and landed at 1.19:1. The
+                          panel looked like a blank cream rectangle, and what disappeared into it was the
+                          LIST of records this book might duplicate, which is the only reason the panel
+                          exists. `--warning-bg` has a dark value (#422006), so both themes now work and
+                          neither needs a hardcoded fallback. */
+                        style={{ borderLeft: '3px solid var(--warning)', background: 'var(--warning-bg)' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                       <div>
                         <strong>{t('library.dup.title')}</strong>

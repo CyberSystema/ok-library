@@ -2952,6 +2952,81 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 82. REGRESSION: a style that is referenced is a style that exists ===")
+
+# A UI audit found five defects that were all the same shape: something referenced a
+# name that was never declared, and CSS fails SILENTLY. A missing custom property takes
+# its var() fallback; a missing class rule renders as unstyled body text. Nothing errors,
+# nothing logs, and it survives every typecheck and every build.
+#
+# What that cost, concretely: `--bg-warning` (the real token is `--warning-bg`) left the
+# duplicate-book warning panel cream in the dark theme with its list of possible
+# duplicates at 1.19:1 — invisible, and that list is the only reason the panel exists.
+# `.combobox-list li.is-active` had no rule, so ArrowDown moved a selection nobody could
+# see. `.icon-button` had none, so six dialog close buttons rendered as raw UA buttons.
+# `.badge` had only scoped rules, so a bare `badge` was plain text.
+_WEB = os.path.join(_REPO, "apps", "web", "src")
+_css82 = _slurp(_WEB, "styles.css")
+_tsx82 = []
+for _root, _dirs, _files in os.walk(_WEB):
+    for _f in _files:
+        if _f.endswith((".ts", ".tsx")):
+            with open(os.path.join(_root, _f), encoding="utf-8") as _fh:
+                _tsx82.append((os.path.join(_root, _f), _fh.read()))
+_alltsx82 = "\n".join(b for _, b in _tsx82)
+
+# ── 1. Every custom property that is READ is DECLARED. ──────────────────────────
+_declared82 = set(re.findall(r"(--[a-zA-Z0-9-]+)\s*:", _css82))
+_read82 = set(re.findall(r"var\(\s*(--[a-zA-Z0-9-]+)", _css82 + _alltsx82))
+_undeclared82 = sorted(_read82 - _declared82)
+check("every custom property the app reads is declared",
+      not _undeclared82, _undeclared82)
+
+# Both themes, not just one. A token declared only in :root renders the light value on a
+# dark background — which is how the cream panel happened.
+_root82 = _css82.split(":root", 1)[1].split("}", 1)[0] if ":root" in _css82 else ""
+_dark82 = _css82.split('[data-theme="dark"]', 1)[1].split("}", 1)[0] if '[data-theme="dark"]' in _css82 else ""
+_rootToks = set(re.findall(r"(--[a-zA-Z0-9-]+)\s*:", _root82))
+_darkToks = set(re.findall(r"(--[a-zA-Z0-9-]+)\s*:", _dark82))
+# Colour-valued tokens are the ones that must differ per theme; a font stack or a radius
+# legitimately lives in :root alone.
+_colourish = {t for t in _rootToks
+              if re.search(re.escape(t) + r"\s*:\s*(#|rgb|hsl)", _root82)}
+_missingDark = sorted(_colourish - _darkToks)
+check("every colour token declared for the light theme has a dark value",
+      not _missingDark, _missingDark)
+
+# ── 2. A className used in the JSX has at least one rule. ───────────────────────
+# Only classes used MORE THAN ONCE, so a genuinely one-off hook does not raise noise,
+# and only literal className strings (a template expression is not statically knowable).
+_used82 = {}
+for _path, _body in _tsx82:
+    for _m in re.finditer(r'className="([^"{}]+)"', _body):
+        for _cls in _m.group(1).split():
+            _used82[_cls] = _used82.get(_cls, 0) + 1
+# A class "has a rule" if it appears as a class selector anywhere in the sheet.
+_hasRule82 = set(re.findall(r"\.([a-zA-Z][a-zA-Z0-9_-]*)", _css82))
+_ALLOW82 = {
+    # Set by the app but styled by the UA or by an ancestor's rule on purpose.
+    "sr-only-focusable",
+}
+_unstyled82 = sorted(c for c, n in _used82.items()
+                     if n >= 2 and c not in _hasRule82 and c not in _ALLOW82)
+check("every class used more than once in the JSX has a CSS rule",
+      not _unstyled82, _unstyled82)
+
+# ── 3. The two specific rules whose absence was invisible. ──────────────────────
+# Named individually because each one is a control the librarian operates blind without
+# it, and a generic "has a rule" check would pass on a scoped-only rule.
+check("the combobox keyboard highlight has its own rule",
+      re.search(r"\.combobox-list li\.is-active\s*\{", _css82) is not None, None)
+check("and it is distinct from :hover, which can disagree with it",
+      re.search(r"\.combobox-list li\.is-active\s*\{[^}]*(background|box-shadow)", _css82) is not None, None)
+check("`.badge` has an UNSCOPED base rule, not only .sharing-state/.merge-table ones",
+      re.search(r"(?m)^\.badge\s*\{", _css82) is not None, None)
+check("and the dialog close buttons have one too",
+      re.search(r"(?m)^\.icon-button\s*\{", _css82) is not None, None)
+
 print("=== 81. REGRESSION: an import row does not re-ask what the handler already knows ===")
 
 # Both imports load the custom-field definitions once before their row loop, under a
