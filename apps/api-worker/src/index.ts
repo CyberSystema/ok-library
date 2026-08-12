@@ -49,7 +49,8 @@ import {
 	userHasPermission
 } from './auth';
 import {
-	booksCacheKey,
+	browseCacheKey,
+	versionTooFreshToCache,
 	bumpBooksCacheVersion,
 	computeBookFolds,
 	EMBEDDING_MODEL,
@@ -980,17 +981,31 @@ app.get('/api/books', async (c) => {
 	// librarian can't browse the trash via the public list endpoint.
 	const includeDeleted = Boolean(query.includeDeleted) && c.get('user').role === 'admin';
 
-	// Cache key must reflect the *effective* trash visibility, not the raw
-	// query string. Otherwise two users with different roles passing the same
-	// `?includeDeleted=1` collide on the same cache bucket and one role sees
-	// the other role's response (admin missing trash, or non-admin getting it).
+	// Computed BEFORE the cache lookup now, because it decides whether there is a
+	// cache key at all. `includeDeleted` is part of it, which also settles the role
+	// collision the old key handled by hand: a trash-visible list is never
+	// unfiltered, so it is never cached, so two roles cannot share a bucket.
+	const isFullyUnfiltered = !(query.q ?? '').trim() && !(query.qExclude ?? '').trim()
+		&& !query.status && !query.language && !query.year
+		&& query.yearMin === undefined && query.yearMax === undefined
+		&& !query.roomCode && !query.shelfCode && !query.missingIsbn && !query.missingShelf
+		&& !query.untitled && !query.unknownAuthor && !query.invalidIsbn
+		&& !query.emptyField && !query.facetField
+		&& customFilters.length === 0 && !includeDeleted;
+
 	const cacheVersion = await getBooksCacheVersion(c.env);
-	const cacheKey = booksCacheKey(cacheVersion, {
-		query: { ...query, includeDeleted },
-		customFilters
+	// null for every query outside the canonical browse — see `browseCacheKey`. The
+	// old key embedded JSON.stringify of the whole query, so the caller owned the
+	// key space and each distinct search spent one of the day's 1,000 KV writes.
+	const cacheKey = browseCacheKey(cacheVersion, {
+		isFullyUnfiltered,
+		page: query.page,
+		pageSize: query.pageSize,
+		sortBy: query.sortBy,
+		sortDir: query.sortDir
 	});
 
-	if (c.env.CACHE) {
+	if (cacheKey && c.env.CACHE) {
 		try {
 			const cached = await c.env.CACHE.get(cacheKey, 'json');
 			if (cached) {
@@ -1006,13 +1021,6 @@ app.get('/api/books', async (c) => {
 	// so memoize it under a version-keyed KV key: pagination and re-sorting of
 	// the default browse then reuse one count instead of re-scanning per view.
 	// Version-keyed → any write self-invalidates it, so it can't drift.
-	const isFullyUnfiltered = !(query.q ?? '').trim() && !(query.qExclude ?? '').trim()
-		&& !query.status && !query.language && !query.year
-		&& query.yearMin === undefined && query.yearMax === undefined
-		&& !query.roomCode && !query.shelfCode && !query.missingIsbn && !query.missingShelf
-		&& !query.untitled && !query.unknownAuthor && !query.invalidIsbn
-		&& !query.emptyField && !query.facetField
-		&& customFilters.length === 0 && !includeDeleted;
 	const totalKey = `books:total:${cacheVersion}`;
 	let cachedTotal: number | undefined;
 	if (isFullyUnfiltered && c.env.CACHE) {
@@ -1058,11 +1066,20 @@ app.get('/api/books', async (c) => {
 		items: rowsWithItems
 	};
 
-	if (c.env.CACHE) {
+	// `versionTooFreshToCache`: during a cataloguing session every save bumps the
+	// version, and the client immediately re-requests this list — so the entry
+	// written here would be invalidated seconds later, having been read never. The
+	// list is served from D1 instead, whose daily budget is 5,000,000 rows and not
+	// the thing running out.
+	if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {
-			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+			if (cacheKey) {
+				await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+			}
 			// Store the freshly-computed unfiltered total for the pages/sorts that
 			// follow (skip if we already had it, to avoid a redundant KV write).
+			// ONE key per version, so this is worth its write even when the list
+			// itself is not: it saves a 12,500-row COUNT on every page and re-sort.
 			if (isFullyUnfiltered && cachedTotal === undefined) {
 				await c.env.CACHE.put(totalKey, String(total), { expirationTtl: 3600 });
 			}
@@ -1337,7 +1354,7 @@ app.get('/api/books/facets', async (c) => {
 
 	const response = { authors, publishers, languages, shelfCodes, customFields };
 
-	if (c.env.CACHE) {
+	if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {
 			// Long TTL: correctness comes from the version-keyed cacheKey (a write
 			// bumps the version → a fresh key → recompute), so the DB is not
@@ -2107,8 +2124,14 @@ app.get('/api/books/sets', async (c) => {
 	const limit = Math.min(500, Math.max(1, Number(c.req.query('limit') ?? 200)));
 
 	const cacheVersion = await getBooksCacheVersion(c.env);
-	const cacheKey = `sets:${minBooks}:${withGapsOnly}:${limit}:${cacheVersion}`;
-	if (c.env.CACHE) {
+	// minBooks (1-50) x withGapsOnly (2) x limit (1-500) is 50,000 possible keys,
+	// each one a KV write on first sight; 1,010 of them are already in the
+	// development store. The interface asks for exactly one parameterisation, so
+	// that is the one with any reuse and the only one cached.
+	const cacheKey = minBooks === 2 && limit === 300
+		? `sets:${withGapsOnly}:${cacheVersion}`
+		: null;
+	if (cacheKey && c.env.CACHE) {
 		try {
 			const cached = await c.env.CACHE.get(cacheKey, 'json');
 			if (cached) return c.json(cached);
@@ -2236,7 +2259,7 @@ app.get('/api/books/sets', async (c) => {
 		matched: items.length,
 		suppressed
 	};
-	if (c.env.CACHE) {
+	if (cacheKey && c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {
 			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 86400 });
 		} catch (error) {
@@ -5289,7 +5312,9 @@ app.get('/api/rooms/summary', async (c) => {
 				maintenanceBooks: Number(ua.maintenance_books ?? 0)
 			}
 		};
-		if (c.env.CACHE) {
+		// The post-save refresh asks for this alongside the list and a facet, so it is
+		// one of the writes a cataloguing session was spending per saved book.
+		if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 			try {
 				await c.env.CACHE.put(cacheKey, JSON.stringify(payload), { expirationTtl: 3600 });
 			} catch (error) {
@@ -8125,11 +8150,28 @@ app.get('/api/facets', async (c) => {
 		// A typo must fail loudly rather than return a plausible empty facet.
 		throw new HTTPException(400, { message: `Unknown facet field: ${field}` });
 	}
-	const limit = Math.min(1000, Math.max(1, Number(c.req.query('limit') ?? 600)));
+	// `resolveEmptyFieldExpr` accepts ANY `custom:<key>` matching [a-zA-Z0-9_]+, so
+	// the loud failure above only covered the column fields — a mistyped attribute
+	// key returned exactly the plausible empty facet the comment says must not
+	// happen. It also handed the caller the cache key space: `facet:custom:<junk>`
+	// minted a new KV entry per spelling, and 719 of the development store's entries
+	// are `facet:custom:` keys.
+	if (field.startsWith('custom:')) {
+		const key = field.slice('custom:'.length);
+		const defs = await loadCustomFieldDefs(c.env);
+		if (!defs.some((d) => d.field_key === key)) {
+			throw new HTTPException(400, { message: `Unknown facet field: ${field}` });
+		}
+	}
+	const DEFAULT_FACET_LIMIT = 600;
+	const limit = Math.min(1000, Math.max(1, Number(c.req.query('limit') ?? DEFAULT_FACET_LIMIT)));
 
 	const cacheVersion = await getBooksCacheVersion(c.env);
-	const cacheKey = `facet:${field}:${limit}:${cacheVersion}`;
-	if (c.env.CACHE) {
+	// Only the default limit is cached, so `limit` cannot multiply the key space by
+	// the thousand values it accepts. The interface never asks for another one; a
+	// caller that does gets a live answer rather than a cache entry of its own.
+	const cacheKey = limit === DEFAULT_FACET_LIMIT ? `facet:${field}:${cacheVersion}` : null;
+	if (cacheKey && c.env.CACHE) {
 		try {
 			const cached = await c.env.CACHE.get(cacheKey, 'json');
 			if (cached) return c.json(cached);
@@ -8211,7 +8253,11 @@ app.get('/api/facets', async (c) => {
 	if (totalBooks === null) {
 		const t = await c.env.DB.prepare('SELECT COUNT(*) AS n FROM books WHERE deleted_at IS NULL').first<{ n: number }>();
 		totalBooks = Number(t?.n ?? 0);
-		if (c.env.CACHE) {
+		// Skipped mid-burst like every other version-keyed write: each save mints a new
+		// version, so an entry written now is read by roughly nothing before the next
+		// save discards it. The COUNT still runs; D1 rows are the budget that is not
+		// running out.
+		if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 			try { await c.env.CACHE.put(totalKey, String(totalBooks), { expirationTtl: 3600 }); } catch { /* best effort */ }
 		}
 	}
@@ -8235,7 +8281,7 @@ app.get('/api/facets', async (c) => {
 		overlapping: Boolean(itemColumn),
 		items
 	};
-	if (c.env.CACHE) {
+	if (cacheKey && c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {
 			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 86400 });
 		} catch (error) {
@@ -8288,7 +8334,7 @@ app.get('/api/categories', async (c) => {
 	}));
 
 	const response = { items };
-	if (c.env.CACHE) {
+	if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {
 			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
 		} catch (error) {
@@ -8388,7 +8434,7 @@ app.get('/api/stats', async (c) => {
 		topShelves: (topShelvesRows.results ?? []).map((r) => ({ shelfCode: r.shelf_code, count: Number(r.count) }))
 	};
 
-	if (c.env.CACHE) {
+	if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {
 			await c.env.CACHE.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
 		} catch (error) {

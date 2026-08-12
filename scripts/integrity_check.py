@@ -2923,6 +2923,97 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 80. REGRESSION: no caller can mint a cache key, and a burst writes none ===")
+
+# KV allows 1,000 WRITES a day and every read-through cache spent one per miss. The
+# books-list key embedded JSON.stringify of the whole query, so the caller owned the
+# key space: 30,976 of the development store's 37,306 entries were books-list keys,
+# 83% of every write ever made, at a 60-second TTL almost none of them lived to have
+# read. Two structural changes: the key space is server-enumerable, and a version
+# younger than ten seconds is not cached against at all.
+_db80 = _slurp(_REPO, "apps", "api-worker", "src", "db.ts")
+_idx80 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+check("the query-JSON cache key is gone", "booksCacheKey" not in _idx80 and "booksCacheKey" not in _db80, None)
+check("and the browse key is built from bounded fields only",
+      "export function browseCacheKey" in _db80
+      and "CACHEABLE_PAGE_SIZES" in _db80 and "CACHEABLE_MAX_PAGE" in _db80, None)
+# Every version-keyed write must consult the freshness guard. A new cache that
+# forgets it reintroduces the per-save cost this section exists to hold down.
+_puts80 = [m.start() for m in re.finditer(r"CACHE\.put\(", _idx80)]
+_unguarded80 = []
+for pos in _puts80:
+    head = _idx80.rfind("if (c.env.CACHE", 0, pos)
+    guard = _idx80[head:_idx80.index("{", head)] if head >= 0 else ""
+    ctx = _idx80[max(0, pos - 400):pos]
+    # The limiter counter and the outbound-enrichment cache are not version-keyed.
+    if "cacheVersion" not in ctx and "totalKey" not in ctx:
+        continue
+    if "versionTooFreshToCache" not in guard:
+        _unguarded80.append(_idx80[:pos].count("\n") + 1)
+check("every version-keyed cache write consults the freshness guard",
+      not _unguarded80, f"lines: {_unguarded80}")
+
+if LOCAL:
+    _KV = os.path.join(_REPO, "apps", "api-worker", ".wrangler", "state", "v3", "kv",
+                       "miniflare-KVNamespaceObject")
+    _kvdb = None
+    if os.path.isdir(_KV):
+        _cands = [os.path.join(_KV, f) for f in os.listdir(_KV)
+                  if f.endswith(".sqlite") and f != "metadata.sqlite"]
+        _kvdb = max(_cands, key=os.path.getsize) if _cands else None
+
+    def _kvkeys():
+        if not _kvdb:
+            return None
+        import sqlite3 as _s3
+        try:
+            con = _s3.connect(f"file:{_kvdb}?mode=ro", uri=True)
+            return {r[0] for r in con.execute("SELECT key FROM _mf_entries")}
+        except Exception:
+            return None
+
+    _before = _kvkeys()
+    if _before is not None:
+        # A filtered or searched list must not write a key at all.
+        for _q in ("q=zzcachekeyprobe", "q=%CE%B8%CE%B5%CE%AF%CE%B1", "status=available",
+                   "shelfCode=ZZNOSUCH", "pageSize=7", "page=99"):
+            call("GET", f"/api/books?{_q}&pageSize=25" if "pageSize" not in _q else f"/api/books?{_q}")
+        time.sleep(0.3)
+        _new = {k for k in ((_kvkeys() or set()) - _before) if not k.startswith("rl:")}
+        check("six searches and filters mint no cache keys", not _new, sorted(_new)[:4])
+
+        # An unknown custom facet key must fail loudly rather than cache an empty facet.
+        st, _ = call("GET", "/api/facets?field=custom:zz_no_such_attribute")
+        check("an unknown attribute facet is refused, not cached empty", st == 400, st)
+
+        # A cataloguing burst: each save bumps the version, so an entry written now is
+        # discarded before it can be read.
+        _before2 = _kvkeys()
+        _burst = []
+        for i in range(4):
+            st, b = call("POST", "/api/books", {"title": f"ZZ Cache Burst Probe {i}", "author": "Gate",
+                                                "tags": [], "customFields": {}, "status": "available"})
+            if (b or {}).get("id"):
+                _burst.append(b["id"]); CREATED.append(b["id"])
+            for _p in ("/api/books?page=1&pageSize=25", "/api/facets?field=language", "/api/rooms/summary"):
+                call("GET", _p)
+        time.sleep(0.3)
+        _new2 = {k for k in ((_kvkeys() or set()) - (_before2 or set())) if not k.startswith("rl:")}
+        check("four saves and twelve refreshes spend no cache writes", not _new2, sorted(_new2)[:4])
+
+        # And once the writes stop, the canonical browse is cached again — the guard
+        # declines a doomed write, it does not disable caching.
+        time.sleep(11)
+        _before3 = _kvkeys()
+        call("GET", "/api/books?page=1&pageSize=25")
+        time.sleep(0.3)
+        _new3 = {k for k in ((_kvkeys() or set()) - (_before3 or set())) if not k.startswith("rl:")}
+        check("but a quiet period caches the canonical browse again",
+              any(k.startswith("books:list:") for k in _new3), sorted(_new3)[:4])
+        check("and its key carries no caller-supplied text",
+              all(re.fullmatch(r"books:list:[^:]+:\d+:\d+:\w+:\w+", k)
+                  for k in _new3 if k.startswith("books:list:")), sorted(_new3)[:4])
+
 print("=== 79. REGRESSION: a report and a repository that describe themselves honestly ===")
 
 # ISO 2789 stock is measured now while the report echoes the period it was asked

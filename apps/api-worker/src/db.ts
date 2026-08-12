@@ -81,8 +81,72 @@ export async function bumpBooksCacheVersion(env: Env): Promise<void> {
   }
 }
 
-export function booksCacheKey(version: string, payload: unknown): string {
-  return `${BOOKS_CACHE_PREFIX}${version}:${JSON.stringify(payload)}`;
+/**
+ * Is this version too young to be worth caching against?
+ *
+ * KV allows 1,000 WRITES a day on the free plan and that is the tightest budget in
+ * the system. Every read-through cache here spends one write per miss, and the
+ * client's post-save refresh re-requests the list, a facet, the review count and
+ * the room summary the instant a book is saved — so cataloguing a hundred books
+ * wrote several hundred cache entries, each of which was invalidated by the next
+ * save seconds later. Entries nobody would ever read, at the price of the resource
+ * that also pays for cache invalidation itself.
+ *
+ * The version string is `Date.now().toString(36) + '.' + random`, so its own age is
+ * readable without another KV round trip. During an active write burst — a
+ * cataloguing session, an import, a shelf-tidying pass — the cache is left cold and
+ * every read goes to D1, which has a 5,000,000-row daily budget and is not the
+ * constraint. Once the writes stop for a few seconds the caches populate normally,
+ * which is the state the reading room and the public endpoints are always in.
+ *
+ * Never affects a cache READ: a hit still serves. This only declines to spend a
+ * write that is about to be thrown away.
+ */
+export function versionTooFreshToCache(version: string): boolean {
+  const stamp = Number.parseInt(version.split('.')[0] ?? '', 36);
+  if (!Number.isFinite(stamp) || stamp <= 0) return false;
+  return Date.now() - stamp < 10_000;
+}
+
+/**
+ * A books-list cache key, or null when this query must not be cached at all.
+ *
+ * The key used to embed `JSON.stringify` of the whole query, which handed the
+ * caller the key space: one KV write per distinct search string, page size or
+ * filter combination. Measured on the development store, 30,976 of 37,306 KV
+ * entries were books-list entries — 83% of every write ever made, against a budget
+ * of 1,000 a day, for entries with a 60-second TTL that almost none of them lived
+ * to see read.
+ *
+ * So only the CANONICAL BROWSE is cached: no search, no filters, one of the page
+ * sizes the interface offers, within the first few pages. No caller-supplied string
+ * reaches the key, which bounds the space at 120 entries per version by
+ * construction rather than by hoping nobody types anything unusual. That view is
+ * also the one with real reuse — it is what every librarian sees on opening the
+ * Library tab, identical for all of them.
+ *
+ * Everything else is served live. Filtered and searched lists are the queries whose
+ * keys were unbounded AND whose results were least likely to be asked for twice,
+ * and the expensive part of an unfiltered list — the 12,500-row COUNT — has its own
+ * single-key cache that this does not touch.
+ */
+const CACHEABLE_PAGE_SIZES = new Set([10, 25, 50, 100]);
+const CACHEABLE_MAX_PAGE = 3;
+
+export function browseCacheKey(
+  version: string,
+  opts: {
+    isFullyUnfiltered: boolean;
+    page: number;
+    pageSize: number;
+    sortBy: string;
+    sortDir: string;
+  }
+): string | null {
+  if (!opts.isFullyUnfiltered) return null;
+  if (opts.page > CACHEABLE_MAX_PAGE) return null;
+  if (!CACHEABLE_PAGE_SIZES.has(opts.pageSize)) return null;
+  return `${BOOKS_CACHE_PREFIX}${version}:${opts.page}:${opts.pageSize}:${opts.sortBy}:${opts.sortDir}`;
 }
 
 export async function ensureBootstrapAdmin(env: Env): Promise<void> {
