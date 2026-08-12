@@ -441,10 +441,37 @@ label {
    */
   scrollbar-width: none;
   -ms-overflow-style: none;
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
-  mask-image: linear-gradient(to right, #000 calc(100% - 1.5rem), transparent);
 }
 .simple-tabs::-webkit-scrollbar { height: 0; width: 0; }
+/*
+ * The fade is an OVERLAY, not a mask.
+ *
+ * `mask-image` was the first attempt and it was wrong: a mask applies to everything the
+ * element paints, so it faded the strip's own `--surface` background and its
+ * `border-bottom` along with the tabs — at every width, whether or not there was
+ * anything to scroll. The header's bottom rule visibly dissolved on the right.
+ *
+ * A sticky flex item paints over the tabs instead, pinned to the right edge of the
+ * scrollport, and leaves the strip's own chrome alone. It sits inside the content box,
+ * so the bottom border passes underneath it unbroken. When the tabs fit there is
+ * nothing to see: a gradient that ends in `--surface`, drawn on `--surface`.
+ */
+.simple-tabs::after {
+  content: '';
+  position: sticky;
+  right: 0;
+  flex: 0 0 1.5rem;
+  margin-left: -1.5rem;
+  align-self: stretch;
+  background: linear-gradient(to right, transparent, var(--surface));
+  pointer-events: none;
+}
+/* An INSET focus ring for the tabs. `overflow-x: auto` makes overflow-y compute to
+   auto as well, so this element is now a scroll container in both axes and the global
+   `outline-offset: 2px` ring was clipped top and bottom against it. Pulling the ring
+   inside the button keeps it fully visible without giving the strip padding it does
+   not want. */
+.simple-tabs .tab-btn:focus-visible { outline-offset: -3px; }
 /* Never let a tab be squeezed narrower than its label — the label is already nowrap,
    so shrinking only produced sub-pixel jitter while the row overflowed anyway. */
 .simple-tabs .tab-btn { flex: 0 0 auto; }
@@ -537,6 +564,12 @@ label {
  * nothing but an earlier wrap.
  */
 .search-bar .filter-field { flex: 1; min-width: 200px; }
+/* The sort field is the one .filter-field that does not spend its whole width on the
+   select: `.sort-row` puts a 38px direction button and a 0.4rem gap beside it, so the
+   200px floor above left the select ~44px short and Greek "Τελευταία ενημέρωση" — the
+   DEFAULT sort, i.e. the label that says how the whole catalogue is ordered — was
+   still shorn of its last glyphs. Its floor covers the button too. */
+.search-bar .filter-field:has(.sort-row) { min-width: 245px; }
 /* Wraps because the table view adds a fourth button (the column picker), which
    pushed this row past a phone's width. */
 .search-bar .search-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; padding-bottom: 0; }
@@ -684,10 +717,8 @@ label {
   border: 1.5px solid #fdba74;
   border-radius: 8px;
   padding: 0.3rem 0.6rem 0.3rem 0.5rem;
-  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.95rem;
   font-weight: 700;
-  letter-spacing: 0.04em;
   white-space: nowrap;
   box-shadow: 0 1px 2px rgba(154, 52, 18, 0.08);
   line-height: 1.1;
@@ -696,7 +727,25 @@ label {
   font-size: 0.85rem;
   filter: grayscale(0.1);
 }
-.shelf-badge .shelf-value { font-feature-settings: 'tnum'; }
+/*
+ * Monospace and letter-spacing belong to the shelf CODE, not to the badge.
+ *
+ * They were on `.shelf-badge` itself, so they also applied to the badge's other
+ * possible content: the translated "no shelf" phrase. Greek prose set in IBM Plex Mono
+ * at 0.04em came out as "Χ ω ρ ί ς   ρ ά φ ι" — visibly gappy, and mistakable for a
+ * rendering fault rather than a sentence. A tabular code wants mono and tnum so that
+ * 06-005 lines up under 06-105; a sentence wants the interface font.
+ */
+.shelf-badge .shelf-value {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-feature-settings: 'tnum';
+  letter-spacing: 0.04em;
+}
+/* The empty state carries a sentence, so it opts back out of the code treatment. */
+.shelf-badge.shelf-missing .shelf-value {
+  font-family: inherit;
+  letter-spacing: normal;
+}
 .shelf-badge.shelf-missing {
   background: var(--bg);
   color: var(--text-light);
@@ -1458,7 +1507,8 @@ label {
   border-radius: var(--radius);
   padding: 0.875rem;
   position: sticky;
-  top: 76px;
+  /* header + the tab strip, so it follows a header that can grow. */
+  top: calc(var(--navbar-h, 60px) + 16px);
   max-height: calc(100vh - 100px);
   display: flex;
   flex-direction: column;
@@ -1821,6 +1871,13 @@ label {
 .recent-link:hover { color: var(--accent); }
 
 /* ================== BULK ACTION BAR ================== */
+/* Sticky offsets follow the header's REAL height.
+ *
+ * `top: 60px` here and `top: 76px` on the category rail both hard-coded a header that
+ * was `height: 60px`. It now wraps when its contents do not fit — a long username, or
+ * Greek at phone widths — and at 76px tall it covered the top 16px of this bar, which
+ * is where bulk edit and bulk delete live. `--navbar-h` is published by a
+ * ResizeObserver in main.tsx and falls back to 60px if it never runs. */
 .bulk-bar {
   display: flex;
   flex-wrap: wrap;
@@ -1833,7 +1890,7 @@ label {
   border-radius: var(--radius);
   margin-bottom: 1rem;
   position: sticky;
-  top: 60px;
+  top: var(--navbar-h, 60px);
   z-index: 50;
   box-shadow: var(--shadow-md);
 }

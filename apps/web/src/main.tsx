@@ -1283,11 +1283,74 @@ function App() {
     return () => clearTimeout(timer);
   }, [showSplash, sessionLoading, loggedIn, didBootstrapData]);
 
+  // Publish the header's real height as `--navbar-h`.
+  //
+  // Two sticky offsets used to hard-code it — the bulk-action bar at 60px and the
+  // category rail at 76px — which was safe only while the header was `height: 60px`.
+  // It now wraps when its contents do not fit (a long username, or Greek on a phone),
+  // and a 76px header covered the top of the bulk bar, i.e. the strip that holds bulk
+  // edit and bulk delete. Measured rather than assumed, so the next thing added to the
+  // header cannot silently break the two things pinned below it.
+  useEffect(() => {
+    let raf = 0;
+    const publish = () => {
+      const el = document.querySelector('.simple-navbar');
+      if (!el) return;
+      const h = Math.round(el.getBoundingClientRect().height);
+      document.documentElement.style.setProperty('--navbar-h', `${h}px`);
+    };
+    // Coalesce to one write per frame: a viewport drag fires both the observer and the
+    // resize listener many times, and this only needs the settled value.
+    const schedule = () => {
+      // A hidden tab does not run animation frames, so batching through one there would
+      // hold a stale height until the tab came back. Nothing is painting while hidden,
+      // so publish straight away and keep the frame batching for the visible case,
+      // where a viewport drag fires this many times a second.
+      if (document.hidden) { publish(); return; }
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(publish);
+    };
+    // The FIRST publish is synchronous, not scheduled: `requestAnimationFrame` does not
+    // run in a hidden or background tab, so coalescing the initial value through it left
+    // `--navbar-h` unset — and everything pinned below the header then fell back to the
+    // hard-coded 60px this effect exists to replace. Only the later, repeated events are
+    // worth batching.
+    publish();
+    // BOTH signals, deliberately. A ResizeObserver on the header alone did not fire when
+    // the viewport narrowed enough to wrap it — measured: header 76px while
+    // --navbar-h was still 60px — so the window listener is what actually catches the
+    // reflow, and the observer catches the cases the window does not: a longer username
+    // arriving, a language change, a control appearing.
+    window.addEventListener('resize', schedule);
+    let ro: ResizeObserver | undefined;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(schedule);
+      const el = document.querySelector('.simple-navbar');
+      if (el) ro.observe(el);
+    }
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener('resize', schedule);
+      ro?.disconnect();
+    };
+  }, [loggedIn, lang]);
+
   // Restore UI preferences (sort, density, theme) from localStorage so the app feels personal across sessions.
   useEffect(() => {
     try {
       const raw = localStorage.getItem(PREFS_STORAGE_KEY);
-      if (!raw) return;
+      // The OS preference is consulted even with NOTHING saved.
+      //
+      // This effect used to `return` here when no prefs blob existed, and the
+      // prefers-color-scheme fallback sat at the bottom of the same try block — so it
+      // was reachable only for someone who already had a saved blob with no theme key
+      // in it. A librarian opening the app for the FIRST time on a machine set to dark
+      // got a full-brightness white screen, which is the one case the fallback was
+      // written for.
+      if (!raw) {
+        if (window.matchMedia?.('(prefers-color-scheme: dark)').matches) setTheme('dark');
+        return;
+      }
       const prefs = JSON.parse(raw) as {
         sortBy?: SortBy; sortDir?: SortDir; density?: Density; theme?: Theme;
         tableColumns?: string[]; tableHighlightGaps?: boolean;
