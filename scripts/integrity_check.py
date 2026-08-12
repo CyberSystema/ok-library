@@ -12,7 +12,7 @@ Usage:
 
 Exit code 0 = everything held. Non-zero = at least one assertion failed.
 """
-import atexit, csv, datetime, io, json, os, re, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
+import atexit, collections, csv, datetime, io, json, os, re, sys, time, unicodedata, urllib.request, urllib.parse, uuid, zlib, struct
 
 BASE = os.environ.get("API", "http://127.0.0.1:8787").rstrip("/")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
@@ -5394,6 +5394,148 @@ if LOCAL:
         check("the folds describe the merged row, not the incoming record",
               (_r87.get("author_fold") or "") != "" and (_r87.get("publisher_fold") or "") != ""
               and _r87.get("dn") == _r87.get("dfn"), _r87)
+
+
+print()
+print("=== 88. REGRESSION: the CSV this app calls a backup must be restorable ===")
+
+# The export route's own comment says it: "The CSV doubles as this library's off-site backup, so
+# it must carry every field." Someone made the export carry everything and never checked the
+# import could read it back. It could not, in four separate ways, measured on a real record:
+#
+#   1. The file could not even be CHOSEN. The picker was accept=".xlsx", and the UI said
+#      "Supports .xlsx format" in all four languages.
+#   2. 'Publication Year', 'Room Code' and 'Acquisition Date' were written with spaces, and the
+#      reader looked for 'publicationyear', 'roomcode', 'acquisitiondate'. Three core fields
+#      silently gone, no warning, import reported success.
+#   3. Every attribute beyond fourteen hardcoded aliases was exported under its bare field key
+#      and read back by nothing — issn, series, signed_copy, additional_isbns, isbn_10 and the
+#      rest — because only a `custom_`-prefixed header counted as an attribute.
+#   4. Tags were joined with '; ' and split on ',' alone, so a two-tag record came back as one
+#      tag called "θεολογία; πατερικά".
+#
+# And six attributes were exported TWICE: DEFAULT_BOOK_STRUCTURE spells its keys in camelCase
+# while the definitions are snake_case, so 'Cover Type' (empty on every row) sat beside
+# 'cover_type' (the value).
+#
+# Verified by restoring a purged record through the app's own import in a browser: it comes back
+# whole. What follows is what can be asserted without a browser — that the two sides still agree.
+_idx88 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_web88 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+_i18n88 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+
+def _norm88(text):
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+# The picker must accept the file the app produces, and the reader must actually parse it.
+check("the import picker accepts .csv", 'accept=".xlsx,.csv"' in _web88, None)
+check("and CSV is read as text through the CSV parser, not left to format sniffing",
+      "type: 'string'" in _web88 and ".csv$/i.test(file.name)" in _web88, None)
+check("and the BOM the export prepends is stripped before parsing",
+      "replace(/^\\uFEFF/, '')" in _web88, None)
+check("no locale still promises .xlsx alone",
+      _i18n88.count("Supports .xlsx format") == 0 and _i18n88.count("μορφή .xlsx'") == 0, None)
+
+# Tags: one delimiter on both sides.
+check("tags are joined with a semicolon on the way out", "tags.join('; ')" in _idx88, None)
+check("and split on semicolons as well as commas on the way in",
+      "split(/[;,]/)" in _web88, None)
+
+# Every core column the export writes must be a heading the reader recognises. This is the
+# check that would have caught 'Publication Year' — compared normalized, exactly as the
+# reader now compares.
+_extra88 = re.search(r"const extraCoreColumns: DefaultBookStructureColumn\[\] = \[([\s\S]*?)\];", _idx88)
+_struct88 = re.search(r"const DEFAULT_BOOK_STRUCTURE: DefaultBookStructureColumn\[\] = \[([\s\S]*?)\n\];", _idx88)
+check("the export's column lists are where this check can see them",
+      _extra88 is not None and _struct88 is not None, None)
+_core_labels88 = []
+if _extra88 and _struct88:
+    for _blob in (_struct88.group(1), _extra88.group(1)):
+        for _m in re.finditer(r"\{ label: '([^']+)',\s*coreKey:", _blob):
+            _core_labels88.append(_m.group(1))
+# Comments stripped before reading any list out of the source. An apostrophe inside a `//`
+# comment — "the record's content" — starts a quote as far as a regex over string literals is
+# concerned, and it swallowed the two entries that followed it, so this check reported the very
+# columns the list had just been given. Third time a prose match has fooled a check today.
+_webcode88 = "\n".join(l for l in _web88.split("\n") if not l.strip().startswith("//"))
+_aliases88 = re.search(r"const CORE_SPREADSHEET_ALIASES = \[([\s\S]*?)\];", _webcode88)
+check("the reader's core alias list is where this check can see it", _aliases88 is not None, None)
+_known88 = set()
+if _aliases88:
+    _known88 = {_norm88(a) for a in re.findall(r"'([^']+)'", _aliases88.group(1))}
+_legacy88 = re.search(r"const LEGACY_ID_ALIASES = \[([\s\S]*?)\];", _webcode88)
+if _legacy88:
+    _known88 |= {_norm88(a) for a in re.findall(r"'([^']+)'", _legacy88.group(1))}
+# 'ID' is the legacy id; 'Shelf Location' is an alias on the shelfCode read.
+_known88 |= {_norm88("shelf location"), _norm88("id")}
+_unreadable88 = [l for l in _core_labels88 if _norm88(l) not in _known88]
+check("every core column the export writes is a heading the import recognises",
+      _core_labels88 and not _unreadable88, _unreadable88)
+
+# And the attribute columns must not be duplicated by a camelCase/snake_case mismatch.
+check("the export resolves each default column to the attribute it really names",
+      "findSimilarCustomField(defRefs, column)" in _idx88 and "resolvedCustomKey" in _idx88, None)
+check("and reads its cell through that resolved key",
+      "customFields[resolvedCustomKey.get(column.customKey) ?? column.customKey]" in _idx88, None)
+check("an attribute column is recognised by field key or label on the way back in",
+      "for (const def of customFields) {" in _web88 and "coreHeaderKeys" in _web88, None)
+
+# The mechanism behind the three lost core fields: the reader must index each heading BOTH as
+# written and with punctuation and spacing stripped, or 'Publication Year' can never satisfy a
+# lookup for 'publicationyear' however complete the alias list is.
+_reader88 = _webcode88[_webcode88.find("function normalizeSpreadsheetRow"):][:2200]
+check("the row reader indexes headings by their normalized form as well",
+      "const written = Object.fromEntries" in _reader88
+      and "normalizeColumnName(key)" in _reader88
+      and "row[norm] = value" in _reader88, None)
+check("and an empty cell cannot displace a filled one when two headings normalize alike",
+      "heldIsEmpty && !incomingIsEmpty" in _reader88, None)
+
+# The runtime half: one record, exported, and the file inspected. Duplicate headers are the
+# symptom the camelCase mismatch produced, and an always-empty twin column is how it showed.
+if LOCAL:
+    _room88 = local_sql("SELECT code FROM rooms LIMIT 1")
+    _rc88 = _room88[0]["code"] if _room88 else None
+    _t88 = f"ZZ CSV Export {uuid.uuid4().hex[:6]}"
+    _b88, _ = mkbook(title=_t88, author="Γ. Δοκιμή", publisher="Εκδόσεις Ζήτα", language="EL",
+                     description="Περιγραφή.", publicationYear=1987, shelfCode="06-005",
+                     acquisitionDate="2020-03-04", tags=["θεολογία", "πατερικά"],
+                     customFields={"pages": "351", "issn": "1234-5678"},
+                     **({"roomCode": _rc88} if _rc88 else {}))
+    st, _csv88 = call_text("GET", f"/api/export/books.csv?search={urllib.parse.quote(_t88)}")
+    check("the export answers", st == 200, st)
+    if st == 200:
+        _lines88 = _csv88.lstrip("\ufeff").splitlines()
+        _hdr88 = next(csv.reader([_lines88[0]])) if _lines88 else []
+        _dupes88 = sorted({h for h in _hdr88 if _hdr88.count(h) > 1})
+        check("no column appears twice in the exported header", not _dupes88, _dupes88)
+        _normdupes88 = [k for k, n in collections.Counter(_norm88(h) for h in _hdr88).items() if n > 1 and k]
+        check("and no two columns are the same field under different spellings",
+              not _normdupes88, _normdupes88)
+        _row88 = None
+        for _line in _lines88[1:]:
+            _cells = next(csv.reader([_line]))
+            if len(_cells) > 1 and _cells[1] == _t88:
+                _row88 = dict(zip(_hdr88, _cells)); break
+        check("the record is in the file", _row88 is not None, None)
+        if _row88:
+            for _label, _want in (("Publication Year", "1987"), ("Shelf Location", "06-005"),
+                                  ("Pages", "351")):
+                check(f"  '{_label}' carries its value", _row88.get(_label) == _want,
+                      (_label, _row88.get(_label)))
+            check("  the tag list is semicolon-joined, matching what the import splits on",
+                  ";" in (_row88.get("Tags") or ""), _row88.get("Tags"))
+            # Every non-empty cell must be readable by SOMETHING on the way back: a core alias,
+            # an attribute definition, or the legacy id.
+            _defs88 = local_sql("SELECT field_key, label FROM custom_field_definitions") or []
+            _defnames88 = set()
+            for _d in _defs88:
+                _defnames88 |= {_norm88(_d.get("field_key")), _norm88(_d.get("label"))}
+            _orphans88 = [h for h, v in _row88.items()
+                          if v not in (None, "") and _norm88(h) not in _known88
+                          and _norm88(h) not in _defnames88 and _norm88(h) != _norm88("tags")]
+            check("  every filled cell has a heading the import can map back",
+                  not _orphans88, _orphans88)
 
 
 print("\n" + "=" * 62)

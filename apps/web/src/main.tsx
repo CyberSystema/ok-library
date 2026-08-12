@@ -1737,8 +1737,12 @@ function App() {
         }
       }
 
+      // Semicolons as well as commas, because the CSV export joins tags with '; ' — so the app
+      // read its own two-tag record back as ONE tag named "θεολογία; πατερικά". A tag may well
+      // contain a comma ("Πατέρες, Ελληνικοί"), which is exactly why the export chose the
+      // semicolon; the reader simply never learned about it.
       return trimmed
-        .split(',')
+        .split(/[;,]/)
         .map((item) => item.trim())
         .filter(Boolean);
     }
@@ -1779,8 +1783,54 @@ function App() {
       }
     }
 
+    /*
+     * A column named after one of this catalogue's own attributes IS that attribute.
+     *
+     * Only the `custom_`-prefixed form was recognised, plus fourteen hardcoded aliases. Our own
+     * CSV export writes every other attribute under its bare field key — issn, series,
+     * signed_copy, additional_isbns, isbn_10, volume_label and the rest — so none of them could
+     * be read back, and the file the code calls "this library's off-site backup" silently
+     * dropped them on restore. It matches on the field key or the librarian's label, with
+     * punctuation and spacing ignored, so 'Place of Publication', 'place_of_publication' and
+     * 'placeOfPublication' are one column.
+     *
+     * A core column never becomes an attribute: `title` stays the title even if someone names
+     * an attribute "Title".
+     */
+    const coreHeaderKeys = new Set([
+      ...CORE_SPREADSHEET_ALIASES.map(normalizeColumnName),
+      ...LEGACY_ID_ALIASES.map(normalizeColumnName)
+    ]);
+    for (const def of customFields) {
+      if (fields[def.key] !== undefined) continue;
+      const wanted = [def.key, def.label].filter(Boolean).map(normalizeColumnName);
+      for (const [key, value] of Object.entries(row)) {
+        const norm = normalizeColumnName(key);
+        if (!norm || coreHeaderKeys.has(norm) || !wanted.includes(norm)) continue;
+        if (value === null || value === undefined || String(value).trim() === '') continue;
+        fields[def.key] = value;
+        break;
+      }
+    }
+
     return fields;
   }
+
+  /*
+   * Every heading that means a CORE book column. One list, because it was two: the reader in
+   * normalizeSpreadsheetRow and the "unmapped columns" warning each carried their own, and they
+   * disagreed — the warning knew about 'publicationyear' while the reader looked for exactly
+   * that spelling and our own export writes 'Publication Year'. So a librarian restoring from
+   * the app's CSV got no warning at all and lost the field anyway.
+   */
+  const CORE_SPREADSHEET_ALIASES = [
+    'title', 'author', 'writer', 'writers', 'isbn', 'publisher', 'language', 'description',
+    'publicationyear', 'publication year', 'roomcode', 'room code', 'shelfcode', 'shelf code',
+    'shelf location', 'acquisitiondate', 'acquisition date', 'tags', 'status', 'customfields',
+    // Written by the export; carried so they do not read as unmapped. Nothing imports them:
+    // created_at and updated_at belong to the row, not to the record's content.
+    'created at', 'updated at'
+  ];
 
   function findUnknownSpreadsheetColumns(rows: Array<Record<string, unknown>>): string[] {
     const allowedColumns = new Set([
@@ -1846,6 +1896,20 @@ function App() {
 
         seen.add(key);
         if (allowedColumns.has(key) || key.startsWith('custom.') || key.startsWith('custom_')) {
+          continue;
+        }
+
+        // Compared with punctuation and spacing ignored, and against this catalogue's own
+        // attribute definitions — otherwise re-importing our own export warned about half its
+        // columns, and a warning that cries wolf on the app's own file teaches librarians to
+        // click through the one that matters.
+        const norm = normalizeColumnName(key);
+        const allowedNormalized = new Set([
+          ...[...allowedColumns].map(normalizeColumnName),
+          ...CORE_SPREADSHEET_ALIASES.map(normalizeColumnName),
+          ...customFields.flatMap((def) => [normalizeColumnName(def.key), normalizeColumnName(def.label)])
+        ]);
+        if (norm && allowedNormalized.has(norm)) {
           continue;
         }
 
@@ -1937,7 +2001,26 @@ function App() {
   }
 
   function normalizeSpreadsheetRow(raw: Record<string, unknown>, index: number): Record<string, unknown> | null {
-    const row = Object.fromEntries(Object.entries(raw).map(([key, value]) => [key.trim().toLowerCase(), value]));
+    /*
+     * Headers are indexed BOTH as written (trimmed, lowercased) and with punctuation and spacing
+     * stripped, because the lookups below ask for 'publicationyear' while our own export writes
+     * 'Publication Year'. That mismatch meant a restore from the app's CSV silently dropped the
+     * publication year, the room and the acquisition date — measured on a real record: three
+     * core fields, no warning, and the import reported success.
+     *
+     * The written form wins where both exist, and an empty cell never displaces a filled one, so
+     * two headings that normalize alike cannot blank each other.
+     */
+    const written = Object.fromEntries(Object.entries(raw).map(([key, value]) => [key.trim().toLowerCase(), value]));
+    const row: Record<string, unknown> = { ...written };
+    for (const [key, value] of Object.entries(written)) {
+      const norm = normalizeColumnName(key);
+      if (!norm || norm === key) continue;
+      const held = row[norm];
+      const heldIsEmpty = held === undefined || held === null || String(held).trim() === '';
+      const incomingIsEmpty = value === null || value === undefined || String(value).trim() === '';
+      if (heldIsEmpty && !incomingIsEmpty) row[norm] = value;
+    }
 
     const isEmptyRow = Object.values(row).every((value) => toNullableText(value) === null);
     if (isEmptyRow) {
@@ -4852,9 +4935,18 @@ function App() {
     setImportFileName(file.name);
 
     try {
-      const buffer = await file.arrayBuffer();
       const XLSX = await loadXlsx();
-      const workbook = XLSX.read(buffer, { type: 'array' });
+      /*
+       * CSV is accepted because the app's own export IS a CSV, and the code that writes it calls
+       * it "this library's off-site backup" — while this picker accepted only .xlsx, so the file
+       * a librarian was told to keep could not be chosen at all. It is read as text and handed to
+       * the CSV parser explicitly rather than left to format sniffing, and the BOM the export
+       * prepends for Excel is stripped, since it would otherwise become part of the first header.
+       */
+      const isCsv = /\.csv$/i.test(file.name) || file.type === 'text/csv';
+      const workbook = isCsv
+        ? XLSX.read((await file.text()).replace(/^\uFEFF/, ''), { type: 'string', raw: false })
+        : XLSX.read(await file.arrayBuffer(), { type: 'array' });
       const firstSheetName = workbook.SheetNames[0];
       if (!firstSheetName) {
         throw new Error(t('toast.xlsxNoSheet'));
@@ -8426,7 +8518,7 @@ function App() {
                       <input
                         name="xlsxFile"
                         type="file"
-                        accept=".xlsx"
+                        accept=".xlsx,.csv"
                         required
                         aria-labelledby="import-xlsx-label"
                         style={{ width: 'auto', display: 'block', margin: '0 auto' }}

@@ -7272,12 +7272,37 @@ app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: tr
 		{ label: 'Created At', coreKey: 'createdAt' },
 		{ label: 'Updated At', coreKey: 'updatedAt' }
 	];
-	const knownCustomKeys = new Set(
-		DEFAULT_BOOK_STRUCTURE.filter((column) => column.customKey).map((column) => column.customKey as string)
-	);
-	const extraCustomColumns: DefaultBookStructureColumn[] = (await loadCustomFieldDefs(c.env))
+	/*
+	 * Each of the twenty default columns is resolved to the attribute it actually names.
+	 *
+	 * DEFAULT_BOOK_STRUCTURE spells its keys in camelCase ('coverType', 'placeOfPublication',
+	 * 'numVolume') while the definitions this catalogue really holds are snake_case
+	 * ('cover_type', 'place_of_publication', 'volume_num'). The old code compared the two
+	 * directly, so every such attribute failed the "already known" test and was appended a
+	 * SECOND time under its raw key — and the first column, reading customFields['coverType'],
+	 * was empty on every row of the file. Six pairs of columns, one of each pair always blank,
+	 * in the file this library keeps as its backup.
+	 *
+	 * findSimilarCustomField is the matching the import side already uses, so the header a
+	 * record leaves under is the header it comes back through.
+	 */
+	const defs = await loadCustomFieldDefs(c.env);
+	// Falling back to the key as the label matters: findSimilarCustomField skips any entry with
+	// no label, so an unlabelled definition would match nothing and be duplicated again.
+	const defRefs: ExistingCustomFieldRef[] = defs.map((def) => ({
+		field_key: def.field_key,
+		label: def.label || def.field_key
+	}));
+	const resolvedCustomKey = new Map<string, string>();
+	for (const column of DEFAULT_BOOK_STRUCTURE) {
+		if (!column.customKey) continue;
+		const match = findSimilarCustomField(defRefs, column);
+		resolvedCustomKey.set(column.customKey, match?.field_key ?? column.customKey);
+	}
+	const knownCustomKeys = new Set(resolvedCustomKey.values());
+	const extraCustomColumns: DefaultBookStructureColumn[] = defs
 		.filter((def) => !knownCustomKeys.has(def.field_key))
-		.map((def) => ({ label: def.field_key, customKey: def.field_key }));
+		.map((def) => ({ label: def.label || def.field_key, customKey: def.field_key }));
 
 	const exportColumns: DefaultBookStructureColumn[] = [
 		...DEFAULT_BOOK_STRUCTURE,
@@ -7295,7 +7320,8 @@ app.get('/api/export/books.csv', requirePermission('export.csv', { librarian: tr
 			if (column.coreKey) {
 				shaped[column.label] = row[column.coreKey];
 			} else if (column.customKey) {
-				shaped[column.label] = customFields[column.customKey] ?? null;
+				// Read through the resolved key, so 'Cover Type' carries what cover_type holds.
+				shaped[column.label] = customFields[resolvedCustomKey.get(column.customKey) ?? column.customKey] ?? null;
 			}
 		}
 		const tags = row.tags;
