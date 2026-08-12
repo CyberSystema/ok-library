@@ -2910,6 +2910,68 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 75. REGRESSION: every permission in the matrix governs something ===")
+
+# `labels.print` and `settings` were toggles in the admin matrix that no route
+# consulted, so turning them off changed only which buttons the SPA drew. One of
+# them had a server operation squarely inside the scope its own description
+# advertises, gated on a different permission.
+_idx = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+check("the QR/barcode generator is gated on labels.print",
+      "app.post('/api/books/:id/codes', requirePermission('labels.print'" in _idx, None)
+
+# The break itself, against a live role. A librarian WITHOUT labels.print may still
+# write books, and must no longer be able to mint a code — the button disappearing
+# was the whole of the old enforcement.
+#
+# PUT /api/role-permissions replaces the WHOLE matrix (it writes every key in
+# PERMISSION_KEYS from `desired[perm] === true`), so the matrix is read, one key
+# flipped, and the original put back in a finally — sending a fragment would strip
+# every other permission from both roles.
+_uname = f"zzperm{uuid.uuid4().hex[:8]}"
+st, _ = call("POST", "/api/users", {"username": _uname, "password": "ZzIntegrity!2026", "role": "librarian"})
+check("a probe librarian is created", st == 201, st)
+USERS.append(_uname)
+st, _perm = call("GET", "/api/role-permissions")
+_matrix = (_perm or {}).get("matrix") or {}
+_orig = json.loads(json.dumps(_matrix)) if _matrix else None
+if _orig:
+    try:
+        _off = json.loads(json.dumps(_orig))
+        _off["librarian"]["labels.print"] = False
+        st, _ = call("PUT", "/api/role-permissions", {"matrix": _off})
+        check("labels.print can be turned off for librarians", st == 200, st)
+        _tok = login(_uname, "ZzIntegrity!2026")
+        st, _page = call("GET", "/api/books?limit=1")
+        _bk = next(iter((_page or {}).get("items", [])), None)
+        if _bk and _tok:
+            st, r = call("POST", f"/api/books/{_bk['id']}/codes",
+                         {"type": "qr", "label": "zz-gate"}, token=_tok)
+            check("and the endpoint then refuses, not just the button", st == 403, (st, r))
+            st, _ = call("PUT", f"/api/books/{_bk['id']}",
+                         {"title": _bk["title"], "version": _bk.get("version", 0)}, token=_tok)
+            check("while the same librarian can still write books", st == 200, st)
+            # And with it back on, the same call goes through — a toggle that only
+            # ever refuses is not enforcement either.
+            st, _ = call("PUT", "/api/role-permissions", {"matrix": _orig})
+            st, r = call("POST", f"/api/books/{_bk['id']}/codes",
+                         {"type": "qr", "label": "zz-gate"}, token=_tok)
+            check("and permitted again once the toggle is back on", st in (200, 201), (st, r))
+    finally:
+        call("PUT", "/api/role-permissions", {"matrix": _orig})
+        st, _after = call("GET", "/api/role-permissions")
+        check("the matrix is left exactly as it was found",
+              (_after or {}).get("matrix") == _orig, None)
+
+# `settings` genuinely cannot be enforced — it shows a tab whose every action is
+# governed by its own permission — so the honest fix was to stop advertising it as
+# access control. The description must not read as a capability.
+_i18n = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+_desc = re.findall(r"'perm\.settings\.desc':\s*'([^']*)'", _i18n)
+check("all four locales describe settings as navigation", len(_desc) == 4, len(_desc))
+check("and none of them still calls it access to the settings",
+      all("Open the settings area" not in d for d in _desc), _desc)
+
 print("=== 74. REGRESSION: a collision is refused by name, not by a retried 500 ===")
 
 # Two UNIQUE indexes were written with no pre-check, so a collision surfaced as

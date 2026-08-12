@@ -4962,7 +4962,19 @@ app.get('/api/borrow/active', requirePermission('circulation', { librarian: true
 	}
 });
 
-app.post('/api/books/:id/codes', requirePermission('books.write', { librarian: true }), async (c) => {
+// `labels.print`, not `books.write`. This is the only server-side operation in the
+// scope the permission matrix advertises for that toggle — its description is
+// literally "Generate and print spine / shelf labels and QR codes" — and it was
+// gated on a different permission, which broke the toggle in both directions:
+// turning labels.print OFF hid the menu item while the endpoint kept accepting the
+// call, and turning it ON for a role without books.write showed the librarian a menu
+// item that answered 403. A permission that changes only which buttons are drawn is
+// not a permission.
+//
+// Still `librarian: true`: it writes a row, so the librarian-or-above floor every
+// other write carries stays. The default matrix gives librarians both, so no role
+// changes behaviour on deploy.
+app.post('/api/books/:id/codes', requirePermission('labels.print', { librarian: true }), async (c) => {
 	const bookId = c.req.param('id');
 	const payload = GenerateCodeSchema.parse(await c.req.json());
 
