@@ -31,3 +31,9 @@ apps/mobile/.packages
 apps/mobile/.metadata
 apps/mobile/ios/Pods/
 apps/mobile/android/.gradle/
+
+# Database backups written by scripts/backup_d1.mjs. These are a full dump of the live
+# catalogue — every book, reader, loan and staff row — so they must never enter git history,
+# where they could not be removed. Keep them somewhere that is not this repository and not
+# this laptop.
+backups/

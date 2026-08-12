@@ -144,8 +144,19 @@ before the system handles real patron data.
    - CSV export
    - Mobile cold-start session restore
 7. `scripts/reset_database.mjs --remote` is locked behind a typed
-   `DELETE PRODUCTION` confirmation. Never run it against production
-   without an out-of-band sign-off.
+   `DELETE PRODUCTION` confirmation, which **no flag can skip** — and it
+   takes a backup first, refusing to continue if the backup fails. This
+   used to be untrue in the one way that mattered: `--i-am-sure` skipped
+   the prompt entirely, so a single pasteable line wiped the catalogue
+   with no confirmation and no copy of the data. Never run it against
+   production without an out-of-band sign-off.
+8. **Take a backup before any bulk operation** — an import, a sweep, a
+   merge, a type change: `node scripts/backup_d1.mjs --remote`. It writes
+   `backups/production-<timestamp>/`, is read-only, and can be checked
+   with `--verify --out <dir>`. `wrangler d1 export` does not work on this
+   database (`books_fts` is an fts5 virtual table). D1 Time Travel also
+   gives 30 days of point-in-time recovery, which is the fallback if no
+   backup was taken — it needs a timestamp from before the damage.
 
 ## 9. CORS, auth, and cookies — verification recipe
 
