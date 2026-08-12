@@ -2910,6 +2910,51 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 73. REGRESSION: an anonymous caller cannot spend the write budget ===")
+
+# `enforceRateLimit` did an unconditional KV PUT on every permitted request, and the
+# two public protocol endpoints are configured at 60/minute. That is 86,400 permitted
+# requests a day against a free-tier allowance of 1,000 KV writes — so the limiter ran
+# out of its own storage after ~1.6% of the traffic it allows.
+#
+# And the same 1,000 writes back the read-through caches that the middleware's comment
+# says make normal browsing "effectively free", so an anonymous flood degrades the
+# LIBRARIAN's app: a better denial of service than the one being prevented.
+_w73 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+check("the public protocol bucket does not spend a KV write",
+      "enforceRateLimit(c, 'harvest', 60, { kvBacked: false })" in _w73,
+      "the harvest bucket is still KV-backed")
+check("and the limiter still has a KV path for authenticated buckets",
+      "enforceRateLimit(c, 'login', 20)" in _w73 and "CACHE.put(key" in _w73, None)
+
+# It must still actually limit. The counter is per isolate, which is a floor rather
+# than a guarantee across colos — but a tight loop, which is what this exists to stop,
+# keeps arriving at the same isolate.
+st, _cfg73 = call("GET", "/api/library-settings")
+_prior73 = (_cfg73 or {}).get("publicSharing")
+call("PUT", "/api/library-settings", {"publicSharing": "on"})
+try:
+    _ok = _limited = 0
+    for _ in range(70):
+        # call_text: OAI answers XML, and call() would try to parse it as JSON.
+        st, _ = call_text("GET", "/api/oai?verb=Identify")
+        if st == 429:
+            _limited += 1
+        else:
+            _ok += 1
+    check("an anonymous flood is still rate-limited", _limited > 0,
+          f"{_ok} permitted, {_limited} limited")
+    check("and the permitted share is about the configured minute limit",
+          _ok <= 65, f"{_ok} permitted against a 60/min limit")
+    # Give the window back. This section deliberately exhausts a 60/minute bucket
+    # that later sections (§64, §67) also use, and the counter is keyed on
+    # floor(now/60000) — so waiting for the next minute boundary clears it. Sleeping
+    # to the boundary rather than a flat minute keeps the cost to what is needed.
+    _wait = 61 - (int(time.time()) % 60)
+    time.sleep(_wait)
+finally:
+    call("PUT", "/api/library-settings", {"publicSharing": _prior73 or "off"})
+
 print("=== 72. REGRESSION: one definition of duplicate, one of in-use, one honest period ===")
 uniq = uuid.uuid4().hex[:5]
 

@@ -324,13 +324,60 @@ function clientIp(c: AppContext): string {
 	return c.req.header('cf-connecting-ip') ?? c.req.header('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown';
 }
 
-async function enforceRateLimit(c: AppContext, bucket: string, perMinuteLimit: number): Promise<void> {
+/**
+ * Per-isolate request counts, for the buckets that must not spend KV writes.
+ *
+ * Cleared when the isolate is recycled and not shared between colos, so this is a
+ * floor on protection rather than a guarantee — but what it exists to stop is a
+ * harvester or a script in a tight loop, and a tight loop keeps arriving at the same
+ * isolate. Bounded, so a flood of distinct keys cannot grow it without limit.
+ */
+const memoryRateLimits = new Map<string, number>();
+
+function enforceInMemoryLimit(key: string, perMinuteLimit: number): void {
+	if (memoryRateLimits.size > 5000) memoryRateLimits.clear();
+	const count = (memoryRateLimits.get(key) ?? 0) + 1;
+	memoryRateLimits.set(key, count);
+	if (count > perMinuteLimit) {
+		throw new HTTPException(429, { message: 'Rate limit exceeded. Please retry shortly.' });
+	}
+}
+
+/**
+ * `kvBacked: false` for anything an anonymous caller can reach.
+ *
+ * This spent one KV WRITE on every permitted request. The free tier allows 1,000 KV
+ * writes a day and the two public protocol endpoints are configured at 60 requests a
+ * minute — 86,400 permitted requests a day, one write each. The limiter therefore ran
+ * out of its own storage after about 1.6% of the traffic it was configured to allow,
+ * and the comment above the middleware reasoned about that bucket purely as request
+ * isolation, never noticing that the one bucket reachable by anyone on the internet
+ * is the one paying out of the librarian's budget.
+ *
+ * The damage does not stop at the limiter. Those same 1,000 writes back the
+ * read-through caches — which the middleware's own comment says are what make normal
+ * browsing "effectively free" — so an anonymous flood degrades the LIBRARIAN's app.
+ * That is a better denial of service than the one the limiter was written to prevent.
+ *
+ * Authenticated buckets keep the KV counter: they need a session, so the volume is a
+ * working day's clicks, and there the write is both affordable and exact.
+ */
+async function enforceRateLimit(
+	c: AppContext, bucket: string, perMinuteLimit: number,
+	opts: { kvBacked?: boolean } = {}
+): Promise<void> {
+	const key = `rl:${bucket}:${clientIp(c)}:${Math.floor(Date.now() / 60000)}`;
+
+	if (opts.kvBacked === false) {
+		enforceInMemoryLimit(key, perMinuteLimit);
+		return;
+	}
+
 	if (!c.env.CACHE) {
 		return;
 	}
 
 	try {
-		const key = `rl:${bucket}:${clientIp(c)}:${Math.floor(Date.now() / 60000)}`;
 		const countRaw = await c.env.CACHE.get(key);
 		const count = Number(countRaw ?? '0');
 
@@ -428,7 +475,10 @@ app.use('/api/*', async (c, next) => {
   if (isAuthLogin) {
     await enforceRateLimit(c, 'login', 20);
   } else if (isPublicProtocol) {
-    await enforceRateLimit(c, 'harvest', 60);
+    // No KV write: see enforceRateLimit. An anonymous caller must not be able to
+    // spend the librarian's daily write budget, least of all on the counter that
+    // exists to restrain them.
+    await enforceRateLimit(c, 'harvest', 60, { kvBacked: false });
   } else if (isCoverWrite) {
     await enforceRateLimit(c, 'cover', 30);
   } else if (isMutating) {
