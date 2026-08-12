@@ -95,6 +95,35 @@ def login(user=ADMIN_USER, pw=ADMIN_PW):
 # those run only here, and say so out loud when they do not.
 LOCAL = BASE.startswith("http://127.0.0.1") or BASE.startswith("http://localhost")
 
+# THIS SCRIPT MUTATES SHARED, LIBRARY-WIDE STATE, and one of those mutations can
+# outlive a failed run. §75 turns `labels.print` OFF for the librarian role, exercises
+# the refusal, and puts the matrix back in a `finally` — but a run killed between the
+# two (a session limit, a dropped connection, Ctrl-C in the wrong second) leaves a real
+# librarian without a real permission, with nothing on any screen to explain it. The
+# library-settings sections have the same shape: they write publicSharing, the ISIL and
+# libraryName and restore them afterwards.
+#
+# Against a dev database that is a non-event. Against the live catalogue it is an
+# outage of a feature, caused by the tool that exists to prove features work. Nothing
+# stopped `API=https://... python3 scripts/integrity_check.py` from doing exactly that,
+# and after a deploy that is a natural thing to reach for.
+#
+# So the shared-state mutations are gated. Remote runs still exercise everything that
+# only touches its own throwaway records — which is most of the file — and say out loud
+# what they skipped. The override exists because there is one legitimate case, a staging
+# API that nobody is using, and it should have to be typed.
+MUTATE_SHARED = LOCAL or os.environ.get("ALLOW_SHARED_MUTATION") == "1"
+SKIPPED_SHARED = []
+
+
+def shared_mutation(what):
+    """True when it is safe to mutate library-wide state; records the skip when not."""
+    if MUTATE_SHARED:
+        return True
+    if what not in SKIPPED_SHARED:
+        SKIPPED_SHARED.append(what)
+    return False
+
 
 # The repo root, so nothing here depends on the caller's working directory: the
 # --config path below is relative, and running the gate from anywhere but the root
@@ -3357,6 +3386,9 @@ USERS.append(_uname)
 st, _perm = call("GET", "/api/role-permissions")
 _matrix = (_perm or {}).get("matrix") or {}
 _orig = json.loads(json.dumps(_matrix)) if _matrix else None
+if _orig and not shared_mutation("the role-permission matrix (§75's live half)"):
+    print("  SKIP  flipping labels.print — refusing to touch a live permission matrix")
+    _orig = None
 if _orig:
     try:
         _off = json.loads(json.dumps(_orig))
@@ -4868,6 +4900,12 @@ if LOCAL:
           LOCAL_SQL_FAILURES[:3])
 
 print("\n" + "=" * 62)
+if SKIPPED_SHARED:
+    print("SKIPPED (would mutate shared state on a non-local API; set")
+    print("ALLOW_SHARED_MUTATION=1 to include them):")
+    for _sk in SKIPPED_SHARED:
+        print("  - " + _sk)
+    print()
 print(f"PASSED: {len(PASSES)}   FAILED: {len(FAILURES)}")
 if FAILURES:
     print("\nFAILURES:")
