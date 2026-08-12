@@ -1507,6 +1507,42 @@ app.get('/api/books/trash', requirePermission('books.delete'), async (c) => {
 	});
 });
 
+/**
+ * Refuse a `legacyId` that is already on another record, by name.
+ *
+ * `idx_books_legacy_id` is UNIQUE on the bare column (migration 0005 widened it
+ * from the partial index deliberately), and neither POST /api/books nor PUT
+ * /api/books/:id checked it — so typing an accession number a second time came
+ * back as `{"error":"Internal server error"}`, a 5xx, which `apps/web/src/api.ts`
+ * retries up to four times before giving up. The librarian saw a slow failure
+ * with nothing to act on, for the single most likely typo in retrospective
+ * cataloguing: entering the number of the book they catalogued a minute ago.
+ *
+ * The index covers SOFT-DELETED rows too, so a number can be held by a book in
+ * the trash — invisible in every list, and the refusal has to say so or it is
+ * unactionable. That is the whole point of naming the holder.
+ */
+async function assertLegacyIdFree(
+	env: Env,
+	legacyId: string | null | undefined,
+	excludeBookId: string | null
+): Promise<void> {
+	const value = (legacyId ?? '').trim();
+	if (!value) return;
+	const holder = await env.DB.prepare(
+		'SELECT id, title, deleted_at FROM books WHERE legacy_id = ? AND id IS NOT ? LIMIT 1'
+	)
+		.bind(value, excludeBookId)
+		.first<{ id: string; title: string; deleted_at: string | null }>();
+	if (!holder) return;
+	throw new HTTPException(409, {
+		message: holder.deleted_at
+			? `Accession number ${value} is already on "${holder.title}", which is in the trash. Restore or purge that record first, or use another number.`
+			: `Accession number ${value} is already on "${holder.title}". Every record needs its own number.`
+	});
+}
+
+
 app.get('/api/books/duplicates', requirePermission('books.write', { librarian: true }), async (c) => {
 	// Step 1: aggregate to find duplicate keys directly in SQL — never loads the full table.
 	const limit = Math.max(1, Math.min(200, Number(c.req.query('limit') ?? 50)));
@@ -2613,6 +2649,7 @@ app.post('/api/books', requirePermission('books.write', { librarian: true }), as
 		? await deterministicUuid(`create_book:${clientMutationId}`)
 		: crypto.randomUUID();
 	const customFields = await validateCustomFields(c.env, payload.customFields);
+	await assertLegacyIdFree(c.env, payload.legacyId, null);
 
 	const tagsJson = JSON.stringify(payload.tags);
 	const customFieldsJson = JSON.stringify(customFields);
@@ -2866,6 +2903,11 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 		version: currentVersion + 1,
 		updatedAt: now
 	};
+
+	// Same UNIQUE index, same retried 500 — reachable here by editing the
+	// accession number of an existing record onto one already taken. Excludes
+	// this record so re-saving a book that already holds its own number passes.
+	await assertLegacyIdFree(c.env, (merged as { legacyId?: string | null }).legacyId, id);
 
 	const mergedTagsJson = JSON.stringify(merged.tags);
 	const mergedCustomFieldsJson = JSON.stringify(merged.customFields);
@@ -5451,6 +5493,64 @@ app.post('/api/custom-fields', requirePermission('customFields.manage', { librar
 	const payload = UpsertCustomFieldSchema.parse(await c.req.json());
 	const id = crypto.randomUUID();
 	const now = nowIso();
+
+	// `custom_field_definitions.field_key` is UNIQUE, and this INSERT had no
+	// pre-check — so a key already in use came back out of D1 as the generic
+	// `Internal server error`, which api.ts treats as retryable and sends four
+	// more times. Every sibling create pre-checks its unique index for exactly
+	// this reason (POST /api/rooms: "The UNIQUE index would otherwise throw the
+	// same retried 500").
+	//
+	// The UNIQUE is on the column, not on `(field_key, deleted_at)`, so the
+	// SOFT-DELETED definitions collide too — and that is the case worth handling
+	// carefully, because it is the one the librarian cannot see. GET
+	// /api/custom-fields filters `deleted_at IS NULL`, so a deleted attribute is
+	// absent from the only list they have; retyping the key is then the obvious
+	// thing to do, and it failed with an unexplained 500 forever, with no restore
+	// path anywhere in the API to get out of it.
+	//
+	// So a buried definition is REVIVED rather than refused. The delete is soft
+	// precisely so the values stay on the books, and asking for the key back is
+	// asking for those values back — the librarian gets the attribute and its
+	// history, which is what deleting-then-recreating was always trying to mean.
+	//
+	// Only when the TYPE matches. Reviving a `text` definition as a `number`
+	// would leave every stored value the wrong type, which is the exact damage
+	// the retype sweep on PUT exists to prevent, and this handler has no sweep.
+	// A mismatch is refused with the buried type named, so the librarian can
+	// recreate it as it was and retype it through the editor that converts.
+	const clash = await c.env.DB.prepare(
+		'SELECT id, field_type, deleted_at FROM custom_field_definitions WHERE field_key = ? LIMIT 1'
+	).bind(payload.key).first<{ id: string; field_type: string; deleted_at: string | null }>();
+	if (clash && !clash.deleted_at) {
+		throw new HTTPException(409, {
+			message: `An attribute with the key "${payload.key}" already exists. Edit that one, or choose another key.`
+		});
+	}
+	if (clash && clash.deleted_at) {
+		if (clash.field_type !== payload.type) {
+			throw new HTTPException(409, {
+				message: `The key "${payload.key}" belongs to a deleted attribute of type "${clash.field_type}", and books still hold values of that type. Recreate it as "${clash.field_type}" and then change the type from the attribute editor, which converts the stored values.`
+			});
+		}
+		await c.env.DB.prepare(
+			`UPDATE custom_field_definitions
+			    SET deleted_at = NULL, label = ?, required = ?, enum_options = ?,
+			        pinned = ?, sort_order = ?, updated_at = ?
+			  WHERE id = ?`
+		)
+			.bind(
+				payload.label, payload.required ? 1 : 0, JSON.stringify(payload.enumOptions),
+				payload.pinned ? 1 : 0, payload.sortOrder ?? 0, now, clash.id
+			)
+			.run();
+		await insertAuditLog(c.env, c.get('user').sub, 'customField.restore', 'custom_field', clash.id, {
+			key: payload.key
+		});
+		// `restored` so the client can say so: the values already on the books
+		// reappearing is a surprise if the librarian thinks they made a new field.
+		return c.json({ id: clash.id, restored: true }, 200);
+	}
 
 	await c.env.DB.prepare(
 		`INSERT INTO custom_field_definitions

@@ -2910,6 +2910,84 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 74. REGRESSION: a collision is refused by name, not by a retried 500 ===")
+
+# Two UNIQUE indexes were written with no pre-check, so a collision surfaced as
+# `{"error":"Internal server error"}` — a 5xx, which apps/web/src/api.ts retries four
+# times before giving up. Both are the likeliest mistakes in their own workflow.
+
+# books.legacy_id: UNIQUE on the bare column since migration 0005, so it covers the
+# trash as well as the shelf.
+_lid = f"ZZGATE-{uuid.uuid4().hex[:10].upper()}"
+st, _bk1 = call("POST", "/api/books", {"title": "ZZ Gate Accession One", "author": "Gate",
+                                       "legacyId": _lid, "tags": [], "customFields": {},
+                                       "status": "available"})
+check("a first accession number is accepted", st == 201, st)
+_b1 = (_bk1 or {}).get("id")
+if _b1: CREATED.append(_b1)
+st, r = call("POST", "/api/books", {"title": "ZZ Gate Accession Two", "author": "Gate",
+                                    "legacyId": _lid, "tags": [], "customFields": {},
+                                    "status": "available"})
+check("a second record cannot take it", st == 409, st)
+check("and the refusal names the record holding it",
+      "ZZ Gate Accession One" in json.dumps(r or {}), r)
+
+st, _bk2 = call("POST", "/api/books", {"title": "ZZ Gate Accession Three", "author": "Gate",
+                                       "tags": [], "customFields": {}, "status": "available"})
+_b2 = (_bk2 or {}).get("id")
+if _b2: CREATED.append(_b2)
+if _b2:
+    st, _cur = call("GET", f"/api/books/{_b2}")
+    st, r = call("PUT", f"/api/books/{_b2}", {"legacyId": _lid, "version": (_cur or {}).get("version", 0)})
+    check("nor can an edit move it onto another record", st == 409, st)
+if _b1:
+    st, _cur = call("GET", f"/api/books/{_b1}")
+    st, _ = call("PUT", f"/api/books/{_b1}", {"legacyId": _lid, "version": (_cur or {}).get("version", 0)})
+    check("but a record re-saving its OWN number is not a collision", st == 200, st)
+    # The index does not honour deleted_at, so a number held by a binned record still
+    # blocks — and a refusal that does not say where it is cannot be acted on.
+    call("DELETE", f"/api/books/{_b1}")
+    st, r = call("POST", "/api/books", {"title": "ZZ Gate Accession Four", "author": "Gate",
+                                        "legacyId": _lid, "tags": [], "customFields": {},
+                                        "status": "available"})
+    check("a number held by a record in the trash still refuses", st == 409, st)
+    check("and the refusal says it is in the trash",
+          "trash" in json.dumps(r or {}).lower(), r)
+
+# custom_field_definitions.field_key: UNIQUE on the column, so the SOFT-DELETED rows
+# collide too — and those are invisible in GET /api/custom-fields, which is the only
+# list the librarian has. That case gets the definition back rather than a refusal.
+_key = f"zzgate_{uuid.uuid4().hex[:8]}"
+st, _cf = call("POST", "/api/custom-fields", {"key": _key, "label": "Gate", "type": "text",
+                                              "required": False, "enumOptions": []})
+check("a first attribute key is accepted", st == 201, st)
+_cfid = (_cf or {}).get("id")
+st, r = call("POST", "/api/custom-fields", {"key": _key, "label": "Gate again", "type": "text",
+                                            "required": False, "enumOptions": []})
+check("a live duplicate key is refused, not 500", st == 409, st)
+if _cfid:
+    call("DELETE", f"/api/custom-fields/{_cfid}")
+    st, _list = call("GET", "/api/custom-fields")
+    check("a deleted attribute is absent from the list the librarian sees",
+          all(f.get("key") != _key for f in (_list or {}).get("items", [])), _key)
+    st, r = call("POST", "/api/custom-fields", {"key": _key, "label": "Gate reborn", "type": "text",
+                                                "required": False, "enumOptions": []})
+    check("so retyping the same key restores it rather than failing", st == 200, (st, r))
+    check("and it is the same definition, so the values on books come back",
+          (r or {}).get("id") == _cfid and (r or {}).get("restored") is True, r)
+    # Reviving under a different type would leave every stored value the wrong type.
+    st, _now = call("GET", "/api/custom-fields")
+    _live = next((f for f in (_now or {}).get("items", []) if f.get("key") == _key), None)
+    call("DELETE", f"/api/custom-fields/{(_live or {}).get('id')}")
+    st, r = call("POST", "/api/custom-fields", {"key": _key, "label": "Gate", "type": "number",
+                                                "required": False, "enumOptions": []})
+    check("but not under a different type", st == 409, st)
+    # Read the message itself: json.dumps would escape the quotes around the type
+    # name, so the substring could never match and the check could only ever fail.
+    check("and the refusal names the buried type",
+          'type "text"' in ((r or {}).get("error") or ""), r)
+    local_sql(f"DELETE FROM custom_field_definitions WHERE field_key = '{_key}'")
+
 print("=== 73. REGRESSION: an anonymous caller cannot spend the write budget ===")
 
 # `enforceRateLimit` did an unconditional KV PUT on every permitted request, and the
