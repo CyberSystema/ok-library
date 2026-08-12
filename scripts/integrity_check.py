@@ -2913,6 +2913,64 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 77. REGRESSION: a re-import cannot split a book\'s date in two ===")
+
+# `reconcileBookDates` states the invariant outright — "the two representations can
+# never drift apart" — and the XLSX re-import UPDATE broke it by writing
+# publication_year unconditionally while COALESCEing publication_year_end and
+# date_edtf. A sheet with no year column therefore blanked the year and left the
+# other two standing: (1955, 1957, '1955/1957') became (NULL, 1957, '1955/1957').
+_lid77 = f"ZZ-DATE-{uuid.uuid4().hex[:10].upper()}"
+
+
+def _dates77():
+    if not LOCAL:
+        return None
+    r = local_sql("SELECT publication_year AS y, publication_year_end AS e, date_edtf AS d "
+                  f"FROM books WHERE legacy_id = '{_lid77}'")
+    return r[0] if r else None
+
+
+def _row77(**extra):
+    return {"title": "ZZ Date Invariant Probe", "author": "Gate", "legacyId": _lid77,
+            "tags": [], "customFields": {}, **extra}
+
+
+st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(dateEdtf="1955/1957")]})
+check("a sheet carrying an EDTF span imports", st == 201 and (r or {}).get("importedRows") == 1, (st, r))
+_d = _dates77()
+if _d is not None:
+    check("and the span derives both years",
+          (_d["y"], _d["e"], _d["d"]) == (1955, 1957, "1955/1957"), _d)
+
+# The case that broke it: a corrective sheet that mentions no date at all.
+st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(shelfCode="A1")]})
+check("a corrective sheet with no year column updates the record",
+      st == 201 and (r or {}).get("updatedRows") == 1, (st, r))
+_d = _dates77()
+if _d is not None:
+    check("and leaves all three date columns exactly as they were",
+          (_d["y"], _d["e"], _d["d"]) == (1955, 1957, "1955/1957"), _d)
+
+# A sheet that DOES speak moves all three together.
+st, _ = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(publicationYear=1960)]})
+_d = _dates77()
+if _d is not None:
+    check("a sheet giving a bare year mirrors it into all three",
+          (_d["y"], _d["e"], _d["d"]) == (1960, 1960, "1960"), _d)
+
+# And an explicit null is a clear, not an omission — the distinction the reconciler
+# documents for partial updates, which the CASE binding has to preserve.
+st, _ = call("POST", "/api/import/books", {"dryRun": False, "rows": [_row77(publicationYear=None)]})
+_d = _dates77()
+if _d is not None:
+    check("an explicit null clears all three, not one",
+          (_d["y"], _d["e"], _d["d"]) == (None, None, None), _d)
+
+if LOCAL:
+    local_sql(f"DELETE FROM items WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid77}')")
+    local_sql(f"DELETE FROM books WHERE legacy_id = '{_lid77}'")
+
 print("=== 76. REGRESSION: one check digit, one answer ===")
 
 # The badge on a record and the smart list built to find broken ISBNs disagreed on

@@ -6212,6 +6212,15 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 			}
 
 			const bookId = existing?.id ?? crypto.randomUUID();
+			// Read from the RAW row, not the normalized one: `reconcileBookDates`
+			// mirrors a bare year into `dateEdtf`, so asking the normalized row
+			// whether the sheet mentioned a date answers a different question.
+			// `!== undefined` and not a null check — CreateBookSchema declares both
+			// `.optional().nullable()` with no default, so an absent spreadsheet
+			// column leaves the key absent, and an explicit null is the librarian
+			// clearing the date rather than not mentioning it.
+			const rawDates = item.row as { publicationYear?: number | null; dateEdtf?: string | null };
+			const sheetGaveDates = rawDates.publicationYear !== undefined || rawDates.dateEdtf !== undefined;
 			const importTagsJson = JSON.stringify(row.tags);
 			const importCustomFieldsJson = JSON.stringify(customFields);
 			const importFolds = computeBookFolds({
@@ -6233,11 +6242,30 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 				// owned by the borrow/return flow, and a sheet saying 'available'
 				// must not wipe out an open loan.
 				await c.env.DB.prepare(
+					// THE THREE DATE COLUMNS MOVE TOGETHER OR NOT AT ALL.
+					//
+					// `publication_year` was written unconditionally while its two
+					// companions were COALESCEd, so a re-import from a sheet with no
+					// year column — a sheet correcting shelf marks, say — blanked the
+					// year and left `date_edtf` and `publication_year_end` standing.
+					// Measured: a record at (1955, 1957, '1955/1957') came back as
+					// (NULL, 1957, '1955/1957'), which is silent loss of the start year
+					// AND a direct breach of the invariant `reconcileBookDates` states
+					// in so many words — "the two representations can never drift
+					// apart". They drifted in the one place that never called it twice.
+					//
+					// `reconcileBookDates` has already made the incoming three
+					// consistent with each other, so the only question left is whether
+					// the sheet said anything about dates at all. `sheetGaveDates` is
+					// bound three times to answer it once: absent means leave all three,
+					// an explicit null clears all three. That is the same contract the
+					// reconciler itself documents for a partial update.
 					`UPDATE books SET
-						title = ?, author = ?, isbn = ?, publication_year = ?, publisher = ?, language = ?,
+						title = ?, author = ?, isbn = ?, publisher = ?, language = ?,
 						description = ?, room_code = ?, shelf_code = ?, acquisition_date = ?,
-						publication_year_end = COALESCE(?, publication_year_end),
-						date_edtf = COALESCE(?, date_edtf),
+						publication_year     = CASE WHEN ? THEN ? ELSE publication_year END,
+						publication_year_end = CASE WHEN ? THEN ? ELSE publication_year_end END,
+						date_edtf            = CASE WHEN ? THEN ? ELSE date_edtf END,
 						ddc = COALESCE(?, ddc),
 						bib_level = COALESCE(?, bib_level),
 						title_romanized = COALESCE(?, title_romanized),
@@ -6256,15 +6284,15 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						row.title,
 						row.author,
 						row.isbn ?? null,
-						row.publicationYear ?? null,
 						row.publisher ?? null,
 						row.language ?? null,
 						row.description ?? null,
 						row.roomCode ?? null,
 						row.shelfCode ?? null,
 						row.acquisitionDate ?? null,
-						row.publicationYearEnd ?? null,
-						row.dateEdtf ?? null,
+						sheetGaveDates ? 1 : 0, row.publicationYear ?? null,
+						sheetGaveDates ? 1 : 0, row.publicationYearEnd ?? null,
+						sheetGaveDates ? 1 : 0, row.dateEdtf ?? null,
 						row.ddc ?? null,
 						row.bibLevel ?? null,
 						row.titleRomanized ?? null,
