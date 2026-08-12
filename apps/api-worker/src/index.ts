@@ -5724,6 +5724,24 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 				.bind(payload.isbn).first<{ id: string; version: number }>()
 			: null;
 
+		// Validate the custom fields BEFORE the dry-run guard, so the prediction is
+		// the outcome.
+		//
+		// The guard used to return first, and `validateCustomFields` ran only on the
+		// real pass — so a record the import would REFUSE was counted as `created` in
+		// the preview. The comment a few lines above explains why the match lookup was
+		// deliberately moved ahead of this same guard ("predicting the wrong thing is
+		// worse than not offering to predict"); the argument applies here and had not
+		// been applied. It is a pure read of the definition cache, so it costs the dry
+		// run nothing.
+		try {
+			await validateCustomFields(c.env, payload.customFields as Record<string, unknown>);
+		} catch (error) {
+			skipped += 1;
+			problems.push(error instanceof Error ? error.message : 'a record has a custom field the catalogue rejects');
+			continue;
+		}
+
 		if (dryRun) { if (existing) updated += 1; else created += 1; continue; }
 
 		try {
@@ -5732,6 +5750,32 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 				// carries are written — a MARC record that omits a field must not
 				// blank what the librarian already catalogued by hand.
 				const cf = await validateCustomFields(c.env, payload.customFields as Record<string, unknown>);
+				// THE FOLDS GO WITH THE TEXT. This was the only UPDATE in the worker
+				// that wrote title, author, publisher and description without their
+				// `*_fold` columns — a script over every `UPDATE books SET` template
+				// flags this statement and no other.
+				//
+				// It is not cosmetic. The books_fts triggers index
+				// `COALESCE(new.title_fold, new.title, '')`, and COALESCE only falls
+				// through when the fold is NULL — so a pre-existing, now stale fold
+				// WINS. A record re-imported with a corrected title kept answering
+				// searches under its old one, in the accent-and-case-folded matching
+				// that is how this catalogue is actually searched in Greek.
+				//
+				// Computed from the POST-MERGE values, because several columns above
+				// are COALESCE(?, col): the fold has to describe what the row will
+				// hold, not what the MARC record happened to carry.
+				const mergedForFold = {
+					title: payload.title,
+					author: payload.author,
+					isbn: (existing as { isbn?: string | null }).isbn ?? null,
+					publisher: payload.publisher ?? (existing as { publisher?: string | null }).publisher ?? null,
+					description: payload.description ?? (existing as { description?: string | null }).description ?? null,
+					titleRomanized: payload.titleRomanized ?? (existing as { title_romanized?: string | null }).title_romanized ?? null,
+					authorRomanized: payload.authorRomanized ?? (existing as { author_romanized?: string | null }).author_romanized ?? null,
+					publisherRomanized: payload.publisherRomanized ?? (existing as { publisher_romanized?: string | null }).publisher_romanized ?? null
+				};
+				const reFolds = computeBookFolds(mergedForFold);
 				await c.env.DB.prepare(
 					`UPDATE books SET title = ?, author = ?, publisher = ?, language = ?, description = ?,
 					        ddc = COALESCE(?, ddc), bib_level = COALESCE(?, bib_level),
@@ -5742,6 +5786,8 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 					        author_romanized = COALESCE(?, author_romanized),
 					        publisher_romanized = COALESCE(?, publisher_romanized),
 					        custom_fields = json_patch(custom_fields, ?),
+					        title_fold = ?, author_fold = ?, publisher_fold = ?, description_fold = ?,
+					        title_romanized_fold = ?, author_romanized_fold = ?, publisher_romanized_fold = ?,
 					        updated_at = ?, version = version + 1
 					  WHERE id = ?`
 				).bind(
@@ -5750,7 +5796,10 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 					(payload as { bibLevel?: string }).bibLevel ?? null, payload.dateEdtf ?? null,
 					payload.publicationYear ?? null, payload.publicationYearEnd ?? null,
 					payload.titleRomanized ?? null, payload.authorRomanized ?? null, payload.publisherRomanized ?? null,
-					JSON.stringify(cf), now, existing.id
+					JSON.stringify(cf),
+					reFolds.title_fold, reFolds.author_fold, reFolds.publisher_fold, reFolds.description_fold,
+					reFolds.title_romanized_fold, reFolds.author_romanized_fold, reFolds.publisher_romanized_fold,
+					now, existing.id
 				).run();
 				// Deliberately NOT ensurePrimaryItem here: it writes the passed
 				// location onto the primary copy, and this payload carries none —
@@ -6038,6 +6087,26 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 			}
 
 			await replaceBookAttributeValues(c.env, bookId, customFields);
+			// A NEW record needs a copy to exist at all.
+			//
+			// Every other creation path calls this — POST /api/books, the offline
+			// sync's create_book, the MARCXML import, whose comment says it plainly:
+			// "a new record needs a copy to exist at all, or it is invisible to every
+			// location filter". The spreadsheet import did not, so it wrote
+			// `books.shelf_code` from the sheet and created ZERO copies: the shelf was
+			// recorded and unreachable, the record missing from every location facet,
+			// from the room summary and from the copies layer that is supposed to be
+			// the source of truth for where a volume is.
+			//
+			// INSERT ONLY. On a re-import `ensurePrimaryItem` would overwrite the
+			// primary copy's shelf with the sheet's, discarding a location the
+			// librarian may have corrected on the copy itself since.
+			if (!existing) {
+				await ensurePrimaryItem(c.env, bookId, {
+					shelfCode: row.shelfCode ?? null,
+					roomCode: row.roomCode ?? null
+				});
+			}
 			if (existing) updatedRows += 1;
 			else importedRows += 1;
 		} catch (error) {
@@ -8761,6 +8830,16 @@ app.post('/api/import/books-catalog', requirePermission('import'), async (c) => 
 				await replaceBookAttributeValues(c.env, bookId, effectiveCf);
 			} catch {
 				attributeFailures += 1;
+			}
+
+			// Same as the spreadsheet import above: a new record with no copy is
+			// invisible to every location facet and to the room summary, however
+			// faithfully `books.shelf_code` was filled in from the sheet. Insert only —
+			// on a re-import this would overwrite a shelf the librarian may since have
+			// corrected on the copy itself.
+			if (!didUpdate) {
+				// This sheet carries no room column — Prepared has shelfCode only.
+				await ensurePrimaryItem(c.env, bookId, { shelfCode: p.shelfCode ?? null });
 			}
 
 			if (didUpdate) updated += 1;

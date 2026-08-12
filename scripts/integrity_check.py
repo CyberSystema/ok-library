@@ -2910,6 +2910,63 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 68. REGRESSION: an imported record is a real record ===")
+uniq = uuid.uuid4().hex[:6]
+
+# A record with NO COPY is not a record with no copy — it is a record that has
+# fallen out of the catalogue: invisible to every location facet, to the room
+# summary, and to the copies layer that is the source of truth for where a volume
+# is. Every other creation path calls ensurePrimaryItem and says so in a comment;
+# both spreadsheet imports did not, so they wrote books.shelf_code from the sheet
+# and created zero copies. The shelf was recorded and unreachable.
+_legacy68 = f"ZZIMPITEM-{uniq}"
+st, res = call("POST", "/api/import/books", {"dryRun": False, "rows": [{
+    "legacyId": _legacy68, "title": f"ZZIMPITEM {uniq}", "author": "ZZ", "shelfCode": "07-199"}]})
+check("the import accepts a row with a shelf mark",
+      st in (200, 201) and (res or {}).get("importedRows") == 1, f"{st} {res}")
+if LOCAL:
+    _r68 = local_sql(f"""SELECT b.id, b.shelf_code AS book_shelf,
+                                (SELECT COUNT(*) FROM items i
+                                  WHERE i.book_id = b.id AND i.deleted_at IS NULL) AS copies,
+                                (SELECT i.shelf_code FROM items i
+                                  WHERE i.book_id = b.id AND i.deleted_at IS NULL LIMIT 1) AS copy_shelf
+                           FROM books b WHERE b.legacy_id = '{_legacy68}'""")
+    row68 = _r68[0] if _r68 else None
+    if row68:
+        CREATED.append(row68["id"])
+    check("and the imported record has a copy, not just a shelf column",
+          row68 and int(row68["copies"]) == 1, row68)
+    check("and the copy carries the shelf mark the sheet gave",
+          row68 and row68["copy_shelf"] == "07-199", row68)
+
+    # The invariant behind it, over the whole table: a live record with no copy is
+    # missing from every location answer in the app.
+    _orphans68 = local_sql("""SELECT COUNT(*) AS n FROM books b
+                               WHERE b.deleted_at IS NULL
+                                 AND NOT EXISTS (SELECT 1 FROM items i
+                                                  WHERE i.book_id = b.id AND i.deleted_at IS NULL)""")
+    check("no live record anywhere is without a copy",
+          _orphans68 and int(_orphans68[0]["n"]) == 0,
+          _orphans68[0]["n"] if _orphans68 else "query failed")
+
+# The MARCXML re-import wrote title/author/publisher/description and NOT their folds
+# — the only books UPDATE in the worker with that gap. The FTS triggers index
+# COALESCE(new.title_fold, new.title, ''), and COALESCE only falls through when the
+# fold is NULL, so a stale fold WINS: a record re-imported with a corrected title
+# kept answering searches under the old one.
+_worker68 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+import re as _re68
+_updates68 = [(m.start(), m.group(1)) for m in
+              _re68.finditer(r"`UPDATE books SET(.{0,900}?)`", _worker68, _re68.S)]
+_textcols68 = ("title = ?", "title=?")
+_missing68 = [
+    _worker68[:pos].count("\n") + 1
+    for pos, seg in _updates68
+    if any(t in seg for t in _textcols68) and "_fold" not in seg
+]
+check("every books UPDATE that writes text writes its folds too",
+      not _missing68, f"lines missing folds: {_missing68}")
+
 print("=== 67. REGRESSION: SRU answers the query it was asked ===")
 
 st, _cfg67 = call("GET", "/api/library-settings")
