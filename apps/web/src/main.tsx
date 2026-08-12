@@ -846,6 +846,59 @@ function ContextMenuView({ state, onClose }: { state: CtxMenuState; onClose: () 
   );
 }
 
+/**
+ * The cover lightbox.
+ *
+ * ITS OWN COMPONENT for one reason: `useModalFocus` locks page scrolling for as long as it
+ * is mounted, and a hook cannot be called conditionally. Calling it from App — which is
+ * where this started — set `document.body.style.overflow = 'hidden'` on first render and
+ * never released it, so the whole application became unscrollable whether or not a cover
+ * was open. Mounting the hook WITH the overlay is what makes "lock the page behind the
+ * dialog" mean the dialog.
+ *
+ * What it fixes, and why it needs the hook at all: the overlay declared `aria-modal` and
+ * managed nothing. Focus stayed behind it on the detail dialog, so Tab walked the page
+ * underneath, its own ✕ could never be reached, Escape did nothing, and closing did not
+ * restore focus. It was the only role="dialog" in the app that skipped this helper — the
+ * helper that exists, in its own comment, "so an overlay that cannot use Dialog's markup
+ * can still get Dialog's behaviour from the same lines".
+ */
+function CoverLightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  const t = useT();
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  // 'container' because the overlay's only control is its ✕, and focusing the container
+  // keeps the Escape/Tab handler on the element that owns them.
+  useModalFocus(boxRef, 'container');
+  return (
+    <div
+      ref={boxRef}
+      className="lightbox-overlay"
+      role="dialog"
+      aria-modal="true"
+      aria-label={t('detail.coverZoomAria')}
+      onClick={onClose}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.stopPropagation();
+          onClose();
+          return;
+        }
+        trapTab(boxRef.current, e);
+      }}
+    >
+      <button
+        type="button"
+        className="lightbox-close"
+        onClick={onClose}
+        title={t('common.close')}
+        aria-label={t('common.close')}
+      >✕</button>
+      {/* Clicking anywhere (backdrop or the image) closes — matches the hint. */}
+      <img className="lightbox-img" src={src} alt={t('detail.coverZoomAria')} />
+    </div>
+  );
+}
+
 function App() {
   const toast = useToast();
   const confirm = useConfirm();
@@ -1095,12 +1148,6 @@ function App() {
   // Full-screen cover zoom (lightbox). Holds the resolved cover URL while open,
   // null while closed. Opened by clicking the large cover in the detail view.
   const [coverZoom, setCoverZoom] = useState<string | null>(null);
-  // The lightbox is a dialog, so it gets a dialog's focus handling: focus moves in on
-  // mount, is restored to the opener on unmount, and the page behind is locked. Passing
-  // 'container' because the overlay's only control is its ✕ and focusing the container
-  // keeps the Escape/Tab handler on the element that owns them.
-  const lightboxRef = useRef<HTMLDivElement | null>(null);
-  useModalFocus(lightboxRef, 'container');
   // Custom right-click menu: null when closed, else its screen position + items.
   const [contextMenu, setContextMenu] = useState<CtxMenuState | null>(null);
   // A hidden file input reused by the "Replace/Add cover" menu item — the book
@@ -6351,40 +6398,7 @@ function App() {
 
       {/* ═══ COVER ZOOM LIGHTBOX ═══ */}
       {coverZoom && (
-        <div
-          ref={lightboxRef}
-          className="lightbox-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label={t('detail.coverZoomAria')}
-          onClick={() => setCoverZoom(null)}
-          /*
-           * It DECLARED aria-modal and then managed nothing: focus stayed behind it on the
-           * detail dialog, so Tab walked the page underneath, its own ✕ could never be
-           * reached, Escape did nothing, and on close focus did not come back. It was the
-           * only role="dialog" in the app that skipped useModalFocus — the very helper
-           * that exists, in its own words, "so an overlay that cannot use Dialog's markup
-           * can still get Dialog's behaviour from the same lines".
-           */
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') {
-              e.stopPropagation();
-              setCoverZoom(null);
-              return;
-            }
-            trapTab(lightboxRef.current, e);
-          }}
-        >
-          <button
-            type="button"
-            className="lightbox-close"
-            onClick={() => setCoverZoom(null)}
-            title={t('common.close')}
-            aria-label={t('common.close')}
-          >✕</button>
-          {/* Clicking anywhere (backdrop or the image) closes — matches the hint. */}
-          <img className="lightbox-img" src={coverZoom} alt={t('detail.coverZoomAria')} />
-        </div>
+        <CoverLightbox src={coverZoom} onClose={() => setCoverZoom(null)} />
       )}
 
       {/* ═══ CUSTOM CONTEXT MENU ═══ */}
