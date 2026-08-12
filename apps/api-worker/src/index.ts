@@ -6015,9 +6015,23 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 		// re-send from a partner library was told they were about to add 1,200
 		// records when the real run would have updated 1,200. Predicting the
 		// wrong thing is worse than not offering to predict.
+		// Every column the merge below needs is selected. It used to be `id, version` only,
+		// while the fold computation read existing.publisher, existing.description and the
+		// three romanized columns off this same row — all `undefined`, always, so the folds
+		// silently described the incoming MARC record rather than the merged row. On a record
+		// where the column was preserved and the fold was not, the two disagree, and the
+		// folded columns are what Greek search actually matches on.
 		const existing = payload.isbn
-			? await c.env.DB.prepare('SELECT id, version FROM books WHERE isbn = ? AND deleted_at IS NULL LIMIT 1')
-				.bind(payload.isbn).first<{ id: string; version: number }>()
+			? await c.env.DB.prepare(
+				`SELECT id, version, author, isbn, publisher, language, description,
+				        title_romanized, author_romanized, publisher_romanized
+				   FROM books WHERE isbn = ? AND deleted_at IS NULL LIMIT 1`)
+				.bind(payload.isbn).first<{
+					id: string; version: number; author: string | null; isbn: string | null;
+					publisher: string | null; language: string | null; description: string | null;
+					title_romanized: string | null; author_romanized: string | null;
+					publisher_romanized: string | null;
+				}>()
 			: null;
 
 		// Validate the custom fields BEFORE the dry-run guard, so the prediction is
@@ -6061,19 +6075,43 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 				// Computed from the POST-MERGE values, because several columns above
 				// are COALESCE(?, col): the fold has to describe what the row will
 				// hold, not what the MARC record happened to carry.
+				/*
+				 * A MARC record carries only what the sending library chose to send. 245$a is
+				 * required and checked above, so the title is always real; everything else can
+				 * legitimately be absent, and absent must mean "keep what we have".
+				 *
+				 * It did not. publisher, language and description were written UNCONDITIONALLY
+				 * beside ddc, bib_level and the romanized trio which were COALESCEd — the same
+				 * split policy in one statement that destroyed seven fields per record on the
+				 * XLSX re-import. The comment directly above this block already stated the
+				 * correct rule ("a MARC record that omits a field must not blank what the
+				 * librarian already catalogued by hand"); the SQL contradicted it.
+				 *
+				 * The author needed its own flag rather than COALESCE. marcToBookFields yields
+				 * `f.author ?? ''` for a record with no 100/110/700, so what arrives is an empty
+				 * string, not NULL, and COALESCE would cheerfully write it over a hand-catalogued
+				 * name. An author-less book in this catalogue is stored as '' or '(Unknown)'
+				 * deliberately, so '' is a value some records really hold — but a MARC record
+				 * cannot tell us "this book has no author", only "this record does not say".
+				 */
+				const marcGaveAuthor = (payload.author ?? '').trim() !== '';
 				const mergedForFold = {
 					title: payload.title,
-					author: payload.author,
-					isbn: (existing as { isbn?: string | null }).isbn ?? null,
-					publisher: payload.publisher ?? (existing as { publisher?: string | null }).publisher ?? null,
-					description: payload.description ?? (existing as { description?: string | null }).description ?? null,
-					titleRomanized: payload.titleRomanized ?? (existing as { title_romanized?: string | null }).title_romanized ?? null,
-					authorRomanized: payload.authorRomanized ?? (existing as { author_romanized?: string | null }).author_romanized ?? null,
-					publisherRomanized: payload.publisherRomanized ?? (existing as { publisher_romanized?: string | null }).publisher_romanized ?? null
+					author: marcGaveAuthor ? payload.author : (existing.author ?? ''),
+					isbn: existing.isbn ?? null,
+					publisher: payload.publisher ?? existing.publisher ?? null,
+					description: payload.description ?? existing.description ?? null,
+					titleRomanized: payload.titleRomanized ?? existing.title_romanized ?? null,
+					authorRomanized: payload.authorRomanized ?? existing.author_romanized ?? null,
+					publisherRomanized: payload.publisherRomanized ?? existing.publisher_romanized ?? null
 				};
 				const reFolds = computeBookFolds(mergedForFold);
 				await c.env.DB.prepare(
-					`UPDATE books SET title = ?, author = ?, publisher = ?, language = ?, description = ?,
+					`UPDATE books SET title = ?,
+					        author = CASE WHEN ? THEN ? ELSE author END,
+					        publisher = COALESCE(?, publisher),
+					        language = COALESCE(?, language),
+					        description = COALESCE(?, description),
 					        ddc = COALESCE(?, ddc), bib_level = COALESCE(?, bib_level),
 					        date_edtf = COALESCE(?, date_edtf),
 					        publication_year = COALESCE(?, publication_year),
@@ -6087,7 +6125,9 @@ app.post('/api/import/marcxml', requirePermission('import'), async (c) => {
 					        updated_at = ?, version = version + 1
 					  WHERE id = ?`
 				).bind(
-					payload.title, payload.author, payload.publisher ?? null, payload.language ?? null,
+					payload.title,
+					marcGaveAuthor ? 1 : 0, payload.author,
+					payload.publisher ?? null, payload.language ?? null,
 					payload.description ?? null, payload.ddc ?? null,
 					(payload as { bibLevel?: string }).bibLevel ?? null, payload.dateEdtf ?? null,
 					payload.publicationYear ?? null, payload.publicationYearEnd ?? null,

@@ -5309,6 +5309,93 @@ if _a:
     call("DELETE", f"/api/books/{_a}/purge")
 
 
+print()
+print("=== 87. REGRESSION: a MARC record that omits a field must not blank it ===")
+
+# The third instance of one bug in one day. The XLSX re-import destroyed seven fields per
+# matched record; this statement destroyed FOUR, and the comment directly above it already
+# stated the rule it was breaking: "a MARC record that omits a field must not blank what the
+# librarian already catalogued by hand."
+#
+# A partner library re-sending a book with only 245$a and 020 — a completely ordinary minimal
+# record — blanked author, publisher, language and description, while ddc, bib_level, date_edtf
+# and the romanized trio in the SAME statement were COALESCEd and survived. Split policy in one
+# UPDATE, again.
+#
+# The author needed a flag, not COALESCE: marcToBookFields gives `f.author ?? ''`, so an absent
+# 100/110/700 arrives as an empty string and COALESCE would write it straight over a name.
+_idx87 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_m87 = _idx87[_idx87.index("app.post('/api/import/marcxml'"):]
+_m87 = _m87[:_m87.index("app.post('", 40) if "app.post('" in _m87[40:] else 40000]
+# COMMENTS ARE STRIPPED FIRST. Two anchors were tried and both landed in prose: this handler
+# carries a comment explaining a previous fix to this very statement, and it says the words
+# "UPDATE books SET" — in backticks, so quoting the template's opening backtick did not escape
+# it either. A check that reads a comment instead of the code is how §86's first draft came to
+# pass on an empty string. Strip the prose, then there is only one thing left to match.
+_code87 = re.sub(r"/\*[\s\S]*?\*/", "", _m87)
+_code87 = "\n".join(l for l in _code87.split("\n") if not l.strip().startswith("//"))
+_ai87 = _code87.find("UPDATE books SET")
+_upd87 = _code87[_ai87:_ai87 + 1600] if _ai87 >= 0 else ""
+check("the marcxml re-import UPDATE is where this check can see it",
+      _upd87 != "" and "WHERE id = ?" in _upd87, _ai87)
+for _col in ("publisher", "language", "description"):
+    check(f"{_col} is preserved when the record does not carry it",
+          f"{_col} = COALESCE(?, {_col})" in _upd87, None)
+check("the author is preserved behind an explicit flag, because absent arrives as ''",
+      "author = CASE WHEN ? THEN ? ELSE author END" in _upd87 and "marcGaveAuthor" in _code87, None)
+check("the title is still written outright, since 245$a is required and checked above",
+      _upd87.startswith("UPDATE books SET title = ?,"), _upd87[:40])
+
+# The row the merge reads from must actually contain the columns it reads. It did not: the
+# lookup selected `id, version` while the fold computation read existing.publisher,
+# existing.description and three romanized columns off it — undefined, always — so the folds
+# described the incoming record instead of the merged row. A preserved column with a fold that
+# does not match it is a record that answers Greek search under text it no longer holds.
+_sel87 = re.search(r"SELECT id, version[\s\S]{0,400}?FROM books WHERE isbn", _code87)
+check("the match lookup selects every column the merge reads", _sel87 is not None, None)
+if _sel87:
+    _cols87 = _sel87.group(0)
+    for _c in ("publisher", "description", "title_romanized", "author_romanized",
+               "publisher_romanized", "author", "language"):
+        check(f"  ...including {_c}", _c in _cols87, None)
+
+# And the round trip, on a real record: catalogue by hand, re-import a minimal MARC record,
+# nothing may change but the title.
+if LOCAL:
+    _isbn87 = "9789" + uuid.uuid4().hex[:9].translate(str.maketrans("abcdef", "012345"))
+    _title87 = f"ZZ MARC Partial {uuid.uuid4().hex[:6]}"
+    _b87, _ = mkbook(title=_title87, author="Ιωάννης Χρυσόστομος", isbn=_isbn87,
+                     publisher="Εκδόσεις Δέλτα", language="EL",
+                     description="Περιγραφή γραμμένη με το χέρι.",
+                     titleRomanized="ZZ MARC Partial", customFields={"pages": "333"})
+    _before87 = get(_b87) or {}
+    _xml87 = ('<?xml version="1.0" encoding="UTF-8"?>'
+              '<collection xmlns="http://www.loc.gov/MARC21/slim"><record>'
+              '<leader>00000nam a2200000 a 4500</leader>'
+              f'<datafield tag="020" ind1=" " ind2=" "><subfield code="a">{_isbn87}</subfield></datafield>'
+              f'<datafield tag="245" ind1="1" ind2="0"><subfield code="a">{_title87}</subfield></datafield>'
+              '</record></collection>')
+    st, _res87 = call("POST", "/api/import/marcxml", raw=_xml87.encode("utf-8"), ctype="application/xml")
+    check("the minimal MARC record is accepted as an update",
+          st == 200 and (_res87 or {}).get("updated") == 1, (st, _res87))
+    _after87 = get(_b87) or {}
+    _lost87 = [k for k in ("author", "publisher", "language", "description", "titleRomanized")
+               if _after87.get(k) != _before87.get(k)]
+    check("nothing the MARC record left out was blanked", not _lost87,
+          {k: (_before87.get(k), _after87.get(k)) for k in _lost87})
+    check("and the hand-entered attributes survived",
+          (_after87.get("customFields") or {}).get("pages") == "333",
+          _after87.get("customFields"))
+    _f87 = local_sql("SELECT author_fold, publisher_fold, "
+                     "(description IS NULL) AS dn, (description_fold IS NULL) AS dfn "
+                     f"FROM books WHERE id = '{_b87}'")
+    if _f87:
+        _r87 = _f87[0]
+        check("the folds describe the merged row, not the incoming record",
+              (_r87.get("author_fold") or "") != "" and (_r87.get("publisher_fold") or "") != ""
+              and _r87.get("dn") == _r87.get("dfn"), _r87)
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
