@@ -1512,9 +1512,17 @@ function App() {
       return await operation();
     } catch (error) {
       if (error instanceof ApiRequestError && error.status === 401) {
-        setCurrentUser(null);
-        setDidBootstrapData(false);
-        setError(t('login.sessionExpired'));
+        // ONLY when a session actually existed. A 401 from the login request itself means
+        // the password was wrong, not that anything expired — and this branch reported
+        // "Session expired. Please sign in again." to somebody who was already on the
+        // sign-in screen and had never been signed in. `login()`'s own catch then showed
+        // the same string a second time. `loggedInRef` is the same test the unauthorized
+        // handler uses, so the two agree about what a session is.
+        if (loggedInRef.current) {
+          setCurrentUser(null);
+          setDidBootstrapData(false);
+          setError(t('login.sessionExpired'));
+        }
       }
       throw error;
     } finally {
@@ -2255,7 +2263,13 @@ function App() {
       setDidBootstrapData(false);
       setMessage(t('login.welcome', { username: response.user.username }));
     } catch (e) {
-      setError((e as Error).message);
+      // A 401 HERE means the credentials were wrong, and it is the only 401 a librarian
+      // meets regularly — so it gets its own translated sentence rather than the worker's
+      // English "Invalid credentials". Everything else keeps the server's text, which is
+      // usually more specific than anything this catch could invent.
+      setError(e instanceof ApiRequestError && e.status === 401
+        ? t('login.badCredentials')
+        : (e as Error).message);
     }
   }
 
@@ -5028,6 +5042,19 @@ function App() {
       else openBookDetail(book);
     };
     return {
+      // tabIndex, so the onKeyDown below can actually happen.
+      //
+      // The table layout spreads these onto a <tr>. Without tabIndex the row cannot take
+      // focus, so the Enter/Space handler sitting right here was unreachable: in table
+      // density — the view a librarian uses to work down a shelf — no book could be
+      // opened, and in selection mode no book could be ticked, without a mouse. The card
+      // and list layouts were fine because `bookCardHandlers` adds tabIndex on top.
+      //
+      // NOT `role: 'button'`, which is what the card version adds: that would stop the
+      // <tr> being a row for a screen reader, losing the column associations that make a
+      // 7-column table readable at all. The gate asserts that too. A focusable row with a
+      // key handler is what a grid row is supposed to be.
+      tabIndex: 0,
       onClick: activate,
       onContextMenu: (e: React.MouseEvent) =>
         openContextMenu(e, buildBookMenu(book), displayTitle(book, t('common.untitled'))),
@@ -5041,7 +5068,9 @@ function App() {
 
   /** The card layout: a div that really is a button, so it says so. */
   function bookCardHandlers(book: Book) {
-    return { role: 'button' as const, tabIndex: 0, ...bookRowHandlers(book) };
+    // tabIndex now comes from bookRowHandlers, which every layout needs; only the ROLE is
+    // specific to the card, where the element really is a button rather than a table row.
+    return { role: 'button' as const, ...bookRowHandlers(book) };
   }
 
   // Open a book we only hold an id for — the title-duplicate warning carries a
@@ -6263,7 +6292,7 @@ function App() {
                   </details>
 
                   <div className="button-group">
-                    <button type="submit" className="primary">{t('detail.saveChanges')}</button>
+                    <button type="submit" className="primary" disabled={isWorking}>{isWorking ? t('common.saving') : t('detail.saveChanges')}</button>
                     <button type="button" className="secondary" onClick={() => setDetailMode('view')}>{t('common.cancel')}</button>
                   </div>
                 </form>
@@ -6339,7 +6368,7 @@ function App() {
                 <label htmlFor="fld-login-password">{t('login.password')}</label>
                 <input id="fld-login-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
               </div>
-              <button type="submit" className="primary">{isWorking ? t('login.signingIn') : t('login.signIn')}</button>
+              <button type="submit" className="primary" disabled={isWorking}>{isWorking ? t('login.signingIn') : t('login.signIn')}</button>
             </form>
           </div>
         </div>
@@ -7182,7 +7211,7 @@ function App() {
                       </details>
 
                       <div className="button-group">
-                        <button type="submit" className="primary">{t('library.add.submit')}</button>
+                        <button type="submit" className="primary" disabled={isWorking}>{isWorking ? t('common.saving') : t('library.add.submit')}</button>
                         <button
                           type="button"
                           className="secondary"
@@ -8197,8 +8226,11 @@ function App() {
                       <input type="checkbox" checked={importDryRun} onChange={(e) => setImportDryRun(e.target.checked)} />
                       {t('import.dryRun')}
                     </label>
-                    <button type="submit" className="primary">
-                      {importDryRun ? t('import.testBtn') : t('import.importBtn')}
+                    {/* Disabled in flight like every other submit in the app: an import is the
+                        longest write here, so it is the one where a second Enter is most
+                        likely and most expensive. */}
+                    <button type="submit" className="primary" disabled={isWorking}>
+                      {isWorking ? t('common.saving') : importDryRun ? t('import.testBtn') : t('import.importBtn')}
                     </button>
                   </form>
                 </div>
@@ -8393,7 +8425,7 @@ function App() {
                           </div>
                         )}
                         <div className="button-group">
-                          <button type="submit" className="primary">{editingCustomFieldId ? t('settings.attrSave') : t('settings.attrAdd')}</button>
+                          <button type="submit" className="primary" disabled={isWorking}>{isWorking ? t('common.saving') : editingCustomFieldId ? t('settings.attrSave') : t('settings.attrAdd')}</button>
                           {editingCustomFieldId && (
                             <button type="button" className="secondary" onClick={resetCustomFieldForm}>{t('common.cancel')}</button>
                           )}
@@ -8563,7 +8595,7 @@ function App() {
                           </div>
                         </div>
                         <p className="muted small" style={{ marginTop: '0.5rem' }}>{t('users.passwordHint')}</p>
-                        <button type="submit" className="primary small" style={{ marginTop: '0.5rem' }}>{t('users.create')}</button>
+                        <button type="submit" className="primary small" style={{ marginTop: '0.5rem' }} disabled={isWorking}>{isWorking ? t('common.saving') : t('users.create')}</button>
                       </form>
                     </details>
                   </div>

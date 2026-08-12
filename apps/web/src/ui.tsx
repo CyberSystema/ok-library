@@ -531,8 +531,18 @@ export function Combobox<T>(props: {
  * — Tab cycles WITHIN the dialog, which is what aria-modal already promises AT
  * users and what Tab did not honour).
  */
-export function Dialog({ onClose, labelledBy, label, className, style, children, initialFocus }: {
+export function Dialog({ onClose, onDismissAttempt, labelledBy, label, className, style, children, initialFocus }: {
   onClose: () => void;
+  /**
+   * Called INSTEAD of `onClose` for the two ways a dialog closes by accident:
+   * Escape, and a click that starts on the backdrop. A dialog holding typed work passes
+   * this and asks before discarding; everything else omits it and keeps the old
+   * behaviour, where a stray Escape is a convenience rather than a loss.
+   *
+   * The explicit Cancel button and the ✕ still call `onClose` directly — the operator
+   * pressed those on purpose, and it is that screen's business whether to confirm.
+   */
+  onDismissAttempt?: () => void;
   /** Id of the heading inside. Preferred over `label` — it names the dialog with its own title. */
   labelledBy?: string;
   label?: string;
@@ -543,11 +553,12 @@ export function Dialog({ onClose, labelledBy, label, className, style, children,
 }) {
   const boxRef = useRef<HTMLDivElement | null>(null);
   useModalFocus(boxRef, initialFocus);
+  const dismiss = onDismissAttempt ?? onClose;
 
   function onKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Escape') {
       e.stopPropagation();
-      onClose();
+      dismiss();
       return;
     }
     trapTab(boxRef.current, e);
@@ -559,7 +570,7 @@ export function Dialog({ onClose, labelledBy, label, className, style, children,
     // itself, so a drag that ends outside the box does not close it.
     <div
       className="modal-overlay"
-      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+      onMouseDown={(e) => { if (e.target === e.currentTarget) dismiss(); }}
       onKeyDown={onKeyDown}
     >
       <div

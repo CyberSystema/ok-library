@@ -122,12 +122,50 @@ export function CopiesEditor({ book, onClose, onSaved }: {
     return (book.items ?? []).filter((i) => !kept.has(i.id)).map((i) => i.id);
   }, [drafts, book.items]);
 
-  // Escape is handled by Dialog; this only guards against losing typed work.
+  /*
+   * DIRTY, not BUSY.
+   *
+   * The comment on this effect said it "guards against losing typed work" and the
+   * listener was attached `if (busy)` — busy meaning a save is already in flight, which
+   * is the one moment when there is nothing left to lose. So the guard was armed for the
+   * wrong instant and unarmed for the whole time it mattered: a librarian could enter ten
+   * copies with their shelf marks, conditions and notes, press Escape or click a
+   * millimetre outside the dialog, and every keystroke went with no prompt at all.
+   *
+   * Dirtiness is DERIVED from the drafts rather than set by a flag, so no future edit
+   * path can forget to raise it — patch, move, remove and addOne all funnel through
+   * `drafts`.
+   */
+  const dirty = useMemo(() => {
+    if (removedIds.length > 0) return true;
+    if (withdrawalReason.trim() !== '') return true;
+    const initial = (book.items ?? []).map(toDraft);
+    if (initial.length !== drafts.length) return true;
+    const strip = (d: Draft) => { const { key, ...rest } = d; return rest; };
+    return JSON.stringify(initial.map(strip)) !== JSON.stringify(drafts.map(strip));
+  }, [drafts, removedIds, withdrawalReason, book.items]);
+
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); };
-    if (busy) window.addEventListener('beforeunload', onBeforeUnload);
+    if (dirty || busy) window.addEventListener('beforeunload', onBeforeUnload);
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
-  }, [busy]);
+  }, [dirty, busy]);
+
+  // Escape and a backdrop click are the two accidental exits, so they ask first — but
+  // only when there is something to lose. With a clean editor, Escape still just closes,
+  // which is what it should do.
+  function requestDismiss() {
+    if (!dirty) { onClose(); return; }
+    void (async () => {
+      const ok = await confirm({
+        title: t('copies.discardTitle'),
+        body: t('copies.discardBody'),
+        confirmLabel: t('copies.discardConfirm'),
+        danger: true
+      });
+      if (ok) onClose();
+    })();
+  }
 
   function patch(key: string, next: Partial<Draft>) {
     setDrafts((prev) => prev.map((d) => (d.key === key ? { ...d, ...next } : d)));
@@ -192,7 +230,7 @@ export function CopiesEditor({ book, onClose, onSaved }: {
   }
 
   return (
-    <Dialog onClose={onClose} labelledBy="copies-editor-title" className="modal wide">
+    <Dialog onClose={onClose} onDismissAttempt={requestDismiss} labelledBy="copies-editor-title" className="modal wide">
       <div className="modal-header">
         <h3 id="copies-editor-title">
           {t('copies.editorTitle', { n: drafts.length })}

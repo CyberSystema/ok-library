@@ -302,11 +302,28 @@ export async function apiRequest<T>(
         // don't keep overriding a possibly-valid cookie with a dead token, and
         // notify the app so it can return to the login screen instead of leaving
         // the user on a stale "logged-in" shell with no data.
-        setAuthToken(null);
-        if (onUnauthorized) {
-          try { onUnauthorized(); } catch { /* ignore handler errors */ }
+        //
+        // ONLY when a token was actually sent. A 401 from the sign-in request itself
+        // means the password was wrong; there is no session to drop and no shell to
+        // return to, and running this branch on the login screen is what made a
+        // mistyped password report an expired session.
+        const hadToken = Boolean(authToken);
+        if (hadToken) {
+          setAuthToken(null);
+          if (onUnauthorized) {
+            try { onUnauthorized(); } catch { /* ignore handler errors */ }
+          }
         }
-        throw new ApiRequestError(401, 'Session expired. Please sign in again.');
+        // KEEP THE SERVER'S MESSAGE. This threw a hardcoded English string for every
+        // 401, discarding what the API actually said — so "Invalid username or
+        // password", which the worker returns and which is the only 401 a librarian
+        // sees regularly, was replaced by an untranslated sentence about a session
+        // that had not expired. The generic text is still the fallback for a 401 with
+        // no body, and it is the one case where the app genuinely does not know more.
+        throw new ApiRequestError(
+          401,
+          errorBody.error ?? (hadToken ? 'Session expired. Please sign in again.' : 'Unauthorized')
+        );
       }
 
       const message = errorBody.requestId

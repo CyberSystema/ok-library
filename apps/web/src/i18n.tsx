@@ -52,6 +52,7 @@ const en: Dict = {
   'login.welcome': "Welcome {username}. You're signed in.",
   'login.signedOut': 'Signed out.',
   'login.sessionExpired': 'Session expired. Please sign in again.',
+  'login.badCredentials': 'Wrong username or password.',
 
   // Tabs
   'tab.dashboard': 'Overview',
@@ -117,6 +118,9 @@ const en: Dict = {
   'copies.moveDown': 'Move this copy later',
   'copies.withdraw': 'Withdraw',
   'copies.withdrawTitle': 'Withdraw this copy?',
+  'copies.discardTitle': 'Discard the copies you entered?',
+  'copies.discardBody': 'The changes to the copies of this record have not been saved. Closing now loses them.',
+  'copies.discardConfirm': 'Discard changes',
   'copies.withdrawBody': 'Copy {n} leaves the collection when you save. The record and its other copies stay. Withdrawals are counted in the ISO 2789 return.',
   'copies.lastCopy': 'A record must keep at least one copy. To remove the whole record, delete it — it goes to the trash and can be brought back.',
   'copies.onLoan': 'This copy is on loan. Take it back first.',
@@ -1165,6 +1169,7 @@ const ko: Dict = {
   'login.welcome': '환영합니다 {username}님. 로그인되었습니다.',
   'login.signedOut': '로그아웃되었습니다.',
   'login.sessionExpired': '세션이 만료되었습니다. 다시 로그인해 주세요.',
+  'login.badCredentials': '사용자 이름 또는 비밀번호가 올바르지 않습니다.',
 
   'tab.dashboard': '개요',
   'tab.books': '도서관',
@@ -1228,6 +1233,9 @@ const ko: Dict = {
   'copies.moveDown': '아래로 옮기기',
   'copies.withdraw': '제적',
   'copies.withdrawTitle': '이 소장본을 제적할까요?',
+  'copies.discardTitle': '입력한 사본을 버리시겠습니까?',
+  'copies.discardBody': '이 자료의 사본 변경 사항이 저장되지 않았습니다. 지금 닫으면 사라집니다.',
+  'copies.discardConfirm': '변경 사항 버리기',
   'copies.withdrawBody': '저장하면 {n}번 소장본이 장서에서 빠집니다. 서지 레코드와 다른 소장본은 그대로 남습니다. 제적은 ISO 2789 통계에 집계됩니다.',
   'copies.lastCopy': '레코드에는 소장본이 최소 한 권 남아 있어야 합니다. 레코드 전체를 없애려면 삭제하세요 — 휴지통으로 가며 되살릴 수 있습니다.',
   'copies.onLoan': '대출 중인 소장본입니다. 먼저 반납 처리하세요.',
@@ -2267,6 +2275,7 @@ const ru: Dict = {
   'login.welcome': 'Добро пожаловать, {username}. Вы вошли в систему.',
   'login.signedOut': 'Вы вышли из системы.',
   'login.sessionExpired': 'Сессия истекла. Войдите снова.',
+  'login.badCredentials': 'Неверное имя пользователя или пароль.',
 
   'tab.dashboard': 'Обзор',
   'tab.books': 'Библиотека',
@@ -2330,6 +2339,9 @@ const ru: Dict = {
   'copies.moveDown': 'Переместить ниже',
   'copies.withdraw': 'Списать',
   'copies.withdrawTitle': 'Списать этот экземпляр?',
+  'copies.discardTitle': 'Отменить введённые экземпляры?',
+  'copies.discardBody': 'Изменения экземпляров этой записи не сохранены. Если закрыть сейчас, они будут потеряны.',
+  'copies.discardConfirm': 'Отменить изменения',
   'copies.withdrawBody': 'Экземпляр {n} выйдет из фонда при сохранении. Запись и остальные экземпляры сохранятся. Списания учитываются в отчёте ISO 2789.',
   'copies.lastCopy': 'У записи должен остаться хотя бы один экземпляр. Чтобы убрать всю запись, удалите её — она попадёт в корзину, откуда её можно вернуть.',
   'copies.onLoan': 'Экземпляр выдан. Сначала примите его обратно.',
@@ -3374,6 +3386,7 @@ const el: Dict = {
   'login.welcome': 'Καλώς ήρθατε {username}. Συνδεθήκατε.',
   'login.signedOut': 'Αποσυνδεθήκατε.',
   'login.sessionExpired': 'Η συνεδρία έληξε. Συνδεθείτε ξανά.',
+  'login.badCredentials': 'Λανθασμένο όνομα χρήστη ή κωδικός.',
 
   'tab.dashboard': 'Επισκόπηση',
   'tab.books': 'Βιβλιοθήκη',
@@ -3437,6 +3450,9 @@ const el: Dict = {
   'copies.moveDown': 'Μετακίνηση πιο κάτω',
   'copies.withdraw': 'Απόσυρση',
   'copies.withdrawTitle': 'Απόσυρση αυτού του αντιτύπου;',
+  'copies.discardTitle': 'Να απορριφθούν τα αντίτυπα που καταχωρίσατε;',
+  'copies.discardBody': 'Οι αλλαγές στα αντίτυπα αυτής της εγγραφής δεν έχουν αποθηκευτεί. Αν κλείσετε τώρα, θα χαθούν.',
+  'copies.discardConfirm': 'Απόρριψη αλλαγών',
   'copies.withdrawBody': 'Το αντίτυπο {n} φεύγει από τη συλλογή με την αποθήκευση. Η εγγραφή και τα άλλα αντίτυπα παραμένουν. Οι αποσύρσεις καταγράφονται στη στατιστική ISO 2789.',
   'copies.lastCopy': 'Κάθε εγγραφή πρέπει να διατηρεί τουλάχιστον ένα αντίτυπο. Για να αφαιρέσετε ολόκληρη την εγγραφή, διαγράψτε την — πηγαίνει στον κάδο και μπορεί να επανέλθει.',
   // παραλαμβάνω is what the *reader* does when collecting a hold (see
