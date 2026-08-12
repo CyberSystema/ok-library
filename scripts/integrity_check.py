@@ -2952,6 +2952,67 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 84. REGRESSION: nothing may be drawn outside the thing that contains it ===")
+
+# Reported from the desk: "Nothing should go out of the boundaries. If one line is not
+# enough, it should auto-break to the next line." The mechanism behind every instance was
+# the same pair of properties — `white-space: nowrap` with no width ceiling, which does not
+# mean "keep this on one line", it means "leave the container rather than break".
+#
+# Three defects came from it in one day: the Handbook contents rail chopped Greek chapter
+# names at the rail's edge; the Handbook's cross-reference block, a <button> holding a whole
+# sentence under the GLOBAL button nowrap, ran out past the prose column; and the legacy
+# accession chip hung 29px outside a book card at 400px, on a column that allows 64
+# characters.
+_css84 = _slurp(_REPO, "apps", "web", "src", "styles.css")
+_code84 = re.sub(r"/\*[\s\S]*?\*/", "", _css84)
+
+# The global button rule must NOT force nowrap — a button label is translated text — and it
+# must carry a ceiling so no button can ever be wider than its container.
+_btn84 = re.search(r"(?m)^button\s*\{([^}]*)\}", _code84)
+check("the global button rule exists", _btn84 is not None, None)
+if _btn84:
+    check("and does not force every button onto one line",
+          "white-space: nowrap" not in _btn84.group(1), _btn84.group(1)[:90])
+    check("and caps every button at its container's width",
+          "max-width: 100%" in _btn84.group(1), _btn84.group(1)[:90])
+
+# Every rule that DOES ask for nowrap has to bound its width too. Selectors may span several
+# lines, which is why the pattern allows newlines before the brace — a first version of this
+# check required a single-line selector and silently passed a multi-line one.
+_bounded84 = set()
+for _m in re.finditer(r"([^{}]+)\{([^}]*)\}", _code84):
+    if any(k in _m.group(2) for k in ("max-width", "text-overflow", "overflow: hidden")):
+        for _sel in _m.group(1).split(","):
+            _bounded84.add(" ".join(_sel.split()))
+# Two documented exceptions, both contained by something other than their own width.
+_ALLOW84 = {
+    ".simple-tabs .tab-btn",  # the strip is a horizontal scroller; a wrapped tab would put
+                              # the active underline in mid-air
+    ".sr-only",               # clipped to 1px on purpose; it is never painted
+    ".tab-btn",
+    ".ctx-item",              # bounded by its CHILD, which this check cannot see:
+                              # `.ctx-menu` is max-width 320px, `.ctx-item` is width 100% of
+                              # it, and `.ctx-label` inside carries the ellipsis. Verified,
+                              # not assumed.
+}
+_unbounded84 = []
+for _m in re.finditer(r"([^{}]+)\{([^}]*white-space:\s*nowrap[^}]*)\}", _code84):
+    for _sel in _m.group(1).split(","):
+        _sel = " ".join(_sel.split())
+        if not _sel or _sel.startswith("@") or _sel in _ALLOW84:
+            continue
+        if _sel not in _bounded84:
+            _unbounded84.append(_sel[:60])
+check("every nowrap element is bounded by a width or an ellipsis",
+      not _unbounded84, sorted(set(_unbounded84)))
+
+# And the two specific renderers that overflowed, so a future edit cannot quietly undo them.
+check("the Handbook cross-reference link wraps like the prose around it",
+      re.search(r"\.link-button\s*\{[^}]*white-space:\s*normal", _code84, re.S) is not None, None)
+check("and the Handbook contents rail wraps its chapter names",
+      re.search(r"\.hb-contents-link\s*\{[^}]*white-space:\s*normal", _code84, re.S) is not None, None)
+
 print("=== 83. REGRESSION: a scroll lock lives as long as the thing it locks for ===")
 
 # `useModalFocus` sets `document.body.style.overflow = 'hidden'` for as long as it is

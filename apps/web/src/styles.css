@@ -143,6 +143,29 @@ h3 { font-size: 1.0625rem; }
 h4 { font-size: 0.9375rem; }
 p { margin: 0; }
 
+/*
+ * A BUTTON WRAPS RATHER THAN LEAVING ITS CONTAINER.
+ *
+ * This rule used to set `white-space: nowrap` for every button in the app. The intent was
+ * good — stop a short label like "Add Book" breaking into two lines in a narrow column —
+ * but the cost is that any button whose label is longer than its container escapes the
+ * container instead, and three separate defects today traced back to exactly that:
+ *
+ *   - the Handbook contents rail chopped Greek chapter names in half at the rail's edge;
+ *   - the Handbook's cross-reference block (a button holding a whole sentence) ran out past
+ *     the right edge of the prose column;
+ *   - the tab strip needed its own scroll container to contain the overflow.
+ *
+ * Between the two failure modes, wrapping is always the better one: a label on two lines is
+ * legible, a label outside its box is not, and on a screen holding 12,700 records there is
+ * no room for anything to sit on top of anything else. `max-width: 100%` is the guarantee —
+ * no button, whatever its content, can be wider than what contains it — and
+ * `overflow-wrap: break-word` handles the pathological case of one unbroken token longer
+ * than the box, such as a 64-character legacy accession number.
+ *
+ * Where a specific button genuinely must stay on one line, it says so locally: see
+ * `.tab-btn` (which scrolls instead) and `.shelf-badge`'s code span.
+ */
 button {
   cursor: pointer;
   font-family: inherit;
@@ -152,7 +175,8 @@ button {
   border-radius: var(--radius-sm);
   padding: 0.5rem 1rem;
   transition: all 0.15s ease;
-  white-space: nowrap;
+  max-width: 100%;
+  overflow-wrap: break-word;
 }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button:not(:disabled):hover { opacity: 0.88; }
@@ -430,6 +454,34 @@ label {
   border-right: 1px solid var(--border);
 }
 
+/*
+ * NOWRAP IS ONLY SAFE WITH A CEILING.
+ *
+ * `white-space: nowrap` says "do not break this line", and with no width limit that becomes
+ * "leave the container instead". Every element below holds TRANSLATED text — status and
+ * shelf badges, merge-table headers, the download call to action, the column picker — so
+ * its width is whatever Greek, Russian or Korean makes it, and three defects today came
+ * from exactly this pair of properties without a third.
+ *
+ * The ceiling plus an ellipsis keeps the line unbroken (which is why nowrap was wanted: a
+ * shelf mark or a status split across two lines is harder to read) while making the
+ * overflow visible and contained rather than silently escaping. The gate asserts the rule
+ * generally — see §84 — with `.simple-tabs .tab-btn` and `.sr-only` as the two documented
+ * exceptions, both of which are contained by something else.
+ */
+.shelf-badge,
+.status-badge,
+.audit-time,
+.merge-table th,
+.btn-download,
+.desktop-download-other,
+.column-picker-toggle,
+.isbn-row > button {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ================== TABS ================== */
 /*
  * The tab strip SCROLLS AT EVERY WIDTH, not only on phones.
@@ -507,7 +559,9 @@ label {
 .simple-tabs .tab-btn:focus-visible { outline-offset: -3px; }
 /* Never let a tab be squeezed narrower than its label — the label is already nowrap,
    so shrinking only produced sub-pixel jitter while the row overflowed anyway. */
-.simple-tabs .tab-btn { flex: 0 0 auto; }
+/* The strip SCROLLS, so its tabs are the one place that still wants nowrap: a wrapped tab
+   label would make the active underline sit in mid-air (see the note on `.simple-tabs`). */
+.simple-tabs .tab-btn { flex: 0 0 auto; white-space: nowrap; }
 .tab-btn {
   background: transparent;
   border: none;
@@ -724,6 +778,16 @@ label {
   letter-spacing: 0.04em;
 }
 .book-card-meta { display: flex; gap: 0.375rem; flex-wrap: wrap; }
+/*
+ * A chip may not leave its row.
+ *
+ * `white-space: nowrap` with no width ceiling meant a chip holding a long token escaped
+ * `.book-card-meta` — measured at a 400px viewport, the legacy accession chip
+ * "ZZ-DATE-CC4DA8BF5E" hung 29px outside the card's meta row, and `legacy_id` is a 64-char
+ * column, so a real one can be far worse. nowrap is right for a chip (an identifier broken
+ * across two lines is harder to read than a truncated one), so a ceiling and an ellipsis
+ * are what make it safe; the JSX carries a `title` so the full value stays available.
+ */
 .meta-chip {
   font-size: 0.6875rem;
   font-weight: 600;
@@ -733,6 +797,9 @@ label {
   color: var(--text-muted);
   border: 1px solid var(--border);
   white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .book-card-status { flex-shrink: 0; margin-top: 0.125rem; }
 
@@ -3417,6 +3484,26 @@ mark.hl {
 .hb-fields thead th { background: var(--surface-2, var(--bg)); }
 .hb-fieldkey { display: block; font-size: 0.75rem; color: var(--text-muted); font-weight: 400; }
 .hb-see { margin: 0 0 1rem; }
+/*
+ * `.link-button` is a button that means "go here", and it had no rule at all outside the
+ * print block — so it inherited the global button's padding, radius and background and
+ * rendered a whole sentence as a wide grey slab. The print block's three `!important`
+ * overrides existed precisely to undo that on paper, which is the tell.
+ *
+ * It reads as a link now: no chrome, accent colour, underlined on hover, aligned with the
+ * prose around it, and it wraps like the paragraph it sits in.
+ */
+.link-button {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  text-align: start;
+  white-space: normal;
+  cursor: pointer;
+}
+.link-button:hover { text-decoration: underline; }
 .hb-chapter-nav {
   display: flex;
   justify-content: space-between;

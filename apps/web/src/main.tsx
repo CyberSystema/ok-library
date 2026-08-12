@@ -7923,7 +7923,9 @@ function App() {
                                       ? <span className="meta-chip is-warn" title={t('detail.isbnBadTitle')}>ISBN ⚠</span>
                                       : <span className="meta-chip">ISBN</span>
                                   )}
-                                  {book.legacyId && <span className="meta-chip mono">{book.legacyId}</span>}
+                                  {/* `title`, because the chip now ellipsises: a 64-character accession
+                                      number would otherwise be unreadable AND unrecoverable. */}
+                                  {book.legacyId && <span className="meta-chip mono" title={book.legacyId}>{book.legacyId}</span>}
                                   {/*
                                     * HOW MANY COPIES. A record held in ten places looked exactly
                                     * like a record held in one: a single shelf badge, a single
