@@ -557,6 +557,15 @@ label {
   gap: 0.25rem;
 }
 .stat-box-label { font-size: 0.7rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.07em; }
+/* The scope caption under a tile whose number is not filtered. Small and muted: it is a
+   qualification, not a third line of data. */
+.stat-box-scope {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  line-height: 1.2;
+}
 .stat-box-value { font-size: 1.875rem; font-weight: 700; line-height: 1; color: var(--text); }
 .stat-box.accent .stat-box-value { color: var(--accent); }
 .stat-box.success .stat-box-value { color: var(--success); }
@@ -729,14 +738,37 @@ label {
 
 /* Right-side stack: shelf badge on top (most useful number on the card),
    status badge below it. Always 110px wide so it forms a clean column. */
+/*
+ * THE BADGES GIVE WAY, NOT THE TITLE.
+ *
+ * `flex-shrink: 0` with `min-width: 110px` meant this column took its 110px first and the
+ * title got whatever was left. On a single-column grid at a narrow width that left the
+ * title roughly 136px for a two-line clamp — and a Greek title in caps, which is most of
+ * this catalogue, is unreadable in 136px x 2 lines. The card also had no tooltip anywhere,
+ * so the hidden half was unrecoverable.
+ *
+ * Inverted: the column may shrink, is capped at 45% of the card, and the badges inside it
+ * ellipsise instead of forcing width. A shelf code is short and stays whole in practice;
+ * the point is that when something must give, it is the badge and not the record's name.
+ */
 .book-card-side {
-  flex-shrink: 0;
+  flex-shrink: 1;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 0.5rem;
-  min-width: 110px;
+  min-width: 0;
+  max-width: 45%;
 }
+.book-card-side .shelf-badge,
+.book-card-side .status-badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Three lines rather than two: the extra line costs 20px and buys the part of a long
+   Greek title that actually distinguishes it from its neighbour. */
+.book-card-title { -webkit-line-clamp: 3; }
 
 /* Shelf badge: monospace, color-coded, big enough to read across the room.
    This is the field a librarian needs every minute, so it gets the strongest
@@ -1207,6 +1239,46 @@ label {
 .book-table tbody tr.is-selected td { background: var(--accent-light); }
 .book-table tbody tr.is-selecting { cursor: copy; }
 .book-table .col-select, .book-table .col-status { width: 1%; }
+/*
+ * FREEZE THE COLUMN THAT SAYS WHICH BOOK THIS IS.
+ *
+ * The default column set is 16 wide — roughly 2,480px of minWidths — inside a scroller
+ * that is 726px at a typical laptop width. So a librarian checking a copy's condition
+ * against its shelf mark scrolls right until the title is off-screen and then has no idea
+ * which of 12,700 records the row belongs to. Freezing the title keeps the row
+ * identifiable at every scroll position, which is the whole reason the table view exists.
+ *
+ * The header cell needs the higher z-index: it is sticky in BOTH axes (the thead is
+ * already sticky vertically), and it has to stay above the body cells of its own column
+ * as well as above the other headers. Opaque backgrounds on both, or the text of the
+ * columns sliding underneath shows through.
+ */
+.book-table .col-sticky {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  /* Opaque, or the columns sliding underneath show through the frozen one.
+     DELIBERATELY the weakest of the cell backgrounds: `tr:hover td` (0,2,3),
+     `tr.is-selected td` (0,2,3) and `.show-gaps td.cell-empty` (0,3,1) all outrank this
+     (0,2,0), so the frozen cell keeps following its row's hover, selection and
+     missing-value states instead of sitting there in the default colour while the rest of
+     the row highlights. Do not raise this selector's specificity to "fix" it. */
+  background: var(--surface);
+}
+.book-table thead .col-sticky {
+  z-index: 3;
+  background: var(--surface-2);
+}
+/* A hairline so the frozen column reads as pinned rather than as overlapping text. */
+.book-table .col-sticky::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 1px;
+  background: var(--border);
+}
 .book-table .col-select { padding-right: 0; }
 
 /* Empty cells read as a deliberate gap rather than as blank space — this is the

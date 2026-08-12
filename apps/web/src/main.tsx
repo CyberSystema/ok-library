@@ -1437,6 +1437,28 @@ function App() {
     roomSummary.reduce((sum, room) => sum + Number(room.borrowed_books ?? 0), 0) + Number(unassignedSummary.borrowedBooks ?? 0);
   const availableBooksDisplay = fmt(availableBooksFromSummary);
   const borrowedBooksDisplay = fmt(borrowedBooksFromSummary);
+  /*
+   * THE FOUR TILES DO NOT COUNT THE SAME THING.
+   *
+   * "Total books" is `response.total` — the FILTERED count, which is the point of it. But
+   * Available and Borrowed are summed from /api/rooms/summary and Overdue from the active
+   * loans, and none of those three takes a filter parameter. So searching for "Χρυσόστομος"
+   * gave a row reading 41 / 13.006 / 3 / 0: one number about the search beside three about
+   * the whole catalogue, with nothing to say so. A librarian reading it left to right
+   * concludes 41 books of which 13.006 are available.
+   *
+   * The three keep their meaning and are labelled with it. Deriving them from the filtered
+   * query instead would be the richer fix, but it needs a status facet per keystroke, and
+   * saying plainly what a number counts is worth more than making it agree.
+   */
+  const filtersActive = Boolean(
+    q || qExclude || status || filterLanguage || filterYear
+    // `facetField` is deliberately NOT here: it is which field the category rail is
+    // BROWSING and it always has a value (it defaults to custom:category_code), so
+    // including it made every tile carry the caption on a completely unfiltered page.
+    // Only a chosen bucket narrows the list.
+    || facetValue || facetEmpty || needsReviewFilter || shelfFilter || smartListKey
+  );
   const overdueCount = activeBorrows.filter((item) => item.isOverdue).length;
   const dueSoonCount = activeBorrows.filter((item) => {
     if (item.isOverdue) {
@@ -6748,10 +6770,12 @@ function App() {
                   <div className="stat-box success">
                     <span className="stat-box-label">{t('status.available')}</span>
                     <span className="stat-box-value">{availableBooksDisplay}</span>
+                    {filtersActive && <span className="stat-box-scope">{t('library.wholeCatalogue')}</span>}
                   </div>
                   <div className="stat-box warning">
                     <span className="stat-box-label">{t('status.borrowed')}</span>
                     <span className="stat-box-value">{borrowedBooksDisplay}</span>
+                    {filtersActive && <span className="stat-box-scope">{t('library.wholeCatalogue')}</span>}
                   </div>
                   {/* Overdue is derived from active-loan data, which only
                       circulation users can load — hide it for viewers rather
@@ -6760,6 +6784,7 @@ function App() {
                     <div className="stat-box danger">
                       <span className="stat-box-label">{t('library.overdue')}</span>
                       <span className="stat-box-value">{overdueCount}</span>
+                      {filtersActive && <span className="stat-box-scope">{t('library.wholeCatalogue')}</span>}
                     </div>
                   )}
                 </div>
@@ -7698,7 +7723,15 @@ function App() {
                                 {canWrite && selectionMode && <th className="col-select" scope="col"><span className="sr-only">{t('library.select.start')}</span></th>}
                                 <th className="col-status" scope="col">{t('detail.statusRow')}</th>
                                 {visibleTableColumns.map((col) => (
-                                  <th key={col.key} scope="col" style={col.width ? { minWidth: col.width } : undefined}>
+                                  <th
+                                    key={col.key}
+                                    scope="col"
+                                    /* The title column is frozen: with 16 columns in a
+                                       726px scroller, scrolling right to read a copy's
+                                       condition otherwise leaves the row unidentifiable. */
+                                    className={col.key === 'title' ? 'col-sticky' : undefined}
+                                    style={col.width ? { minWidth: col.width } : undefined}
+                                  >
                                     {col.label}
                                   </th>
                                 ))}
@@ -7741,7 +7774,10 @@ function App() {
                                       return (
                                         <td
                                           key={col.key}
-                                          className={empty ? 'cell-empty' : undefined}
+                                          className={[
+                                            empty ? 'cell-empty' : '',
+                                            col.key === 'title' ? 'col-sticky' : ''
+                                          ].filter(Boolean).join(' ') || undefined}
                                           title={empty ? undefined : display}
                                         >
                                           {empty ? <><span className="sr-only">{t('library.table.missing')}</span><span aria-hidden="true">—</span></> : display}
