@@ -84,10 +84,26 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
 export class ApiRequestError extends Error {
   status: number;
 
-  constructor(status: number, message: string) {
+  /**
+   * The API's own machine-readable reason, when it sends one.
+   *
+   * A status alone is not always enough: `PUT /api/books/:id/items` answers 409 for a stale
+   * version, a duplicate barcode, a copy on loan, a copy on the hold shelf and the last
+   * remaining copy, and only the first means "reload and try again". The alternative is
+   * matching the server's English sentence, in an app that runs in four languages.
+   */
+  code?: string;
+
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
   }
+}
+
+/** Whether this failure means someone else changed the record first. */
+export function isVersionConflict(error: unknown): boolean {
+  return error instanceof ApiRequestError && error.status === 409 && error.code === 'version_conflict';
 }
 
 /**
@@ -291,7 +307,7 @@ export async function apiRequest<T>(
       const responseText = await response.text();
       const errorBody = (() => {
         try {
-          return JSON.parse(responseText) as { error?: string; requestId?: string };
+          return JSON.parse(responseText) as { error?: string; requestId?: string; code?: string };
         } catch {
           return { error: response.statusText };
         }
@@ -329,7 +345,7 @@ export async function apiRequest<T>(
       const message = errorBody.requestId
         ? `${errorBody.error ?? `Request failed with status ${response.status}`} (ref: ${errorBody.requestId})`
         : (errorBody.error ?? `Request failed with status ${response.status}`);
-      throw new ApiRequestError(response.status, message);
+      throw new ApiRequestError(response.status, message, errorBody.code);
     }
 
     if (raw) {

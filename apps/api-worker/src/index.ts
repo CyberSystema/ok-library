@@ -508,7 +508,20 @@ app.use('*', async (c, next) => {
 
 app.onError((error, c) => {
 	if (error instanceof HTTPException) {
-		return c.json({ error: error.message }, error.status);
+		/*
+		 * A route may attach a machine-readable `code` through `cause`, and it is carried into
+		 * the body here.
+		 *
+		 * Some routes answer the same status for several unrelated reasons — the two replace
+		 * endpoints return 409 for a stale version, a duplicate barcode, a copy on loan, a copy
+		 * on the hold shelf and the last remaining copy — and a client that must act
+		 * differently for one of them has otherwise only the English sentence to go on, in an
+		 * app whose interface runs in four languages. The message stays exactly as it was, so
+		 * nothing that reads it is affected.
+		 */
+		const cause = error.cause as { code?: string } | undefined;
+		const code = cause && typeof cause.code === 'string' ? cause.code : undefined;
+		return c.json(code ? { error: error.message, code } : { error: error.message }, error.status);
 	}
 
 	// Input validation failures are CLIENT errors (400), not server errors.
@@ -4561,7 +4574,18 @@ app.put('/api/books/:id/serial-holdings', requirePermission('books.write', { lib
 
 	const payload = ReplaceSerialHoldingsSchema.parse(await c.req.json());
 	if (payload.expectedVersion !== undefined && payload.expectedVersion !== book.version) {
-		throw new HTTPException(409, { message: 'Book was modified by someone else' });
+		/*
+		 * A machine-readable code, not just a sentence. A replace route answers 409 for several
+		 * different reasons — a stale version, a barcode already in use, a copy on loan, a copy
+		 * on the hold shelf, the last remaining copy — and only ONE of them means "reload and
+		 * try again". The client has to tell them apart to know whether reloading is the right
+		 * response, and matching the server's English prose from a UI that runs in four
+		 * languages is how that kind of check quietly stops working.
+		 */
+		throw new HTTPException(409, {
+			message: 'Book was modified by someone else',
+			cause: { code: 'version_conflict' }
+		});
 	}
 
 	const existing = await loadSerialHoldings(c.env, id);
@@ -4634,7 +4658,18 @@ app.put('/api/books/:id/items', requirePermission('books.write', { librarian: tr
 
 	const payload = ReplaceItemsSchema.parse(await c.req.json());
 	if (payload.expectedVersion !== undefined && payload.expectedVersion !== book.version) {
-		throw new HTTPException(409, { message: 'Book was modified by someone else' });
+		/*
+		 * A machine-readable code, not just a sentence. A replace route answers 409 for several
+		 * different reasons — a stale version, a barcode already in use, a copy on loan, a copy
+		 * on the hold shelf, the last remaining copy — and only ONE of them means "reload and
+		 * try again". The client has to tell them apart to know whether reloading is the right
+		 * response, and matching the server's English prose from a UI that runs in four
+		 * languages is how that kind of check quietly stops working.
+		 */
+		throw new HTTPException(409, {
+			message: 'Book was modified by someone else',
+			cause: { code: 'version_conflict' }
+		});
 	}
 
 	const existing = await loadBookItems(c.env, id);
@@ -4796,11 +4831,10 @@ app.put('/api/books/:id/items', requirePermission('books.write', { librarian: tr
 		}
 	});
 
-	statements.push(
-		c.env.DB.prepare('UPDATE books SET updated_at = ?, version = version + 1 WHERE id = ?').bind(now, id)
-	);
 	await runAtomic(c.env, statements);
-	// The record's own shelf/room/status are derived from its copies.
+	// The record's own shelf/room/status are derived from its copies — and syncBookFromItems
+	// moves updated_at and version, which is why this route no longer bumps them itself. It
+	// did, and add-copies did not; centralising it there is what closed that gap.
 	await syncBookFromItems(c.env, id);
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.items.replace', 'book', id, {

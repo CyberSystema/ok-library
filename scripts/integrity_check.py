@@ -5538,6 +5538,105 @@ if LOCAL:
                   not _orphans88, _orphans88)
 
 
+print()
+print("=== 89. REGRESSION: changing a record's copies must move the record's version ===")
+
+# `books.version` is the optimistic-concurrency token for the WHOLE record, and the copies editor
+# sends it as `expectedVersion`. add-copies inserted rows into `items` and left the version alone,
+# so:
+#
+#   A opens the copies editor on a book with one copy, at version 5.
+#   B adds a second copy with the bulk action. The copies changed; version is still 5.
+#   A saves. expectedVersion 5 matches, the guard passes, and A's list — which has never heard
+#   of copy 2 — WITHDRAWS it.
+#
+# Reproduced against a real record: one copy left, 200 OK, no warning. The guard was present and
+# it agreed to the overwrite, because nothing had told it the record moved.
+#
+# Bumped inside syncBookFromItems, which is the hook every path that changes a record's copies
+# already calls. There were three call sites and one of them was wrong; centralising means the
+# next path that moves a copy inherits it.
+_db89 = _slurp(_REPO, "apps", "api-worker", "src", "db.ts")
+_sync89 = _db89[_db89.index("export async function syncBookFromItems"):][:2600]
+check("syncBookFromItems moves the record's version", "version = version + 1" in _sync89, None)
+check("and its updated_at, which is the sync cursor offline clients read",
+      "updated_at = ?" in _sync89, None)
+
+if LOCAL:
+    _b89, _ = mkbook(title=f"ZZ Copies Version {uuid.uuid4().hex[:6]}", author="Δ. Δοκιμή")
+    _before89 = get(_b89) or {}
+    _v89 = _before89.get("version")
+    st, _items89 = call("GET", f"/api/books/{_b89}/items")
+    _copies89 = (_items89 or {}).get("items") or []
+    check("the new record has its primary copy", len(_copies89) == 1, len(_copies89))
+
+    st, _ = call("POST", "/api/items/add-copies", {"bookIds": [_b89], "copies": 1})
+    check("a colleague can add a copy", st == 200, st)
+    _after89 = get(_b89) or {}
+    check("and that moved the record's version",
+          _after89.get("version") != _v89, (_v89, _after89.get("version")))
+    check("and its updated_at",
+          _after89.get("updatedAt") != _before89.get("updatedAt"),
+          (_before89.get("updatedAt"), _after89.get("updatedAt")))
+
+    # The save that used to destroy the new copy.
+    _stale89 = {"expectedVersion": _v89,
+                "items": [{"id": c["id"], "copyNumber": c["copyNumber"], "status": c.get("status", "available")}
+                          for c in _copies89]}
+    st, _res89 = call("PUT", f"/api/books/{_b89}/items", _stale89)
+    check("a save carrying the version the editor was opened at is refused", st == 409, st)
+    check("and it says WHY in a way a client can act on, not just in English",
+          (_res89 or {}).get("code") == "version_conflict", _res89)
+    st, _items89b = call("GET", f"/api/books/{_b89}/items")
+    check("the colleague's copy is still there",
+          len((_items89b or {}).get("items") or []) == 2,
+          len((_items89b or {}).get("items") or []))
+
+    # The other 409s on this route must NOT carry that code, or the client reloads for the
+    # wrong reason and quietly discards what the librarian typed.
+    _live89 = (_items89b or {}).get("items") or []
+    _fresh89 = get(_b89) or {}
+    st, _res89c = call("PUT", f"/api/books/{_b89}/items", {
+        "expectedVersion": _fresh89.get("version"),
+        "items": [{"id": _live89[0]["id"], "copyNumber": 1, "status": "available", "barcode": "ZZDUPE-89"},
+                  {"copyNumber": 2, "status": "available", "barcode": "ZZDUPE-89"}]
+    })
+    check("a duplicate barcode is still a 409", st == 409, st)
+    check("but is NOT flagged as a version conflict",
+          (_res89c or {}).get("code") is None, _res89c)
+
+    # And the honest retry works, or the fix has only moved the dead end.
+    st, _res89d = call("PUT", f"/api/books/{_b89}/items", {
+        "expectedVersion": _fresh89.get("version"),
+        "items": [{"id": c["id"], "copyNumber": c["copyNumber"], "status": "available", "shelfCode": "07-001"}
+                  for c in _live89]
+    })
+    check("a save carrying the current version succeeds", st == 200, st)
+    st, _items89e = call("GET", f"/api/books/{_b89}/items")
+    check("and both copies kept their new shelf mark",
+          all(c.get("shelfCode") == "07-001" for c in ((_items89e or {}).get("items") or [])),
+          [(c.get("copyNumber"), c.get("shelfCode")) for c in ((_items89e or {}).get("items") or [])])
+    call("DELETE", f"/api/books/{_b89}")
+    call("DELETE", f"/api/books/{_b89}/purge")
+
+# The client half: the editor must be able to recover, or a conflict is a dead end that costs
+# the librarian everything they typed — the exact loss the open dialog exists to prevent.
+_cop89 = _slurp(_REPO, "apps", "web", "src", "screens", "copies.tsx")
+check("the copies editor holds the server version in state, not off the prop",
+      "const [serverVersion, setServerVersion]" in _cop89
+      and "expectedVersion: serverVersion" in _cop89, None)
+check("and reloads into the current copies on a version conflict",
+      "isVersionConflict(e)" in _cop89 and "setServerItems(fresh.items" in _cop89, None)
+check("keeping the copies the librarian added that were never saved",
+      "drafts.filter((d) => !d.id)" in _cop89, None)
+check("and saying so, rather than leaving them to notice",
+      "copies.reloadedAfterConflict" in _cop89, None)
+_api89 = _slurp(_REPO, "apps", "web", "src", "api.ts")
+check("the machine-readable code survives the trip to the client",
+      "code?: string" in _api89 and "errorBody.code" in _api89
+      and "export function isVersionConflict" in _api89, None)
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

@@ -23,7 +23,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { ITEM_TYPES } from '@ok-library/shared';
 import type { Book, Item } from '../types';
-import { apiRequest } from '../api';
+import { apiRequest, isVersionConflict } from '../api';
 import { useT } from '../i18n';
 import { Dialog, endOfLocalDayIso, isoToLocalDateInput, useConfirm, useToast } from '../ui';
 import { HelpLink } from '../handbook/context';
@@ -111,6 +111,17 @@ export function CopiesEditor({ book, onClose, onSaved }: {
   const t = useT();
   const toast = useToast();
   const confirm = useConfirm();
+  /*
+   * The server's copies AND version, held here rather than read from the `book` prop.
+   *
+   * They were read straight off the prop, so a version conflict was a dead end: the dialog
+   * stayed open (right — nothing typed should be lost) holding the same stale version, so every
+   * further Save could only 409 again. The only way out was to close the editor, losing the
+   * work the open dialog existed to protect. Now a conflict reloads into these.
+   */
+  const [serverItems, setServerItems] = useState<Book['items']>(book.items ?? []);
+  const [serverVersion, setServerVersion] = useState(book.version);
+  const [reloadedNote, setReloadedNote] = useState(false);
   const [drafts, setDrafts] = useState<Draft[]>(() => (book.items ?? []).map(toDraft));
   const [busy, setBusy] = useState(false);
   // Removing a copy is a WITHDRAWAL in ISO 2789 terms, so the reason travels
@@ -119,8 +130,8 @@ export function CopiesEditor({ book, onClose, onSaved }: {
 
   const removedIds = useMemo(() => {
     const kept = new Set(drafts.map((d) => d.id).filter(Boolean));
-    return (book.items ?? []).filter((i) => !kept.has(i.id)).map((i) => i.id);
-  }, [drafts, book.items]);
+    return (serverItems ?? []).filter((i) => !kept.has(i.id)).map((i) => i.id);
+  }, [drafts, serverItems]);
 
   /*
    * DIRTY, not BUSY.
@@ -139,11 +150,11 @@ export function CopiesEditor({ book, onClose, onSaved }: {
   const dirty = useMemo(() => {
     if (removedIds.length > 0) return true;
     if (withdrawalReason.trim() !== '') return true;
-    const initial = (book.items ?? []).map(toDraft);
+    const initial = (serverItems ?? []).map(toDraft);
     if (initial.length !== drafts.length) return true;
     const strip = (d: Draft) => { const { key, ...rest } = d; return rest; };
     return JSON.stringify(initial.map(strip)) !== JSON.stringify(drafts.map(strip));
-  }, [drafts, removedIds, withdrawalReason, book.items]);
+  }, [drafts, removedIds, withdrawalReason, serverItems]);
 
   useEffect(() => {
     const onBeforeUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); };
@@ -211,7 +222,7 @@ export function CopiesEditor({ book, onClose, onSaved }: {
         method: 'PUT',
         body: JSON.stringify({
           items: drafts.map(toPayload),
-          expectedVersion: book.version,
+          expectedVersion: serverVersion,
           ...(removedIds.length > 0 && withdrawalReason.trim()
             ? { withdrawalReason: withdrawalReason.trim() }
             : {})
@@ -224,6 +235,31 @@ export function CopiesEditor({ book, onClose, onSaved }: {
       // A duplicate barcode and a stale version both come back as a 409 with a
       // sentence that says which; the dialog stays open so nothing typed is lost.
       toast.push('error', (e as Error).message);
+      /*
+       * A stale version needs more than a message. Until add-copies started moving
+       * books.version this conflict could not even happen — the guard passed and a
+       * colleague's newly added copy was withdrawn instead. Now that it fires, the editor has
+       * to offer a way forward, or the librarian's only option is to close the dialog and
+       * lose what they typed.
+       *
+       * Reload into the CURRENT list, and keep the copies they had added that were never
+       * saved — those have no id, so they cannot be in conflict with anything. Edits to
+       * copies that already existed are replaced by the server's version of them, and the
+       * note below says so rather than leaving the librarian to notice.
+       */
+      if (isVersionConflict(e)) {
+        try {
+          const fresh = await apiRequest<Book>(`/api/books/${book.id}`);
+          const unsaved = drafts.filter((d) => !d.id);
+          setServerItems(fresh.items ?? []);
+          setServerVersion(fresh.version);
+          setDrafts([...(fresh.items ?? []).map(toDraft), ...unsaved]);
+          setReloadedNote(true);
+        } catch {
+          // Leave the dialog exactly as it is. A failed reload must not also
+          // discard the drafts.
+        }
+      }
     } finally {
       setBusy(false);
     }
@@ -240,6 +276,10 @@ export function CopiesEditor({ book, onClose, onSaved }: {
       </div>
 
       <p className="muted small">{t('copies.editorIntro')}</p>
+
+      {reloadedNote && (
+        <p className="inline-warning" role="status">{t('copies.reloadedAfterConflict')}</p>
+      )}
 
       <ul className="copy-drafts">
         {drafts.map((d, index) => (

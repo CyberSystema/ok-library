@@ -800,9 +800,38 @@ const ITEM_IS_FREE = `i.status = 'available'
        AND NOT EXISTS (SELECT 1 FROM holds h
                         WHERE h.item_id = i.id AND h.status = 'ready')`;
 
+/**
+ * Re-derive a record's shelf, room and status from its copies — AND move its version.
+ *
+ * The version bump is not bookkeeping. `books.version` is the optimistic-concurrency token for
+ * the whole record, and the copies editor sends it as `expectedVersion` when it saves. This
+ * function is the one hook every path that changes a record's copies already calls, and it used
+ * to leave the version alone, so:
+ *
+ *   A opens the copies editor on a book with one copy, at version 5.
+ *   B adds a second copy with the bulk action. The copies changed; version is still 5.
+ *   A saves. expectedVersion 5 still matches, so the guard passes — and A's list, which has
+ *   never heard of copy 2, WITHDRAWS it.
+ *
+ * Reproduced against a real record before this change: one copy left, no error, no warning. The
+ * guard was there and it agreed to the overwrite, because nothing had told it the record moved.
+ *
+ * `updated_at` moves for the same reason one step further out: it is the sync cursor. A record
+ * whose shelf or status changed because its copies changed, but whose updated_at stood still,
+ * is never delivered to an offline client — it would keep showing the old shelf indefinitely.
+ *
+ * Bumping here rather than at each call site is deliberate. There were three call sites and one
+ * of them was wrong; the next path that moves a copy will call this function, because deriving
+ * the record from its copies is why it exists. Being bumped twice is harmless — a version only
+ * has to CHANGE — so the caller that already bumps is not a bug, while a caller that does not
+ * is the bug above.
+ */
 export async function syncBookFromItems(env: Env, bookId: string): Promise<void> {
+  const now = new Date().toISOString();
   await env.DB.prepare(
     `UPDATE books SET
+       updated_at = ?,
+       version = version + 1,
        shelf_code = (SELECT i.shelf_code FROM items i
                       WHERE i.book_id = books.id AND i.deleted_at IS NULL
                       ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1),
@@ -819,7 +848,7 @@ export async function syncBookFromItems(env: Env, bookId: string): Promise<void>
                          ORDER BY i.copy_number ASC, i.created_at ASC, i.id ASC LIMIT 1), books.status)
        END
      WHERE id = ?`
-  ).bind(bookId).run();
+  ).bind(now, bookId).run();
 }
 
 /**
