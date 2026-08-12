@@ -2952,6 +2952,53 @@ for pack in sorted(_glob.glob(os.path.join(_HB, "content", "*.ts"))):
     stray = re.findall(r"\b\d{3}\s*\$[a-z]", body)
     check(f"no MARC tag is written into {os.path.basename(pack)}", not stray, stray[:5])
 
+print("=== 85. REGRESSION: every table is in the backup, or explicitly excluded ===")
+
+# Until today this database had NO backup. `wrangler d1 export` refuses on it — "cannot export
+# databases with Virtual Tables (fts5)", because books_fts exists — there is no cron and no
+# scheduled handler in wrangler.toml, and the only database script in the repo was
+# reset_database.mjs, which does the opposite. So a librarian who deleted the wrong record and
+# emptied the trash had nothing to go back to.
+#
+# scripts/backup_d1.mjs closes that. What this section protects is the thing most likely to go
+# wrong next: a migration adds a table, nobody thinks about the backup, and the new data is
+# silently outside it. Every table named by a migration must be either dumped or deliberately
+# skipped, and the script must say which.
+_bk85 = _slurp(_REPO, "scripts", "backup_d1.mjs")
+_migdir85 = os.path.join(_REPO, "apps", "api-worker", "migrations")
+_declared85 = set()
+for _f in sorted(os.listdir(_migdir85)):
+    if not _f.endswith(".sql"):
+        continue
+    with open(os.path.join(_migdir85, _f), encoding="utf-8") as _fh:
+        _sql = _fh.read()
+    for _m in re.finditer(r"CREATE\s+(?:VIRTUAL\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"\'`]?([A-Za-z0-9_]+)", _sql, re.I):
+        _declared85.add(_m.group(1))
+    for _m in re.finditer(r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?[\"\'`]?([A-Za-z0-9_]+)", _sql, re.I):
+        _declared85.discard(_m.group(1))
+check("the migrations declare the tables this check reads", len(_declared85) >= 15, sorted(_declared85))
+
+# The script's two lists: SKIP (deliberately not dumped) and ORDER (dumped, in FK order).
+_skip85 = set(re.findall(r"[\'\"]([A-Za-z0-9_]+)[\'\"]", (re.search(r"const SKIP = new Set\(\[([\s\S]*?)\]\)", _bk85) or re.match("", "")).group(1) if re.search(r"const SKIP = new Set\(\[([\s\S]*?)\]\)", _bk85) else ""))
+_order85 = set(re.findall(r"[\'\"]([A-Za-z0-9_]+)[\'\"]", (re.search(r"const ORDER = \[([\s\S]*?)\];", _bk85) or re.match("", "")).group(1) if re.search(r"const ORDER = \[([\s\S]*?)\];", _bk85) else ""))
+check("the backup script declares a skip list", len(_skip85) >= 5, sorted(_skip85))
+check("and a restore order", len(_order85) >= 15, len(_order85))
+
+# The FTS shadow tables are created by SQLite, not by a migration, so they are not in
+# _declared85 and need no accounting here; everything a migration creates does.
+_unaccounted85 = sorted(t for t in _declared85 if t not in _skip85 and t not in _order85)
+check("every table a migration creates is either backed up or explicitly skipped",
+      not _unaccounted85, _unaccounted85)
+
+# The tool must be incapable of writing. That is what makes it safe to point at production.
+check("the backup tool refuses any statement that is not a read",
+      "refusing a non-read statement" in _bk85, None)
+check("and it retries, because D1 answers 7500 intermittently under this many calls",
+      "gave up after" in _bk85 and "retry" in _bk85, None)
+# A backup nobody has checked is a directory of hopeful files.
+check("and it can verify a backup against the live database",
+      "--verify" in _bk85 and "CORRUPT" in _bk85, None)
+
 print("=== 84. REGRESSION: nothing may be drawn outside the thing that contains it ===")
 
 # Reported from the desk: "Nothing should go out of the boundaries. If one line is not
@@ -3487,6 +3534,70 @@ if _d is not None and _before77 is not None:
 _idx77 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
 check("and the server does not test the date keys for undefined",
       "rawDates.publicationYear !== undefined" not in _idx77, None)
+
+# EVERY column, not only the three date ones.
+#
+# The date fix earlier today was half a fix. The client builds every import row through one
+# object literal that ALWAYS carries author, isbn, publisher, language, description, roomCode,
+# shelfCode, acquisitionDate, tags and customFields, filling in null or an empty collection for
+# any column the spreadsheet lacks — and ten of those were written unconditionally. Measured on
+# a real record: a corrective sheet carrying only title, legacyId and a fixed author destroyed
+# SEVEN fields (publisher, language, description, shelf mark, acquisition date, every tag, every
+# custom attribute) and reported "1 updated". 12,528 of 12,675 live records carry the legacy_id
+# this matches on.
+_lid77b = f"ZZ-KEEP-{uuid.uuid4().hex[:10].upper()}"
+_full77 = {"title": "ZZ Preserve Probe", "author": "Ιωάννης Χρυσόστομος", "legacyId": _lid77b,
+           "isbn": "9789603157335", "publisher": "Εκδόσεις Ζήτρος", "language": "EL",
+           "description": "Μια περιγραφή που δεν πρέπει να χαθεί.", "shelfCode": "15-003",
+           "acquisitionDate": "2020-01-01T00:00:00.000Z",
+           "tags": ["πατερικά"], "customFields": {"pages": "420"}}
+st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [_full77]})
+check("a fully catalogued row imports", st == 201 and (r or {}).get("importedRows") == 1, (st, r))
+
+# THE SHAPE THE CLIENT ACTUALLY SENDS for a corrective sheet: every key present, most of them
+# null or empty, because the spreadsheet simply does not have those columns.
+st, r = call("POST", "/api/import/books", {"dryRun": False, "rows": [{
+    "title": "ZZ Preserve Probe", "author": "Ιωάννης ο Χρυσόστομος", "legacyId": _lid77b,
+    "isbn": None, "publisher": None, "language": None, "description": None,
+    "shelfCode": None, "roomCode": None, "acquisitionDate": None,
+    "tags": [], "customFields": {}, "publicationYear": None
+}]})
+check("a corrective sheet updates the record", st == 201 and (r or {}).get("updatedRows") == 1, (st, r))
+if LOCAL:
+    _keep = local_sql(
+        "SELECT author, isbn, publisher, language, description, shelf_code AS shelf, "
+        "acquisition_date AS acq, tags, custom_fields AS cf, isbn_valid AS iv "
+        f"FROM books WHERE legacy_id = '{_lid77b}'")
+    _k = _keep[0] if _keep else {}
+    # What the sheet DID say is applied.
+    check("the one field the sheet carried is updated",
+          _k.get("author") == "Ιωάννης ο Χρυσόστομος", _k.get("author"))
+    # Everything the sheet did not mention survives.
+    for _col, _want in [("publisher", "Εκδόσεις Ζήτρος"), ("language", "EL"),
+                        ("shelf", "15-003"), ("isbn", "9789603157335")]:
+        check(f"an omitted column keeps its value: {_col}", _k.get(_col) == _want,
+              {"got": _k.get(_col), "want": _want})
+    check("an omitted description is not blanked", bool((_k.get("description") or "").strip()), _k.get("description"))
+    check("an omitted acquisition date is not blanked", bool(_k.get("acq")), _k.get("acq"))
+    check("an omitted tags column does not wipe the tags",
+          "πατερικά" in (_k.get("tags") or ""), _k.get("tags"))
+    check("an omitted attribute column does not wipe the attributes",
+          "420" in (_k.get("cf") or ""), _k.get("cf"))
+    # isbn_valid is derived from isbn, so preserving one must preserve the other.
+    check("and isbn_valid still agrees with the preserved ISBN", _k.get("iv") == 1, _k.get("iv"))
+    local_sql(f"DELETE FROM book_attribute_values WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid77b}')")
+    local_sql(f"DELETE FROM items WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid77b}')")
+    local_sql(f"DELETE FROM books WHERE legacy_id = '{_lid77b}'")
+
+# The two OTHER import/sync UPDATEs write unconditionally and are correct to: they bind values
+# already merged in JS — keepIfBlank(payload, existing) in the catalogue import, and
+# {...parseBook(existing), ...payload} in the sync push. Asserted so that a future edit cannot
+# quietly replace a merged bind with a raw payload one, which is exactly what went wrong here.
+_idx77b = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+check("the catalogue import still binds merged values, not raw payload",
+      "mergedPublisher" in _idx77b and "keepIfBlank" in _idx77b, None)
+check("and the sync push still merges over the existing row",
+      re.search(r"\.\.\.parseBook\(existingMap\)", _idx77b) is not None, None)
 
 if LOCAL:
     local_sql(f"DELETE FROM items WHERE book_id IN (SELECT id FROM books WHERE legacy_id = '{_lid77}')")

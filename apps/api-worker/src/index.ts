@@ -6281,6 +6281,17 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 			const rawDates = item.row as { publicationYear?: number | null; dateEdtf?: string | null };
 			const sheetGaveDates = (rawDates.publicationYear ?? null) !== null
 				|| (rawDates.dateEdtf ?? null) !== null;
+			/*
+			 * tags and customFields cannot use COALESCE like the scalars, because the client sends
+			 * [] and {} rather than null for a column the sheet does not have — the value arriving
+			 * is not NULL, so COALESCE would write the empty collection over the real one. An
+			 * explicit flag is the only way to tell "this book has no tags" from "this spreadsheet
+			 * has no tags column": one is a fact about the book, the other about the file.
+			 */
+			const rawTags = (item.row as { tags?: unknown }).tags;
+			const sheetGaveTags = Array.isArray(rawTags) && rawTags.length > 0;
+			const sheetGaveCustomFields = Object.keys(customFields ?? {}).length > 0;
+			const sheetGaveIsbn = ((item.row as { isbn?: string | null }).isbn ?? null) !== null;
 			const importTagsJson = JSON.stringify(row.tags);
 			const importCustomFieldsJson = JSON.stringify(customFields);
 			const importFolds = computeBookFolds({
@@ -6320,9 +6331,47 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 					// bound three times to answer it once: absent means leave all three,
 					// an explicit null clears all three. That is the same contract the
 					// reconciler itself documents for a partial update.
+					/*
+					 * NULL MEANS "THE SHEET DID NOT MENTION IT" FOR EVERY COLUMN, not just the
+					 * three date ones.
+					 *
+					 * The date columns were fixed earlier today and the rest of this statement was
+					 * left as it was, which turns out to have been half a fix. The client builds
+					 * every import row through one object literal that ALWAYS carries author, isbn,
+					 * publisher, language, description, roomCode, shelfCode, acquisitionDate, tags
+					 * and customFields (apps/web/src/main.tsx), filling in null or an empty
+					 * collection for any column the spreadsheet does not have. Ten of those were
+					 * written unconditionally here, so they were overwritten with nothing.
+					 *
+					 * Measured on a real record: a corrective sheet carrying only title, legacyId
+					 * and a fixed author silently destroyed SEVEN fields — publisher, language,
+					 * description, shelf mark, acquisition date, every tag and every custom
+					 * attribute value — and the import reported "1 updated" with no warning. On
+					 * production 12,528 of 12,675 records carry a legacy_id, which is what this
+					 * statement matches on, so one partial re-upload could do that to the whole
+					 * catalogue. Re-uploading a corrected sheet is the ordinary way this import is
+					 * used; the comment above the match lookup says so.
+					 *
+					 * COALESCE for the scalars, which is what ddc, bib_level and the three
+					 * romanized columns beside them already did — the inconsistency inside one
+					 * statement is the whole bug. tags and custom_fields need a flag rather than
+					 * COALESCE because the client sends [] and {}, not null, and an empty
+					 * collection is indistinguishable from an absent column.
+					 *
+					 * The cost is that this import cannot CLEAR a field, which it has never been
+					 * able to do usefully and which the edit form does properly. A fold is
+					 * COALESCEd with its own text so the two can never disagree — §68 asserts that.
+					 */
 					`UPDATE books SET
-						title = ?, author = ?, isbn = ?, publisher = ?, language = ?,
-						description = ?, room_code = ?, shelf_code = ?, acquisition_date = ?,
+						title = ?,
+						author = COALESCE(?, author),
+						isbn = COALESCE(?, isbn),
+						publisher = COALESCE(?, publisher),
+						language = COALESCE(?, language),
+						description = COALESCE(?, description),
+						room_code = COALESCE(?, room_code),
+						shelf_code = COALESCE(?, shelf_code),
+						acquisition_date = COALESCE(?, acquisition_date),
 						publication_year     = CASE WHEN ? THEN ? ELSE publication_year END,
 						publication_year_end = CASE WHEN ? THEN ? ELSE publication_year_end END,
 						date_edtf            = CASE WHEN ? THEN ? ELSE date_edtf END,
@@ -6331,18 +6380,27 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						title_romanized = COALESCE(?, title_romanized),
 						author_romanized = COALESCE(?, author_romanized),
 						publisher_romanized = COALESCE(?, publisher_romanized),
-						tags = ?, custom_fields = ?, updated_at = ?, version = version + 1,
-						title_fold = ?, author_fold = ?, isbn_fold = ?, publisher_fold = ?,
-						description_fold = ?, tags_fold = ?, custom_fields_fold = ?,
+						tags = COALESCE(?, tags),
+						custom_fields = COALESCE(?, custom_fields),
+						updated_at = ?, version = version + 1,
+						title_fold = ?,
+						author_fold = COALESCE(?, author_fold),
+						isbn_fold = COALESCE(?, isbn_fold),
+						publisher_fold = COALESCE(?, publisher_fold),
+						description_fold = COALESCE(?, description_fold),
+						tags_fold = COALESCE(?, tags_fold),
+						custom_fields_fold = COALESCE(?, custom_fields_fold),
 						title_romanized_fold = COALESCE(?, title_romanized_fold),
 						author_romanized_fold = COALESCE(?, author_romanized_fold),
 						publisher_romanized_fold = COALESCE(?, publisher_romanized_fold),
-						isbn_valid = ?
+						/* Follows isbn: preserving the ISBN while recomputing its validity from a
+						   null would mark every untouched ISBN as broken. */
+						isbn_valid = CASE WHEN ? THEN ? ELSE isbn_valid END
 					 WHERE id = ? AND deleted_at IS NULL`
 				)
 					.bind(
 						row.title,
-						row.author,
+						row.author ?? null,
 						row.isbn ?? null,
 						row.publisher ?? null,
 						row.language ?? null,
@@ -6358,20 +6416,22 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 						row.titleRomanized ?? null,
 						row.authorRomanized ?? null,
 						row.publisherRomanized ?? null,
-						importTagsJson,
-						importCustomFieldsJson,
+						sheetGaveTags ? importTagsJson : null,
+						sheetGaveCustomFields ? importCustomFieldsJson : null,
 						now,
 						importFolds.title_fold,
 						importFolds.author_fold,
 						importFolds.isbn_fold,
 						importFolds.publisher_fold,
 						importFolds.description_fold,
-						importFolds.tags_fold,
-						importFolds.custom_fields_fold,
+						// Each fold rides with its own text, or the pair desyncs and FTS keeps
+						// answering under a value the record no longer has.
+						sheetGaveTags ? importFolds.tags_fold : null,
+						sheetGaveCustomFields ? importFolds.custom_fields_fold : null,
 						importFolds.title_romanized_fold,
 						importFolds.author_romanized_fold,
 						importFolds.publisher_romanized_fold,
-						importFolds.isbn_valid,
+						sheetGaveIsbn ? 1 : 0, importFolds.isbn_valid,
 						bookId
 					)
 					.run();
