@@ -3049,6 +3049,10 @@ mark.hl {
   margin-bottom: 0.35rem;
 }
 
+/* Content that exists only on paper. Hidden here, un-hidden inside @media print.
+   Without this rule the block has no screen styling at all and simply shows. */
+.print-only { display: none; }
+
 /* ===== ISO 2789 report ===== */
 .iso-grid {
   display: grid;
@@ -3608,12 +3612,31 @@ mark.hl {
   .hb-page > .hb-body { display: none !important; }
   .hb { display: block !important; }
   .hb-body { max-width: none; }
-  .card, .hb-card {
+  /* SCOPED TO THE HANDBOOK. This block is written for it, but `.card` is the
+     shell every screen builds on, so flattening it applied everywhere — the ISO
+     2789 return, the one document in this app a library actually files on paper,
+     printed as unbounded text with its sections running together. A page is not
+     a chapter. */
+  .hb-page .card, .hb-card {
     border: 0 !important;
     box-shadow: none !important;
     padding: 0 !important;
     background: transparent !important;
   }
+  /* Shown only on paper: the heading block that lets a filed page identify
+     itself. Hidden on screen by the `.print-only` rule above the media query,
+     un-hidden here. */
+  .iso-print-header {
+    display: block !important;
+    margin-bottom: 1rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 2px solid #000;
+  }
+  .iso-print-header h2 { margin: 0 0 0.3rem; }
+  .iso-print-header p { margin: 0.15rem 0; }
+  /* Keep a statistics section whole. Half a table of withdrawals by reason,
+     continued overleaf, is what makes a filed return get queried. */
+  .iso-grid > section, .stat-box, .iso-list { break-inside: avoid; }
   /* Never break a rule or a comparison across a page — half of a right-and-wrong
      pair on its own is worse than nothing. */
   .hb-callout, .hb-compare, .hb-quote, .hb-fields { break-inside: avoid; }

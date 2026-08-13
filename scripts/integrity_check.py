@@ -6380,6 +6380,45 @@ if LOCAL:
             call("DELETE", f"/api/books/{_rowsq[0]['id']}/purge")
 
 
+print()
+print("=== 101. REGRESSION: the printed page belongs to the screen it came from ===")
+
+# The @media print block was written for the Handbook and applied to every screen. `.card` is the
+# shell every screen builds on, so `border: 0; padding: 0; background: transparent` flattened all
+# of them — including the ISO 2789 return, which is the one document in this application a library
+# actually files on paper. Its sections printed as unbounded text running together. A page is not
+# a chapter.
+#
+# That return also had NO print affordance at all: Ctrl+P was the only route, and what came out
+# carried neither the library's name nor the period the figures covered — the two things a filed
+# return has to state, both of which live on screen in a toolbar the print block hides.
+_css101 = _slurp(_REPO, "apps", "web", "src", "styles.css")
+_pi101 = _css101.find("@media print {")
+_print101 = _css101[_pi101:] if _pi101 >= 0 else ""
+check("the print block is where this check can see it", "@media print" in _css101, None)
+check("card flattening is scoped to the Handbook, not every screen",
+      ".hb-page .card, .hb-card {" in _print101 and "\n  .card, .hb-card {" not in _print101, None)
+check("a statistics section is not split across a page",
+      ".iso-grid > section" in _print101 and "break-inside: avoid" in _print101, None)
+check("the paper-only heading is shown when printing",
+      ".iso-print-header {" in _print101 and "display: block !important;" in _print101, None)
+# ...and hidden on screen, which needs a rule OUTSIDE the media query. Inside it alone, the block
+# has no screen styling at all and simply shows.
+_screen101 = _css101[:_pi101] if _pi101 >= 0 else _css101
+check("and hidden on screen by a rule outside the media query",
+      ".print-only { display: none; }" in _screen101, None)
+
+_web101 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+check("the ISO return has a Print button of its own",
+      "iso.print" in _web101 and "window.print()" in _web101, None)
+check("and the printed page names the library and the period it covers",
+      "iso-print-header" in _web101 and "isoReport.library.isil" in _web101
+      and "isoReport.period.from" in _web101, None)
+_i18n101 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+check("the button is labelled in all four languages",
+      _i18n101.count("'iso.print':") == 4, _i18n101.count("'iso.print':"))
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

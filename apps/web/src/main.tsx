@@ -6859,7 +6859,36 @@ function App() {
                         {isoBusy ? t('iso.running') : t('iso.run')}
                       </button>
                     </div>
+                    {isoReport && (
+                      <div className="search-actions">
+                        <span aria-hidden="true" className="field-spacer" />
+                        {/* This return is the one document in the app a library files on paper,
+                            and Ctrl+P was its only route. */}
+                        <button className="secondary" onClick={() => window.print()}>
+                          {t('iso.print')}
+                        </button>
+                      </div>
+                    )}
                   </div>
+
+                  {/* Shown only on paper. A filed return has to identify itself: which library,
+                      which ISIL, and the period the figures cover. On screen all three are in
+                      the toolbar and the heading, and the toolbar is hidden when printing. */}
+                  {isoReport && (
+                    <div className="print-only iso-print-header">
+                      <h2>{t('iso.heading')}</h2>
+                      <p>
+                        {isoReport.library.name || ''}
+                        {isoReport.library.isil ? ` · ISIL ${isoReport.library.isil}` : ''}
+                        {isoReport.library.place ? ` · ${isoReport.library.place}` : ''}
+                      </p>
+                      <p>
+                        {t('iso.from')}: {String(isoReport.period.from).slice(0, 10)}
+                        {'  ·  '}
+                        {t('iso.to')}: {String(isoReport.period.to).slice(0, 10)}
+                      </p>
+                    </div>
+                  )}
 
                   {isoReport && (
                     <div style={{ marginTop: '1rem' }}>
