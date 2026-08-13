@@ -7713,16 +7713,42 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 					authorRomanized: row.authorRomanized ?? null,
 					publisherRomanized: row.publisherRomanized ?? null
 				});
+				/*
+				 * The same collision guard the direct create runs. `legacy_id` carries a UNIQUE
+				 * index (migration 0005), so a sync that pushed an accession number already in the
+				 * catalogue would come back as a raw constraint error — a 500 the client treats as
+				 * transient and retries four times — instead of a sentence naming the clash.
+				 */
+				await assertLegacyIdFree(c.env, (row as { legacyId?: string | null }).legacyId ?? null, null);
 				await c.env.DB.prepare(
+					/*
+					 * COLUMN FOR COLUMN with POST /api/books. `bib_level` and `legacy_id` were
+					 * missing from this list and only from this list — two statements that have
+					 * to stay identical, drifting apart quietly, which is the shape behind every
+					 * import bug fixed in this pass.
+					 *
+					 * Neither omission errors, which is why it went unnoticed: bib_level is NOT
+					 * NULL DEFAULT 'monograph' so the row takes the default, and legacy_id is
+					 * nullable. The loss is silent — a serial created offline came back a
+					 * monograph, and a book carrying its accession number from the source
+					 * spreadsheet arrived with none, so a later re-import of that spreadsheet
+					 * could not match it and would add a second copy of the record.
+					 *
+					 * Not reachable today: nothing in the shipped clients enqueues a create
+					 * (the mobile queueCreateBook has no caller; the web's bulk push is typed to
+					 * update and delete). Fixed anyway, because the day an add-book screen lands
+					 * on the mobile client this is a data-loss bug that nobody will think to look
+					 * for — and a one-line divergence is cheaper to close than to diagnose.
+					 */
 					`INSERT OR IGNORE INTO books (
 						id, title, author, isbn, publication_year, publication_year_end, date_edtf,
-						publisher, language, description, ddc,
+						publisher, language, description, ddc, bib_level,
 						title_romanized, author_romanized, publisher_romanized,
 						room_code, shelf_code, acquisition_date, tags, custom_fields, status, version,
-						created_at, updated_at, deleted_at,
+						legacy_id, created_at, updated_at, deleted_at,
 						title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
 						title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
-					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 				)
 					.bind(
 						id,
@@ -7736,6 +7762,8 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						row.language ?? null,
 						row.description ?? null,
 						row.ddc ?? null,
+						// Was omitted entirely, so an offline-created serial came back a monograph.
+						(row as { bibLevel?: string }).bibLevel ?? 'monograph',
 						row.titleRomanized ?? null,
 						row.authorRomanized ?? null,
 						row.publisherRomanized ?? null,
@@ -7745,6 +7773,10 @@ app.post('/api/sync/push', requirePermission('books.write', { librarian: true })
 						tagsJson,
 						customFieldsJson,
 						row.status,
+						// Likewise: without it a book keeps no link to the row it came from in the
+						// source spreadsheet, so a later re-import of that sheet cannot match it and
+						// adds a second copy of the record instead of updating it.
+						(row as { legacyId?: string | null }).legacyId ?? null,
 						now,
 						now,
 						folds.title_fold,

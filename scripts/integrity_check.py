@@ -6258,6 +6258,59 @@ check("and so does the production checklist",
       "Cover images are NOT in that backup" in _chk98, None)
 
 
+print()
+print("=== 99. REGRESSION: a book created through sync must carry the same columns ===")
+
+# `/api/sync/push`'s create_book branch used an INSERT that is byte-for-byte the direct create's
+# except for two columns it never listed: `bib_level` and `legacy_id`. Two statements that have to
+# stay identical, drifting apart quietly — the shape behind every import bug in this pass.
+#
+# Neither omission errors, which is why nobody noticed: bib_level is NOT NULL DEFAULT 'monograph'
+# so the row takes the default, and legacy_id is nullable. The loss is silent. A serial catalogued
+# offline came back a monograph — and the ISO 2789 report counts serials off that column. A book
+# carrying its accession number from the source spreadsheet arrived with none, so a later
+# re-import of that spreadsheet could not match it and would add a SECOND copy of the record
+# rather than updating it.
+#
+# Not reachable from a shipped client today (the mobile queueCreateBook has no caller and the
+# web's bulk push is typed to update and delete), so this is prophylactic. It is here because the
+# day an add-book screen lands on the mobile client, this is a data-loss bug nobody will think to
+# look for.
+_idx99 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_a99 = _idx99.find("if (mutation.operation === 'create_book')")
+_end99 = _idx99.find("else if (mutation.operation === 'delete_book')", _a99)
+_seg99 = _idx99[_a99:_end99] if _a99 >= 0 and _end99 > _a99 else ""
+_code99 = re.sub(r"/\*[\s\S]*?\*/", "", _seg99)
+_code99 = "\n".join(l for l in _code99.split("\n") if not l.strip().startswith("//"))
+check("the sync create branch is where this check can see it",
+      "INSERT OR IGNORE INTO books" in _code99, _a99)
+check("its INSERT lists bib_level", "ddc, bib_level," in _code99, None)
+check("and legacy_id", "legacy_id, created_at, updated_at, deleted_at," in _code99, None)
+check("and it guards the unique accession number the way the direct create does",
+      "assertLegacyIdFree" in _code99, None)
+
+if LOCAL:
+    _leg99 = "ZZLEG-" + uuid.uuid4().hex[:6]
+    _cid99 = "zzsync-" + uuid.uuid4().hex[:8]
+    st, _r99 = call("POST", "/api/sync/push", {"mutations": [{
+        "clientMutationId": _cid99,
+        "clientTimestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "operation": "create_book",
+        "payload": {"title": f"ZZ Sync Serial {_leg99}", "author": "Τ. Δοκιμή", "status": "available",
+                    "bibLevel": "serial", "legacyId": _leg99, "tags": [], "customFields": {}}
+    }]})
+    check("a book can be created through sync", st == 200, (st, _r99))
+    _rows99 = local_sql(f"SELECT id, bib_level, legacy_id FROM books WHERE legacy_id = '{_leg99}'")
+    check("it kept the bibliographic level it was created with — a serial is not a monograph",
+          _rows99 and _rows99[0].get("bib_level") == "serial", _rows99)
+    check("and it kept its accession number, so a re-import can still match it",
+          _rows99 and _rows99[0].get("legacy_id") == _leg99, _rows99)
+    if _rows99:
+        _bid99 = _rows99[0]["id"]
+        call("DELETE", f"/api/books/{_bid99}")
+        call("DELETE", f"/api/books/{_bid99}/purge")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
