@@ -6177,6 +6177,41 @@ _base96 = re.search(r"\.modal-overlay\s*\{[^}]*z-index:\s*(\d+)", _css96)
 check("higher than the base overlay", _base96 is not None and int(_base96.group(1)) < 300,
       _base96.group(1) if _base96 else None)
 
+print()
+print("=== 97. REGRESSION: a saved record must not be undone by the next copies save ===")
+
+# Correct a shelf mark on the record, then — without closing the panel — open "Edit copies" to
+# type a barcode and save. The correction is gone from books AND items, with no error.
+#
+# The route is innocent: PUT /api/books/:id writes books.shelf_code AND pushes it onto the primary
+# copy through ensurePrimaryItem, so the two agree the moment the response is sent. The fault is
+# the client's optimistic patch, which updated the fields the FORM owns and took the new
+# `version` — but left `items` at its pre-edit value. That pairing is poison, because the copies
+# editor seeds its version from that object (now current) and its drafts from that object's items
+# (now stale): expectedVersion matches, so there is no 409 and no warning, and the whole-array
+# replace writes the OLD shelf back onto the copy. syncBookFromItems then re-derives the record
+# from it, faithfully.
+#
+# The tell is visible before the damage: right after the record save the panel shows the NEW shelf
+# in its header and the OLD one in its "Copy 1" row — which is exactly what makes a librarian open
+# the copies editor. Reproduced in a browser both ways.
+#
+# NOTE ON HOW THIS WAS NEARLY MISSED: an API-level test of the same sequence PASSES, because a
+# script builds the copies payload from a fresh GET. The bug only exists in what the CLIENT holds.
+# The same lesson as the record editor's 409: assert the client's real payload, not the schema's.
+_main97 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+_save97 = _main97[_main97.find("async function saveBookEdit"):][:11000]
+check("the record save reconciles with the server rather than only patching locally",
+      "TAKE THE SERVER'S RECORD BACK" in _save97
+      and "apiRequest<Book>(`/api/books/${editForm.id}`)" in _save97, None)
+check("and it replaces the detail record, so its copies are the server's",
+      "setDetailBook((prev) => (prev && prev.id === fresh.id ? fresh : prev))" in _save97, None)
+# The optimistic patch may stay — it is what makes the panel feel instant — but it must not be
+# the last word, and it must not be the thing the copies editor reads.
+check("the reconciliation runs after the optimistic patch, not instead of it",
+      _save97.find("version: result.version,") < _save97.find("TAKE THE SERVER'S RECORD BACK"), None)
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

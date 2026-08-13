@@ -3631,7 +3631,39 @@ function App() {
           : prev
       );
       setDetailMode('view');
-      await Promise.all([loadBooks(), loadFacet(facetField), loadNeedsReviewCount(), loadRoomSummary()]);
+      /*
+       * TAKE THE SERVER'S RECORD BACK, copies included.
+       *
+       * The patch above is optimistic so the panel updates the instant the save returns, and it
+       * covers every field this form owns — but the record editor also changes something it does
+       * not own: `PUT /api/books/:id` pushes the new shelf and room onto the PRIMARY COPY through
+       * ensurePrimaryItem. The patch left `items` at its pre-edit value while taking the new
+       * `version`, and that pairing is poison:
+       *
+       *   the copies editor seeds its version from this object — now CURRENT —
+       *   and its drafts from this object's items — now STALE.
+       *
+       * So a librarian who corrects a shelf mark and then, in the same open panel, opens "Edit
+       * copies" to type a barcode, saves a copy list still carrying the OLD shelf. The
+       * expectedVersion check passes, because the version really is current: no 409, no warning.
+       * The replace writes the stale shelf onto the copy, syncBookFromItems re-derives the record
+       * from it, and the correction is gone from both tables — while the panel had been showing
+       * the new shelf in its header and the old one in its "Copy 1" row, which is exactly what
+       * invites someone to open the copies editor in the first place.
+       *
+       * Worse with a second copy: blankDraft inherits the previous draft's shelf, so adding one
+       * right after the correction files BOTH at the old location — and the shelf facets read
+       * items directly, so the catalogue then sends the next person to the wrong shelf.
+       *
+       * Reconciled rather than hand-patched: reproducing normalizeCode and the primary-copy
+       * ordering in the client is how this drifts apart again. One GET beside the four requests
+       * already firing here.
+       */
+      const [fresh] = await Promise.all([
+        apiRequest<Book>(`/api/books/${editForm.id}`).catch(() => null),
+        loadBooks(), loadFacet(facetField), loadNeedsReviewCount(), loadRoomSummary()
+      ]);
+      if (fresh) setDetailBook((prev) => (prev && prev.id === fresh.id ? fresh : prev));
     } catch (e) {
       /*
        * Version conflict: the book changed since it was opened. Re-fetch the latest and take
