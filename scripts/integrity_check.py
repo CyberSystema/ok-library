@@ -6212,6 +6212,52 @@ check("the reconciliation runs after the optimistic patch, not instead of it",
       _save97.find("version: result.version,") < _save97.find("TAKE THE SERVER'S RECORD BACK"), None)
 
 
+print()
+print("=== 98. REGRESSION: a cover overwrite is unrecoverable, so it must be deliberate ===")
+
+# A cover lives at ONE deterministic key per book, `covers/<bookId>.<ext>`, and the upload is a
+# bare put — the previous scan is overwritten in place. R2 has no object versioning here, and
+# scripts/backup_d1.mjs is a D1 tool by construction: it never opens the bucket. So those bytes
+# exist in exactly one place and nothing anywhere can bring them back — not the backup, not D1
+# Time Travel.
+#
+# The realistic accident is a slip, not a decision: the picker is opened from the RIGHT-CLICK menu
+# on a row of a 12,675-row list, and the file lands on whichever record was under the cursor. It
+# fired straight into the upload with no prompt at all.
+#
+# What is lost is one photograph of a book that is physically in the building, and the remedy is
+# to walk to the shelf and scan it again. So the fix is proportionate to that: confirm and NAME
+# THE BOOK, so the librarian hunting for the title they meant sees a different one. Deliberately
+# NOT a `.prev` copy — the orphan sweep parses a book id out of the key with a greedy `(.+)`, so
+# `covers/<id>.prev.jpg` reads as book `<id>.prev`, matches no record, and the sweep would delete
+# every backup it found as an orphan.
+_web98 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+# Cut at the NEXT function, not at a character count. A fixed window ran past the end of this
+# one into code that also calls confirm(), so the first check below passed against a version with
+# no confirmation in it at all — the exact vacuous pass this suite keeps having to be taught out of.
+_up98 = _web98[_web98.find("async function uploadBookCover"):]
+_nextFn98 = re.search(r"\n  (?:async )?function ", _up98[10:])
+_up98 = _up98[:_nextFn98.start() + 10] if _nextFn98 else _up98[:3400]
+check("the cover upload is where this check can see it",
+      "/api/books/${book.id}/cover" in _up98, len(_up98))
+check("replacing a cover asks first", "await confirm({" in _up98, None)
+check("and only when there is one to lose — adding a first cover does not ask",
+      "if (book.coverUrl) {" in _up98, None)
+check("and the prompt names the book, which is what catches the wrong row",
+      "detail.replaceCoverBody" in _up98 and "{ title: book.title }" in _up98, None)
+_i18n98 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+check("the prompt says the old scan cannot be recovered",
+      _i18n98.count("'detail.replaceCoverBody'") == 4, _i18n98.count("'detail.replaceCoverBody'"))
+
+# And the boundary is written down where someone would otherwise assume otherwise.
+_bak98 = _slurp(_REPO, "scripts", "backup_d1.mjs")
+check("the backup script states that it does NOT cover the images",
+      "WHAT IT DOES NOT COVER: THE COVER IMAGES" in _bak98, None)
+_chk98 = _slurp(_REPO, "docs", "PRODUCTION_CHECKLIST.md")
+check("and so does the production checklist",
+      "Cover images are NOT in that backup" in _chk98, None)
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

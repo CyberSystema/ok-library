@@ -15,7 +15,23 @@
  * the schema DDL and which migrations had been applied. NDJSON rather than one big array so a
  * 12,700-row table streams and a truncated file still parses up to its last complete line.
  *
- * WHAT IT SKIPS, and why that is safe:
+ * WHAT IT DOES NOT COVER: THE COVER IMAGES. They live in R2, not D1, and this tool never opens
+ * the bucket. That is a deliberate boundary — a database dump and an object store are different
+ * jobs — but it has to be said out loud, because "the first backup this catalogue has ever had"
+ * invites the assumption that it holds everything. It does not:
+ *
+ *   · a cover is stored at one deterministic key, `covers/<bookId>.<ext>`;
+ *   · uploading a replacement is a bare `put` to that key, so the old scan is overwritten;
+ *   · the bucket has no object versioning;
+ *   · therefore those bytes exist in exactly ONE place, and nothing can bring them back.
+ *
+ * The consequence is bounded — what is lost is one photograph of a book that is physically in the
+ * building, and the remedy is to walk to the shelf and scan it again — which is why replacing a
+ * cover asks for confirmation and names the book, rather than this script growing an object-store
+ * mode. If that judgement ever stops holding (a rare-book collection photographed once, say),
+ * `wrangler r2 object get` in a loop over these ids is the thing to write.
+ *
+ * WHAT IT SKIPS INSIDE D1, and why that is safe:
  *   · books_fts and its books_fts_* shadow tables — a derived index. The triggers rebuild it
  *     from `books`, and `POST /api/admin/rebuild-search-index` exists to force that. Backing
  *     up a derived index would only create a way for it to disagree with its source.

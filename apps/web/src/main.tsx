@@ -2286,6 +2286,35 @@ function App() {
       setError(t('toast.coverTooLarge'));
       return;
     }
+    /*
+     * REPLACING a cover asks first, and names the book. Adding a first one does not.
+     *
+     * A cover lives at one deterministic key per book, `covers/<id>.<ext>`, and the upload is a
+     * bare put: the previous scan is overwritten in place. R2 has no object versioning here, and
+     * `scripts/backup_d1.mjs` is a D1 tool by construction — it does not touch the bucket — so
+     * those bytes exist in exactly one place and nothing anywhere can bring them back.
+     *
+     * The realistic accident is not a bad decision, it is a slip: this picker is opened from the
+     * right-click menu on a row of a 12,675-row list, and the file lands on whichever record was
+     * under the cursor. Naming the book in the prompt is what turns that into a caught mistake —
+     * the librarian is looking for the title they meant, and sees a different one.
+     *
+     * Deliberately NOT keeping a `.prev` copy instead: the orphan sweep parses a book id out of
+     * the object key with a greedy `(.+)`, so `covers/<id>.prev.jpg` reads as book `<id>.prev`,
+     * which matches no record — the sweep would delete every backup it found as an orphan. What
+     * is lost here is one photograph of a book that is physically in the building, and the remedy
+     * is to walk to the shelf and re-scan it. A confirmation is proportionate to that; a
+     * versioning scheme with a landmine in it is not.
+     */
+    if (book.coverUrl) {
+      const ok = await confirm({
+        title: t('detail.replaceCoverTitle'),
+        body: t('detail.replaceCoverBody', { title: book.title }),
+        confirmLabel: t('detail.replaceCover'),
+        danger: true
+      });
+      if (!ok) return;
+    }
     try {
       const res = await runAction(() =>
         apiRequest<{ ok: boolean; coverUrl: string; version: number }>(`/api/books/${book.id}/cover`, {

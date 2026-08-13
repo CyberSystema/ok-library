@@ -157,6 +157,15 @@ before the system handles real patron data.
    database (`books_fts` is an fts5 virtual table). D1 Time Travel also
    gives 30 days of point-in-time recovery, which is the fallback if no
    backup was taken — it needs a timestamp from before the damage.
+9. **Cover images are NOT in that backup, and are NOT versioned.** They live
+   in R2 at `covers/<bookId>.<ext>`, one key per book, and an upload
+   overwrites in place — so a replaced or wrongly-targeted scan is gone for
+   good. Neither `backup_d1.mjs` (a D1 tool by construction) nor D1 Time
+   Travel covers the bucket. Replacing a cover now asks for confirmation and
+   names the book, which is the guard against the realistic accident: the
+   right-click menu landing on the wrong row of a 12,675-row list. Losing one
+   is a re-scan, not a catalogue loss — but do not assume a backup brings it
+   back, because nothing does.
 
 ## 9. CORS, auth, and cookies — verification recipe
 
