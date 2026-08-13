@@ -5828,6 +5828,28 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 	const payload = UpsertCustomFieldSchema.parse(await c.req.json());
 	const now = nowIso();
 
+	/*
+	 * `?dryRun=1` answers "what would this cost me" and writes nothing.
+	 *
+	 * Changing an attribute's type DESTROYS every stored value that cannot be converted — the
+	 * sweep below does `delete values[newKey]` — and there was no warning of any kind, no
+	 * preview, and no count until afterwards. A librarian changing "Σελίδες" from text to number
+	 * to make it sortable silently loses every extent recorded the way ISBD asks for it:
+	 * "σ. 351-700", "156,[3]σ.", "χ.α." Narrowing an enum's options does the same to every book
+	 * holding an option that was removed.
+	 *
+	 * This runs the identical scan and coercion the real call runs, on the same page window and
+	 * the same write cap, so the preview describes exactly what one real call would do rather
+	 * than a different code path that happens to look similar — the import's dry run did diverge
+	 * like that, and told a librarian they were adding 1,200 records when it was about to update
+	 * them.
+	 */
+	const dryRun = c.req.query('dryRun') === '1' || c.req.query('dryRun') === 'true';
+	// What a real run would delete: enough to put it back by hand afterwards, capped so a
+	// catalogue-wide retype cannot write a megabyte into an audit row.
+	const LOST_SAMPLE_CAP = 200;
+	const lost: Array<{ bookId: string; value: unknown }> = [];
+
 	const existing = await c.env.DB.prepare(
 		'SELECT id, field_key, field_type, enum_options, pinned, sort_order FROM custom_field_definitions WHERE id = ? AND deleted_at IS NULL LIMIT 1'
 	)
@@ -5965,6 +5987,10 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 				const current = values[newKey];
 				const coerced = coerceToType(current);
 				if (coerced === undefined) {
+					// Recorded before it is deleted. This is the only trace the value ever existed
+					// once the JSON is rewritten, and it is what makes a mistaken retype
+					// recoverable by hand rather than a shrug.
+					if (lost.length < LOST_SAMPLE_CAP) lost.push({ bookId: row.id, value: current });
 					delete values[newKey];
 					changed = true;
 					// Losing an out-of-range enum choice and losing an un-convertible
@@ -5997,9 +6023,51 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 			);
 		}
 
-		for (let i = 0; i < bookUpdates.length; i += D1_BATCH_LIMIT) {
-			await runAtomic(c.env, bookUpdates.slice(i, i + D1_BATCH_LIMIT));
+		// A preview writes nothing at all — not the books, not the definition below.
+		if (!dryRun) {
+			for (let i = 0; i < bookUpdates.length; i += D1_BATCH_LIMIT) {
+				await runAtomic(c.env, bookUpdates.slice(i, i + D1_BATCH_LIMIT));
+			}
 		}
+	}
+
+	/*
+	 * The losses are logged PER PAGE, not with the summary at the end.
+	 *
+	 * This sweep is paged, and each page is a separate HTTP request with its own `lost` array.
+	 * The summary entry is written only on the page that completes the sweep, so recording the
+	 * destroyed values there captured the LAST page's losses and silently dropped every earlier
+	 * page's. Measured: a three-page retype destroyed three values and logged one.
+	 */
+	if (!dryRun && lost.length > 0) {
+		await insertAuditLog(c.env, c.get('user').sub, 'customField.valuesDestroyed', 'custom_field', id, {
+			key: payload.key,
+			oldType: existing.field_type,
+			type: payload.type,
+			sweepOffset,
+			count: lost.length,
+			values: lost,
+			truncated: lost.length >= LOST_SAMPLE_CAP
+		});
+	}
+
+	if (dryRun) {
+		return c.json({
+			id,
+			dryRun: true,
+			// Same page window and same write cap as a real call, so these numbers are that
+			// call's numbers. A caller loops on nextSweepOffset exactly as it would for real.
+			sweepComplete,
+			nextSweepOffset: sweepComplete ? null : sweepOffset + sweepScanned,
+			scanned: sweepScanned,
+			wouldRename: renamedBooks,
+			wouldClearEnum: clearedEnumBooks,
+			wouldRetype: retypedBooks,
+			// The values that would be destroyed, with the record each one is on.
+			wouldLose: lost.length,
+			wouldLoseSamples: lost.slice(0, 20),
+			wouldLoseTruncated: lost.length >= LOST_SAMPLE_CAP
+		});
 	}
 
 	// More pages to go: leave the definition untouched so the next call derives
@@ -6055,9 +6123,15 @@ app.put('/api/custom-fields/:id', requirePermission('customFields.manage', { lib
 	await insertAuditLog(c.env, c.get('user').sub, 'customField.update', 'custom_field', id, {
 		oldKey: existing.field_key,
 		key: payload.key,
+		oldType: existing.field_type,
+		type: payload.type,
 		renamedBooks,
 		clearedEnumBooks,
-		retypedBooks
+		retypedBooks,
+		// The destroyed values themselves are in the per-page `customField.valuesDestroyed`
+		// entries, not here: this summary is written only by the page that finishes the sweep,
+		// so anything recorded here would cover that page alone.
+		lostValuesThisPage: lost.length
 	});
 
 	// Counters are per-page; a caller that looped accumulates its own totals.

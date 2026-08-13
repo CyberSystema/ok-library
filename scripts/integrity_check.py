@@ -6023,6 +6023,113 @@ if LOCAL:
         call("DELETE", f"/api/books/{_bid94}/purge")
 
 
+print()
+print("=== 95. REGRESSION: changing an attribute's type must not destroy values silently ===")
+
+# Changing a custom attribute's type DESTROYS every stored value that cannot be converted — the
+# sweep does `delete values[newKey]` — and there was no warning of any kind, no preview, and no
+# count until afterwards. A librarian changing "Σελίδες" from text to number to make it sortable
+# loses every extent recorded the way ISBD area 5 asks for it: "σ. 351-700", "156,[3]σ.", "χ.α."
+# Narrowing an enum's options does the same to every book holding an option that was removed.
+#
+# Two changes, both additive. `?dryRun=1` runs the identical scan and coercion on the same page
+# window and the same write cap, writes NOTHING, and reports which values would go — by their
+# text, with the record each is on. And a real run records every destroyed value in the audit
+# trail, so a mistake can be undone by hand: a count cannot put an extent back, "σ. 351-700" can.
+_idx95 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_a95 = _idx95.find("app.put('/api/custom-fields/:id'")
+_r95 = _idx95[_a95:_idx95.find("app.delete('/api/custom-fields/:id'", _a95)] if _a95 >= 0 else ""
+_c95 = re.sub(r"/\*[\s\S]*?\*/", "", _r95)
+_c95 = "\n".join(l for l in _c95.split("\n") if not l.strip().startswith("//"))
+check("the attribute editor route is where this check can see it",
+      "delete values[newKey]" in _c95, _a95)
+check("it offers a preview", "dryRun" in _c95, None)
+check("the preview writes nothing at all", "if (!dryRun) {" in _c95, None)
+check("and it records what a real run would destroy, not just how much",
+      "wouldLoseSamples" in _c95, None)
+check("a real run records every destroyed value with the record it was on",
+      "customField.valuesDestroyed" in _c95 and "values: lost" in _c95, None)
+# Per page, not once at the end. The sweep is paged and each page is a separate request with its
+# own array, while the summary entry is written only by the page that finishes — so recording the
+# values there captured the LAST page and silently dropped every earlier one. Measured: a
+# three-page retype destroyed three values and logged one.
+# .find(), not .index(): under the broken state the string is absent and .index() raised, which
+# ABORTED the gate at this line and hid every check after it — including the runtime half that
+# proves the behaviour. A check that crashes is worse than one that fails, because it takes the
+# rest of the suite with it and the failure it reports is a stack trace about itself.
+_lossAt95 = _c95.find("customField.valuesDestroyed")
+_dryAt95 = _c95.find("if (dryRun) {")
+check("and does so PER PAGE, since each page is its own request",
+      _lossAt95 >= 0 and _dryAt95 >= 0 and _lossAt95 < _dryAt95, (_lossAt95, _dryAt95))
+
+if LOCAL:
+    _k95 = uuid.uuid4().hex[:6]
+    _key95 = f"zz_extent_{_k95}"
+    st, _f95 = call("POST", "/api/custom-fields",
+                    {"key": _key95, "label": f"ZZ Έκταση {_k95}", "type": "text",
+                     "required": False, "enumOptions": []})
+    _fid95 = (_f95 or {}).get("id")
+    check("a text attribute can be created", st == 201 and bool(_fid95), (st, _f95))
+    # Real extents from this catalogue's own cataloguing, plus one that IS a number.
+    _vals95 = ["σ. 351-700", "156,[3]σ.", "420", "χ.α."]
+    _books95 = []
+    for _v in _vals95:
+        _b, _ = mkbook(title=f"ZZ Extent {_k95} {_v}", author="Ξ. Δοκιμή",
+                       customFields={_key95: _v})
+        _books95.append((_b, _v))
+    _body95 = {"key": _key95, "label": f"ZZ Έκταση {_k95}", "type": "number",
+               "required": False, "enumOptions": []}
+
+    if _fid95:
+        # THE PREVIEW. Looped exactly as a caller would, and it must touch nothing.
+        _off95, _pages95, _would95 = 0, 0, []
+        while _pages95 < 12:
+            st, _d95 = call("PUT", f"/api/custom-fields/{_fid95}?dryRun=1&sweepOffset={_off95}", _body95)
+            _pages95 += 1
+            if st != 200: break
+            _would95 += (_d95 or {}).get("wouldLoseSamples") or []
+            if (_d95 or {}).get("sweepComplete"): break
+            _off95 = (_d95 or {}).get("nextSweepOffset")
+            if _off95 is None: break
+        check("the preview names the values that would be destroyed",
+              {w["value"] for w in _would95} == {"σ. 351-700", "156,[3]σ.", "χ.α."},
+              [w.get("value") for w in _would95])
+        check("and it does NOT list a value that converts cleanly",
+              all(w["value"] != "420" for w in _would95), _would95)
+        _afterDry95 = [(get(_b) or {}).get("customFields", {}).get(_key95) for _b, _ in _books95]
+        check("the preview wrote nothing to the records",
+              _afterDry95 == _vals95, _afterDry95)
+        _defs95 = local_sql(f"SELECT field_type FROM custom_field_definitions WHERE id = '{_fid95}'")
+        check("and did not change the attribute either",
+              _defs95 and _defs95[0]["field_type"] == "text", _defs95)
+
+        # THE REAL RUN. The values still go — that is what a type change means — but every one of
+        # them is named in the audit trail afterwards.
+        local_sql("DELETE FROM audit_logs WHERE action = 'customField.valuesDestroyed'")
+        _off95, _pages95 = 0, 0
+        while _pages95 < 12:
+            st, _r95b = call("PUT", f"/api/custom-fields/{_fid95}?sweepOffset={_off95}", _body95)
+            _pages95 += 1
+            if st != 200 or (_r95b or {}).get("sweepComplete"): break
+            _off95 = (_r95b or {}).get("nextSweepOffset")
+            if _off95 is None: break
+        check("the type change completes", st == 200, st)
+        _kept95 = (get(_books95[2][0]) or {}).get("customFields", {}).get(_key95)
+        check("the value that converts is kept, as a number", str(_kept95) == "420", _kept95)
+        _rows95 = local_sql("SELECT metadata FROM audit_logs WHERE action = 'customField.valuesDestroyed' "
+                            "ORDER BY created_at")
+        _logged95 = []
+        for _row in (_rows95 or []):
+            _logged95 += [v["value"] for v in json.loads(_row["metadata"])["values"]]
+        check("and EVERY destroyed value is in the audit trail, from every page",
+              set(_logged95) == {"σ. 351-700", "156,[3]σ.", "χ.α."}, _logged95)
+
+    for _b, _ in _books95:
+        call("DELETE", f"/api/books/{_b}")
+        call("DELETE", f"/api/books/{_b}/purge")
+    if _fid95: call("DELETE", f"/api/custom-fields/{_fid95}")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
