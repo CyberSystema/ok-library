@@ -1879,6 +1879,42 @@ app.put('/api/books/:id/authorities', requirePermission('books.write', { librari
 
 	const payload = LinkAuthoritiesSchema.parse(await c.req.json());
 	const now = nowIso();
+
+	/*
+	 * Read the headings this record holds now — needed for three things: the conflict check, the
+	 * audit entry, and knowing what is actually being removed.
+	 *
+	 * The names come along because the DELETE below is a HARD delete. `book_authorities` has no
+	 * deleted_at, and the audit entry recorded `{count}` and nothing else, so a replace that
+	 * dropped the wrong heading left no record anywhere of what it had been. A count cannot
+	 * answer "which heading did I just lose".
+	 */
+	const beforeRows = await c.env.DB.prepare(
+		`SELECT ba.authority_id, ba.role, a.preferred_form
+		   FROM book_authorities ba
+		   LEFT JOIN authorities a ON a.id = ba.authority_id
+		  WHERE ba.book_id = ?
+		  ORDER BY ba.seq ASC`
+	).bind(id).all<{ authority_id: string; role: string; preferred_form: string | null }>();
+	const before = beforeRows.results ?? [];
+	const keyOf = (authorityId: string, role: string) => `${authorityId}|${role}`;
+	const beforeKeys = new Set(before.map((r) => keyOf(r.authority_id, r.role)));
+
+	// The conflict check. A set comparison, so the order the client happens to hold them in is
+	// not a conflict — only a heading appearing or disappearing is.
+	if (payload.expectedLinks) {
+		const expectedKeys = new Set(payload.expectedLinks.map((l) => keyOf(l.authorityId, l.role)));
+		const same = expectedKeys.size === beforeKeys.size
+			&& [...expectedKeys].every((k) => beforeKeys.has(k));
+		if (!same) {
+			throw new HTTPException(409, {
+				message: 'The headings on this record changed since you loaded them.',
+				cause: { code: 'version_conflict' }
+			});
+		}
+	}
+
+	const afterKeys = new Set(payload.links.map((l) => keyOf(l.authorityId, l.role)));
 	const statements: D1PreparedStatement[] = [
 		c.env.DB.prepare('DELETE FROM book_authorities WHERE book_id = ?').bind(id)
 	];
@@ -1890,10 +1926,39 @@ app.put('/api/books/:id/authorities', requirePermission('books.write', { librari
 			).bind(id, link.authorityId, link.role, index, now)
 		);
 	});
+	/*
+	 * The record's timestamp moves, in the same batch — or a failure could leave the headings
+	 * changed and the record claiming it had not been touched.
+	 *
+	 * This is for OAI-PMH, which harvests incrementally on `(updated_at, id)`. MARC 1xx, 6xx and
+	 * 7xx are built from exactly these links, so with the timestamp standing still a partner
+	 * library that had already harvested this record would NEVER receive its corrected subject
+	 * headings — the cursor would step straight past it forever. The offline sync cursor is the
+	 * same column.
+	 *
+	 * `version` is deliberately NOT bumped. It guards the record editor and the copies editor,
+	 * and neither of them writes a heading — `PUT /api/books/:id` never touches
+	 * book_authorities, and nothing anywhere compares books.version before writing one. The
+	 * concurrency check for THIS route is the heading set above. Bumping version would buy no
+	 * protection at all and would cost a librarian who is correcting a title a conflict dialog
+	 * because a colleague tagged a subject, which is how a guard earns the reputation of being
+	 * noise to click through.
+	 */
+	statements.push(
+		c.env.DB.prepare('UPDATE books SET updated_at = ? WHERE id = ?').bind(now, id)
+	);
 	await runAtomic(c.env, statements);
 	await bumpBooksCacheVersion(c.env);
 	await insertAuditLog(c.env, c.get('user').sub, 'book.authorities.replace', 'book', id, {
-		count: payload.links.length
+		count: payload.links.length,
+		// What went, by name, so a mistaken replace can be undone by hand. Headings are
+		// bibliographic vocabulary, not personal data about a reader.
+		removed: before
+			.filter((r) => !afterKeys.has(keyOf(r.authority_id, r.role)))
+			.map((r) => ({ authorityId: r.authority_id, role: r.role, form: r.preferred_form })),
+		added: payload.links
+			.filter((l) => !beforeKeys.has(keyOf(l.authorityId, l.role)))
+			.map((l) => ({ authorityId: l.authorityId, role: l.role }))
 	});
 	return c.json({ bookId: id, count: payload.links.length });
 });
@@ -2400,7 +2465,16 @@ app.get('/api/books/merge-candidates', requirePermission('books.write', { librar
 
 app.post('/api/books/merge', requirePermission('books.write', { librarian: true }), async (c) => {
 	const payload = MergeBooksSchema.parse(await c.req.json());
-	const mergeIds = payload.mergeIds.filter((id) => id !== payload.keepId);
+	/*
+	 * DEDUPED. The list was filtered against keepId and nothing else, so the same loser passed
+	 * twenty times — the schema's cap — walked the copy loop twenty times and emitted twenty
+	 * statements for the SAME copy. That is not merely waste: the cascade is chunked at 40
+	 * statements per D1 batch and batches are separate transactions, so the amplification is what
+	 * makes a torn merge reachable from a payload that looks entirely ordinary. It also handed one
+	 * copy twenty different copy numbers, and told the librarian 20 records had been removed when
+	 * there was one.
+	 */
+	const mergeIds = [...new Set(payload.mergeIds.filter((id) => id !== payload.keepId))];
 	if (mergeIds.length === 0) throw new HTTPException(400, { message: 'Nothing to merge into the kept record' });
 
 	const ids = [payload.keepId, ...mergeIds];
@@ -2620,6 +2694,28 @@ app.post('/api/books/merge', requirePermission('books.write', { librarian: true 
 			  WHERE id IN (${mergePh})`
 		).bind(now, payload.keepId, now, ...mergeIds)
 	);
+
+	/*
+	 * THE PROVENANCE IS WRITTEN FIRST, before any copy moves.
+	 *
+	 * `movedItems` in the log below — item id → the record it came from — is the ONLY record of
+	 * which copy belonged to which record before the merge, and the restore path says so in as
+	 * many words: a merged copy is re-parented, not deleted, so nothing about the copy itself
+	 * remembers where it was. That log used to be written after every batch. This cascade is
+	 * chunked at 40 statements and each chunk is its own transaction, so a failure part way
+	 * through committed the copy moves and then never wrote the provenance — and a re-run, which
+	 * is the obvious and correct response, sees only the copies still on the losers, so the ones
+	 * the committed chunk already moved lose their origin permanently.
+	 *
+	 * Writing it first inverts the failure: at worst there is an entry for a merge that did not
+	 * happen, which is a puzzle rather than a loss, and the re-run records the rest. insertAuditLog
+	 * is best-effort and swallows its own errors, so it cannot break the merge to save the log.
+	 */
+	await insertAuditLog(c.env, c.get('user').sub, 'book.merge.intent', 'book', payload.keepId, {
+		mergedIds: mergeIds,
+		copiesToMove: movingItems.length,
+		movedItems: movingItems.map((i) => ({ itemId: i.id, from: i.bookId }))
+	});
 
 	for (let i = 0; i < statements.length; i += 40) {
 		await runAtomic(c.env, statements.slice(i, i + 40));
@@ -8114,15 +8210,30 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 	// DECOMPOSED — "ē" as e + U+0304 — which never compares equal to its
 	// composed twin), and their folds have to be rebuilt in lock-step like every
 	// other pair.
+	/*
+	 * KEYSET on id, not OFFSET, and `version` is selected because the UPDATE below matches on it.
+	 *
+	 * Ids are random UUIDs, so a book catalogued while this sweep is running lands at an arbitrary
+	 * position in the id order — including before the current offset. Every row after it then
+	 * shifts by one and the next page steps clean over a row that was never processed, while the
+	 * response reports "processed 500" and the operator has no way to know. The same OFFSET-walk
+	 * hazard was already fixed in the CSV export and the sync cursor here; the attribute sweep's
+	 * comment still claims the window "stays stable across calls" because it considered only this
+	 * sweep's own writes and not a concurrent insert.
+	 *
+	 * `offset` is still honoured when no cursor is given, so an operator loop already written
+	 * against it keeps working; `nextAfterId` in the response is what a caller should follow.
+	 */
+	const afterId = c.req.query('afterId') ?? '';
 	const rows = await c.env.DB.prepare(
-		`SELECT id, title, author, isbn, publisher, language, description,
+		`SELECT id, version, title, author, isbn, publisher, language, description,
 		        room_code, shelf_code, acquisition_date, tags, custom_fields,
 		        title_romanized, author_romanized, publisher_romanized,
 		        title_fold, author_fold, isbn_fold, publisher_fold,
 		        description_fold, tags_fold, custom_fields_fold,
 		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
-		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
-	).bind(limit, offset).all<Record<string, unknown>>();
+		 FROM books WHERE deleted_at IS NULL AND id > ? ORDER BY id LIMIT ? OFFSET ?`
+	).bind(afterId, limit, afterId ? 0 : offset).all<Record<string, unknown>>();
 
 	let updated = 0;
 	let foldsBackfilled = 0;
@@ -8222,6 +8333,18 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 			publisherRomanized: n.publisherRomanized ?? null
 		});
 
+		/*
+		 * `AND version=?` — write the row back only if nobody has touched it since this page was
+		 * read. A sweep that writes a row it no longer holds is a sweep that undoes a librarian.
+		 *
+		 * A refused row is simply not written. Safe, because both sweeps are idempotent and
+		 * re-runnable by design, AND because the record's own save path already recomputes
+		 * everything these passes compute — a librarian's edit went through normalizeBookData and
+		 * computeBookFolds on its way in, so the row it leaves behind is already consistent.
+		 * Counted as `skipped` rather than folded into the success count: a number that quietly
+		 * means something else is how the import came to report "0 rows" after overwriting
+		 * thousands.
+		 */
 		updates.push(
 			c.env.DB.prepare(
 				`UPDATE books SET
@@ -8232,7 +8355,7 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
 				   description_fold=?, tags_fold=?, custom_fields_fold=?,
 				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?, isbn_valid=?
-				 WHERE id=?`
+				 WHERE id=? AND version=?`
 			).bind(
 				n.title, n.author, n.isbn ?? null, n.publisher ?? null, n.language ?? null, n.description ?? null,
 				n.roomCode ?? null, n.shelfCode ?? null, n.acquisitionDate ?? null,
@@ -8243,7 +8366,8 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
 				folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
 				folds.isbn_valid,
-				row.id as string
+				row.id as string,
+				row.version as number
 			)
 		);
 
@@ -8252,9 +8376,16 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 
 	// D1 batch caps at 50 statements per call.
 	const BATCH_SIZE = 50;
+	let skipped = 0;
 	for (let i = 0; i < updates.length; i += BATCH_SIZE) {
-		await c.env.DB.batch(updates.slice(i, i + BATCH_SIZE));
+		const results = await c.env.DB.batch(updates.slice(i, i + BATCH_SIZE));
+		// changes === 0 means the version guard refused it — somebody edited that record while
+		// this page was in flight.
+		for (const r of results) {
+			if ((r as { meta?: { changes?: number } }).meta?.changes === 0) skipped += 1;
+		}
 	}
+	updated -= skipped;
 
 	// Heal the location codes on the COPIES too.
 	//
@@ -8307,9 +8438,22 @@ app.post('/api/admin/normalize-books', requirePermission('setup'), async (c) => 
 		processed, updated, foldsBackfilled, itemCodesHealed, offset, limit
 	});
 
+	/*
+	 * `nextAfterId` is the cursor a caller should follow — the id of the last row this page saw.
+	 * `nextOffset` stays for a loop already written against it. `skipped` is reported separately
+	 * because those rows were deliberately not written: somebody edited them mid-sweep, and their
+	 * own save already normalized them.
+	 */
+	const lastId = (rows.results ?? []).length > 0
+		? String((rows.results ?? [])[(rows.results ?? []).length - 1].id)
+		: null;
 	return c.json({
-		processed, updated, foldsBackfilled, itemCodesHealed,
-		unchanged: processed - updated, offset, nextOffset: offset + processed, totalBooks
+		processed, updated, skipped, foldsBackfilled, itemCodesHealed,
+		unchanged: processed - updated - skipped,
+		offset, nextOffset: offset + processed,
+		nextAfterId: processed < limit ? null : lastId,
+		done: processed < limit,
+		totalBooks
 	});
 });
 
@@ -8336,18 +8480,21 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 	const limit = Math.min(500, Math.max(1, Number(c.req.query('limit') ?? 500)));
 	const offset = Math.max(0, Number(c.req.query('offset') ?? 0));
 	const force = c.req.query('force') === '1' || c.req.query('force') === 'true';
+	// Keyset, for the reason normalize-books gives: ids are random UUIDs, so a book catalogued
+	// mid-sweep can land before the current offset and shift a row out of every page.
+	const afterId = c.req.query('afterId') ?? '';
 
 	// ALL TEN fold columns, not the seven that existed before migration 0023.
 	// This pass is the only thing that can repair a fold after the fact, so a
 	// column it does not know about is a column that stays wrong forever — and
 	// `title_romanized_fold` is what makes "Klemes Romes" find Κλήμης Ῥώμης.
 	const rows = await c.env.DB.prepare(
-		`SELECT id, title, author, isbn, publisher, description, tags, custom_fields,
+		`SELECT id, version, title, author, isbn, publisher, description, tags, custom_fields,
 		        title_romanized, author_romanized, publisher_romanized,
 		        title_fold, author_fold, isbn_fold, publisher_fold, description_fold, tags_fold, custom_fields_fold,
 		        title_romanized_fold, author_romanized_fold, publisher_romanized_fold, isbn_valid
-		 FROM books WHERE deleted_at IS NULL ORDER BY id LIMIT ? OFFSET ?`
-	).bind(limit, offset).all<Record<string, unknown>>();
+		 FROM books WHERE deleted_at IS NULL AND id > ? ORDER BY id LIMIT ? OFFSET ?`
+	).bind(afterId, limit, afterId ? 0 : offset).all<Record<string, unknown>>();
 
 	const processed = rows.results?.length ?? 0;
 	let rebuilt = 0;
@@ -8381,13 +8528,14 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 				   title_fold=?, author_fold=?, isbn_fold=?, publisher_fold=?,
 				   description_fold=?, tags_fold=?, custom_fields_fold=?,
 				   title_romanized_fold=?, author_romanized_fold=?, publisher_romanized_fold=?, isbn_valid=?
-				 WHERE id=?`
+				 WHERE id=? AND version=?`
 			).bind(
 				folds.title_fold, folds.author_fold, folds.isbn_fold, folds.publisher_fold,
 				folds.description_fold, folds.tags_fold, folds.custom_fields_fold,
 				folds.title_romanized_fold, folds.author_romanized_fold, folds.publisher_romanized_fold,
 				folds.isbn_valid,
-				row.id as string
+				row.id as string,
+				row.version as number
 			)
 		);
 
@@ -8396,9 +8544,17 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 
 	// D1 batch caps at 50 statements per call.
 	const BATCH_SIZE = 50;
+	let skipped = 0;
 	for (let i = 0; i < updates.length; i += BATCH_SIZE) {
-		await c.env.DB.batch(updates.slice(i, i + BATCH_SIZE));
+		const results = await c.env.DB.batch(updates.slice(i, i + BATCH_SIZE));
+		// Refused by the version guard: the record was edited while this page was in flight, and
+		// its own save writes the folds in lock-step with the new text — so the row it left behind
+		// is already correct, and rewriting it from the stale copy is what would break it.
+		for (const r of results) {
+			if ((r as { meta?: { changes?: number } }).meta?.changes === 0) skipped += 1;
+		}
 	}
+	rebuilt -= skipped;
 
 	if (rebuilt > 0) {
 		await bumpBooksCacheVersion(c.env);
@@ -8413,12 +8569,19 @@ app.post('/api/admin/rebuild-search-index', requirePermission('setup'), async (c
 		processed, rebuilt, offset, limit, force
 	});
 
+	const lastRebuiltId = (rows.results ?? []).length > 0
+		? String((rows.results ?? [])[(rows.results ?? []).length - 1].id)
+		: null;
 	return c.json({
 		processed,
 		rebuilt,
-		unchanged: processed - rebuilt,
+		skipped,
+		unchanged: processed - rebuilt - skipped,
 		offset,
 		nextOffset: done ? null : nextOffset,
+		// The cursor to follow. OFFSET cannot be trusted here: ids are random UUIDs, so a book
+		// catalogued mid-sweep lands anywhere in the order and shifts a row out of a later page.
+		nextAfterId: processed < limit ? null : lastRebuiltId,
 		totalBooks,
 		done
 	});

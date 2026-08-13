@@ -27,7 +27,7 @@
 // simply wrong, consolidate it. If all of them are right, make a heading.
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { MARC_RELATORS } from '@ok-library/shared';
-import { apiRequest } from '../api';
+import { apiRequest, isVersionConflict } from '../api';
 import { useT } from '../i18n';
 import { Combobox, Dialog, fmt, useConfirm, useToast } from '../ui';
 import { HelpLink } from '../handbook/context';
@@ -156,14 +156,30 @@ export function BookAuthorities({ bookId, canWrite, onChanged }: {
     try {
       await apiRequest(`/api/books/${bookId}/authorities`, {
         method: 'PUT',
-        body: JSON.stringify({ links: next.map((l) => ({ authorityId: l.authorityId, role: l.role })) })
+        body: JSON.stringify({
+          links: next.map((l) => ({ authorityId: l.authorityId, role: l.role })),
+          /*
+           * What we believe is stored. This route replaces the whole set, so without it two
+           * librarians adding a heading each meant the second save deleted the first one's —
+           * silently, 200 OK. `links` is the list we loaded, so it is exactly the right baseline.
+           */
+          expectedLinks: links.map((l) => ({ authorityId: l.authorityId, role: l.role }))
+        })
       });
       setLinks(next);
       toast.push('success', t('authorities.linksSaved'));
       onChanged?.();
     } catch (e) {
-      toast.push('error', (e as Error).message);
-      await load();
+      // Someone else changed the headings first. Reload so the list on screen is the real one
+      // and the librarian can redo their change on top, rather than being left looking at a set
+      // that no longer exists and clicking a button that can only fail again.
+      if (isVersionConflict(e)) {
+        toast.push('error', t('authorities.linksConflict'));
+        await load();
+      } else {
+        toast.push('error', (e as Error).message);
+        await load();
+      }
     } finally {
       setBusy(false);
     }

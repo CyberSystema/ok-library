@@ -536,7 +536,28 @@ export const LinkAuthoritiesSchema = z.object({
   links: z.array(z.object({
     authorityId: z.string().min(1),
     role: MarcRelatorSchema.default('aut')
-  })).max(100)
+  })).max(100),
+  /*
+   * The set of links the caller believes is stored right now.
+   *
+   * This route REPLACES every heading on a record — it deletes them all and re-inserts the
+   * payload — and it had no concurrency control of any kind. Two librarians with the same record
+   * open, each adding a heading: the second save deleted the first one's, silently, 200 OK.
+   * Reproduced on a real record.
+   *
+   * The guard compares the HEADINGS rather than `books.version` on purpose. This is a set
+   * replacement, and the client that sends it (BookAuthorities) never sees the record version —
+   * it holds exactly the list it loaded. Comparing the list detects precisely the conflict that
+   * matters and does not refuse a save because somebody corrected the title meanwhile, which a
+   * version check would.
+   *
+   * Optional, so an older client keeps working — it simply gets the old unguarded behaviour
+   * rather than a 400.
+   */
+  expectedLinks: z.array(z.object({
+    authorityId: z.string().min(1),
+    role: MarcRelatorSchema.default('aut')
+  })).max(100).optional()
 });
 
 // ─── Multi-part works ──────────────────────────────────────────────────────

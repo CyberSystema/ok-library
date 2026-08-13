@@ -5756,6 +5756,273 @@ for _cls in ("withdrawn-copies", "withdrawn-list", "withdrawn-what"):
           f".{_cls}" in _css91, None)
 
 
+print()
+print("=== 92. REGRESSION: replacing a record's headings must not delete a colleague's ===")
+
+# PUT /api/books/:id/authorities REPLACES every heading on a record — one DELETE of the whole set
+# followed by an INSERT per link — and it had no concurrency control of any kind. Two librarians
+# with the same record open, each adding a subject heading: the second save deleted the first
+# one's. Reproduced on a real record: 200 OK, and only the second librarian's heading remained.
+#
+# Three defects in twenty-five lines, and all three mattered:
+#   1. no guard at all — LinkAuthoritiesSchema had no expectedVersion and the handler read only
+#      `SELECT id FROM books`;
+#   2. the DELETE is HARD (book_authorities has no deleted_at) and the audit entry recorded
+#      `{count}` — so nothing anywhere said WHICH heading had just been dropped;
+#   3. books.version and updated_at never moved, which hid the change from the record editor's
+#      guard AND from OAI-PMH, which harvests incrementally on (updated_at, id) — a partner
+#      library that had already harvested the record would never receive its corrected subjects,
+#      and MARC 1xx/6xx/7xx are built from exactly these links.
+#
+# The guard compares the HEADING SET rather than books.version deliberately: this is a set
+# replacement, the client that sends it never sees the record version, and a version check would
+# refuse the save because somebody corrected the title meanwhile.
+_idx92 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_a92 = _idx92.find("app.put('/api/books/:id/authorities'")
+_route92 = _idx92[_a92:_a92 + 5200] if _a92 >= 0 else ""
+_code92 = re.sub(r"/\*[\s\S]*?\*/", "", _route92)
+_code92 = "\n".join(l for l in _code92.split("\n") if not l.strip().startswith("//"))
+check("the authorities route is where this check can see it",
+      "DELETE FROM book_authorities" in _code92, _a92)
+check("it refuses a save whose baseline no longer matches the stored headings",
+      "expectedLinks" in _code92 and "version_conflict" in _code92, None)
+check("and moves the record's updated_at in the SAME batch, for the harvest cursor",
+      "UPDATE books SET updated_at = ? WHERE id = ?" in _code92
+      and _code92.index("UPDATE books SET updated_at") < _code92.index("runAtomic"), None)
+# And deliberately does NOT bump version. PUT /api/books/:id never writes book_authorities and
+# nothing compares books.version before writing a heading, so bumping it protects nothing here —
+# it would only hand a spurious conflict to a librarian correcting a title while a colleague tags
+# subjects. The guard for this route is the heading set.
+check("and deliberately does NOT bump version, which guards editors that never write headings",
+      "version = version + 1" not in _code92, None)
+check("the audit entry records which headings went, not just how many",
+      "removed:" in _code92 and "preferred_form" in _code92, None)
+_shared92 = _slurp(_REPO, "packages", "shared", "src", "index.ts")
+# Reads the declaration rather than guessing at its punctuation — the first attempt matched one
+# closing paren too few and failed against correct code.
+_exp92 = re.search(r"expectedLinks:\s*z\.array\([\s\S]{0,400}?\)\s*\.max\(\d+\)\s*\.optional\(\)", _shared92)
+check("the schema accepts the baseline, and optionally, so an old client still works",
+      _exp92 is not None, None)
+_web92 = _slurp(_REPO, "apps", "web", "src", "screens", "authorities.tsx")
+check("the client sends the list it loaded as that baseline",
+      "expectedLinks: links.map" in _web92, None)
+check("and reloads instead of dead-ending when someone got there first",
+      "isVersionConflict(e)" in _web92 and "authorities.linksConflict" in _web92, None)
+
+if LOCAL:
+    _k92 = uuid.uuid4().hex[:6]
+    st, _s1 = call("POST", "/api/authorities",
+                   {"kind": "subject", "preferredForm": f"ZZ Πατρολογία {_k92}", "variants": []})
+    st, _s2 = call("POST", "/api/authorities",
+                   {"kind": "subject", "preferredForm": f"ZZ Λειτουργική {_k92}", "variants": []})
+    _id1, _id2 = (_s1 or {}).get("id"), (_s2 or {}).get("id")
+    check("two headings can be created", bool(_id1 and _id2), (_s1, _s2))
+    _b92, _ = mkbook(title=f"ZZ Authority Race {_k92}", author="Κ. Δοκιμή")
+    _before92 = get(_b92) or {}
+
+    if _id1 and _id2:
+        # A loads an empty heading list. B links one. A saves against the list A loaded.
+        st, _ = call("PUT", f"/api/books/{_b92}/authorities",
+                     {"links": [{"authorityId": _id2, "role": "aut"}], "expectedLinks": []})
+        check("the first librarian's heading lands", st == 200, st)
+        _after92 = get(_b92) or {}
+        check("and it moved the record's updated_at, which is what OAI-PMH harvests on",
+              _after92.get("updatedAt") != _before92.get("updatedAt"),
+              (_before92.get("updatedAt"), _after92.get("updatedAt")))
+        # And left `version` alone. It guards the record editor and the copies editor, neither of
+        # which writes a heading, so bumping it would only hand a conflict dialog to a librarian
+        # correcting a title while a colleague tags subjects.
+        check("and deliberately left the version alone, so the title editor is not interrupted",
+              _after92.get("version") == _before92.get("version"),
+              (_before92.get("version"), _after92.get("version")))
+
+        st, _conf92 = call("PUT", f"/api/books/{_b92}/authorities",
+                           {"links": [{"authorityId": _id1, "role": "aut"}], "expectedLinks": []})
+        check("the second librarian's stale save is refused", st == 409, st)
+        check("and is flagged so the client knows to reload",
+              (_conf92 or {}).get("code") == "version_conflict", _conf92)
+        st, _links92 = call("GET", f"/api/books/{_b92}/authorities")
+        _forms92 = [l.get("preferredForm") for l in ((_links92 or {}).get("links") or [])]
+        check("the first librarian's heading is still there",
+              any(f"ZZ Λειτουργική {_k92}" == f for f in _forms92), _forms92)
+
+        # The honest retry: reload, add on top, both survive.
+        _fresh92 = [{"authorityId": l["authorityId"], "role": l["role"]}
+                    for l in ((_links92 or {}).get("links") or [])]
+        st, _ = call("PUT", f"/api/books/{_b92}/authorities",
+                     {"links": _fresh92 + [{"authorityId": _id1, "role": "aut"}],
+                      "expectedLinks": _fresh92})
+        check("adding on top of the reloaded list succeeds", st == 200, st)
+        st, _links92b = call("GET", f"/api/books/{_b92}/authorities")
+        check("and both librarians' headings are on the record",
+              len(((_links92b or {}).get("links") or [])) == 2,
+              [l.get("preferredForm") for l in ((_links92b or {}).get("links") or [])])
+
+        # Dropping one must leave a record of WHICH one, or a misclick is unrecoverable.
+        _keep92 = _fresh92[:1]
+        _base92 = [{"authorityId": l["authorityId"], "role": l["role"]}
+                   for l in ((_links92b or {}).get("links") or [])]
+        st, _ = call("PUT", f"/api/books/{_b92}/authorities",
+                     {"links": _keep92, "expectedLinks": _base92})
+        check("a heading can be removed", st == 200, st)
+        _md92 = local_sql("SELECT metadata FROM audit_logs WHERE action = 'book.authorities.replace' "
+                          "ORDER BY created_at DESC LIMIT 1")
+        _meta92 = json.loads(_md92[0]["metadata"]) if _md92 else {}
+        check("and the audit trail names the heading that was removed",
+              bool(_meta92.get("removed")) and bool(_meta92["removed"][0].get("form")),
+              _meta92)
+
+    call("DELETE", f"/api/books/{_b92}")
+    call("DELETE", f"/api/books/{_b92}/purge")
+    for _aid in (_id1, _id2):
+        if _aid: call("DELETE", f"/api/authorities/{_aid}")
+
+
+print()
+print("=== 93. REGRESSION: a catalogue-wide sweep must not write back a row that moved ===")
+
+# normalize-books reads a page of rows, computes new values in JS, then writes FOURTEEN AUTHORED
+# columns back — title, author, publisher, description, the location codes, tags, the attribute
+# map — from values captured at read time, with no version match. A librarian who corrected a
+# title while the sweep was between its read and its write had that correction overwritten with
+# the pre-edit text. rebuild-search-index has the same shape for the derived fold columns, where
+# the damage is a fold that no longer matches its text: the record then answers Greek search under
+# words it no longer holds, which is the desync two earlier commits were about.
+#
+# BOTH sweeps now match on the version they read, and a refused row is reported as `skipped`
+# rather than counted as updated. Safe to refuse, because both passes are idempotent and
+# re-runnable, and because a librarian's save already runs normalizeBookData and computeBookFolds
+# on its way in — the row it leaves behind is consistent, and rewriting it from the stale copy is
+# what would break it.
+#
+# THE PAGING IS KEYSET NOW TOO. Ids are random UUIDs, so a book catalogued mid-sweep lands at an
+# arbitrary position and shifts every row after it, and an OFFSET walk steps clean over a row that
+# was never processed while reporting a full page. The attribute sweep's comment still claims the
+# window "stays stable across calls" — true only of this sweep's own writes, not of a concurrent
+# insert.
+_idx93 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+for _route93, _label93 in (("normalize-books", "the normalize sweep"),
+                           ("rebuild-search-index", "the search-index sweep")):
+    _a93 = _idx93.find(f"app.post('/api/admin/{_route93}'")
+    _end93 = _idx93.find("\napp.", _a93 + 10)
+    _seg93 = _idx93[_a93:_end93] if _a93 >= 0 else ""
+    _c93 = re.sub(r"/\*[\s\S]*?\*/", "", _seg93)
+    _c93 = "\n".join(l for l in _c93.split("\n") if not l.strip().startswith("//"))
+    check(f"{_label93} is where this check can see it", "UPDATE books SET" in _c93, _a93)
+    # The guard is worthless unless the version it matches on was actually SELECTed. It was not,
+    # on the first attempt at this fix, so `row.version` bound undefined, the guard matched
+    # nothing, and the sweep silently stopped writing at all — a fix that quietly disables the
+    # thing it protects. That is what the runtime half below exists to catch.
+    check(f"  it selects version, or the guard binds undefined and never matches",
+          re.search(r"SELECT id, version,", _c93) is not None, None)
+    check(f"  its write matches on the version it read", "AND version=?" in _c93, None)
+    check(f"  and binds that version", "row.version as number" in _c93, None)
+    check(f"  it pages by keyset, not by OFFSET alone", "AND id > ?" in _c93, None)
+    check(f"  and hands back the cursor to follow", "nextAfterId" in _c93, None)
+    check(f"  refusals are reported, not folded into the success count", "skipped" in _c93, None)
+
+if LOCAL:
+    # THE REGRESSION THAT MATTERS MOST: the sweep must still do its job. A version guard whose
+    # bound value is wrong turns the whole pass into a no-op that reports success.
+    _b93, _ = mkbook(title=f"ZZ Sweep Guard {uuid.uuid4().hex[:6]}", author="Λ. Δοκιμή")
+    local_sql(f"UPDATE books SET title_fold = NULL WHERE id = '{_b93}'")
+    _cleared93 = local_sql(f"SELECT title_fold FROM books WHERE id = '{_b93}'")
+    check("a fold can be cleared to make the row a sweep candidate",
+          _cleared93 and _cleared93[0].get("title_fold") is None, _cleared93)
+    _prev93 = local_sql(f"SELECT id FROM books WHERE id < '{_b93}' AND deleted_at IS NULL "
+                        "ORDER BY id DESC LIMIT 1")
+    _after93 = _prev93[0]["id"] if _prev93 else ""
+    st, _r93 = call("POST", f"/api/admin/normalize-books?limit=1&afterId={urllib.parse.quote(_after93)}")
+    check("the sweep answers", st == 200, st)
+    check("and it processed exactly the row the cursor pointed at",
+          (_r93 or {}).get("processed") == 1, _r93)
+    _fold93 = local_sql(f"SELECT title_fold FROM books WHERE id = '{_b93}'")
+    check("and it REPAIRED that row rather than reporting success and doing nothing",
+          _fold93 and _fold93[0].get("title_fold"), _fold93)
+
+    # The cursor must actually move the window, not merely appear in the response. It did not:
+    # the response advertised nextAfterId while the query still walked from the top.
+    _ids93 = [r["id"] for r in (local_sql("SELECT id FROM books WHERE deleted_at IS NULL "
+                                         "ORDER BY id LIMIT 2") or [])]
+    if len(_ids93) == 2:
+        st, _p1 = call("POST", "/api/admin/normalize-books?limit=1")
+        st, _p2 = call("POST", f"/api/admin/normalize-books?limit=1&afterId={urllib.parse.quote(_ids93[0])}")
+        check("the first page starts at the first row",
+              (_p1 or {}).get("nextAfterId") == _ids93[0], ((_p1 or {}).get("nextAfterId"), _ids93[0]))
+        check("and a cursor really moves the window rather than being decoration",
+              (_p2 or {}).get("nextAfterId") == _ids93[1], ((_p2 or {}).get("nextAfterId"), _ids93[1]))
+
+    # And the guard's own SQL: a write carrying a version the row no longer has must change nothing.
+    _v93 = local_sql(f"SELECT version, title FROM books WHERE id = '{_b93}'")
+    if _v93:
+        _stale93 = int(_v93[0]["version"]) + 99
+        local_sql(f"UPDATE books SET title = 'ZZ CLOBBERED' WHERE id = '{_b93}' AND version = {_stale93}")
+        _still93 = local_sql(f"SELECT title FROM books WHERE id = '{_b93}'")
+        check("a write carrying a stale version changes nothing",
+              _still93 and _still93[0]["title"] != "ZZ CLOBBERED", _still93)
+    call("DELETE", f"/api/books/{_b93}")
+    call("DELETE", f"/api/books/{_b93}/purge")
+
+print()
+print("=== 94. REGRESSION: a merge must not lose where a copy came from ===")
+
+# The merge cascade is chunked at 40 statements per D1 batch and each batch is its own
+# transaction. The provenance — item id → the record it came from — was written to the audit log
+# AFTER every batch, and it is the ONLY record of which copy belonged to which record: a merged
+# copy is re-parented, not deleted, so nothing about the copy itself remembers. The restore path
+# says so explicitly. So a failure part way through committed the copy moves and never wrote the
+# provenance, and the obvious response — re-run the merge — sees only the copies still on the
+# losers, permanently losing the origin of the ones already moved.
+#
+# Written FIRST now. At worst there is an entry for a merge that did not happen, which is a puzzle
+# rather than a loss.
+#
+# ALSO: mergeIds was filtered against keepId but never DEDUPED, so the same loser passed twenty
+# times (the schema's cap) emitted twenty statements per copy — the amplification that makes the
+# 40-statement tear reachable from a payload that looks entirely ordinary, and it would hand the
+# same copy two different copy numbers.
+_m94 = _idx93[_idx93.find("app.post('/api/books/merge'"):]
+_m94 = _m94[:_m94.find("app.get('/api/books/:id'")]
+_c94 = re.sub(r"/\*[\s\S]*?\*/", "", _m94)
+_c94 = "\n".join(l for l in _c94.split("\n") if not l.strip().startswith("//"))
+check("the merge deduplicates the ids it was given",
+      "new Set(payload.mergeIds" in _c94, None)
+check("and records the copy provenance BEFORE the first batch runs",
+      "book.merge.intent" in _c94
+      and _c94.index("book.merge.intent") < _c94.index("runAtomic"), None)
+check("the provenance names the record each copy came from",
+      "from: i.bookId" in _c94, None)
+
+if LOCAL:
+    _k94 = uuid.uuid4().hex[:6]
+    _keep94, _ = mkbook(title=f"ZZ Merge Keep {_k94}", author="Ν. Δοκιμή")
+    _lose94, _ = mkbook(title=f"ZZ Merge Lose {_k94}", author="Ν. Δοκιμή")
+    # The same loser twenty times. Before the dedupe this multiplied every copy statement.
+    # dryRun defaults to TRUE in MergeBooksSchema. The first version of this check omitted it and
+    # asserted against a preview, which tested nothing at all.
+    st, _res94 = call("POST", "/api/books/merge",
+                      {"keepId": _keep94, "mergeIds": [_lose94] * 20, "dryRun": False})
+    check("a merge naming the same loser twenty times is accepted", st == 200, (st, _res94))
+    check("and it moved each copy exactly once, not twenty times",
+          (_res94 or {}).get("copiesMoved") == 1, _res94)
+    _items94 = local_sql(f"SELECT copy_number FROM items WHERE book_id = '{_keep94}' "
+                         "AND deleted_at IS NULL ORDER BY copy_number")
+    _nums94 = [int(r["copy_number"]) for r in (_items94 or [])]
+    check("the survivor's copy numbers are unique",
+          len(_nums94) == len(set(_nums94)), _nums94)
+    # Scoped to THIS book. Read unscoped it picked up an earlier section's merge and passed on
+    # somebody else's evidence.
+    _intent94 = local_sql("SELECT metadata FROM audit_logs WHERE action = 'book.merge.intent' "
+                          f"AND entity_id = '{_keep94}' ORDER BY created_at DESC LIMIT 1")
+    _meta94 = json.loads(_intent94[0]["metadata"]) if _intent94 else {}
+    check("the provenance was recorded, naming where each copy came from",
+          bool(_meta94.get("movedItems")) and _meta94["movedItems"][0].get("from") == _lose94,
+          _meta94)
+    for _bid94 in (_keep94, _lose94):
+        call("DELETE", f"/api/books/{_bid94}")
+        call("DELETE", f"/api/books/{_bid94}/purge")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
