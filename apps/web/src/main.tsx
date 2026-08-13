@@ -908,6 +908,35 @@ function CoverLightbox({ src, onClose }: { src: string; onClose: () => void }) {
  * against, so a version conflict opened from the detail panel (the button librarians actually
  * use) still sent a whole stale record. Every opener goes through here now.
  */
+/**
+ * Bring the first invalid field into view and put the cursor in it.
+ *
+ * Both submit gates said "focus the first one" in a comment and focused only the TITLE. A book
+ * whose sole problem was a missing required attribute got a red border, an aria-invalid, and a
+ * toast in the corner — while the field itself sat several screens below the fold, or below the
+ * fold of the detail modal's `max-height: 90vh` scroll box. The librarian read a label in the
+ * corner and then hunted a form of two dozen attributes for it.
+ *
+ * Chosen by DOCUMENT ORDER rather than from the error set, because the form renders pinned
+ * attributes in their own group at the top: the first key in the set is not the first field on
+ * screen, and "first" has to mean what the librarian sees.
+ *
+ * Deferred by a timeout so React has committed the aria-invalid attributes this queries for.
+ * A frame callback would be the other way, but this runs from a submit — a tab that is not
+ * visible cannot have one, and rAF does not fire in a hidden tab.
+ */
+function focusFirstInvalidField(): void {
+  setTimeout(() => {
+    const first = document.querySelector<HTMLElement>('[aria-invalid="true"]');
+    if (!first) return;
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
+    first.scrollIntoView({ block: 'center', behavior: reduced ? 'auto' : 'smooth' });
+    // preventScroll, or focus() fights the scrollIntoView above and lands the field under the
+    // sticky header.
+    first.focus({ preventScroll: true });
+  }, 0);
+}
+
 function editFieldsFromBook(b: Book) {
   return {
     title: b.title,
@@ -3137,7 +3166,10 @@ function App() {
     setCreateFieldErrors(errorKeys);
     if (missingLabels.length > 0) {
       setError(t('toast.requiredFields', { list: missingLabels.join(', ') }));
+      // The title keeps its ref — it is above every attribute and the ref is exact. Anything
+      // else, including a required attribute on its own, is found on screen.
       if (errorKeys.has('title')) titleInputRef.current?.focus();
+      else focusFirstInvalidField();
       return;
     }
 
@@ -3477,7 +3509,11 @@ function App() {
     setEditFieldErrors(errorKeys);
     if (missingLabels.length > 0) {
       setError(t('toast.requiredFields', { list: missingLabels.join(', ') }));
+      // Same as the create gate: the title has an exact ref, everything else is found on screen.
+      // In this form it matters more — the field can be below the fold INSIDE the detail modal's
+      // own scroll box, so it is not merely off-screen, it is off-screen within a box.
       if (errorKeys.has('title')) editTitleInputRef.current?.focus();
+      else focusFirstInvalidField();
       return;
     }
 
@@ -5395,6 +5431,23 @@ function App() {
       const idAttr = `cf-${field.key}`;
       const hasError = errorKeys?.has(`cf:${field.key}`) ?? false;
       const mark = field.required ? <span className="required-mark"> *</span> : null;
+      /*
+       * The error said BESIDE THE FIELD, not only in a corner toast.
+       *
+       * A missing required attribute set aria-invalid and a red border, and put the label in a
+       * toast bottom-right — so a screen reader announced "invalid" with nothing saying why, and
+       * a sighted librarian read a label in the corner and then hunted a form of two dozen
+       * attributes for it. With the catalogue preset the offending field is usually several
+       * screens below the fold, and inside the detail modal it is below the fold of a
+       * `max-height: 90vh` scroll box, so the red border was not even on screen.
+       *
+       * WCAG 2.1 3.3.1 asks for the error to be identified in text; a live region the eye never
+       * lands on is not that.
+       */
+      const errId = `${idAttr}-err`;
+      const errText = hasError
+        ? <p id={errId} className="field-error">{t('validation.requiredField')}</p>
+        : null;
       if (field.type === 'boolean') {
         const checked = v === true || v === 'true';
         return (
@@ -5406,6 +5459,7 @@ function App() {
               onChange={(e) => setValue(field.key, e.target.checked)}
             />
             <span>{field.label}{mark}</span>
+            {errText}
           </label>
         );
       }
@@ -5418,6 +5472,7 @@ function App() {
               className={hasError ? 'input-error' : undefined}
               aria-required={field.required || undefined}
               aria-invalid={hasError || undefined}
+              aria-describedby={hasError ? errId : undefined}
               value={(v as string) ?? ''}
               onChange={(e) => setValue(field.key, e.target.value || null)}
             >
@@ -5426,6 +5481,7 @@ function App() {
                 <option key={opt} value={opt}>{opt}</option>
               ))}
             </select>
+            {errText}
           </div>
         );
       }
@@ -5444,6 +5500,7 @@ function App() {
             className={hasError ? 'input-error' : undefined}
             aria-required={field.required || undefined}
             aria-invalid={hasError || undefined}
+            aria-describedby={hasError ? errId : undefined}
             value={displayValue === null || displayValue === undefined ? '' : String(displayValue)}
             onChange={(e) => setValue(field.key, e.target.value)}
             placeholder={field.key}
@@ -5451,6 +5508,7 @@ function App() {
             // existing values for this field (title-like uniqueness aside).
             list={field.type === 'text' ? `suggest-cf-${field.key}` : undefined}
           />
+          {errText}
         </div>
       );
     };
@@ -9280,7 +9338,18 @@ function HandbookDrawer() {
   const { drawerOpen, close } = useHandbook();
   if (!drawerOpen) return null;
   return (
-    <Dialog onClose={close} labelledBy="hb-drawer-title" className="modal hb-drawer">
+    /*
+     * ALWAYS STACKED. Every "?" in this app sits inside a form, and most of those forms are
+     * inside a dialog — the record editor, the copies editor, the add-book panel. Without this
+     * the drawer rendered at the base overlay z-index, i.e. BEHIND the dialog the librarian
+     * pressed "?" in: the page dimmed, the answer was underneath, and there was nothing to
+     * click. Reported from the desk.
+     *
+     * Unconditional rather than conditional on "is a dialog open", because the drawer is the
+     * innermost thing on screen whenever it is open — it is opened FROM whatever is already
+     * there — and a z-index that depends on state is a z-index that will be wrong once.
+     */
+    <Dialog stacked onClose={close} labelledBy="hb-drawer-title" className="modal hb-drawer">
       <div className="modal-header">
         <h3 id="hb-drawer-title">📖 {t('handbook.title')}</h3>
         <button className="icon-button" onClick={close} aria-label={t('common.close')}>✕</button>

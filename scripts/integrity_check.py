@@ -6130,6 +6130,53 @@ if LOCAL:
     if _fid95: call("DELETE", f"/api/custom-fields/{_fid95}")
 
 
+print()
+print("=== 96. REGRESSION: the help drawer must open ON TOP, and give the scroll back ===")
+
+# Reported from the desk: "When I click on '?' buttons, modals open under the current modal and,
+# when I close them, the main page doesn't scroll."
+#
+# Two separate defects behind one sentence, both reproduced in a browser.
+#
+# 1. STACKING. Every "?" sits inside a form, and most of those forms are inside a dialog — the
+#    record editor, the copies editor, the add-book panel. The drawer rendered at the base
+#    overlay z-index, so it appeared BEHIND the dialog it was opened from: the screen dimmed, the
+#    answer was underneath, and there was nothing to click.
+#
+# 2. THE SCROLL LOCK WAS PER DIALOG. Each one remembered document.body.style.overflow, set it to
+#    hidden, and put the remembered value back on unmount. Correct for one dialog, wrong the
+#    moment two overlap:
+#       record modal opens   -> remembers ''       sets hidden
+#       "?" drawer opens     -> remembers 'hidden' sets hidden
+#       the MODAL closes     -> puts back ''       the page scrolls behind the open drawer
+#       the drawer closes    -> puts back 'hidden' AND NOTHING EVER CLEARS IT
+#    The page is then unscrollable until a reload, with nothing on screen to explain why.
+#    Measured against the reverted code: three steps, ending 'hidden' with zero dialogs open.
+#    That order is not exotic — the drawer lives at the root, so it outlives the dialog it was
+#    opened from, and saving a form closes that dialog by itself.
+_ui96 = _slurp(_REPO, "apps", "web", "src", "ui.tsx")
+_main96 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+_css96 = _slurp(_REPO, "apps", "web", "src", "styles.css")
+
+check("the page scroll lock is reference counted across all dialogs",
+      "let scrollLockDepth" in _ui96 and "function lockPageScroll" in _ui96, None)
+check("the first locker records what the page had, the last one puts it back",
+      "if (scrollLockDepth === 0) {" in _ui96
+      and "if (scrollLockDepth === 0) document.body.style.overflow = scrollLockPrevious;" in _ui96, None)
+check("and a double cleanup cannot drive the count below zero",
+      "if (released) return;" in _ui96 and "Math.max(0, scrollLockDepth - 1)" in _ui96, None)
+# The old shape must be gone: a per-dialog save/restore alongside the counter would still leak.
+_focus96 = _ui96[_ui96.find("export function useModalFocus"):][:2600]
+check("no dialog still saves and restores body overflow on its own",
+      "document.body.style.overflow = previousOverflow" not in _focus96, None)
+
+check("the handbook drawer is stacked above whatever opened it",
+      "<Dialog stacked onClose={close} labelledBy=\"hb-drawer-title\"" in _main96, None)
+check("and the stacked overlay really sits higher", ".modal-overlay-stacked { z-index: 300; }" in _css96, None)
+_base96 = re.search(r"\.modal-overlay\s*\{[^}]*z-index:\s*(\d+)", _css96)
+check("higher than the base overlay", _base96 is not None and int(_base96.group(1)) < 300,
+      _base96.group(1) if _base96 else None)
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

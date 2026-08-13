@@ -635,6 +635,46 @@ export const FOCUSABLE = [
  * scrolling panel wants: a screen reader then announces the dialog and its name
  * instead of starting the reader on whatever control happens to come first.
  */
+/*
+ * THE PAGE SCROLL LOCK IS REFERENCE COUNTED, across every dialog at once.
+ *
+ * It used to be a save/restore per dialog: remember `document.body.style.overflow`, set it to
+ * `hidden`, put the remembered value back on unmount. That is correct for one dialog and wrong
+ * the moment two overlap, which they routinely do — every "?" opens the Handbook drawer from
+ * inside whatever dialog the librarian is already in.
+ *
+ *   The record modal opens.        It remembers ''      and sets hidden.
+ *   The "?" drawer opens over it.  It remembers 'hidden' and sets hidden.
+ *   The MODAL closes first.        It puts back ''      — the page scrolls behind the drawer.
+ *   The drawer closes.             It puts back 'hidden' — AND NOTHING EVER CLEARS IT.
+ *
+ * The page is then unscrollable until a reload, with no dialog on screen to explain why.
+ * Reported from the desk exactly that way. The order is not exotic: the drawer lives at the root
+ * so it outlives the dialog it was opened from, and saving a form closes that dialog by itself.
+ *
+ * A counter cannot get this wrong in any order: the first locker records what the page had and
+ * hides it, the last one to leave puts that back, and everyone in between is a no-op.
+ */
+let scrollLockDepth = 0;
+let scrollLockPrevious = '';
+
+function lockPageScroll(): () => void {
+  if (scrollLockDepth === 0) {
+    scrollLockPrevious = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+  }
+  scrollLockDepth += 1;
+  let released = false;
+  return () => {
+    // Guarded: React may run a cleanup twice in StrictMode, and a double decrement would drop
+    // the count below zero and unlock the page while a dialog is still open.
+    if (released) return;
+    released = true;
+    scrollLockDepth = Math.max(0, scrollLockDepth - 1);
+    if (scrollLockDepth === 0) document.body.style.overflow = scrollLockPrevious;
+  };
+}
+
 export function useModalFocus(
   boxRef: React.RefObject<HTMLElement | null>,
   initialFocus: 'first' | 'container' = 'first'
@@ -653,10 +693,9 @@ export function useModalFocus(
       if (target === box) box.setAttribute('tabindex', '-1');
       target.focus();
     }
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
+    const releaseScroll = lockPageScroll();
     return () => {
-      document.body.style.overflow = previousOverflow;
+      releaseScroll();
       // The restore had a comment describing two guards and neither guard was in
       // the code — it was a bare `returnToRef.current?.focus?.()`. Both failures
       // are real:
