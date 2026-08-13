@@ -6524,7 +6524,44 @@ app.post('/api/import/books', requirePermission('import'), async (c) => {
 	}
 
 	if (payload.dryRun) {
-		return c.json({ dryRun: true, acceptedRows: readyRows.length, skippedRows });
+		/*
+		 * THE PREVIEW HAS TO SAY WHICH ROWS OVERWRITE SOMETHING.
+		 *
+		 * It reported one number, `acceptedRows`, so "about to add 1,200 books" and "about to
+		 * overwrite 1,200 books" looked identical — and those are the two most different things
+		 * this endpoint can do. Re-uploading a corrected sheet is the ordinary way the import is
+		 * used, and it was, until this pass, the operation that destroyed seven fields on every
+		 * record it matched. A preview of a destructive operation that cannot say what it will
+		 * overwrite is not a preview.
+		 *
+		 * The same lookup and the same trash rule as the real loop below, so the prediction is
+		 * that loop's behaviour rather than a second implementation that resembles it. It costs
+		 * one indexed read per row — exactly what the real run pays — which is the honest price
+		 * of an answer that is true.
+		 */
+		let wouldCreate = 0;
+		let wouldUpdate = 0;
+		for (const item of readyRows) {
+			const legacyId = (item.row as { legacyId?: string | null }).legacyId?.trim() || null;
+			if (!legacyId) { wouldCreate += 1; continue; }
+			const match = await c.env.DB.prepare(
+				'SELECT id, deleted_at FROM books WHERE legacy_id = ? LIMIT 1'
+			).bind(legacyId).first<{ id: string; deleted_at: string | null } | null>();
+			if (match?.deleted_at) {
+				// The real run refuses these; the preview said they were fine.
+				skippedRows.push({ index: item.index, reason: 'matching book is in the trash — restore it first' });
+				continue;
+			}
+			if (match) wouldUpdate += 1;
+			else wouldCreate += 1;
+		}
+		return c.json({
+			dryRun: true,
+			acceptedRows: wouldCreate + wouldUpdate,
+			wouldCreate,
+			wouldUpdate,
+			skippedRows
+		});
 	}
 
 	let importedRows = 0;

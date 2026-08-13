@@ -5188,6 +5188,8 @@ function App() {
         let chunkSize = IMPORT_CHUNK_SIZE;
         let cursor = 0;
         let totalAccepted = 0;
+        let totalWouldCreate = 0;
+        let totalWouldUpdate = 0;
         let serverSkipped = 0;
 
         while (cursor < rows.length) {
@@ -5198,13 +5200,16 @@ function App() {
 
           try {
             const result = await runAction(() =>
-              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number; skippedRows?: Array<{ index: number; reason: string }> }>('/api/import/books', {
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; wouldCreate?: number; wouldUpdate?: number; skippedRows?: Array<{ index: number; reason: string }> }>('/api/import/books', {
                 method: 'POST',
                 body: JSON.stringify({ dryRun: true, rows: chunk })
               })
             );
 
             totalAccepted += result.acceptedRows ?? chunk.length;
+            // What the preview is FOR: how many of these overwrite a record that already exists.
+            totalWouldCreate += result.wouldCreate ?? 0;
+            totalWouldUpdate += result.wouldUpdate ?? 0;
             serverSkipped += result.skippedRows?.length ?? 0;
             cursor = end;
           } catch (error) {
@@ -5216,7 +5221,9 @@ function App() {
           }
         }
 
-        setMessage(t('toast.xlsxDryRunDone', { n: totalAccepted, skippedNote }));
+        setMessage(t('toast.xlsxDryRunDone', {
+          n: totalAccepted, create: totalWouldCreate, update: totalWouldUpdate, skippedNote
+        }));
         // Rows the SERVER rejected (missing title, bad custom field) are separate
         // from client-side parse skips — surface them so the count isn't silently
         // inflated.
@@ -5225,6 +5232,7 @@ function App() {
         let chunkSize = IMPORT_CHUNK_SIZE;
         let cursor = 0;
         let totalImported = 0;
+        let totalUpdated = 0;
         let serverSkipped = 0;
         const uploadSkippedRows: number[] = [];
 
@@ -5236,13 +5244,26 @@ function App() {
 
           try {
             const result = await runAction(() =>
-              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number; skippedRows?: Array<{ index: number; reason: string }> }>('/api/import/books', {
+              apiRequest<{ dryRun?: boolean; acceptedRows?: number; importedRows?: number; updatedRows?: number; skippedRows?: Array<{ index: number; reason: string }> }>('/api/import/books', {
                 method: 'POST',
                 body: JSON.stringify({ dryRun: false, rows: chunk })
               })
             );
 
+            /*
+             * BOTH NUMBERS. The server returns `importedRows` and `updatedRows` separately, and
+             * only the first was read — so a corrective re-upload, where every row matches an
+             * existing book and nothing is created, ended with "Imported 0 rows" after rewriting
+             * all of them. Measured: 3 rows re-uploaded, `{importedRows: 0, updatedRows: 3}`,
+             * toast said 0.
+             *
+             * That is the most dangerous sentence this app can show. Re-uploading a corrected
+             * sheet is the ordinary way this import is used, and until this pass it was the
+             * operation that destroyed seven fields on every record it matched — a librarian
+             * told "0 rows" has every reason to conclude nothing happened and upload again.
+             */
             totalImported += result.importedRows ?? 0;
+            totalUpdated += result.updatedRows ?? 0;
             serverSkipped += result.skippedRows?.length ?? 0;
             cursor = end;
           } catch (error) {
@@ -5273,7 +5294,7 @@ function App() {
             : '';
 
         setMessage(
-          t('toast.xlsxImportDone', { n: totalImported, skippedNote, uploadSkippedNote })
+          t('toast.xlsxImportDone', { n: totalImported, updated: totalUpdated, skippedNote, uploadSkippedNote })
         );
         if (serverSkipped > 0) pushAppToast('error', t('toast.importServerSkipped', { n: serverSkipped }));
       }

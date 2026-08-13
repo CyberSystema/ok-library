@@ -6311,6 +6311,75 @@ if LOCAL:
         call("DELETE", f"/api/books/{_bid99}/purge")
 
 
+print()
+print("=== 100. REGRESSION: the import must say what it did, and predict what it will do ===")
+
+# The server counts creations and updates SEPARATELY — `if (existing) updatedRows += 1; else
+# importedRows += 1;` — and the client read only the first. So a corrective re-upload, where every
+# row matches an existing book and nothing is created, ended with "Imported 0 rows" after
+# rewriting all of them. Measured: three rows re-uploaded, `{importedRows: 0, updatedRows: 3}`,
+# toast said 0.
+#
+# That is the most dangerous sentence this application can show. Re-uploading a corrected sheet is
+# the ordinary way this import is used, and until this pass it was the operation that destroyed
+# seven fields on every record it matched. A librarian told "0 rows" has every reason to conclude
+# nothing happened — and to upload again.
+#
+# AND THE PREVIEW COULD NOT TELL THE TWO APART EITHER. It returned one number, `acceptedRows`, so
+# "about to add 1,200 books" and "about to overwrite 1,200 books" looked identical. The dry run
+# now runs the same match lookup and the same trash rule as the real loop, so it predicts that
+# loop rather than resembling it — one indexed read per row, exactly what the real run pays.
+_idx100 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_web100 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+check("the dry run predicts how many rows would be OVERWRITTEN",
+      "wouldUpdate," in _idx100 and "wouldCreate," in _idx100, None)
+check("and applies the same trash rule the real loop does, so it predicts the skips too",
+      _idx100.count("matching book is in the trash — restore it first") == 2,
+      _idx100.count("matching book is in the trash — restore it first"))
+check("the client counts updates as well as creations",
+      "totalUpdated += result.updatedRows ?? 0;" in _web100, None)
+check("and the completion message reports both",
+      "{ n: totalImported, updated: totalUpdated, skippedNote, uploadSkippedNote }" in _web100, None)
+_i18n100 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+# Counted on the SPECIFIC KEYS, not across the file: `{updated}` and `{update}` are used by other
+# strings too, so a file-wide count says 16 and 12 and means nothing.
+_done100 = re.findall(r"'toast\.xlsxImportDone':\s*'([^']*)'", _i18n100)
+_dry100 = re.findall(r"'toast\.xlsxDryRunDone':\s*'([^']*)'", _i18n100)
+check("every locale has both import messages", len(_done100) == 4 and len(_dry100) == 4,
+      (len(_done100), len(_dry100)))
+check("and each completion message reports the updates, not just the creations",
+      all("{updated}" in v for v in _done100), [v[:40] for v in _done100 if "{updated}" not in v])
+check("and each preview names how many records would be overwritten",
+      all("{update}" in v for v in _dry100), [v[:40] for v in _dry100 if "{update}" not in v])
+
+if LOCAL:
+    _k100 = uuid.uuid4().hex[:6]
+    _rows100 = [{"title": f"ZZ Reimport {_k100} {i}", "author": "Υ. Δοκιμή",
+                 "legacyId": f"ZZRI-{_k100}-{i}", "tags": [], "customFields": {}} for i in range(3)]
+    st, _d0 = call("POST", "/api/import/books", {"dryRun": True, "rows": _rows100})
+    check("a preview of rows the catalogue has never seen says they are all new",
+          (_d0 or {}).get("wouldCreate") == 3 and (_d0 or {}).get("wouldUpdate") == 0, _d0)
+    st, _f100 = call("POST", "/api/import/books", {"dryRun": False, "rows": _rows100})
+    check("the first upload creates them", (_f100 or {}).get("importedRows") == 3, _f100)
+    for _r in _rows100:
+        _r["author"] = "Υ. Διορθωμένος"
+    st, _d1 = call("POST", "/api/import/books", {"dryRun": True, "rows": _rows100})
+    check("and a preview of the corrective re-upload warns that all three are OVERWRITES",
+          (_d1 or {}).get("wouldUpdate") == 3 and (_d1 or {}).get("wouldCreate") == 0, _d1)
+    st, _s100 = call("POST", "/api/import/books", {"dryRun": False, "rows": _rows100})
+    check("the re-upload reports the updates rather than a bare zero",
+          (_s100 or {}).get("updatedRows") == 3, _s100)
+    # The whole point: a librarian must not be able to read the result as "nothing happened".
+    check("so the two numbers the message is built from are not both zero",
+          ((_s100 or {}).get("importedRows") or 0) + ((_s100 or {}).get("updatedRows") or 0) == 3,
+          _s100)
+    for _r in _rows100:
+        _rowsq = local_sql(f"SELECT id FROM books WHERE legacy_id = '{_r['legacyId']}'")
+        if _rowsq:
+            call("DELETE", f"/api/books/{_rowsq[0]['id']}")
+            call("DELETE", f"/api/books/{_rowsq[0]['id']}/purge")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
