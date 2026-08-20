@@ -3348,6 +3348,37 @@ mark.hl {
   max-width: 46rem;
 }
 
+/* The "what is this book?" dialog raised when a librarian picks an existing title
+   out of the duplicate list. Each option is a button with one line under it
+   saying when it applies: the point is to teach the rule, not merely enforce it. */
+.dup-choice { max-width: 34rem; }
+.dup-choice-record {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.dup-choice-intro { margin: 0.75rem 0 0; line-height: 1.45; }
+.dup-choice-options {
+  list-style: none;
+  margin: 0.9rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+.dup-choice-options li {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+/* The button sizes to its text rather than the dialog, so a long Greek or Russian
+   label wraps inside the control instead of stretching it across the panel. */
+.dup-choice-options button { align-self: flex-start; text-align: start; }
+
 /* Withdrawn copies: the way back from a mistake, folded away until wanted.
    Collapsed by default because on most records it is empty or irrelevant, and an
    editor that opens showing a list of things that are gone reads as an error. */

@@ -6521,6 +6521,65 @@ check("and no hardcoded offset is left to go stale when a translation wraps",
       "margin-top: 1.85rem" not in _css102, None)
 
 
+print()
+print("=== 103. REGRESSION: the app must offer the right thing, not just refuse the wrong one ===")
+
+# The duplicate-title panel warned "13 already in the catalogue with this title" and, if the
+# librarian clicked one, opened its detail page. That answers "let me look" and leaves the commoner
+# case unserved: the book in their hand IS that edition, and what belongs in the catalogue is a
+# COPY. Nothing offered that, so the path of least resistance was to keep filling the form and
+# create a second record for one edition.
+#
+# ONE RECORD DESCRIBES ONE EDITION. A second record splits the holdings — a shelf list shows one
+# and not the other, and the ISO 2789 title count counts the edition twice.
+#
+# The rule the owner set: guide, kindly, and still let them proceed. So the dialog offers the copy
+# first, offers a volume for a multi-part work, offers to open the record, and offers "it is a
+# different edition" as a plain equal choice — because that is a correct answer and a librarian who
+# is right should not have to fight the software to say so.
+_web103 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+_code103 = re.sub(r"/\*[\s\S]*?\*/", "", _web103)
+_code103 = "\n".join(l for l in _code103.split("\n") if not l.strip().startswith("//"))
+
+check("picking a duplicate asks what the book is, instead of just opening it",
+      "onPick={(b) => setDuplicateChoice(b)}" in _code103, None)
+check("the choice dialog exists", 'className="modal dup-choice"' in _code103, None)
+for _key, _what in (("dupChoice.addCopy", "another exemplar of the same edition"),
+                    ("dupChoice.addVolume", "another volume of a multi-part work"),
+                    ("dupChoice.openRecord", "look at the record first"),
+                    ("dupChoice.different", "it really is a different edition")):
+    check(f"  it offers: {_what}", _key in _code103, None)
+check("adding a copy goes to the copies endpoint, creating no second record",
+      "async function addCopyToExisting" in _code103 and "'/api/items/add-copies'" in _code103, None)
+check("and a volume hands over the editor where a volume designation can be typed",
+      "async function addVolumeToExisting" in _code103 and "setCopiesEditorOpen(true)" in _code103, None)
+# Guidance nobody can read is not guidance.
+_i18n103 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+for _k in ("dupChoice.title", "dupChoice.intro", "dupChoice.addCopyHint", "toast.copyAddedTo"):
+    check(f"  '{_k}' is written in all four languages",
+          _i18n103.count(f"'{_k}':") == 4, _i18n103.count(f"'{_k}':"))
+# The rule itself, stated where the librarian is deciding.
+check("the dialog explains WHY, rather than only offering buttons",
+      "dupChoice.intro" in _code103 and "dupChoice.addCopyHint" in _code103, None)
+
+if LOCAL:
+    # The invariant the whole dialog exists to protect: a second exemplar becomes a copy on the
+    # record that is already there, and the catalogue gains no second record for that edition.
+    _t103 = f"ZZ One Edition {uuid.uuid4().hex[:6]}"
+    _b103, _ = mkbook(title=_t103, author="Δ. Δοκιμή", shelfCode="06-003")
+    _before103 = sql_count(local_sql(f"SELECT COUNT(*) AS n FROM books WHERE title = '{_t103}' AND deleted_at IS NULL"))
+    st, _ = call("POST", "/api/items/add-copies", {"bookIds": [_b103], "copies": 1})
+    check("a second exemplar can be added to the record that already exists", st == 200, st)
+    _after103 = sql_count(local_sql(f"SELECT COUNT(*) AS n FROM books WHERE title = '{_t103}' AND deleted_at IS NULL"))
+    check("and the catalogue still holds ONE record for that edition",
+          _after103 == _before103 == 1, (_before103, _after103))
+    st, _items103 = call("GET", f"/api/books/{_b103}/items")
+    check("with two copies on it", len((_items103 or {}).get("items") or []) == 2,
+          len((_items103 or {}).get("items") or []))
+    call("DELETE", f"/api/books/{_b103}")
+    call("DELETE", f"/api/books/{_b103}/purge")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

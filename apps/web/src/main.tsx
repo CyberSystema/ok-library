@@ -1274,6 +1274,17 @@ function App() {
   const coverInputRef = useRef<HTMLInputElement | null>(null);
   const coverUploadBookRef = useRef<Book | null>(null);
   const [showAddBook, setShowAddBook] = useState(false);
+  /*
+   * The existing record a librarian just clicked in the duplicate-title list.
+   *
+   * Clicking one used to open its detail panel and nothing else. That answers "let me look" and
+   * leaves the commoner case unserved: the book in their hand IS this edition, and what they
+   * should record is a COPY. Nothing offered that, so the path of least resistance was to carry on
+   * filling the form and create a second record for one edition — the unlinked duplicate this list
+   * exists to prevent, and the habit that produced the duplicates the merge tool had to clean up.
+   */
+  const [duplicateChoice, setDuplicateChoice] = useState<TitleSuggestion | null>(null);
+  const [duplicateBusy, setDuplicateBusy] = useState(false);
   const [bulkStatus, setBulkStatus] = useState<string>('');
   // Full bulk editor. Values are keyed 'core:<bookKey>' or 'cf:<attributeKey>';
   // a key is only written if it appears in `bulkEditValues` (set it) or in
@@ -5554,6 +5565,60 @@ function App() {
     }
   }
 
+  /*
+   * ONE RECORD DESCRIBES ONE EDITION.
+   *
+   * A second exemplar of an edition already held is a COPY on that record, not a record of its
+   * own — a second record splits the holdings, so a shelf list shows one of them and the ISO 2789
+   * title count double-counts the edition. These three handlers are the routes out of the
+   * duplicate-title panel, and the dialog offers them BEFORE the librarian keeps typing, which is
+   * the only moment the choice is still free.
+   *
+   * Nothing here refuses anything: "a different edition" is a real and frequent answer, and it
+   * simply returns them to the form they were already filling.
+   */
+  async function addCopyToExisting(book: TitleSuggestion): Promise<void> {
+    setDuplicateBusy(true);
+    try {
+      await runAction(() => apiRequest('/api/items/add-copies', {
+        method: 'POST',
+        body: JSON.stringify({ bookIds: [book.id], copies: 1 })
+      }));
+      setMessage(t('toast.copyAddedTo', { title: displayTitle(book, t('common.untitled')) }));
+      setDuplicateChoice(null);
+      // The record they were about to create is now a copy on an existing record, so the form has
+      // nothing left to say. Closing it is the honest end of the task.
+      setCreateForm({
+        title: '', author: '', isbn: '', shelfCode: '', publicationYear: '',
+        titleRomanized: '', authorRomanized: '', publisherRomanized: '',
+        publisher: '', language: '', ddc: '', bibLevel: 'monograph' as BibLevel, description: ''
+      });
+      setCreateFieldErrors(new Set());
+      setCreateAttrValues({});
+      clearCreateCover();
+      setShowAddBook(false);
+      await Promise.all([loadBooks(), loadRoomSummary()]);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setDuplicateBusy(false);
+    }
+  }
+
+  /** A volume needs its designation typed, so this hands them the copies editor to do it in. */
+  async function addVolumeToExisting(book: TitleSuggestion): Promise<void> {
+    setDuplicateBusy(true);
+    try {
+      const opened = await openBookDetailById(book.id);
+      if (opened) {
+        setDuplicateChoice(null);
+        setCopiesEditorOpen(true);
+      }
+    } finally {
+      setDuplicateBusy(false);
+    }
+  }
+
   function closeDetail() {
     setDetailBook(null);
     setDetailMode('view');
@@ -5928,6 +5993,72 @@ function App() {
             <div className="splash-spinner" />
           </div>
         </div>
+      )}
+
+      {/*
+        * Clicking a book in the duplicate-title list asks what it is, rather than assuming.
+        *
+        * The options are ordered by what is most often true when this panel appears: the librarian
+        * is holding another exemplar of an edition the library already has. Each carries one line
+        * saying when it applies, so the choice teaches the rule instead of merely enforcing it —
+        * and "a different edition" is offered plainly, because it is a correct answer and a
+        * librarian who is right should not have to fight the software to say so.
+        */}
+      {duplicateChoice && (
+        <Dialog
+          stacked
+          onClose={() => setDuplicateChoice(null)}
+          labelledBy="dup-choice-title"
+          className="modal dup-choice"
+        >
+          <div className="modal-header">
+            <h3 id="dup-choice-title">{t('dupChoice.title')}</h3>
+            <button className="icon-button" onClick={() => setDuplicateChoice(null)} aria-label={t('common.close')}>✕</button>
+          </div>
+
+          <div className="dup-choice-record">
+            <strong>{displayTitle(duplicateChoice, t('common.untitled'))}</strong>
+            <span className="muted small">{displayAuthor(duplicateChoice, t('common.unknownAuthor'))}</span>
+            <span className="muted small">
+              {duplicateChoice.shelfCode ? <span className="shelf-badge">{duplicateChoice.shelfCode}</span> : null}
+              {duplicateChoice.publicationYear ? <span> · {duplicateChoice.publicationYear}</span> : null}
+              {duplicateChoice.isbn ? <span> · {duplicateChoice.isbn}</span> : null}
+            </span>
+          </div>
+
+          <p className="muted small dup-choice-intro">{t('dupChoice.intro')}</p>
+
+          <ul className="dup-choice-options">
+            <li>
+              <button className="primary" disabled={duplicateBusy}
+                onClick={() => void addCopyToExisting(duplicateChoice)}>
+                {t('dupChoice.addCopy')}
+              </button>
+              <span className="muted small">{t('dupChoice.addCopyHint')}</span>
+            </li>
+            <li>
+              <button className="secondary" disabled={duplicateBusy}
+                onClick={() => void addVolumeToExisting(duplicateChoice)}>
+                {t('dupChoice.addVolume')}
+              </button>
+              <span className="muted small">{t('dupChoice.addVolumeHint')}</span>
+            </li>
+            <li>
+              <button className="secondary" disabled={duplicateBusy}
+                onClick={() => { const b = duplicateChoice; setDuplicateChoice(null); void openBookDetailById(b.id); }}>
+                {t('dupChoice.openRecord')}
+              </button>
+              <span className="muted small">{t('dupChoice.openRecordHint')}</span>
+            </li>
+            <li>
+              <button className="secondary" disabled={duplicateBusy}
+                onClick={() => setDuplicateChoice(null)}>
+                {t('dupChoice.different')}
+              </button>
+              <span className="muted small">{t('dupChoice.differentHint')}</span>
+            </li>
+          </ul>
+        </Dialog>
       )}
 
       {serialsEditorOpen && detailBook && canWrite && (
@@ -7527,7 +7658,7 @@ function App() {
                           }}
                           items={titleSuggestions}
                           getKey={(b) => b.id}
-                          onPick={(b) => { void openBookDetailById(b.id); }}
+                          onPick={(b) => setDuplicateChoice(b)}
                           listHeader={
                             <p className="title-dup-note">
                               {t('library.add.titleDupNote', { n: fmt(titleSuggestTotal) })}
