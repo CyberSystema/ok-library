@@ -498,7 +498,22 @@ export function Combobox<T>(props: {
         }
       />
       {open && (
-        <>
+        /*
+         * ONE PANEL, not two floating siblings.
+         *
+         * The header and the list were both absolutely positioned at `top: 100%`, and the list
+         * cleared the header with a hardcoded `margin-top: 1.85rem` — one line of text. The
+         * duplicate-title warning is a whole sentence, so in Greek ("Υπάρχουν ήδη 13 στον
+         * κατάλογο με αυτόν τον τίτλο — ανοίξτε ένα για έλεγχο:") it wraps to two lines, stands
+         * ~3.1rem tall, and its lower half sat on top of the first book in the list — the row a
+         * librarian is most likely to want, on the panel whose whole job is to stop them
+         * cataloguing a duplicate.
+         *
+         * Positioning the pair once and letting them stack in normal flow inside it means the
+         * header can be any height in any language and the list always begins below it. No
+         * magic number can go stale.
+         */
+        <div className="combobox-panel">
           {props.listHeader}
           <ul className="combobox-list" role="listbox" id={listId}>
             {items.map((item, i) => (
@@ -515,7 +530,7 @@ export function Combobox<T>(props: {
               </li>
             ))}
           </ul>
-        </>
+        </div>
       )}
       {props.footer}
     </div>

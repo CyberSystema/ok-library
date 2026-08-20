@@ -6498,6 +6498,28 @@ check("and the frame is laid out, since a frame with no page box prints blank",
 check("the import file button belongs to the application",
       "::file-selector-button" in _css102, None)
 
+# 10. The duplicate-title warning sat ON TOP of the first book it was warning about. The note and
+#     the list were two separately floating layers, and the list cleared the note with a hardcoded
+#     `margin-top: 1.85rem` — the height of ONE line. The warning is a sentence, so in Greek,
+#     Russian and English it wraps to two lines (~50px measured) and its lower half covered the
+#     first row: the very record a librarian opens to check whether they are about to catalogue a
+#     duplicate. Reported from the desk with a screenshot.
+#
+#     They are one panel now — positioned once, stacked in normal flow — so the header can be any
+#     height in any language. Measured after the fix at 0px overlap in all four, with Korean's
+#     shorter 32px note proving the list follows the real height rather than a fixed offset.
+_uicode102 = _slurp(_REPO, "apps", "web", "src", "ui.tsx")
+check("the suggestion header and list are one positioned panel",
+      '<div className="combobox-panel">' in _uicode102, None)
+check("the panel owns the positioning",
+      ".combobox-panel {" in _css102 and "position: absolute;" in
+      _css102[_css102.index(".combobox-panel {"):_css102.index(".combobox-panel {") + 220], None)
+check("the list no longer floats on its own",
+      "position: absolute;" not in
+      _css102[_css102.index(".combobox-list {"):_css102.index(".combobox-list {") + 320], None)
+check("and no hardcoded offset is left to go stale when a translation wraps",
+      "margin-top: 1.85rem" not in _css102, None)
+
 
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:

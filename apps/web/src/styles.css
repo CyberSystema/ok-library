@@ -2753,22 +2753,28 @@ mark.hl {
 
 /* ================== COMBOBOX (borrower autocomplete) ================== */
 .combobox { position: relative; }
-.combobox-list {
-  list-style: none;
-  margin: 0;
-  padding: 0.25rem;
+/* The floating panel: header (optional) + list, stacked in normal flow.
+   Positioning lives HERE and nowhere else, so a header of any height pushes the
+   list down instead of being cleared by a hardcoded offset that only ever fitted
+   one line of English. */
+.combobox-panel {
   position: absolute;
   top: 100%;
   left: 0;
   right: 0;
+  z-index: 21;
+  margin-top: 0.25rem;
+}
+.combobox-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem;
   background: var(--surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-md);
   max-height: 240px;
   overflow-y: auto;
-  z-index: 5;
-  margin-top: 0.25rem;
 }
 .combobox-list li {
   display: flex;
@@ -2801,11 +2807,6 @@ mark.hl {
    same absolutely-positioned stack, so it scrolls and dismisses with it. */
 .title-combobox .combobox-list { border-color: var(--warning); }
 .title-dup-note {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  right: 0;
-  z-index: 21;
   margin: 0;
   padding: 0.4rem 0.6rem;
   font-size: 0.75rem;
@@ -2817,10 +2818,11 @@ mark.hl {
   border-bottom: none;
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
 }
-/* Push the list below the note so the two read as one panel. */
+/* The note and the list already sit one above the other inside .combobox-panel;
+   only the corners need to agree so they read as a single card. */
 .title-combobox .combobox-list {
-  margin-top: 1.85rem;
   border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  border-top: none;
 }
 /* Two tidy lines per row instead of the borrower picker's single wrapping line.
    Catalogue titles here run to 80+ characters ("ΒΙΒΛΙΟΘΗΚΗ ΕΛΛΗΝΩΝ ΠΑΤΕΡΩΝ ΚΑΙ
