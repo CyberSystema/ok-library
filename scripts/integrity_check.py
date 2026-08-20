@@ -6542,7 +6542,7 @@ _code103 = re.sub(r"/\*[\s\S]*?\*/", "", _web103)
 _code103 = "\n".join(l for l in _code103.split("\n") if not l.strip().startswith("//"))
 
 check("picking a duplicate asks what the book is, instead of just opening it",
-      "onPick={(b) => setDuplicateChoice(b)}" in _code103, None)
+      "setDuplicateChoice(b);" in _code103, None)
 check("the choice dialog exists", 'className="modal dup-choice"' in _code103, None)
 for _key, _what in (("dupChoice.addCopy", "another exemplar of the same edition"),
                     ("dupChoice.addVolume", "another volume of a multi-part work"),
@@ -6562,6 +6562,29 @@ for _k in ("dupChoice.title", "dupChoice.intro", "dupChoice.addCopyHint", "toast
 check("the dialog explains WHY, rather than only offering buttons",
       "dupChoice.intro" in _code103 and "dupChoice.addCopyHint" in _code103, None)
 
+# ── Where the copy physically is ────────────────────────────────────────────
+#
+# The server files a shelf-less copy at the FIRST existing copy's location. So a chooser that
+# never asks records the exemplar on 19-000 as being on 19-000 when it is on "19-000 ΠΙΣΩ" —
+# shelf facets and shelf lists read `items`, so a shelf reconciliation then reports it missing.
+# That is the exact failure the copies layer was built to prevent, reintroduced by the dialog
+# meant to prevent it.
+check("the chooser asks where the new copy sits",
+      'id="fld-dup-shelf"' in _code103 and "dupChoice.shelf" in _code103, None)
+check("  prefilled from the shelf the librarian already typed on the form",
+      "setDuplicateShelf(createForm.shelfCode.trim() || b.shelfCode || '')" in _code103, None)
+check("  and that shelf actually reaches the server",
+      "shelfCode: duplicateShelf.trim() || null" in _code103, None)
+for _k in ("dupChoice.shelf", "dupChoice.shelfHint"):
+    check(f"  '{_k}' is written in all four languages",
+          _i18n103.count(f"'{_k}':") == 4, _i18n103.count(f"'{_k}':"))
+
+# The suggestion list matches a folded TITLE, not an edition. A heading that says "this edition"
+# states something the app has not checked, on the one screen whose whole job is to be believed.
+check("the heading claims only what was actually matched (a title, not an edition)",
+      "'dupChoice.title': 'A record with this title is already in the catalogue'" in _i18n103
+      and "This edition is already in the catalogue" not in _i18n103, None)
+
 if LOCAL:
     # The invariant the whole dialog exists to protect: a second exemplar becomes a copy on the
     # record that is already there, and the catalogue gains no second record for that edition.
@@ -6576,6 +6599,14 @@ if LOCAL:
     st, _items103 = call("GET", f"/api/books/{_b103}/items")
     check("with two copies on it", len((_items103 or {}).get("items") or []) == 2,
           len((_items103 or {}).get("items") or []))
+    # …and a copy shelved somewhere else is recorded somewhere else.
+    st, _ = call("POST", "/api/items/add-copies",
+                 {"bookIds": [_b103], "copies": 1, "shelfCode": "06-003 ΠΙΣΩ"})
+    check("a copy given its own shelf is filed there, not beside copy 1", st == 200, st)
+    st, _items103b = call("GET", f"/api/books/{_b103}/items")
+    _shelves103 = sorted({(i.get("shelfCode") or "") for i in (_items103b or {}).get("items") or []})
+    check("  so the record now spans both shelves",
+          _shelves103 == ["06-003", "06-003 ΠΙΣΩ"], _shelves103)
     call("DELETE", f"/api/books/{_b103}")
     call("DELETE", f"/api/books/{_b103}/purge")
 

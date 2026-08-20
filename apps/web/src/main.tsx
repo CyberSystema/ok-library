@@ -1285,6 +1285,10 @@ function App() {
    */
   const [duplicateChoice, setDuplicateChoice] = useState<TitleSuggestion | null>(null);
   const [duplicateBusy, setDuplicateBusy] = useState(false);
+  // Where the exemplar in the librarian's hand physically sits. Seeded from what they already
+  // typed on the form, falling back to the record's own shelf; without it the server files the
+  // copy at the FIRST existing copy's location and the shelf list stops matching the shelf.
+  const [duplicateShelf, setDuplicateShelf] = useState('');
   const [bulkStatus, setBulkStatus] = useState<string>('');
   // Full bulk editor. Values are keyed 'core:<bookKey>' or 'cf:<attributeKey>';
   // a key is only written if it appears in `bulkEditValues` (set it) or in
@@ -5582,7 +5586,11 @@ function App() {
     try {
       await runAction(() => apiRequest('/api/items/add-copies', {
         method: 'POST',
-        body: JSON.stringify({ bookIds: [book.id], copies: 1 })
+        body: JSON.stringify({
+          bookIds: [book.id],
+          copies: 1,
+          shelfCode: duplicateShelf.trim() || null
+        })
       }));
       setMessage(t('toast.copyAddedTo', { title: displayTitle(book, t('common.untitled')) }));
       setDuplicateChoice(null);
@@ -6035,6 +6043,16 @@ function App() {
                 {t('dupChoice.addCopy')}
               </button>
               <span className="muted small">{t('dupChoice.addCopyHint')}</span>
+              <div className="dup-choice-shelf">
+                <label htmlFor="fld-dup-shelf">{t('dupChoice.shelf')}</label>
+                <input id="fld-dup-shelf"
+                  value={duplicateShelf}
+                  onChange={(e) => setDuplicateShelf(e.target.value)}
+                  placeholder={t('library.copies.shelfPh')}
+                  list="suggest-shelf"
+                />
+                <span className="muted small">{t('dupChoice.shelfHint')}</span>
+              </div>
             </li>
             <li>
               <button className="secondary" disabled={duplicateBusy}
@@ -7658,7 +7676,10 @@ function App() {
                           }}
                           items={titleSuggestions}
                           getKey={(b) => b.id}
-                          onPick={(b) => setDuplicateChoice(b)}
+                          onPick={(b) => {
+                            setDuplicateShelf(createForm.shelfCode.trim() || b.shelfCode || '');
+                            setDuplicateChoice(b);
+                          }}
                           listHeader={
                             <p className="title-dup-note">
                               {t('library.add.titleDupNote', { n: fmt(titleSuggestTotal) })}

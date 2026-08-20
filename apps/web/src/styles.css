@@ -3379,6 +3379,22 @@ mark.hl {
    label wraps inside the control instead of stretching it across the panel. */
 .dup-choice-options button { align-self: flex-start; text-align: start; }
 
+/* The shelf question belongs to the copy option above it, so it is indented under that
+   option rather than floating as a field of the whole dialog. The li is a column flex
+   container, so this needs its own block to keep label/input/hint stacked and the input
+   from stretching the full dialog width. */
+.dup-choice-shelf {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0.35rem 0 0 0.1rem;
+  padding-inline-start: 0.75rem;
+  border-inline-start: 2px solid var(--border);
+}
+.dup-choice-shelf label { font-size: 0.85rem; font-weight: 600; }
+.dup-choice-shelf input { max-width: 18rem; }
+
+
 /* Withdrawn copies: the way back from a mistake, folded away until wanted.
    Collapsed by default because on most records it is empty or irrelevant, and an
    editor that opens showing a list of things that are gone reads as an error. */
