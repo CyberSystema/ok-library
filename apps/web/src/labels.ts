@@ -259,10 +259,45 @@ export async function openPrintLabels(
 </html>`;
 
   const win = window.open('', '_blank');
-  if (!win) {
+  if (win) {
+    win.document.open();
+    win.document.write(html);
+    win.document.close();
+    return;
+  }
+
+  /*
+   * NO POPUP? PRINT ANYWAY, FROM A HIDDEN FRAME.
+   *
+   * Spine labels are not a nice-to-have in a lending library — a copy without one does not scan
+   * at the desk — and this was the only route to them. When `window.open` returns null the
+   * librarian used to get a toast telling them to go and change a browser setting, which is not
+   * something a person cataloguing books should have to do, and on a locked-down machine may not
+   * be something they CAN do. Popups are blocked by policy in plenty of places, and a click that
+   * loses its user activation (a confirm dialog in between, a slow await) is blocked in every
+   * browser.
+   *
+   * An iframe on the current page needs no permission. It prints the identical document: the
+   * markup already carries its own stylesheet and an on-load hook that calls print(), and every
+   * barcode is an inline data URL, so there is nothing to fetch and nothing to race.
+   */
+  const frame = document.createElement('iframe');
+  frame.setAttribute('aria-hidden', 'true');
+  frame.setAttribute('title', s.docTitle);
+  // Off-screen rather than display:none: a frame that is not laid out has no page box, and
+  // Chrome prints it blank.
+  frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:820px;height:1160px;border:0;';
+  document.body.appendChild(frame);
+  const doc = frame.contentWindow?.document;
+  if (!doc) {
+    frame.remove();
     throw new Error(s.popupBlocked);
   }
-  win.document.open();
-  win.document.write(html);
-  win.document.close();
+  doc.open();
+  doc.write(html);
+  doc.close();
+  // The document prints itself on load. Kept alive well past that, because removing the frame
+  // mid-print cancels the job in some browsers, then taken away so the page does not accumulate
+  // one frame per label run.
+  window.setTimeout(() => frame.remove(), 60_000);
 }

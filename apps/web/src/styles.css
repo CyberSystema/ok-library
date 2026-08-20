@@ -1064,6 +1064,28 @@ label {
 .form-row > div { display: flex; flex-direction: column; }
 .form-field { display: flex; flex-direction: column; margin-bottom: 0.875rem; }
 
+/* THE "?" SITS ON THE LABEL'S LINE, NOT ON A LINE OF ITS OWN.
+   A field wrapper is a COLUMN flex container, so the help button was a flex item
+   in its own right and took a whole row: every field carrying help pushed its
+   input 19px below the input of the field beside it, and nothing in a row lined
+   up. Measured on the add-book form — Έτος έκδοσης at 660 against Κωδικός ραφίου
+   at 641, Εκδότης at 770 against Γλώσσα at 752.
+   Taken out of flow rather than re-flowed, so a field with help and a field
+   without it produce byte-identical geometry for everything below the label.
+   Scoped to help links that are DIRECT CHILDREN of a field: the same class is
+   used inside headings and legends, and those must stay where they are. */
+.form-row > div, .form-field { position: relative; }
+.form-row > div > .help-link,
+.form-field > .help-link {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+  margin: 0;
+}
+/* Room for it, so a long Greek or Russian label cannot run under the button. */
+.form-row > div:has(> .help-link) > label,
+.form-field:has(> .help-link) > label { padding-inline-end: 1.5rem; }
+
 /* ISBN row: the input takes all remaining width so a full 13-digit ISBN stays
    visible while typing; the lookup button never wraps or shrinks it away. */
 .isbn-row { display: flex; gap: 0.4rem; align-items: stretch; }
@@ -1483,6 +1505,35 @@ label {
   transition: border-color 0.15s;
 }
 .import-dropzone:hover { border-color: var(--accent); }
+/* THE FILE BUTTON IS PART OF THE APP, NOT PART OF THE OPERATING SYSTEM.
+   The input itself is styled, but the button inside it lives in a shadow
+   pseudo-element that inherits nothing — so a pale system-grey control with
+   system-grey text sat in the middle of a dark panel, on the screen where a
+   librarian hands the app twelve thousand records. It also carried the
+   platform's own wording next to the app's Greek. */
+.import-dropzone input[type="file"] {
+  margin: 0 auto;
+  max-width: 100%;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+.import-dropzone input[type="file"]::file-selector-button {
+  margin-inline-end: 0.75rem;
+  padding: 0.5rem 1rem;
+  border: 1.5px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.import-dropzone input[type="file"]::file-selector-button:hover {
+  background: var(--accent-light);
+  border-color: var(--accent);
+}
 
 /* ================== BANNERS ================== */
 .banner {

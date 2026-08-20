@@ -91,11 +91,22 @@ export function AuthorityPicker({ kind, onPick, label, idPrefix }: {
   // reason variants are stored: the librarian types the spelling they remember,
   // not the one the cataloguer chose.
   useEffect(() => {
+    /*
+     * NOTHING UNTIL THE LIBRARIAN TYPES.
+     *
+     * This ran on mount with an empty term, so it fetched the first twenty headings and handed
+     * them to the Combobox — which opens whenever it HAS items, regardless of focus. Opening any
+     * book record therefore dropped a list of unrelated authorities over the record's own details,
+     * before the librarian had touched anything, and cost a request per book opened.
+     *
+     * A picker with an empty box has nothing to suggest: twenty arbitrary headings are not
+     * suggestions, they are the first page of a table.
+     */
+    if (!term.trim()) { setItems([]); return; }
     let cancelled = false;
     const handle = setTimeout(async () => {
-      const params = new URLSearchParams({ limit: '20' });
+      const params = new URLSearchParams({ limit: '20', q: term.trim() });
       if (kind) params.set('kind', kind);
-      if (term.trim()) params.set('q', term.trim());
       try {
         const res = await apiRequest<{ items: Authority[] }>(`/api/authorities?${params}`);
         if (!cancelled) setItems(res.items ?? []);

@@ -6419,6 +6419,86 @@ check("the button is labelled in all four languages",
       _i18n101.count("'iso.print':") == 4, _i18n101.count("'iso.print':"))
 
 
+print()
+print("=== 102. REGRESSION: what a librarian meets on the screens they use all day ===")
+
+# Found by working the application the way the desk does: catalogue a book, look it up, lend it,
+# take it back, print its label. Nine defects, every one on a path used daily.
+_web102 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+# Comments stripped before any of these match. Twice in this section alone a check read the
+# EXPLANATION of a fix instead of the fix — "behavior: 'smooth'" and "display:none" both appear in
+# prose describing why they are wrong. Sixth time in this suite; strip first, match second.
+_webcode102 = re.sub(r"/\*[\s\S]*?\*/", "", _web102)
+_webcode102 = "\n".join(l for l in _webcode102.split("\n") if not l.strip().startswith("//"))
+_css102 = _slurp(_REPO, "apps", "web", "src", "styles.css")
+_i18n102 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+_auth102 = _slurp(_REPO, "apps", "web", "src", "screens", "authorities.tsx")
+_lbl102 = _slurp(_REPO, "apps", "web", "src", "labels.ts")
+
+# 1. A field wrapper is a COLUMN flex container, so a "?" help button was a flex item in its own
+#    right and took a whole row — every field carrying help pushed its input 19px below the field
+#    beside it. Measured on Add book: Έτος έκδοσης 660 against Κωδικός ραφίου 641.
+check("the help button is out of flow, so help cannot shift a field's input",
+      ".form-row > div > .help-link," in _css102 and "inset-block-start: 0;" in _css102, None)
+check("and a label leaves room for it rather than running underneath",
+      "padding-inline-end: 1.5rem;" in _css102, None)
+
+# 2. Twenty-five boxes on the busiest form carried the DATABASE COLUMN NAME as their placeholder.
+check("no attribute box shows its machine key as a placeholder",
+      "placeholder={field.key}" not in _web102, None)
+
+# 3. Those same boxes were labelled in English inside a Greek interface, because the application
+#    seeds them that way. Translated — but only while the label is still the one WE chose.
+check("attribute labels are translated through one helper",
+      "function attrLabel(field: { key: string; label: string }): string {" in _web102, None)
+check("and a label the librarian renamed wins over any translation",
+      "if (!seeded || field.label !== seeded) return field.label;" in _web102, None)
+check("the seeded labels are known, so a rename can be told apart from a default",
+      "const CATALOG_SEEDED_LABELS" in _web102, None)
+check("every seeded attribute has a name in every language",
+      all(_i18n102.count(f"'catalogAttr.{k}':") == 4
+          for k in ("place_of_publication", "cover_type", "pages", "needs_review")), None)
+# The form, the facet picker and the settings list must all say the same thing.
+check("the form, the category picker and the settings list share that one name",
+      _web102.count("attrLabel(") >= 5, _web102.count("attrLabel("))
+
+# 4. Opening ANY book popped a list of unrelated headings over the record — the picker fetched
+#    twenty on mount and the Combobox opens whenever it HAS items — and cost a request per book.
+check("the authority picker suggests nothing until the librarian types",
+      "if (!term.trim()) { setItems([]); return; }" in _auth102, None)
+
+# 5. "Δανεισμός" on a record switched tab and left the librarian at the top of it, with the form
+#    holding their book 4,076px below — under a directory of 1,918 readers.
+check("lending takes the librarian to the borrow form",
+      "function revealBorrowForm(): void {" in _web102, None)
+check("and every way into lending uses it",
+      _web102.count("revealBorrowForm()") >= 4, _web102.count("revealBorrowForm()"))
+
+# 6. Both of those scrolls asked for smooth behaviour. Measured in a real browser: 'smooth' moved
+#    the page 0px where 'auto' moved it 3,524px to the same target. A scroll that depends on an
+#    animation running is a scroll that can silently not happen.
+check("neither scroll depends on an animation actually running",
+      "behavior: 'smooth'" not in _webcode102, None)
+
+# 7. After a loan the form kept the book that had just gone out, with Confirm still enabled.
+_borrow102 = _web102[_web102.find("async function borrowBook"):][:4000]
+check("a completed loan clears the book, not just the borrower",
+      "setSelectedBook(null);" in _borrow102, None)
+
+# 8. Spine labels had exactly one route — a popup — and popups are blocked by policy in plenty of
+#    places. A copy without a label does not scan at the desk.
+check("labels still print when popups are blocked",
+      "document.createElement('iframe')" in _lbl102 and "left:-10000px" in _lbl102, None)
+_lblcode102 = re.sub(r"/\*[\s\S]*?\*/", "", _lbl102)
+_lblcode102 = "\n".join(l for l in _lblcode102.split("\n") if not l.strip().startswith("//"))
+check("and the frame is laid out, since a frame with no page box prints blank",
+      "display:none" not in _lblcode102.split("createElement('iframe')")[1][:600], None)
+
+# 9. The file button on the import screen was the operating system's, in the middle of a dark panel.
+check("the import file button belongs to the application",
+      "::file-selector-button" in _css102, None)
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

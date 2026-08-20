@@ -225,6 +225,32 @@ const DEFAULT_TABLE_COLUMNS = [
 
 // Kept in sync with CATALOG_CUSTOM_FIELDS in apps/api-worker/src/index.ts.
 const CATALOG_FIELD_COUNT = 25;
+
+/*
+ * The labels this application SEEDS for the twenty-six catalogue attributes.
+ *
+ * They are hardcoded English in CATALOG_CUSTOM_FIELDS on the worker, so a Greek library opens the
+ * busiest form it has — Add book — and reads ΤΙΤΛΟΣ, ΣΥΓΓΡΑΦΕΑΣ, ΕΚΔΟΤΗΣ and then twenty-five
+ * boxes labelled PLACE OF PUBLICATION, COVER TYPE, ILLUSTRATION TYPE. The section headings around
+ * them are Greek, which makes it worse rather than better.
+ *
+ * This map exists so the interface can tell the difference between a label the app chose and a
+ * label the LIBRARIAN chose. A stored label that still matches the seed is ours to translate; one
+ * that does not is theirs, and is shown exactly as they typed it. Renaming an attribute in
+ * Settings therefore wins over any translation here, which is the only behaviour that stays
+ * correct once somebody has renamed something.
+ */
+const CATALOG_SEEDED_LABELS: Record<string, string> = {
+  series: 'Series', subTitle: 'Sub Title', volume_label: 'Volume Label', volume_num: 'Volume Number',
+  editor: 'Editor', translator: 'Translator', place_of_publication: 'Place of Publication',
+  edition: 'Edition', category_code: 'Category Code', category_label: 'Category Label',
+  cover_type: 'Cover Type', pages: 'Pages', condition: 'Condition', isbn_10: 'ISBN-10',
+  issn: 'ISSN', additional_isbns: 'Additional ISBNs', has_illustrations: 'Has Illustrations',
+  illustration_type: 'Illustration Type', signed_copy: 'Signed Copy',
+  signature_notes: 'Signature Notes', copies_count: 'Copies Count', source_sheet: 'Source Sheet',
+  original_id: 'Original ID', transformations_applied: 'Transformations Applied',
+  cleanup_notes: 'Cleanup Notes', needs_review: 'Needs Review'
+};
 // Legacy English sentinels historically minted by catalog imports. New writes
 // store '' instead (see normalizeBookData), but existing rows may still hold
 // these until re-normalized, so the UI must treat both as "no value".
@@ -925,12 +951,43 @@ function CoverLightbox({ src, onClose }: { src: string; onClose: () => void }) {
  * A frame callback would be the other way, but this runs from a submit — a tab that is not
  * visible cannot have one, and rAF does not fire in a hidden tab.
  */
+/**
+ * Take the librarian to the borrow form, and put the cursor in it.
+ *
+ * "Δανεισμός" on a record switches to the circulation tab and selects the book — and left the
+ * librarian at the TOP of that tab, where the readers directory sits. With this library's 1,918
+ * readers the borrow form holding their book was 4,076px down: four screens, with nothing on the
+ * first one to say the click had worked. The obvious reading is that the button does nothing.
+ *
+ * Deferred by a timeout so the circulation section has committed and the field exists to scroll
+ * to. Smooth, so the jump reads as movement rather than a teleport, unless the librarian has
+ * asked for reduced motion.
+ */
+function revealBorrowForm(): void {
+  setTimeout(() => {
+    const el = document.getElementById('borrower-input');
+    if (!el) return;
+    /*
+     * INSTANT, not smooth. A smooth scroll is an animation, and an animation that does not run
+     * leaves the librarian exactly where they were: measured in this browser, `behavior: 'smooth'`
+     * moved the page 0px while `'auto'` moved it 3,524px to the same target. Anything that can be
+     * switched off — a headless or embedded runtime, a motion preference, a platform that treats
+     * it as a hint — turns a navigation into a no-op. Landing there at once is also simply faster
+     * across four screens, which is what the person at the desk wants.
+     */
+    el.scrollIntoView({ block: 'center', behavior: 'auto' });
+    // preventScroll, or focus() undoes the scroll above and lands the field under the header.
+    (el as HTMLElement).focus({ preventScroll: true });
+  }, 0);
+}
+
 function focusFirstInvalidField(): void {
   setTimeout(() => {
     const first = document.querySelector<HTMLElement>('[aria-invalid="true"]');
     if (!first) return;
-    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ?? false;
-    first.scrollIntoView({ block: 'center', behavior: reduced ? 'auto' : 'smooth' });
+    // Instant for the same reason revealBorrowForm() is: a smooth scroll that does not animate
+    // does not scroll, and a validation error the librarian never sees is worse than no scroll.
+    first.scrollIntoView({ block: 'center', behavior: 'auto' });
     // preventScroll, or focus() fights the scrollIntoView above and lands the field under the
     // sticky header.
     first.focus({ preventScroll: true });
@@ -3812,6 +3869,14 @@ function App() {
       setSelectedBorrowerId('');
       setBorrowerQuery('');
       setBorrowerSuggestions([]);
+      /*
+       * AND THE BOOK. It stayed selected, so after a successful loan the form sat there still
+       * headed with the title that had just gone out, borrower box empty, "Confirm loan" enabled
+       * — offering an action that cannot succeed, since the copy is now on loan, and leaving a
+       * librarian to wonder whether the loan they just made had registered at all. The book is
+       * lent; the next thing anyone does here is a different book.
+       */
+      setSelectedBook(null);
       await Promise.all([loadBooks(), loadActiveBorrows(), loadRoomSummary(), loadHolds()]);
     } catch (e) {
       setError((e as Error).message);
@@ -5326,7 +5391,7 @@ function App() {
     () => [
       { key: RAIL_SETS, label: t('library.sets.mode') },
       ...CORE_FACET_CHOICES.map((f) => ({ key: f.key, label: t(f.labelKey) })),
-      ...customFields.map((f) => ({ key: `custom:${f.key}`, label: f.label }))
+      ...customFields.map((f) => ({ key: `custom:${f.key}`, label: attrLabel(f) }))
     ],
     [customFields, t]
   );
@@ -5496,6 +5561,21 @@ function App() {
     setCoverZoom(null); // never leave the cover lightbox open without its book
   }
 
+  /**
+   * What to call an attribute on screen.
+   *
+   * A stored label that still matches what this application seeded is ours, and gets shown in the
+   * librarian's language; anything else was typed by a librarian in Settings and is shown exactly
+   * as they left it. Without this a Greek catalogue reads PLACE OF PUBLICATION and COVER TYPE on
+   * the form it is used on most.
+   */
+  function attrLabel(field: { key: string; label: string }): string {
+    const seeded = CATALOG_SEEDED_LABELS[field.key];
+    if (!seeded || field.label !== seeded) return field.label;
+    const translated = t(`catalogAttr.${field.key}`);
+    return translated === `catalogAttr.${field.key}` ? field.label : translated;
+  }
+
   function renderCustomFieldsForm(
     values: Record<string, unknown>,
     setValue: (key: string, value: unknown) => void,
@@ -5540,7 +5620,7 @@ function App() {
               checked={checked}
               onChange={(e) => setValue(field.key, e.target.checked)}
             />
-            <span>{field.label}{mark}</span>
+            <span>{attrLabel(field)}{mark}</span>
             {errText}
           </label>
         );
@@ -5548,7 +5628,7 @@ function App() {
       if (field.type === 'enum') {
         return (
           <div key={field.key} className="form-field">
-            <label htmlFor={idAttr}>{field.label}{mark}</label>
+            <label htmlFor={idAttr}>{attrLabel(field)}{mark}</label>
             <select
               id={idAttr}
               className={hasError ? 'input-error' : undefined}
@@ -5575,7 +5655,7 @@ function App() {
           : (v as string | number | null | undefined) ?? '';
       return (
         <div key={field.key} className="form-field">
-          <label htmlFor={idAttr}>{field.label}{mark}</label>
+          <label htmlFor={idAttr}>{attrLabel(field)}{mark}</label>
           <input
             id={idAttr}
             type={inputType}
@@ -5585,7 +5665,13 @@ function App() {
             aria-describedby={hasError ? errId : undefined}
             value={displayValue === null || displayValue === undefined ? '' : String(displayValue)}
             onChange={(e) => setValue(field.key, e.target.value)}
-            placeholder={field.key}
+            /*
+             * NO PLACEHOLDER. It was `field.key` — the database column name — so a librarian
+             * cataloguing a book read `place_of_publication`, `volume_num`, `additional_isbns`
+             * inside twenty-five boxes on the busiest form in the app. A placeholder is meant to
+             * show what a value looks like, and a machine key shows nothing: the label above the
+             * box already names the field, in the librarian's own words.
+             */
             // Predictive autocomplete for free-text custom fields, drawn from
             // existing values for this field (title-like uniqueness aside).
             list={field.type === 'text' ? `suggest-cf-${field.key}` : undefined}
@@ -5683,7 +5769,7 @@ function App() {
     if (canSeeCirculation && book.status === 'available') {
       // Mirror the detail-modal Borrow button, including closing the modal so the
       // circulation borrow form isn't hidden behind it.
-      items.push({ label: t('ctx.borrow'), icon: '📤', onClick: () => { setSelectedBook(book); setCurrentSection('circulation'); if (detailBook) closeDetail(); } });
+      items.push({ label: t('ctx.borrow'), icon: '📤', onClick: () => { setSelectedBook(book); setCurrentSection('circulation'); if (detailBook) closeDetail(); revealBorrowForm(); } });
     }
     if (canSeeCirculation && book.status === 'borrowed') {
       items.push({ label: t('ctx.return'), icon: '📥', onClick: () => { void returnBook(book); if (detailBook) closeDetail(); } });
@@ -6208,6 +6294,7 @@ function App() {
                       setSelectedBook(detailBook);
                       setCurrentSection('circulation');
                       closeDetail();
+                      revealBorrowForm();
                     }}>{t('detail.borrowBtn')}</button>
                   )}
                   {canSeeCirculation && detailBook.status === 'borrowed' && (
@@ -8427,7 +8514,7 @@ function App() {
                             scanHit.openLoan!.id
                           )}>{t('loans.return')}</button>
                         ) : (
-                          <button className="primary small" onClick={() => { setSelectedBook(scanHit.book); setScanHit(null); }}>
+                          <button className="primary small" onClick={() => { setSelectedBook(scanHit.book); setScanHit(null); revealBorrowForm(); }}>
                             {t('detail.borrowBtn')}
                           </button>
                         )}
@@ -8792,7 +8879,11 @@ function App() {
                             )}
                             <div className={f.pinned ? 'cf-row cf-row-pinned' : 'cf-row'}>
                               <div className="cf-row-text">
-                                <strong>{f.pinned ? '★ ' : ''}{f.label}</strong>
+                                {/* The name the librarian sees on the book form, so one field is
+                                    not called two different things in two places. The key beneath
+                                    it identifies the field exactly, and the edit dialog still
+                                    holds the STORED label — renaming edits the real value. */}
+                                <strong>{f.pinned ? '★ ' : ''}{attrLabel(f)}</strong>
                                 <span className="muted small">
                                   <code>{f.key}</code> · {f.type}{f.required ? ` ${t('settings.requiredSuffix')}` : ''}
                                   {f.type === 'enum' && f.enumOptions.length > 0 ? ` ${t('settings.optionsSuffix', { n: f.enumOptions.length })}` : ''}
