@@ -26,7 +26,7 @@ import {
   apiRequest, joinApiUrl, sleep, newMutationId,
   setAuthToken, setUnauthorizedHandler, subscribeNetStatus,
   ApiRequestError, SpreadsheetRowMissingError, OfflineWriteBlockedError,
-  isOfflineWriteBlockedError, isPayloadTooLargeError,
+  isOfflineWriteBlockedError, isPayloadTooLargeError, isVersionConflict,
   type NetStatus
 } from './api';
 import type {
@@ -2124,6 +2124,20 @@ function App() {
     });
   }
 
+  /**
+   * The row number the librarian sees in Excel, for a row SheetJS has parsed.
+   *
+   * `sheet_to_json` omits entirely blank rows from its object output, so the array index stops
+   * matching the sheet the moment a blank line appears — and a warning that names row 4 when the
+   * clash is on row 6 sends the librarian to the wrong line, which is worse than no row number.
+   * SheetJS records the true 0-based sheet row on each object as `__rowNum__`; +1 makes it the
+   * 1-based row Excel shows. The index fallback is only for a shape that carries no `__rowNum__`.
+   */
+  function sheetRowNumber(row: unknown, arrayIndex: number): number {
+    const n = (row as { __rowNum__?: unknown } | null | undefined)?.__rowNum__;
+    return typeof n === 'number' && Number.isFinite(n) ? n + 1 : arrayIndex + 2;
+  }
+
   function firstSpreadsheetValue(row: Record<string, unknown>, aliases: string[]): unknown {
     for (const alias of aliases) {
       const key = alias.trim().toLowerCase();
@@ -3764,6 +3778,11 @@ function App() {
         authorRomanized: String(base.form.authorRomanized ?? '').trim() || null,
         publisherRomanized: String(base.form.publisherRomanized ?? '').trim() || null,
         ddc: String(base.form.ddc ?? '').trim() || null,
+        // Without this the baseline reads `undefined` for a field the payload always fills, so
+        // `v !== baseCore[k]` never fails and the accession number rides along on EVERY save —
+        // re-asserting whatever the form was opened with and reverting a colleague's correction.
+        // Exactly the clobber the diff below exists to prevent, disabled for one field.
+        legacyId: String(base.form.legacyId ?? '').trim() || null,
         bibLevel: base.form.bibLevel,
         dateEdtf: String(base.form.publicationYear ?? '').trim() || null,
         status: base.form.status
@@ -3866,7 +3885,18 @@ function App() {
        * edited would suddenly differ from this form's stale copy and be sent back, which is
        * the clobber this whole change exists to stop. Only the version moves.
        */
-      if (e instanceof ApiRequestError && e.status === 409 && editForm.id) {
+      /*
+       * Only a VERSION conflict may be recovered from here. This route now answers 409 for a
+       * second reason — an accession number already held by another record — and treating that
+       * as a conflict reloaded the record, reported "somebody else changed this", and threw the
+       * librarian's edit away over a collision they could have fixed by typing another number.
+       *
+       * An uncoded 409 still counts, so a client running momentarily ahead of the worker that
+       * codes them keeps its conflict recovery instead of losing it.
+       */
+      const isConflict = isVersionConflict(e)
+        || (e instanceof ApiRequestError && e.status === 409 && !e.code);
+      if (isConflict && editForm.id) {
         try {
           const fresh = await apiRequest<Book>(`/api/books/${editForm.id}`);
           setDetailBook((prev) => (prev && prev.id === fresh.id ? { ...prev, ...fresh } : prev));
@@ -5314,7 +5344,7 @@ function App() {
           const row = buildCatalogRow(rawRows[rawIndex], reviewIds);
           if (!row) { blankSkipped += 1; continue; }
           catalogRows.push(row);
-          catalogSheetRows.push(rawIndex + 2); // +1 for the header, +1 for 1-based
+          catalogSheetRows.push(sheetRowNumber(rawRows[rawIndex], rawIndex));
         }
         if (catalogRows.length === 0) {
           throw new Error(t('toast.xlsxNoCatalog'));
@@ -5415,7 +5445,7 @@ function App() {
           }
 
           rows.push(normalized);
-          rowSheetNumbers.push(index + 2); // +1 for the header, +1 for 1-based
+          rowSheetNumbers.push(sheetRowNumber(rawRows[index], index));
         } catch (error) {
           // Locale-safe: detect the row-missing case by class, not by
           // matching a translated string.

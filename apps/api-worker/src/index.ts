@@ -1380,20 +1380,23 @@ app.get('/api/books/facets', async (c) => {
 	async function accessionSeriesSummary(): Promise<Array<{ prefix: string; count: number; next: string }>> {
 		const { results } = await c.env.DB.prepare(
 			`WITH parts AS (
-				SELECT CASE WHEN instr(legacy_id, '-') > 0
+				SELECT deleted_at,
+				       CASE WHEN instr(legacy_id, '-') > 0
 				            THEN substr(legacy_id, 1, instr(legacy_id, '-'))
 				            ELSE '' END AS prefix,
 				       CASE WHEN instr(legacy_id, '-') > 0
 				            THEN substr(legacy_id, instr(legacy_id, '-') + 1)
 				            ELSE legacy_id END AS tail
 				  FROM books
-				 WHERE deleted_at IS NULL AND legacy_id IS NOT NULL AND TRIM(legacy_id) != ''
+				 WHERE legacy_id IS NOT NULL AND TRIM(legacy_id) != ''
 			 )
-			 SELECT prefix, COUNT(*) AS n, MAX(CAST(tail AS INTEGER)) AS maxn
+			 SELECT prefix,
+			        SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS n,
+			        MAX(CAST(tail AS INTEGER)) AS maxn
 			   FROM parts
 			  WHERE tail != '' AND tail NOT GLOB '*[^0-9]*'
 			  GROUP BY prefix
-			 HAVING COUNT(*) > 1
+			 HAVING SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) > 1
 			  ORDER BY n DESC
 			  LIMIT 3`
 		).all<{ prefix: string; n: number; maxn: number }>();
@@ -3008,7 +3011,16 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	const existingMap = existing as Record<string, unknown>;
 	const currentVersion = Number(existingMap.version ?? 0);
 	if (payload.version !== currentVersion) {
-		throw new HTTPException(409, { message: 'Version conflict. Refresh and retry.' });
+		// Coded, because this route now answers 409 for a SECOND reason: an accession number
+		// already held by another record. Without the code the client cannot tell "reload,
+		// somebody edited this" from "that number is taken", and it answered the first for both —
+		// reloading the record and throwing the librarian's edit away over a collision they could
+		// have fixed by typing another number. This is the check that fires in practice; the one
+		// after the UPDATE below catches the narrower read-then-write race.
+		throw new HTTPException(409, {
+			message: 'Version conflict. Refresh and retry.',
+			cause: { code: 'version_conflict' }
+		});
 	}
 
 	// Circulation invariant: the 'borrowed' status must always own an open loan
@@ -3151,7 +3163,18 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 			mergedTagsJson,
 			mergedCustomFieldsJson,
 			merged.status,
-			(merged as { legacyId?: string | null }).legacyId ?? (existingMap.legacy_id as string | null) ?? null,
+			/*
+			 * NO `?? existingMap.legacy_id` HERE.
+			 *
+			 * `merged` spreads parseBook(existingMap) before the payload, so an ABSENT legacyId
+			 * already carries the stored value. The old fallback therefore fired on exactly one
+			 * input — an EXPLICIT null — which is the librarian clearing a number they put on the
+			 * wrong record. It wrote the number straight back and answered 200, so the pill
+			 * returned on the next refresh and the number stayed stuck on the wrong book while
+			 * the right one could never be given it (the UNIQUE index spans the whole table).
+			 * Absent still means "leave alone"; null now means "clear".
+			 */
+			(merged as { legacyId?: string | null }).legacyId ?? null,
 			merged.version,
 			merged.updatedAt,
 			mergedFolds.title_fold,
@@ -3196,8 +3219,12 @@ app.put('/api/books/:id', requirePermission('books.write', { librarian: true }),
 	} else {
 		const res = await updateBookStmt.run();
 		if ((res.meta?.changes ?? 0) === 0) {
-			// Someone else committed between our read and this write.
-			throw new HTTPException(409, { message: 'Version conflict. Refresh and retry.' });
+			// Someone else committed between our read and this write. Coded for the same reason
+			// as the precondition check above.
+			throw new HTTPException(409, {
+				message: 'Version conflict. Refresh and retry.',
+				cause: { code: 'version_conflict' }
+			});
 		}
 	}
 

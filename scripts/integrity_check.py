@@ -6638,7 +6638,8 @@ check("  and both import paths ask before losing the earlier row",
       _code104.count("await accessionCollisionsAccepted(") == 2,
       _code104.count("await accessionCollisionsAccepted("))
 check("  naming the sheet rows the librarian sees, not array indexes",
-      "catalogSheetRows.push(rawIndex + 2)" in _code104 and "rowSheetNumbers.push(index + 2)" in _code104, None)
+      "catalogSheetRows.push(sheetRowNumber(rawRows[rawIndex], rawIndex))" in _code104
+      and "rowSheetNumbers.push(sheetRowNumber(rawRows[index], index))" in _code104, None)
 
 check("a UUID from the bare 'id' column is never taken as an accession number",
       "function resolveLegacyId" in _code104
@@ -6741,9 +6742,13 @@ if LOCAL:
           st == 200 and isinstance(_series105, list) and len(_series105) >= 1, (st, _series105))
     if isinstance(_series105, list) and _series105:
         _top105 = _series105[0]
+        # NO deleted_at filter. `idx_books_legacy_id` is UNIQUE over the WHOLE table, and
+        # assertLegacyIdFree looks the holder up without one, so a number held by a trashed
+        # record is still taken. Asserting against the live-only maximum would encode exactly
+        # the bug where the app offers a number it then refuses.
         _rows105 = local_sql(
             "SELECT MAX(CAST(substr(legacy_id, instr(legacy_id,'-')+1) AS INTEGER)) AS m "
-            "FROM books WHERE deleted_at IS NULL AND legacy_id LIKE '"
+            "FROM books WHERE legacy_id LIKE '"
             + _top105["prefix"].replace("'", "''") + "%' "
             "AND substr(legacy_id, instr(legacy_id,'-')+1) NOT GLOB '*[^0-9]*'")
         _max105 = int((_rows105[0]["m"] if _rows105 and _rows105[0]["m"] is not None else 0))
@@ -6770,6 +6775,98 @@ if LOCAL:
           (_clash105 or {}).get("details"))
     call("DELETE", f"/api/books/{_b105}")
     call("DELETE", f"/api/books/{_b105}/purge")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n=== 106. What making one field editable did to the record editor ===")
+# An adversarial pre-deploy review of §105 found five faults, none of which the 1199-assertion
+# gate noticed. Every one of them comes from the same root: a field that was import-only became
+# something the edit form sends on every save, and four separate mechanisms had been written on
+# the assumption that it never would.
+_web106 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+_code106 = re.sub(r"/\*[\s\S]*?\*/", "", _web106)
+_code106 = "\n".join(l for l in _code106.split("\n") if not l.strip().startswith("//"))
+_api106 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
+_apicode106 = re.sub(r"/\*[\s\S]*?\*/", "", _api106)
+_apicode106 = "\n".join(l for l in _apicode106.split("\n") if not l.strip().startswith("//"))
+
+# (A) The save diffs against a baseline. A field in the payload but not the baseline compares
+#     against `undefined`, so it is ALWAYS "changed" and rides along on every save — re-asserting
+#     what the form was opened with over a colleague's correction.
+check("every field the save sends is also in the baseline it diffs against",
+      "legacyId: String(base.form.legacyId ?? '').trim() || null," in _code106, None)
+
+# (B) `merged` spreads the stored record before the payload, so ABSENT already means "keep".
+#     A `?? existing` on top of that fires only on an explicit null — the clear itself.
+check("clearing the accession number is not coalesced back to the stored value",
+      "(merged as { legacyId?: string | null }).legacyId ?? null," in _apicode106
+      and "legacyId ?? (existingMap.legacy_id as string | null)" not in _apicode106, None)
+
+# (C) The editor recovers from a 409 by reloading and discarding the edit. That is right for a
+#     version conflict and catastrophic for any other 409 — and this route now has one.
+check("only a version conflict is recovered from by reloading",
+      "isVersionConflict(e)" in _code106 and "e.status === 409 && !e.code" in _code106, None)
+check("  so the book route marks its conflicts as such",
+      _apicode106.count("cause: { code: 'version_conflict' }") >= 2
+      or _apicode106.count("code: 'version_conflict'") >= 4, _apicode106.count("code: 'version_conflict'"))
+
+# (E) SheetJS drops blank rows from object output, so the array index is not the Excel row.
+check("a spreadsheet warning names the row the librarian sees in Excel",
+      "function sheetRowNumber" in _code106 and "__rowNum__" in _code106
+      and "sheetRowNumber(rawRows[rawIndex], rawIndex)" in _code106
+      and "sheetRowNumber(rawRows[index], index)" in _code106, None)
+check("  and no import path still numbers rows by array position",
+      "rowSheetNumbers.push(index + 2)" not in _code106
+      and "catalogSheetRows.push(rawIndex + 2)" not in _code106, None)
+
+if LOCAL:
+    # (B) runtime: absent keeps, null clears. Both halves, because fixing one by breaking the
+    #     other is the obvious wrong turn.
+    _b106, _ = mkbook(title="ZZ Editable Accession", author="Δ. Δοκιμή", legacyId=f"ZZE-{uuid.uuid4().hex[:6]}")
+    st, _g106 = call("GET", f"/api/books/{_b106}")
+    _v106 = (_g106 or {}).get("version")
+    st, _ = call("PUT", f"/api/books/{_b106}", {"title": "ZZ Editable Accession II", "version": _v106})
+    st, _g106b = call("GET", f"/api/books/{_b106}")
+    check("a save that never mentions the accession number leaves it alone",
+          (_g106b or {}).get("legacyId") == (_g106 or {}).get("legacyId"),
+          ((_g106 or {}).get("legacyId"), (_g106b or {}).get("legacyId")))
+    st, _ = call("PUT", f"/api/books/{_b106}", {"legacyId": None, "version": (_g106b or {}).get("version")})
+    st, _g106c = call("GET", f"/api/books/{_b106}")
+    check("  and a save that clears it actually clears it",
+          (_g106c or {}).get("legacyId") in (None, ""), (_g106c or {}).get("legacyId"))
+
+    # (C) runtime: the two 409s this route now answers must be tellable apart.
+    _hold106, _ = mkbook(title="ZZ Holds The Number", author="Δ. Δοκιμή", legacyId=f"ZZH-{uuid.uuid4().hex[:6]}")
+    st, _gh = call("GET", f"/api/books/{_hold106}")
+    st, _g106d = call("GET", f"/api/books/{_b106}")
+    st, _stale = call("PUT", f"/api/books/{_b106}",
+                      {"title": "ZZ Stale", "version": (_g106d or {}).get("version", 0) + 99})
+    check("a stale save is refused as a version conflict, by code",
+          st == 409 and (_stale or {}).get("code") == "version_conflict", (st, (_stale or {}).get("code")))
+    st, _taken = call("PUT", f"/api/books/{_b106}",
+                      {"legacyId": (_gh or {}).get("legacyId"), "version": (_g106d or {}).get("version")})
+    check("  and a taken accession number is NOT — or the editor throws the edit away",
+          st == 409 and (_taken or {}).get("code") == "accession_taken", (st, (_taken or {}).get("code")))
+
+    # (D) runtime: the register must not offer a number a trashed record still holds.
+    _pfx106 = f"ZZS{uuid.uuid4().hex[:4]}-"
+    _k1, _ = mkbook(title="ZZ Series One", author="Δ. Δοκιμή", legacyId=f"{_pfx106}1")
+    _k2, _ = mkbook(title="ZZ Series Two", author="Δ. Δοκιμή", legacyId=f"{_pfx106}2")
+    _k3, _ = mkbook(title="ZZ Series Three", author="Δ. Δοκιμή", legacyId=f"{_pfx106}3")
+    call("DELETE", f"/api/books/{_k3}")          # trashed, but it KEEPS its number
+    st, _fac106 = call("GET", "/api/books/facets")
+    _mine106 = [e for e in ((_fac106 or {}).get("accessionSeries") or []) if e.get("prefix") == _pfx106]
+    if _mine106:
+        check("the next number offered skips one a trashed record still holds",
+              _mine106[0]["next"] == f"{_pfx106}4", _mine106[0])
+        st, _refused = call("POST", "/api/books",
+                            {"title": "ZZ Series Thief", "author": "Δ. Δοκιμή", "legacyId": f"{_pfx106}3"})
+        check("  which is exactly the number the server would have refused", st == 409, st)
+    else:
+        check("the new series is reported at all (so the check above is not vacuous)", False, _fac106)
+    for _x in (_b106, _hold106, _k1, _k2, _k3):
+        call("DELETE", f"/api/books/{_x}")
+        call("DELETE", f"/api/books/{_x}/purge")
 
 
 print("\n" + "=" * 62)
