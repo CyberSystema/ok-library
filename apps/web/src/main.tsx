@@ -2037,6 +2037,60 @@ function App() {
     'id'
   ];
 
+  /**
+   * This app's own export writes an 'ID' column holding the internal record UUID, and 'id' is the
+   * last accession-number alias — a courtesy for sheets that name the column that way. While the
+   * export's 'Legacy ID' column is present it wins, because it comes earlier in the list.
+   *
+   * Delete that column in Excel, though, and every row's accession number becomes the UUID of the
+   * record it came from. Nothing matches, so the entire catalogue is created a second time, each
+   * duplicate stamped with the original's internal id — after which a later corrective re-import
+   * matches the duplicates rather than the originals and the damage is no longer undoable in bulk.
+   *
+   * No accession register on earth contains UUIDs, so a UUID-shaped value read from the bare 'id'
+   * column is always this mistake and never a real accession number.
+   */
+  const UUID_SHAPED = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  function resolveLegacyId(row: Record<string, unknown>): string | null {
+    for (const alias of LEGACY_ID_ALIASES) {
+      const key = alias.trim().toLowerCase();
+      if (!Object.prototype.hasOwnProperty.call(row, key)) continue;
+      const text = toNullableText(row[key]);
+      if (key === 'id' && text && UUID_SHAPED.test(text)) return null;
+      return text;
+    }
+    return null;
+  }
+
+  /**
+   * True when the sheet would have fed this app's own record ids in as accession numbers.
+   *
+   * Reads the RAW rows, whose keys are the headers exactly as written ('ID', 'Legacy ID') —
+   * `normalizeSpreadsheetRow` lowercases them only later. So both of that function's forms are
+   * matched here, the trimmed-lowercase one and the punctuation-stripped one. Comparing against
+   * lowercase alone made this guard unable to fire on the very file it was written for.
+   */
+  function sheetUsesInternalIdAsAccession(rawRows: Record<string, unknown>[]): boolean {
+    if (rawRows.length === 0) return false;
+    const headers = Object.keys(rawRows[0]);
+    const keyForms = new Set<string>();
+    for (const header of headers) {
+      const written = header.trim().toLowerCase();
+      keyForms.add(written);
+      keyForms.add(normalizeColumnName(written));
+    }
+    const named = LEGACY_ID_ALIASES.filter((a) => a !== 'id')
+      .flatMap((a) => [a.trim().toLowerCase(), normalizeColumnName(a)]);
+    if (named.some((n) => keyForms.has(n))) return false;   // a real accession column is present
+    const idHeader = headers.find((h) => h.trim().toLowerCase() === 'id');
+    if (!idHeader) return false;
+    return rawRows.some((row) => {
+      const text = toNullableText(row[idHeader]);
+      return !!text && UUID_SHAPED.test(text);
+    });
+  }
+
   function firstSpreadsheetValue(row: Record<string, unknown>, aliases: string[]): unknown {
     for (const alias of aliases) {
       const key = alias.trim().toLowerCase();
@@ -2204,7 +2258,7 @@ function App() {
       // The sheet's own identifier for the record. Sending it lets a corrected
       // re-upload UPDATE the books it already created instead of adding a
       // second copy of each one.
-      legacyId: toNullableText(firstSpreadsheetValue(row, LEGACY_ID_ALIASES)),
+      legacyId: resolveLegacyId(row),
       isbn: toNullableText(firstSpreadsheetValue(row, ['isbn'])),
       publicationYear,
       publisher: toNullableText(firstSpreadsheetValue(row, ['publisher'])),
@@ -5049,6 +5103,62 @@ function App() {
     }
   }
 
+  /**
+   * Two sheet rows carrying the same accession number are not a duplicate row — they are one
+   * book overwriting another.
+   *
+   * Both importers match on `legacy_id` alone and do the lookup INSIDE the write loop, so row 312
+   * finds the record row 45 wrote moments earlier and UPDATEs it. One of the two books never
+   * enters the catalogue, its data having replaced the other's, and the toast reads like an
+   * ordinary corrective re-upload. `books.legacy_id` carries a UNIQUE index, so the schema states
+   * the invariant that the importer was quietly resolving by overwriting.
+   *
+   * Checked here, on the parsed sheet, because it costs nothing, needs no server round trip, and
+   * can only fire on a real collision.
+   */
+  function findAccessionCollisions(
+    pairs: Array<{ legacyId: string | null | undefined; sheetRow: number }>
+  ): Array<{ legacyId: string; rows: number[] }> {
+    const byId = new Map<string, number[]>();
+    for (const pair of pairs) {
+      const key = (pair.legacyId ?? '').trim();
+      if (!key) continue;
+      const seen = byId.get(key);
+      if (seen) seen.push(pair.sheetRow);
+      else byId.set(key, [pair.sheetRow]);
+    }
+    const clashes: Array<{ legacyId: string; rows: number[] }> = [];
+    for (const [legacyId, rows] of byId) {
+      if (rows.length > 1) clashes.push({ legacyId, rows });
+    }
+    return clashes;
+  }
+
+  /** Names the rows and what would be lost, then lets them decide. Returns false to stop. */
+  async function accessionCollisionsAccepted(
+    pairs: Array<{ legacyId: string | null | undefined; sheetRow: number }>
+  ): Promise<boolean> {
+    const clashes = findAccessionCollisions(pairs);
+    if (clashes.length === 0) return true;
+    // Every row after the first under one accession number is a book that never arrives.
+    const lost = clashes.reduce((n, clash) => n + clash.rows.length - 1, 0);
+    const listed = clashes
+      .slice(0, 5)
+      .map((clash) => `${clash.legacyId} (${t('toast.accessionClashRows', { rows: clash.rows.slice(0, 6).join(', ') })})`)
+      .join('; ');
+    // `t()` interpolates {word} only — no ICU — so the tail is composed here, as elsewhere.
+    const extra = clashes.length > 5 ? t('toast.accessionClashMore', { n: clashes.length - 5 }) : '';
+    const ok = await confirm({
+      title: t('toast.accessionClashTitle'),
+      body: t('toast.accessionClashBody', { n: clashes.length, lost, listed, extra }),
+      confirmLabel: t('toast.accessionClashConfirm'),
+      cancelLabel: t('toast.accessionClashCancel'),
+      danger: true
+    });
+    if (!ok) setMessage(t('toast.accessionClashStopped'));
+    return ok;
+  }
+
   async function importCatalogRows(rows: CatalogRow[], dryRun: boolean) {
     const CHUNK = 500;
     let cursor = 0;
@@ -5160,15 +5270,23 @@ function App() {
 
         // Use the FIRST sheet as canonical (typically named "library").
         const catalogRows: CatalogRow[] = [];
+        // Sheet row numbers, kept alongside because blanks are skipped: index in `catalogRows`
+        // is not the row the librarian sees in Excel, and a collision report must name that row.
+        const catalogSheetRows: number[] = [];
         let blankSkipped = 0;
-        for (const raw of rawRows) {
-          const row = buildCatalogRow(raw, reviewIds);
+        for (let rawIndex = 0; rawIndex < rawRows.length; rawIndex += 1) {
+          const row = buildCatalogRow(rawRows[rawIndex], reviewIds);
           if (!row) { blankSkipped += 1; continue; }
           catalogRows.push(row);
+          catalogSheetRows.push(rawIndex + 2); // +1 for the header, +1 for 1-based
         }
         if (catalogRows.length === 0) {
           throw new Error(t('toast.xlsxNoCatalog'));
         }
+
+        if (!(await accessionCollisionsAccepted(
+          catalogRows.map((row, i) => ({ legacyId: row.legacyId, sheetRow: catalogSheetRows[i] }))
+        ))) return;
 
         const reviewMatched = catalogRows.filter((r) => r.needsReview).length;
         const noTitle = catalogRows.filter((r) => !r.title).length;
@@ -5207,6 +5325,23 @@ function App() {
       }
       // ── End catalog fast path ────────────────────────────────────────────
 
+      // Dropping the UUID (above) stops it being written as a bogus accession number, but it
+      // cannot stop the duplication: with no accession column left, every row is a new record.
+      // So say what will happen and let them fix the sheet instead.
+      if (sheetUsesInternalIdAsAccession(rawRows)) {
+        const proceed = await confirm({
+          title: t('toast.internalIdTitle'),
+          body: t('toast.internalIdBody', { n: rawRows.length }),
+          confirmLabel: t('toast.internalIdConfirm'),
+          cancelLabel: t('toast.internalIdCancel'),
+          danger: true
+        });
+        if (!proceed) {
+          setMessage(t('toast.internalIdStopped'));
+          return;
+        }
+      }
+
       const unknownColumns = findUnknownSpreadsheetColumns(rawRows);
       if (unknownColumns.length > 0) {
         const listed = unknownColumns.slice(0, 12).join(', ');
@@ -5229,6 +5364,9 @@ function App() {
       }
 
       const rows: Record<string, unknown>[] = [];
+      // Sheet row numbers for `rows`, kept in step so a collision report can name the row the
+      // librarian sees in Excel rather than an index into the filtered array.
+      const rowSheetNumbers: number[] = [];
       const skippedBlankRows: number[] = [];
       const skippedInvalidRows: number[] = [];
 
@@ -5241,6 +5379,7 @@ function App() {
           }
 
           rows.push(normalized);
+          rowSheetNumbers.push(index + 2); // +1 for the header, +1 for 1-based
         } catch (error) {
           // Locale-safe: detect the row-missing case by class, not by
           // matching a translated string.
@@ -5255,6 +5394,13 @@ function App() {
       if (rows.length === 0) {
         throw new Error(t('toast.xlsxNoValid'));
       }
+
+      if (!(await accessionCollisionsAccepted(
+        rows.map((row, i) => ({
+          legacyId: (row as { legacyId?: string | null }).legacyId,
+          sheetRow: rowSheetNumbers[i]
+        }))
+      ))) return;
 
       const skippedCount = skippedBlankRows.length + skippedInvalidRows.length;
       const skippedInvalidPreview = skippedInvalidRows.slice(0, 8).join(', ');

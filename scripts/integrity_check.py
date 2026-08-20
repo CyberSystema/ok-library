@@ -6611,6 +6611,86 @@ if LOCAL:
     call("DELETE", f"/api/books/{_b103}/purge")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n=== 104. IMPORT: the two ways a spreadsheet silently destroys books ===")
+# Both importers match a row to a record on `legacy_id` and on nothing else, and both do that
+# lookup INSIDE the write loop. Two consequences, each of which loses books without a word:
+#
+#   1. Two rows sharing one accession number. Row 312 finds the record row 45 wrote moments
+#      earlier and UPDATEs it. One book never enters the catalogue. `books.legacy_id` is UNIQUE,
+#      so the schema states the invariant the importer was resolving by overwriting.
+#   2. This app's own export writes an 'ID' column holding the internal UUID, and 'id' is the
+#      last accession-number alias. Delete the 'Legacy ID' column in Excel and every row's
+#      accession number becomes a UUID: nothing matches, the whole catalogue is created a second
+#      time, and each duplicate is stamped with the original's internal id — after which a later
+#      corrective re-import matches the duplicates instead of the originals.
+#
+# Both are stopped on the client, before the first POST, where it costs nothing and can only fire
+# on a genuine fault.
+_web104 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+_code104 = re.sub(r"/\*[\s\S]*?\*/", "", _web104)
+_code104 = "\n".join(l for l in _code104.split("\n") if not l.strip().startswith("//"))
+_i18n104 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+
+check("a repeated accession number in one sheet is detected",
+      "function findAccessionCollisions" in _code104, None)
+check("  and both import paths ask before losing the earlier row",
+      _code104.count("await accessionCollisionsAccepted(") == 2,
+      _code104.count("await accessionCollisionsAccepted("))
+check("  naming the sheet rows the librarian sees, not array indexes",
+      "catalogSheetRows.push(rawIndex + 2)" in _code104 and "rowSheetNumbers.push(index + 2)" in _code104, None)
+
+check("a UUID from the bare 'id' column is never taken as an accession number",
+      "function resolveLegacyId" in _code104
+      and "if (key === 'id' && text && UUID_SHAPED.test(text)) return null;" in _code104, None)
+check("  and the sheet that would duplicate the catalogue is refused first",
+      "sheetUsesInternalIdAsAccession(rawRows)" in _code104
+      and "toast.internalIdTitle" in _code104, None)
+# The trap this guard fell into once: `rawRows` keys are headers AS WRITTEN ('ID'), and
+# normalizeSpreadsheetRow lowercases them only afterwards. Comparing against lowercase alone made
+# the check unable to fire on the very file it exists for, and nothing failed to say so.
+check("  reading the RAW headers in both of the forms the importer itself accepts",
+      "keyForms.add(normalizeColumnName(written))" in _code104
+      and "headers.find((h) => h.trim().toLowerCase() === 'id')" in _code104, None)
+check("  and it stays silent when a real accession column is present",
+      "if (named.some((n) => keyForms.has(n))) return false;" in _code104, None)
+
+for _k in ("toast.accessionClashTitle", "toast.accessionClashBody", "toast.accessionClashMore",
+           "toast.internalIdTitle", "toast.internalIdBody", "toast.internalIdStopped"):
+    check(f"  '{_k}' is written in all four languages",
+          _i18n104.count(f"'{_k}':") == 4, _i18n104.count(f"'{_k}':"))
+# `t()` interpolates {word} and nothing else; ICU syntax renders as literal braces on screen.
+check("the new strings use only the interpolation this app actually has",
+      "plural," not in _i18n104, None)
+
+if LOCAL:
+    # The hazard itself, so it stays measured rather than remembered: two rows, one accession
+    # number, one surviving book. The client guard above is what keeps a librarian from reaching
+    # this; if the server is ever taught to reject the collision outright, update this check.
+    _acc104 = f"ZZACC{uuid.uuid4().hex[:8]}"
+    _rows104 = [
+        {"legacyId": _acc104, "title": "ZZ Collision First", "author": "Δ. Δοκιμή"},
+        {"legacyId": _acc104, "title": "ZZ Collision Second", "author": "Δ. Δοκιμή"}
+    ]
+    # The preview promises two books. (`dryRun` defaults to TRUE on this endpoint — omitting it
+    # writes nothing, which is how the first version of this check silently measured an empty
+    # database and still counted itself as having run.)
+    st, _dry104 = call("POST", "/api/import/books", {"dryRun": True, "rows": _rows104})
+    check("the import preview promises a book for each of the two rows",
+          st == 200 and (_dry104 or {}).get("wouldCreate") == 2, (st, (_dry104 or {}).get("wouldCreate")))
+    st, _r104 = call("POST", "/api/import/books", {"dryRun": False, "rows": _rows104})
+    check("  and the real import is accepted without complaint", st in (200, 201), st)
+    _n104 = sql_count(local_sql(
+        f"SELECT COUNT(*) AS n FROM books WHERE legacy_id = '{_acc104}' AND deleted_at IS NULL"))
+    check("  yet delivers ONE book, not two — which is why the client asks first", _n104 == 1, _n104)
+    _row104 = local_sql(
+        f"SELECT id, title FROM books WHERE legacy_id = '{_acc104}' AND deleted_at IS NULL LIMIT 1")
+    _id104 = (_row104[0]["id"] if _row104 else None)
+    if _id104:
+        call("DELETE", f"/api/books/{_id104}")
+        call("DELETE", f"/api/books/{_id104}/purge")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")
