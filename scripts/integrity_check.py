@@ -6693,88 +6693,73 @@ if LOCAL:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-print("\n=== 105. The accession register can be kept by hand, not only imported ===")
-# 12,528 of the records here carry an accession number and every record created since the import
-# does not, because no form could set one. That gap is not cosmetic: the importer matches on
-# `legacy_id` and on nothing else, so the first time a hand-catalogued book appears in the master
-# spreadsheet, a corrective re-upload creates a SECOND record for it — and §104 is what stops the
-# collision that would otherwise hide.
+print("\n=== 105. legacy_id is provenance, not an identifier this library issues ===")
+# CORRECTED, on the owner's own account of the data. The original catalogue spreadsheet held two
+# tables, OLD and NEW — filled in that order, and identical in every other respect. `legacy_id`
+# points at the row a record came from, and its ONLY purpose is finding that row again.
+#
+# It is therefore NOT an accession register, and the app must never mint one. A book catalogued
+# here has no row in that file to point at, so a suggested "next" value would invent a provenance
+# that does not exist — and would collide with a real row if the file were ever extended. The
+# field is offered where a wrong pointer can be CORRECTED, and nowhere a new one can be INVENTED.
 _web105 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
 _code105 = re.sub(r"/\*[\s\S]*?\*/", "", _web105)
 _code105 = "\n".join(l for l in _code105.split("\n") if not l.strip().startswith("//"))
 _i18n105 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+_api105 = _slurp(_REPO, "apps", "api-worker", "src", "index.ts")
 
-check("an accession number can be typed when cataloguing",
-      'id="fld-library-add-accession"' in _code105, None)
-check("  and corrected afterwards on the record itself",
+check("a wrong reference can be corrected on the record",
       'id="fld-detail-accession"' in _code105, None)
-check("  it reaches the server on create",
-      "legacyId: createForm.legacyId.trim() || null" in _code105, None)
-check("  and on save",
+check("  reaching the server on save",
       "legacyId: editForm.legacyId.trim() || null" in _code105, None)
-check("  and the edit form opens holding what the record already has",
+check("  with the form opening on what the record already holds",
       "legacyId: b.legacyId ?? ''," in _web105, None)
-# A form field added to createForm that a reset forgets leaves the last book's number in the box
-# for the next one — which is how a duplicate accession number gets typed without anyone typing it.
-check("  every reset of the add form clears it too",
-      _code105.count("legacyId: ''") >= 4, _code105.count("legacyId: ''"))
+check("  and explained, since the label alone does not say what it points at",
+      "library.add.accessionHint" in _code105, None)
 
-check("the next free number in each series is offered",
-      "function AccessionSeriesHint" in _code105 and "accessionSeries" in _code105, None)
-# Suggesting, not deciding: this catalogue runs two series, and filling in the wrong one silently
-# is worse than leaving the field empty.
-check("  as a suggestion that retires once anything is typed",
-      "props.current.trim() !== ''" in _code105, None)
-for _k in ("library.add.accession", "library.add.accessionPh", "library.add.accessionNext",
+# The whole point of the correction: cataloguing a book cannot invent a spreadsheet row.
+check("cataloguing a new book cannot invent a reference",
+      'id="fld-library-add-accession"' not in _code105
+      and "legacyId: createForm.legacyId" not in _code105, None)
+check("  and no 'next free' value is offered anywhere",
+      "AccessionSeriesHint" not in _code105
+      and "accessionSeries" not in _code105
+      and "accessionSeries" not in _api105, None)
+# Calling it an accession number is the mistake that produced the suggestion in the first place.
+check("  nor is it called an accession number",
+      "'library.add.accession': 'Accession number'" not in _i18n105, None)
+
+for _k in ("library.add.accession", "library.add.accessionPh", "library.add.accessionHint",
            "toast.accessionTaken", "toast.accessionTakenTrashed"):
     check(f"  '{_k}' is written in all four languages",
           _i18n105.count(f"'{_k}':") == 4, _i18n105.count(f"'{_k}':"))
-# The refusal a librarian will actually meet — re-entering the number of the book they catalogued
-# a minute ago — has to arrive in their own language AND still name the record holding it.
-check("the duplicate-number refusal is translated without losing the record it names",
+check("the collision refusal is translated without losing the record it names",
       "function describeApiError" in _code105
       and "t('toast.accessionTaken', { accession, title })" in _code105, None)
 
 if LOCAL:
-    st, _fac105 = call("GET", "/api/books/facets")
-    _series105 = (_fac105 or {}).get("accessionSeries")
-    check("the catalogue reports the accession series it actually uses",
-          st == 200 and isinstance(_series105, list) and len(_series105) >= 1, (st, _series105))
-    if isinstance(_series105, list) and _series105:
-        _top105 = _series105[0]
-        # NO deleted_at filter. `idx_books_legacy_id` is UNIQUE over the WHOLE table, and
-        # assertLegacyIdFree looks the holder up without one, so a number held by a trashed
-        # record is still taken. Asserting against the live-only maximum would encode exactly
-        # the bug where the app offers a number it then refuses.
-        _rows105 = local_sql(
-            "SELECT MAX(CAST(substr(legacy_id, instr(legacy_id,'-')+1) AS INTEGER)) AS m "
-            "FROM books WHERE legacy_id LIKE '"
-            + _top105["prefix"].replace("'", "''") + "%' "
-            "AND substr(legacy_id, instr(legacy_id,'-')+1) NOT GLOB '*[^0-9]*'")
-        _max105 = int((_rows105[0]["m"] if _rows105 and _rows105[0]["m"] is not None else 0))
-        check("  and the number it offers is the one after the highest in that series",
-              _top105["next"] == f"{_top105['prefix']}{_max105 + 1}",
-              (_top105["next"], _max105))
-        # A prefix used once is a stray identifier, not a series worth continuing.
-        check("  offering only series that are genuinely in use",
-              all(e["count"] > 1 for e in _series105), [e["count"] for e in _series105])
-
-    # A number typed by hand is kept, and a second record cannot take it.
-    _acc105 = f"ZZACC-{uuid.uuid4().hex[:6]}"
-    _b105, _ = mkbook(title="ZZ Accession By Hand", author="Δ. Δοκιμή", legacyId=_acc105)
+    # One row of the original file describes one book, so two records may not claim the same one.
+    _ref105 = f"ZZOLD-{uuid.uuid4().hex[:6]}"
+    _b105, _ = mkbook(title="ZZ From The Spreadsheet", author="Δ. Δοκιμή", legacyId=_ref105)
     _got105 = local_sql(f"SELECT legacy_id FROM books WHERE id = '{_b105}'")
-    check("an accession number typed on the form is stored",
-          _got105 and _got105[0]["legacy_id"] == _acc105, _got105)
+    check("a reference carried in from the original file is stored",
+          _got105 and _got105[0]["legacy_id"] == _ref105, _got105)
     st, _clash105 = call("POST", "/api/books",
-                         {"title": "ZZ Accession Thief", "author": "Δ. Δοκιμή", "legacyId": _acc105})
-    check("  and a second record cannot quietly take it", st == 409, st)
+                         {"title": "ZZ Same Row Twice", "author": "Δ. Δοκιμή", "legacyId": _ref105})
+    check("  and a second record cannot claim the same row", st == 409, st)
     check("    refused with a code the interface can translate",
           (_clash105 or {}).get("code") == "accession_taken", (_clash105 or {}).get("code"))
-    check("    carrying the record that holds it, so the translation can still name it",
-          ((_clash105 or {}).get("details") or {}).get("title") == "ZZ Accession By Hand",
+    check("    naming the record that holds it",
+          ((_clash105 or {}).get("details") or {}).get("title") == "ZZ From The Spreadsheet",
           (_clash105 or {}).get("details"))
-    call("DELETE", f"/api/books/{_b105}")
-    call("DELETE", f"/api/books/{_b105}/purge")
+    # A book catalogued here has no row to point at, and that is CORRECT rather than a gap.
+    _n105, _ = mkbook(title="ZZ Catalogued Here", author="Δ. Δοκιμή")
+    _none105 = local_sql(f"SELECT legacy_id FROM books WHERE id = '{_n105}'")
+    check("a book catalogued here carries no reference, and needs none",
+          _none105 and (_none105[0]["legacy_id"] in (None, "")), _none105)
+    for _x in (_b105, _n105):
+        call("DELETE", f"/api/books/{_x}")
+        call("DELETE", f"/api/books/{_x}/purge")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6782,7 +6767,9 @@ print("\n=== 106. What making one field editable did to the record editor ===")
 # An adversarial pre-deploy review of §105 found five faults, none of which the 1199-assertion
 # gate noticed. Every one of them comes from the same root: a field that was import-only became
 # something the edit form sends on every save, and four separate mechanisms had been written on
-# the assumption that it never would.
+# the assumption that it never would. (The fifth concerned a "next free value" suggestion that
+# §105 has since removed outright — legacy_id turned out to be provenance, not a register — so
+# only its four survivors are checked here.)
 _web106 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
 _code106 = re.sub(r"/\*[\s\S]*?\*/", "", _web106)
 _code106 = "\n".join(l for l in _code106.split("\n") if not l.strip().startswith("//"))
@@ -6848,23 +6835,7 @@ if LOCAL:
     check("  and a taken accession number is NOT — or the editor throws the edit away",
           st == 409 and (_taken or {}).get("code") == "accession_taken", (st, (_taken or {}).get("code")))
 
-    # (D) runtime: the register must not offer a number a trashed record still holds.
-    _pfx106 = f"ZZS{uuid.uuid4().hex[:4]}-"
-    _k1, _ = mkbook(title="ZZ Series One", author="Δ. Δοκιμή", legacyId=f"{_pfx106}1")
-    _k2, _ = mkbook(title="ZZ Series Two", author="Δ. Δοκιμή", legacyId=f"{_pfx106}2")
-    _k3, _ = mkbook(title="ZZ Series Three", author="Δ. Δοκιμή", legacyId=f"{_pfx106}3")
-    call("DELETE", f"/api/books/{_k3}")          # trashed, but it KEEPS its number
-    st, _fac106 = call("GET", "/api/books/facets")
-    _mine106 = [e for e in ((_fac106 or {}).get("accessionSeries") or []) if e.get("prefix") == _pfx106]
-    if _mine106:
-        check("the next number offered skips one a trashed record still holds",
-              _mine106[0]["next"] == f"{_pfx106}4", _mine106[0])
-        st, _refused = call("POST", "/api/books",
-                            {"title": "ZZ Series Thief", "author": "Δ. Δοκιμή", "legacyId": f"{_pfx106}3"})
-        check("  which is exactly the number the server would have refused", st == 409, st)
-    else:
-        check("the new series is reported at all (so the check above is not vacuous)", False, _fac106)
-    for _x in (_b106, _hold106, _k1, _k2, _k3):
+    for _x in (_b106, _hold106):
         call("DELETE", f"/api/books/{_x}")
         call("DELETE", f"/api/books/{_x}/purge")
 

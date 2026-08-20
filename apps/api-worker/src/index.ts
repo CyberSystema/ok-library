@@ -1361,60 +1361,15 @@ app.get('/api/books/facets', async (c) => {
 	// dots and dashes) so "J.-P.MIGNE" / "J. -P. MIGNE" / "J.P. MIGNE" collapse to
 	// ONE suggestion. This only chooses which spelling to SUGGEST — stored data
 	// and search are untouched.
-	/*
-	 * The accession register, as a series rather than a free-text field.
-	 *
-	 * This catalogue runs two: OLD-<n> (8,388 records) and NEW-<n> (4,140). Every real accession
-	 * number holds exactly one hyphen, so the split below is exact rather than a guess, and a tail
-	 * that is not wholly numeric is left out of the maximum instead of being coerced to 0.
-	 * A prefix used exactly once is a stray identifier, not a series, so it is not offered.
-	 *
-	 * What this buys: a book catalogued by hand can be given the next number in the register
-	 * without anyone looking it up. An unbroken register is what lets a corrective re-import match
-	 * an existing record instead of creating a second one — the importer matches on `legacy_id` and
-	 * on nothing else — so the gap this closes is a duplicate per hand-catalogued book, forever.
-	 *
-	 * Cost: one aggregate over a table this handler already scans several times, on a cache key
-	 * that a write invalidates. It does not add a round trip to the add-book form.
-	 */
-	async function accessionSeriesSummary(): Promise<Array<{ prefix: string; count: number; next: string }>> {
-		const { results } = await c.env.DB.prepare(
-			`WITH parts AS (
-				SELECT deleted_at,
-				       CASE WHEN instr(legacy_id, '-') > 0
-				            THEN substr(legacy_id, 1, instr(legacy_id, '-'))
-				            ELSE '' END AS prefix,
-				       CASE WHEN instr(legacy_id, '-') > 0
-				            THEN substr(legacy_id, instr(legacy_id, '-') + 1)
-				            ELSE legacy_id END AS tail
-				  FROM books
-				 WHERE legacy_id IS NOT NULL AND TRIM(legacy_id) != ''
-			 )
-			 SELECT prefix,
-			        SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) AS n,
-			        MAX(CAST(tail AS INTEGER)) AS maxn
-			   FROM parts
-			  WHERE tail != '' AND tail NOT GLOB '*[^0-9]*'
-			  GROUP BY prefix
-			 HAVING SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END) > 1
-			  ORDER BY n DESC
-			  LIMIT 3`
-		).all<{ prefix: string; n: number; maxn: number }>();
-		return (results ?? [])
-			.filter((r) => typeof r.maxn === 'number' && Number.isFinite(r.maxn))
-			.map((r) => ({ prefix: r.prefix, count: r.n, next: `${r.prefix}${r.maxn + 1}` }));
-	}
-
-	const [authors, publishers, languages, shelfCodes, customFields, accessionSeries] = await Promise.all([
+	const [authors, publishers, languages, shelfCodes, customFields] = await Promise.all([
 		distinctValues('author', looseFold('COALESCE(author_fold, LOWER(author))'), 1000),
 		distinctValues('publisher', looseFold('COALESCE(publisher_fold, LOWER(publisher))'), 1000),
 		distinctValues('language', "LOWER(TRIM(language))", 200),
 		distinctValues('shelf_code', "LOWER(TRIM(shelf_code))", 1000),
-		customFieldFacets(),
-		accessionSeriesSummary()
+		customFieldFacets()
 	]);
 
-	const response = { authors, publishers, languages, shelfCodes, customFields, accessionSeries };
+	const response = { authors, publishers, languages, shelfCodes, customFields };
 
 	if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {

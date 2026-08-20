@@ -301,10 +301,6 @@ export type CatalogFacets = {
   shelfCodes: string[];
   // Per-custom-field distinct values (text fields only), keyed by field key.
   customFields: Record<string, string[]>;
-  // The accession-number series in use, commonest first, each with the next free
-  // number in it. Optional: a cached facets payload written before this existed
-  // is still served, and the form simply offers no suggestion.
-  accessionSeries?: Array<{ prefix: string; count: number; next: string }>;
 };
 
 export type SearchMode = 'all' | 'any' | 'exact';

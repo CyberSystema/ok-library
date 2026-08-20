@@ -1002,28 +1002,6 @@ function focusFirstInvalidField(): void {
  * both and lets the librarian choose. It disappears once they have typed anything, because at
  * that point it is no longer helping.
  */
-function AccessionSeriesHint(props: {
-  series: Array<{ prefix: string; count: number; next: string }> | undefined;
-  current: string;
-  onPick: (value: string) => void;
-  t: (key: string, vars?: Record<string, string | number>) => string;
-}) {
-  const series = props.series ?? [];
-  if (series.length === 0 || props.current.trim() !== '') return null;
-  return (
-    <div className="accession-hint">
-      <span className="muted small">{props.t('library.add.accessionNext')}</span>
-      {series.map((entry) => (
-        <button key={entry.prefix} type="button" className="chip ghost"
-          onClick={() => props.onPick(entry.next)}
-          title={props.t('library.add.accessionSeriesTitle', { prefix: entry.prefix, count: entry.count })}>
-          {entry.next}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 function editFieldsFromBook(b: Book) {
   return {
     title: b.title,
@@ -1186,7 +1164,6 @@ function App() {
     title: '',
     author: '',
     isbn: '',
-    legacyId: '',
     shelfCode: '',
     publicationYear: '',
     titleRomanized: '',
@@ -3386,7 +3363,6 @@ function App() {
           title: createForm.title.trim(),
           author: createForm.author.trim(),
           isbn: createForm.isbn.trim() || null,
-          legacyId: createForm.legacyId.trim() || null,
           shelfCode: createForm.shelfCode.trim() || null,
           publisher: createForm.publisher.trim() || null,
           language: createForm.language.trim() || null,
@@ -3415,7 +3391,6 @@ function App() {
     titleRomanized: '',
     authorRomanized: '',
     publisherRomanized: '',
-        legacyId: '',
         publisher: '',
         language: '',
         ddc: '',
@@ -5809,7 +5784,7 @@ function App() {
       // The record they were about to create is now a copy on an existing record, so the form has
       // nothing left to say. Closing it is the honest end of the task.
       setCreateForm({
-        title: '', author: '', isbn: '', legacyId: '', shelfCode: '', publicationYear: '',
+        title: '', author: '', isbn: '', shelfCode: '', publicationYear: '',
         titleRomanized: '', authorRomanized: '', publisherRomanized: '',
         publisher: '', language: '', ddc: '', bibLevel: 'monograph' as BibLevel, description: ''
       });
@@ -7087,18 +7062,17 @@ function App() {
                       <input id="fld-detail-shelfrow" list="suggest-shelf" value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder={t('detail.shelfPh')} />
                     </div>
                     <div>
+                      {/* Provenance, not an identifier this library issues: it points at the row
+                          this record came from in the original catalogue spreadsheet. Editable so
+                          a wrong pointer can be corrected; never suggested, because a book
+                          catalogued here has no row in that file to point at. */}
                       <label htmlFor="fld-detail-accession">{t('library.add.accession')}</label>
                       <input id="fld-detail-accession"
                         value={editForm.legacyId}
                         onChange={(e) => setEditForm({ ...editForm, legacyId: e.target.value })}
                         placeholder={t('library.add.accessionPh')}
                       />
-                      <AccessionSeriesHint
-                        series={facets.accessionSeries}
-                        current={editForm.legacyId}
-                        onPick={(v) => setEditForm({ ...editForm, legacyId: v })}
-                        t={t}
-                      />
+                      <span className="muted small">{t('library.add.accessionHint')}</span>
                     </div>
                     <div>
                       <label htmlFor="fld-detail-statusrow">{t('detail.statusRow')}</label>
@@ -8021,23 +7995,6 @@ function App() {
                         <div>
                           <label htmlFor="fld-library-add-shelf">{t('library.add.shelf')}</label>
                           <input id="fld-library-add-shelf" list="suggest-shelf" value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder={t('library.add.shelfPh')} />
-                        </div>
-                        <div>
-                          {/* The accession register was import-only until now: every book
-                              catalogued by hand had no number, so the master spreadsheet could
-                              never match it and a re-import duplicated it. */}
-                          <label htmlFor="fld-library-add-accession">{t('library.add.accession')}</label>
-                          <input id="fld-library-add-accession"
-                            value={createForm.legacyId}
-                            onChange={(e) => setCreateForm({ ...createForm, legacyId: e.target.value })}
-                            placeholder={t('library.add.accessionPh')}
-                          />
-                          <AccessionSeriesHint
-                            series={facets.accessionSeries}
-                            current={createForm.legacyId}
-                            onPick={(v) => setCreateForm({ ...createForm, legacyId: v })}
-                            t={t}
-                          />
                         </div>
                       </div>
                       <div className="form-row">
