@@ -94,10 +94,20 @@ export class ApiRequestError extends Error {
    */
   code?: string;
 
-  constructor(status: number, message: string, code?: string) {
+  /**
+   * The facts the server's sentence names, when it sends them.
+   *
+   * A code says WHICH refusal; it cannot say which record is holding the accession number. Without
+   * these, a translated message would have to drop the only part that tells the librarian what to
+   * do next — so the app would be choosing between the right language and the right information.
+   */
+  details?: Record<string, unknown>;
+
+  constructor(status: number, message: string, code?: string, details?: Record<string, unknown>) {
     super(message);
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -307,7 +317,7 @@ export async function apiRequest<T>(
       const responseText = await response.text();
       const errorBody = (() => {
         try {
-          return JSON.parse(responseText) as { error?: string; requestId?: string; code?: string };
+          return JSON.parse(responseText) as { error?: string; requestId?: string; code?: string; details?: Record<string, unknown> };
         } catch {
           return { error: response.statusText };
         }
@@ -345,7 +355,7 @@ export async function apiRequest<T>(
       const message = errorBody.requestId
         ? `${errorBody.error ?? `Request failed with status ${response.status}`} (ref: ${errorBody.requestId})`
         : (errorBody.error ?? `Request failed with status ${response.status}`);
-      throw new ApiRequestError(response.status, message, errorBody.code);
+      throw new ApiRequestError(response.status, message, errorBody.code, errorBody.details);
     }
 
     if (raw) {

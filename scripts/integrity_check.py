@@ -6691,6 +6691,87 @@ if LOCAL:
         call("DELETE", f"/api/books/{_id104}/purge")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n=== 105. The accession register can be kept by hand, not only imported ===")
+# 12,528 of the records here carry an accession number and every record created since the import
+# does not, because no form could set one. That gap is not cosmetic: the importer matches on
+# `legacy_id` and on nothing else, so the first time a hand-catalogued book appears in the master
+# spreadsheet, a corrective re-upload creates a SECOND record for it — and §104 is what stops the
+# collision that would otherwise hide.
+_web105 = _slurp(_REPO, "apps", "web", "src", "main.tsx")
+_code105 = re.sub(r"/\*[\s\S]*?\*/", "", _web105)
+_code105 = "\n".join(l for l in _code105.split("\n") if not l.strip().startswith("//"))
+_i18n105 = _slurp(_REPO, "apps", "web", "src", "i18n.tsx")
+
+check("an accession number can be typed when cataloguing",
+      'id="fld-library-add-accession"' in _code105, None)
+check("  and corrected afterwards on the record itself",
+      'id="fld-detail-accession"' in _code105, None)
+check("  it reaches the server on create",
+      "legacyId: createForm.legacyId.trim() || null" in _code105, None)
+check("  and on save",
+      "legacyId: editForm.legacyId.trim() || null" in _code105, None)
+check("  and the edit form opens holding what the record already has",
+      "legacyId: b.legacyId ?? ''," in _web105, None)
+# A form field added to createForm that a reset forgets leaves the last book's number in the box
+# for the next one — which is how a duplicate accession number gets typed without anyone typing it.
+check("  every reset of the add form clears it too",
+      _code105.count("legacyId: ''") >= 4, _code105.count("legacyId: ''"))
+
+check("the next free number in each series is offered",
+      "function AccessionSeriesHint" in _code105 and "accessionSeries" in _code105, None)
+# Suggesting, not deciding: this catalogue runs two series, and filling in the wrong one silently
+# is worse than leaving the field empty.
+check("  as a suggestion that retires once anything is typed",
+      "props.current.trim() !== ''" in _code105, None)
+for _k in ("library.add.accession", "library.add.accessionPh", "library.add.accessionNext",
+           "toast.accessionTaken", "toast.accessionTakenTrashed"):
+    check(f"  '{_k}' is written in all four languages",
+          _i18n105.count(f"'{_k}':") == 4, _i18n105.count(f"'{_k}':"))
+# The refusal a librarian will actually meet — re-entering the number of the book they catalogued
+# a minute ago — has to arrive in their own language AND still name the record holding it.
+check("the duplicate-number refusal is translated without losing the record it names",
+      "function describeApiError" in _code105
+      and "t('toast.accessionTaken', { accession, title })" in _code105, None)
+
+if LOCAL:
+    st, _fac105 = call("GET", "/api/books/facets")
+    _series105 = (_fac105 or {}).get("accessionSeries")
+    check("the catalogue reports the accession series it actually uses",
+          st == 200 and isinstance(_series105, list) and len(_series105) >= 1, (st, _series105))
+    if isinstance(_series105, list) and _series105:
+        _top105 = _series105[0]
+        _rows105 = local_sql(
+            "SELECT MAX(CAST(substr(legacy_id, instr(legacy_id,'-')+1) AS INTEGER)) AS m "
+            "FROM books WHERE deleted_at IS NULL AND legacy_id LIKE '"
+            + _top105["prefix"].replace("'", "''") + "%' "
+            "AND substr(legacy_id, instr(legacy_id,'-')+1) NOT GLOB '*[^0-9]*'")
+        _max105 = int((_rows105[0]["m"] if _rows105 and _rows105[0]["m"] is not None else 0))
+        check("  and the number it offers is the one after the highest in that series",
+              _top105["next"] == f"{_top105['prefix']}{_max105 + 1}",
+              (_top105["next"], _max105))
+        # A prefix used once is a stray identifier, not a series worth continuing.
+        check("  offering only series that are genuinely in use",
+              all(e["count"] > 1 for e in _series105), [e["count"] for e in _series105])
+
+    # A number typed by hand is kept, and a second record cannot take it.
+    _acc105 = f"ZZACC-{uuid.uuid4().hex[:6]}"
+    _b105, _ = mkbook(title="ZZ Accession By Hand", author="Δ. Δοκιμή", legacyId=_acc105)
+    _got105 = local_sql(f"SELECT legacy_id FROM books WHERE id = '{_b105}'")
+    check("an accession number typed on the form is stored",
+          _got105 and _got105[0]["legacy_id"] == _acc105, _got105)
+    st, _clash105 = call("POST", "/api/books",
+                         {"title": "ZZ Accession Thief", "author": "Δ. Δοκιμή", "legacyId": _acc105})
+    check("  and a second record cannot quietly take it", st == 409, st)
+    check("    refused with a code the interface can translate",
+          (_clash105 or {}).get("code") == "accession_taken", (_clash105 or {}).get("code"))
+    check("    carrying the record that holds it, so the translation can still name it",
+          ((_clash105 or {}).get("details") or {}).get("title") == "ZZ Accession By Hand",
+          (_clash105 or {}).get("details"))
+    call("DELETE", f"/api/books/{_b105}")
+    call("DELETE", f"/api/books/{_b105}/purge")
+
+
 print("\n" + "=" * 62)
 if SKIPPED_SHARED:
     print("SKIPPED (would mutate shared state on a non-local API; set")

@@ -519,9 +519,13 @@ app.onError((error, c) => {
 		 * app whose interface runs in four languages. The message stays exactly as it was, so
 		 * nothing that reads it is affected.
 		 */
-		const cause = error.cause as { code?: string } | undefined;
+		const cause = error.cause as { code?: string; details?: Record<string, unknown> } | undefined;
 		const code = cause && typeof cause.code === 'string' ? cause.code : undefined;
-		return c.json(code ? { error: error.message, code } : { error: error.message }, error.status);
+		// Some refusals name a record or a value the client must repeat back in the librarian's
+		// own language; the code alone would force it to drop exactly the useful half.
+		const details = cause && cause.details && typeof cause.details === 'object' ? cause.details : undefined;
+		if (!code) return c.json({ error: error.message }, error.status);
+		return c.json(details ? { error: error.message, code, details } : { error: error.message, code }, error.status);
 	}
 
 	// Input validation failures are CLIENT errors (400), not server errors.
@@ -1357,15 +1361,57 @@ app.get('/api/books/facets', async (c) => {
 	// dots and dashes) so "J.-P.MIGNE" / "J. -P. MIGNE" / "J.P. MIGNE" collapse to
 	// ONE suggestion. This only chooses which spelling to SUGGEST — stored data
 	// and search are untouched.
-	const [authors, publishers, languages, shelfCodes, customFields] = await Promise.all([
+	/*
+	 * The accession register, as a series rather than a free-text field.
+	 *
+	 * This catalogue runs two: OLD-<n> (8,388 records) and NEW-<n> (4,140). Every real accession
+	 * number holds exactly one hyphen, so the split below is exact rather than a guess, and a tail
+	 * that is not wholly numeric is left out of the maximum instead of being coerced to 0.
+	 * A prefix used exactly once is a stray identifier, not a series, so it is not offered.
+	 *
+	 * What this buys: a book catalogued by hand can be given the next number in the register
+	 * without anyone looking it up. An unbroken register is what lets a corrective re-import match
+	 * an existing record instead of creating a second one — the importer matches on `legacy_id` and
+	 * on nothing else — so the gap this closes is a duplicate per hand-catalogued book, forever.
+	 *
+	 * Cost: one aggregate over a table this handler already scans several times, on a cache key
+	 * that a write invalidates. It does not add a round trip to the add-book form.
+	 */
+	async function accessionSeriesSummary(): Promise<Array<{ prefix: string; count: number; next: string }>> {
+		const { results } = await c.env.DB.prepare(
+			`WITH parts AS (
+				SELECT CASE WHEN instr(legacy_id, '-') > 0
+				            THEN substr(legacy_id, 1, instr(legacy_id, '-'))
+				            ELSE '' END AS prefix,
+				       CASE WHEN instr(legacy_id, '-') > 0
+				            THEN substr(legacy_id, instr(legacy_id, '-') + 1)
+				            ELSE legacy_id END AS tail
+				  FROM books
+				 WHERE deleted_at IS NULL AND legacy_id IS NOT NULL AND TRIM(legacy_id) != ''
+			 )
+			 SELECT prefix, COUNT(*) AS n, MAX(CAST(tail AS INTEGER)) AS maxn
+			   FROM parts
+			  WHERE tail != '' AND tail NOT GLOB '*[^0-9]*'
+			  GROUP BY prefix
+			 HAVING COUNT(*) > 1
+			  ORDER BY n DESC
+			  LIMIT 3`
+		).all<{ prefix: string; n: number; maxn: number }>();
+		return (results ?? [])
+			.filter((r) => typeof r.maxn === 'number' && Number.isFinite(r.maxn))
+			.map((r) => ({ prefix: r.prefix, count: r.n, next: `${r.prefix}${r.maxn + 1}` }));
+	}
+
+	const [authors, publishers, languages, shelfCodes, customFields, accessionSeries] = await Promise.all([
 		distinctValues('author', looseFold('COALESCE(author_fold, LOWER(author))'), 1000),
 		distinctValues('publisher', looseFold('COALESCE(publisher_fold, LOWER(publisher))'), 1000),
 		distinctValues('language', "LOWER(TRIM(language))", 200),
 		distinctValues('shelf_code', "LOWER(TRIM(shelf_code))", 1000),
-		customFieldFacets()
+		customFieldFacets(),
+		accessionSeriesSummary()
 	]);
 
-	const response = { authors, publishers, languages, shelfCodes, customFields };
+	const response = { authors, publishers, languages, shelfCodes, customFields, accessionSeries };
 
 	if (c.env.CACHE && !versionTooFreshToCache(cacheVersion)) {
 		try {
@@ -1566,10 +1612,17 @@ async function assertLegacyIdFree(
 		.bind(value, excludeBookId)
 		.first<{ id: string; title: string; deleted_at: string | null }>();
 	if (!holder) return;
+	// The accession number is now typed on a form that runs in four languages, so this refusal
+	// carries a code and the two facts its sentence names. The English message is unchanged for
+	// anything that still reads it; a client that knows the code says the same thing in Greek.
 	throw new HTTPException(409, {
 		message: holder.deleted_at
 			? `Accession number ${value} is already on "${holder.title}", which is in the trash. Restore or purge that record first, or use another number.`
-			: `Accession number ${value} is already on "${holder.title}". Every record needs its own number.`
+			: `Accession number ${value} is already on "${holder.title}". Every record needs its own number.`,
+		cause: {
+			code: holder.deleted_at ? 'accession_taken_trashed' : 'accession_taken',
+			details: { accession: value, title: holder.title }
+		}
 	});
 }
 

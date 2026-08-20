@@ -994,6 +994,36 @@ function focusFirstInvalidField(): void {
   }, 0);
 }
 
+/**
+ * The next free number in each accession series the register already uses.
+ *
+ * A suggestion, never a default. This catalogue runs two series — OLD- and NEW- — and writing the
+ * wrong one into an accession register is worse than leaving the field empty, so the app names
+ * both and lets the librarian choose. It disappears once they have typed anything, because at
+ * that point it is no longer helping.
+ */
+function AccessionSeriesHint(props: {
+  series: Array<{ prefix: string; count: number; next: string }> | undefined;
+  current: string;
+  onPick: (value: string) => void;
+  t: (key: string, vars?: Record<string, string | number>) => string;
+}) {
+  const series = props.series ?? [];
+  if (series.length === 0 || props.current.trim() !== '') return null;
+  return (
+    <div className="accession-hint">
+      <span className="muted small">{props.t('library.add.accessionNext')}</span>
+      {series.map((entry) => (
+        <button key={entry.prefix} type="button" className="chip ghost"
+          onClick={() => props.onPick(entry.next)}
+          title={props.t('library.add.accessionSeriesTitle', { prefix: entry.prefix, count: entry.count })}>
+          {entry.next}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function editFieldsFromBook(b: Book) {
   return {
     title: b.title,
@@ -1004,6 +1034,7 @@ function editFieldsFromBook(b: Book) {
     titleRomanized: b.titleRomanized ?? '',
     authorRomanized: b.authorRomanized ?? '',
     publisherRomanized: b.publisherRomanized ?? '',
+    legacyId: b.legacyId ?? '',
     status: b.status,
     publisher: b.publisher ?? '',
     language: b.language ?? '',
@@ -1155,6 +1186,7 @@ function App() {
     title: '',
     author: '',
     isbn: '',
+    legacyId: '',
     shelfCode: '',
     publicationYear: '',
     titleRomanized: '',
@@ -1188,6 +1220,7 @@ function App() {
     titleRomanized: '',
     authorRomanized: '',
     publisherRomanized: '',
+    legacyId: '',
     status: 'available' as BookStatus,
     version: 0,
     publisher: '',
@@ -3339,6 +3372,7 @@ function App() {
           title: createForm.title.trim(),
           author: createForm.author.trim(),
           isbn: createForm.isbn.trim() || null,
+          legacyId: createForm.legacyId.trim() || null,
           shelfCode: createForm.shelfCode.trim() || null,
           publisher: createForm.publisher.trim() || null,
           language: createForm.language.trim() || null,
@@ -3367,6 +3401,7 @@ function App() {
     titleRomanized: '',
     authorRomanized: '',
     publisherRomanized: '',
+        legacyId: '',
         publisher: '',
         language: '',
         ddc: '',
@@ -3402,7 +3437,7 @@ function App() {
 
       await Promise.all([loadBooks(), loadRoomSummary(), loadFacet(facetField), loadNeedsReviewCount()]);
     } catch (e) {
-      setError((e as Error).message);
+      setError(describeApiError(e));
     }
   }
 
@@ -3702,6 +3737,7 @@ function App() {
         title: editForm.title.trim(),
         author: editForm.author.trim(),
         isbn: editForm.isbn.trim() || null,
+        legacyId: editForm.legacyId.trim() || null,
         shelfCode: editForm.shelfCode.trim() || null,
         publisher: editForm.publisher.trim() || null,
         language: editForm.language.trim() || null,
@@ -3842,7 +3878,7 @@ function App() {
           /* fall through to the generic error below */
         }
       }
-      setError((e as Error).message);
+      setError(describeApiError(e));
     }
   }
 
@@ -5743,7 +5779,7 @@ function App() {
       // The record they were about to create is now a copy on an existing record, so the form has
       // nothing left to say. Closing it is the honest end of the task.
       setCreateForm({
-        title: '', author: '', isbn: '', shelfCode: '', publicationYear: '',
+        title: '', author: '', isbn: '', legacyId: '', shelfCode: '', publicationYear: '',
         titleRomanized: '', authorRomanized: '', publisherRomanized: '',
         publisher: '', language: '', ddc: '', bibLevel: 'monograph' as BibLevel, description: ''
       });
@@ -5771,6 +5807,28 @@ function App() {
     } finally {
       setDuplicateBusy(false);
     }
+  }
+
+  /**
+   * A refusal in the librarian's own language, where the server codes one.
+   *
+   * The server answers in English — 163 of its messages do — which is fine for the ones a
+   * librarian never sees. This is not one of those: re-entering the accession number of the book
+   * catalogued a minute ago is the single most likely typo in retrospective cataloguing, and the
+   * field that provokes it is now on the form. The `details` are what let the translated sentence
+   * still name the record holding the number, which is the only part that says what to do next.
+   */
+  function describeApiError(error: unknown): string {
+    if (error instanceof ApiRequestError && error.code) {
+      const d = (error.details ?? {}) as { accession?: unknown; title?: unknown };
+      const accession = typeof d.accession === 'string' ? d.accession : null;
+      const title = typeof d.title === 'string' ? d.title : null;
+      if (accession && title) {
+        if (error.code === 'accession_taken') return t('toast.accessionTaken', { accession, title });
+        if (error.code === 'accession_taken_trashed') return t('toast.accessionTakenTrashed', { accession, title });
+      }
+    }
+    return (error as Error).message;
   }
 
   function closeDetail() {
@@ -6999,6 +7057,20 @@ function App() {
                       <input id="fld-detail-shelfrow" list="suggest-shelf" value={editForm.shelfCode} onChange={(e) => setEditForm({ ...editForm, shelfCode: e.target.value })} placeholder={t('detail.shelfPh')} />
                     </div>
                     <div>
+                      <label htmlFor="fld-detail-accession">{t('library.add.accession')}</label>
+                      <input id="fld-detail-accession"
+                        value={editForm.legacyId}
+                        onChange={(e) => setEditForm({ ...editForm, legacyId: e.target.value })}
+                        placeholder={t('library.add.accessionPh')}
+                      />
+                      <AccessionSeriesHint
+                        series={facets.accessionSeries}
+                        current={editForm.legacyId}
+                        onPick={(v) => setEditForm({ ...editForm, legacyId: v })}
+                        t={t}
+                      />
+                    </div>
+                    <div>
                       <label htmlFor="fld-detail-statusrow">{t('detail.statusRow')}</label>
                       <select id="fld-detail-statusrow" value={editForm.status} onChange={(e) => setEditForm({ ...editForm, status: e.target.value as BookStatus })}>
                         {/* 'borrowed' is owned by the borrow/return actions — the
@@ -7919,6 +7991,23 @@ function App() {
                         <div>
                           <label htmlFor="fld-library-add-shelf">{t('library.add.shelf')}</label>
                           <input id="fld-library-add-shelf" list="suggest-shelf" value={createForm.shelfCode} onChange={(e) => setCreateForm({ ...createForm, shelfCode: e.target.value })} placeholder={t('library.add.shelfPh')} />
+                        </div>
+                        <div>
+                          {/* The accession register was import-only until now: every book
+                              catalogued by hand had no number, so the master spreadsheet could
+                              never match it and a re-import duplicated it. */}
+                          <label htmlFor="fld-library-add-accession">{t('library.add.accession')}</label>
+                          <input id="fld-library-add-accession"
+                            value={createForm.legacyId}
+                            onChange={(e) => setCreateForm({ ...createForm, legacyId: e.target.value })}
+                            placeholder={t('library.add.accessionPh')}
+                          />
+                          <AccessionSeriesHint
+                            series={facets.accessionSeries}
+                            current={createForm.legacyId}
+                            onPick={(v) => setCreateForm({ ...createForm, legacyId: v })}
+                            t={t}
+                          />
                         </div>
                       </div>
                       <div className="form-row">

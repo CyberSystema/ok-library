@@ -3394,6 +3394,18 @@ mark.hl {
 .dup-choice-shelf label { font-size: 0.85rem; font-weight: 600; }
 .dup-choice-shelf input { max-width: 18rem; }
 
+/* The next-free-number strip under the accession field. Wraps rather than stretching the
+   form row, because Greek and Russian labels plus two series overflow a narrow column. */
+.accession-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.3rem;
+}
+.accession-hint .chip { padding: 0.1rem 0.45rem; font-size: 0.8rem; }
+
+
 
 /* Withdrawn copies: the way back from a mistake, folded away until wanted.
    Collapsed by default because on most records it is empty or irrelevant, and an
