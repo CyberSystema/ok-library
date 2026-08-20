@@ -3351,29 +3351,49 @@ mark.hl {
 /* The "what is this book?" dialog raised when a librarian picks an existing title
    out of the duplicate list. Each option is a button with one line under it
    saying when it applies: the point is to teach the rule, not merely enforce it. */
-.dup-choice { max-width: 34rem; }
+.dup-choice { max-width: 34rem; padding-bottom: 1.5rem; }
+
+/*
+ * The modal itself has no padding — only its header does — so every block below the header
+ * was sitting flush against both edges of the panel, text included. These carry the header's
+ * own 1.5rem gutter down the rest of the dialog so the content sits inside the panel rather
+ * than against it, and the record card reads as a card instead of a full-bleed band.
+ */
+.dup-choice-record,
+.dup-choice-intro,
+.dup-choice-options { margin-inline: 1.5rem; }
+/* …and clear of the header's rule, which it otherwise sits directly under. */
+.dup-choice-record { margin-block-start: 1.25rem; }
+
+/* The title is the one thing that must not push the close button onto its own line: Greek
+   runs long, and `.modal-header` wraps by default. Let the heading shrink instead. */
+.dup-choice .modal-header { flex-wrap: nowrap; }
+.dup-choice .modal-header h3 { flex: 1; min-width: 0; }
+
 .dup-choice-record {
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
-  padding: 0.6rem 0.75rem;
+  gap: 0.3rem;
+  padding: 0.9rem 1rem;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface-2);
 }
-.dup-choice-intro { margin: 0.75rem 0 0; line-height: 1.45; }
+.dup-choice-intro { margin-block: 1.1rem 0; line-height: 1.6; }
 .dup-choice-options {
   list-style: none;
-  margin: 0.9rem 0 0;
+  margin-block: 1.5rem 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.7rem;
+  /* Each option is a button plus a line explaining it. The gap BETWEEN options has to beat
+     the gap inside one, or the explanation reads as belonging to the button below it. */
+  gap: 1.5rem;
 }
 .dup-choice-options li {
   display: flex;
   flex-direction: column;
-  gap: 0.2rem;
+  gap: 0.45rem;
 }
 /* The button sizes to its text rather than the dialog, so a long Greek or Russian
    label wraps inside the control instead of stretching it across the panel. */
@@ -3386,9 +3406,9 @@ mark.hl {
 .dup-choice-shelf {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-  margin: 0.35rem 0 0 0.1rem;
-  padding-inline-start: 0.75rem;
+  gap: 0.45rem;
+  margin: 0.65rem 0 0 0.1rem;
+  padding-inline-start: 1rem;
   border-inline-start: 2px solid var(--border);
 }
 .dup-choice-shelf label { font-size: 0.85rem; font-weight: 600; }
